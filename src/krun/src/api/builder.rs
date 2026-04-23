@@ -640,7 +640,11 @@ mod tests {
         let builder = VmBuilder::new()
             .disk(|d| d.path("/a.raw"))
             .disk(|d| d.path("/b.qcow2").format(DiskImageFormat::Qcow2))
-            .disk(|d| d.path("/c.vmdk").format(DiskImageFormat::Vmdk).read_only(true));
+            .disk(|d| {
+                d.path("/c.vmdk")
+                    .format(DiskImageFormat::Vmdk)
+                    .read_only(true)
+            });
 
         let paths: Vec<_> = builder
             .disk
