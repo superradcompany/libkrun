@@ -39,9 +39,13 @@ pub mod backends;
 
 pub use api::builder::VmBuilder;
 #[cfg(feature = "blk")]
+pub use api::builders::CacheMode;
+#[cfg(feature = "blk")]
 pub use api::builders::DiskBuilder;
 #[cfg(feature = "blk")]
 pub use api::builders::DiskImageFormat;
+#[cfg(feature = "blk")]
+pub use api::builders::SyncMode;
 #[cfg(feature = "net")]
 pub use api::builders::NetBuilder;
 pub use api::builders::{ConsoleBuilder, ExecBuilder, FsBuilder, KernelBuilder, MachineBuilder};
