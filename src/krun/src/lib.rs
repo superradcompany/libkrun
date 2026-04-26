@@ -39,11 +39,15 @@ pub mod backends;
 
 pub use api::builder::VmBuilder;
 #[cfg(feature = "blk")]
+pub use api::builders::CacheMode;
+#[cfg(feature = "blk")]
 pub use api::builders::DiskBuilder;
 #[cfg(feature = "blk")]
 pub use api::builders::DiskImageFormat;
 #[cfg(feature = "net")]
 pub use api::builders::NetBuilder;
+#[cfg(feature = "blk")]
+pub use api::builders::SyncMode;
 pub use api::builders::{ConsoleBuilder, ExecBuilder, FsBuilder, KernelBuilder, MachineBuilder};
 pub use api::error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use api::exit_handle::ExitHandle;

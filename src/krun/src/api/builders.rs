@@ -259,6 +259,30 @@ pub enum DiskImageFormat {
     Vmdk,
 }
 
+/// Host-side cache behavior for a block device.
+///
+/// Mirrors libkrun's internal `CacheType`. `Writeback` honors guest flush
+/// requests via `fsync`; `Unsafe` advertises flush but makes it a noop.
+#[cfg(feature = "blk")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheMode {
+    Writeback,
+    Unsafe,
+}
+
+/// Host-side sync behavior for a block device.
+///
+/// `None` skips all host sync (fastest, data-loss risk). `Relaxed` honors
+/// `VIRTIO_BLK_F_FLUSH` but relaxes hardware sync. `Full` forces strict
+/// hardware flush.
+#[cfg(feature = "blk")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    None,
+    Relaxed,
+    Full,
+}
+
 /// Builder for block device configuration.
 ///
 /// # Example
@@ -273,8 +297,12 @@ pub enum DiskImageFormat {
 pub struct DiskBuilder {
     pub(crate) configs: Vec<DiskConfig>,
     current_path: Option<PathBuf>,
+    current_id: Option<String>,
     current_read_only: bool,
     current_format: DiskImageFormat,
+    current_cache: CacheMode,
+    current_direct_io: bool,
+    current_sync: SyncMode,
 }
 
 /// Configuration for a single block device.
@@ -282,8 +310,14 @@ pub struct DiskBuilder {
 #[derive(Debug, Clone)]
 pub struct DiskConfig {
     pub path: PathBuf,
+    /// Caller-chosen block id. When `None`, the builder auto-assigns
+    /// `vd<suffix>` using the kernel's bijective base-26 scheme.
+    pub id: Option<String>,
     pub read_only: bool,
     pub format: DiskImageFormat,
+    pub cache: CacheMode,
+    pub direct_io: bool,
+    pub sync: SyncMode,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -722,8 +756,12 @@ impl DiskBuilder {
         Self {
             configs: Vec::new(),
             current_path: None,
+            current_id: None,
             current_read_only: false,
             current_format: DiskImageFormat::Raw,
+            current_cache: CacheMode::Writeback,
+            current_direct_io: false,
+            current_sync: SyncMode::Full,
         }
     }
 
@@ -733,17 +771,36 @@ impl DiskBuilder {
         self
     }
 
+    /// Set a stable block id for the current disk.
+    ///
+    /// When unset, the builder auto-assigns `vd<suffix>` by insertion order
+    /// (matching the kernel's bijective base-26 scheme: `vda`..`vdz`,
+    /// `vdaa`..`vdzz`, `vdaaa`...). Setting a custom id lets the guest
+    /// address the device via `/dev/disk/by-id/virtio-<id>` independent of
+    /// attach order.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.current_id = Some(id.into());
+        self
+    }
+
     /// Set the path for a block device.
     pub fn path(mut self, path: impl AsRef<Path>) -> Self {
         // Finalize any pending config
         if let Some(pending_path) = self.current_path.take() {
             self.configs.push(DiskConfig {
                 path: pending_path,
+                id: self.current_id.take(),
                 read_only: self.current_read_only,
                 format: self.current_format,
+                cache: self.current_cache,
+                direct_io: self.current_direct_io,
+                sync: self.current_sync,
             });
             self.current_read_only = false;
             self.current_format = DiskImageFormat::Raw;
+            self.current_cache = CacheMode::Writeback;
+            self.current_direct_io = false;
+            self.current_sync = SyncMode::Full;
         }
 
         self.current_path = Some(path.as_ref().to_path_buf());
@@ -756,13 +813,35 @@ impl DiskBuilder {
         self
     }
 
+    /// Set the host-side cache behavior for the current disk.
+    pub fn cache(mut self, mode: CacheMode) -> Self {
+        self.current_cache = mode;
+        self
+    }
+
+    /// Enable or disable `O_DIRECT` on the host backing file for the current disk.
+    pub fn direct_io(mut self, enabled: bool) -> Self {
+        self.current_direct_io = enabled;
+        self
+    }
+
+    /// Set the host-side sync behavior for the current disk.
+    pub fn sync(mut self, mode: SyncMode) -> Self {
+        self.current_sync = mode;
+        self
+    }
+
     /// Finalize the builder (called internally).
     pub(crate) fn finalize(mut self) -> Self {
         if let Some(path) = self.current_path.take() {
             self.configs.push(DiskConfig {
                 path,
+                id: self.current_id.take(),
                 read_only: self.current_read_only,
                 format: self.current_format,
+                cache: self.current_cache,
+                direct_io: self.current_direct_io,
+                sync: self.current_sync,
             });
         }
         self
@@ -787,6 +866,27 @@ impl From<DiskImageFormat> for devices::virtio::block::ImageType {
             DiskImageFormat::Raw => devices::virtio::block::ImageType::Raw,
             DiskImageFormat::Qcow2 => devices::virtio::block::ImageType::Qcow2,
             DiskImageFormat::Vmdk => devices::virtio::block::ImageType::Vmdk,
+        }
+    }
+}
+
+#[cfg(feature = "blk")]
+impl From<CacheMode> for devices::virtio::CacheType {
+    fn from(mode: CacheMode) -> Self {
+        match mode {
+            CacheMode::Writeback => devices::virtio::CacheType::Writeback,
+            CacheMode::Unsafe => devices::virtio::CacheType::Unsafe,
+        }
+    }
+}
+
+#[cfg(feature = "blk")]
+impl From<SyncMode> for devices::virtio::block::SyncMode {
+    fn from(mode: SyncMode) -> Self {
+        match mode {
+            SyncMode::None => devices::virtio::block::SyncMode::None,
+            SyncMode::Relaxed => devices::virtio::block::SyncMode::Relaxed,
+            SyncMode::Full => devices::virtio::block::SyncMode::Full,
         }
     }
 }

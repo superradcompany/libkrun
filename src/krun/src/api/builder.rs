@@ -210,14 +210,29 @@ impl VmBuilder {
 
     /// Configure block devices.
     ///
-    /// Can be called multiple times to add multiple devices.
+    /// Can be called multiple times to add multiple devices. Devices receive
+    /// deterministic guest names by attach order (`/dev/vda`, `/dev/vdb`,
+    /// ...). For stable addressing across reorderings, set a custom `id()` —
+    /// the guest can then reach the disk via `/dev/disk/by-id/virtio-<id>`.
     ///
-    /// # Example
+    /// # Examples
+    ///
+    /// Single rootfs disk:
     ///
     /// ```rust,no_run
     /// # use msb_krun::VmBuilder;
     /// VmBuilder::new()
     ///     .disk(|d| d.path("/path/to/disk.img").read_only(true));
+    /// ```
+    ///
+    /// Rootfs plus data and cache volumes with stable ids:
+    ///
+    /// ```rust,no_run
+    /// # use msb_krun::{VmBuilder, DiskImageFormat};
+    /// VmBuilder::new()
+    ///     .disk(|d| d.path("/img/root.raw"))
+    ///     .disk(|d| d.path("/img/data.qcow2").format(DiskImageFormat::Qcow2).id("data"))
+    ///     .disk(|d| d.path("/img/cache.raw").id("cache").read_only(true));
     /// ```
     #[cfg(feature = "blk")]
     pub fn disk(mut self, f: impl FnOnce(DiskBuilder) -> DiskBuilder) -> Self {
@@ -437,17 +452,22 @@ impl VmBuilder {
         // Apply block device configuration
         #[cfg(feature = "blk")]
         for (i, config) in self.disk.configs.into_iter().enumerate() {
-            let block_id = format!("vd{}", (b'a' + i as u8) as char);
+            let block_id = config
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("vd{}", vd_suffix(i)));
             let image_type: ImageType = config.format.into();
+            let cache_type: CacheType = config.cache.into();
+            let sync_mode: devices::virtio::block::SyncMode = config.sync.into();
 
             let blk_config = BlockDeviceConfig {
                 block_id,
-                cache_type: CacheType::Writeback,
+                cache_type,
                 disk_image_path: config.path.to_string_lossy().to_string(),
                 disk_image_format: image_type,
                 is_disk_read_only: config.read_only,
-                direct_io: false,
-                sync_mode: devices::virtio::block::SyncMode::default(),
+                direct_io: config.direct_io,
+                sync_mode,
             };
 
             vmr.add_block_device(blk_config)
@@ -543,6 +563,27 @@ fn generate_mac(index: usize) -> [u8; 6] {
     ]
 }
 
+/// Generate a virtio-blk device suffix matching the Linux kernel's
+/// `disk_name()` bijective base-26 scheme from `block/genhd.c`:
+/// `0→"a"`, `25→"z"`, `26→"aa"`, `27→"ab"`, `701→"zz"`, `702→"aaa"`.
+///
+/// The naïve `(b'a' + i) as char` formula rolls over past `z` into
+/// invalid characters (`vd{`, `vd|`, ...), so this helper is required
+/// once we support more than 26 disks.
+#[cfg(feature = "blk")]
+fn vd_suffix(mut index: usize) -> String {
+    let mut buf = Vec::with_capacity(4);
+    loop {
+        buf.push(b'a' + (index % 26) as u8);
+        if index < 26 {
+            break;
+        }
+        index = index / 26 - 1;
+    }
+    buf.reverse();
+    String::from_utf8(buf).expect("ASCII a-z only")
+}
+
 fn map_vm_config_error(machine: &MachineBuilder, err: VmConfigError) -> Error {
     match err {
         VmConfigError::InvalidVcpuCount => {
@@ -576,5 +617,82 @@ mod tests {
             Error::Config(ConfigError::InvalidVcpuCount(3)) => {}
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[cfg(feature = "blk")]
+    #[test]
+    fn vd_suffix_matches_kernel_scheme() {
+        assert_eq!(vd_suffix(0), "a");
+        assert_eq!(vd_suffix(25), "z");
+        assert_eq!(vd_suffix(26), "aa");
+        assert_eq!(vd_suffix(27), "ab");
+        assert_eq!(vd_suffix(51), "az");
+        assert_eq!(vd_suffix(52), "ba");
+        assert_eq!(vd_suffix(701), "zz");
+        assert_eq!(vd_suffix(702), "aaa");
+    }
+
+    #[cfg(feature = "blk")]
+    #[test]
+    fn disk_builder_preserves_insertion_order() {
+        use crate::api::builders::DiskImageFormat;
+
+        let builder = VmBuilder::new()
+            .disk(|d| d.path("/a.raw"))
+            .disk(|d| d.path("/b.qcow2").format(DiskImageFormat::Qcow2))
+            .disk(|d| {
+                d.path("/c.vmdk")
+                    .format(DiskImageFormat::Vmdk)
+                    .read_only(true)
+            });
+
+        let paths: Vec<_> = builder
+            .disk
+            .configs
+            .iter()
+            .map(|c| c.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths, vec!["/a.raw", "/b.qcow2", "/c.vmdk"]);
+        assert_eq!(builder.disk.configs[1].format, DiskImageFormat::Qcow2);
+        assert!(builder.disk.configs[2].read_only);
+    }
+
+    #[cfg(feature = "blk")]
+    #[test]
+    fn disk_builder_auto_id_then_custom() {
+        let builder = VmBuilder::new()
+            .disk(|d| d.path("/a.raw"))
+            .disk(|d| d.path("/b.raw").id("data"))
+            .disk(|d| d.path("/c.raw"));
+
+        assert!(builder.disk.configs[0].id.is_none());
+        assert_eq!(builder.disk.configs[1].id.as_deref(), Some("data"));
+        assert!(builder.disk.configs[2].id.is_none());
+    }
+
+    #[cfg(feature = "blk")]
+    #[test]
+    fn disk_builder_per_disk_settings_dont_leak() {
+        use crate::api::builders::{CacheMode, SyncMode};
+
+        let builder = VmBuilder::new()
+            .disk(|d| {
+                d.path("/a.raw")
+                    .read_only(true)
+                    .cache(CacheMode::Unsafe)
+                    .direct_io(true)
+                    .sync(SyncMode::None)
+            })
+            .disk(|d| d.path("/b.raw"));
+
+        assert!(builder.disk.configs[0].read_only);
+        assert_eq!(builder.disk.configs[0].cache, CacheMode::Unsafe);
+        assert!(builder.disk.configs[0].direct_io);
+        assert_eq!(builder.disk.configs[0].sync, SyncMode::None);
+
+        assert!(!builder.disk.configs[1].read_only);
+        assert_eq!(builder.disk.configs[1].cache, CacheMode::Writeback);
+        assert!(!builder.disk.configs[1].direct_io);
+        assert_eq!(builder.disk.configs[1].sync, SyncMode::Full);
     }
 }
