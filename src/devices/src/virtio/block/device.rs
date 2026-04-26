@@ -243,7 +243,19 @@ impl Block {
             .write(!is_disk_read_only)
             .open(PathBuf::from(&disk_image_path))?;
 
-        let disk_image_id = DiskProperties::build_disk_image_id(&disk_image);
+        // Use the caller-supplied `id` as the virtio-blk disk image id so
+        // it surfaces in the guest at `/sys/block/<dev>/serial` and (when
+        // udev is available) `/dev/disk/by-id/virtio-<id>`. Falls back to
+        // the rdev+inode-derived default if `id` is empty.
+        let disk_image_id = if id.is_empty() {
+            DiskProperties::build_disk_image_id(&disk_image)
+        } else {
+            let mut padded = vec![0u8; VIRTIO_BLK_ID_BYTES as usize];
+            let bytes = id.as_bytes();
+            let n = cmp::min(bytes.len(), padded.len());
+            padded[..n].copy_from_slice(&bytes[..n]);
+            padded
+        };
 
         let file_opts = StorageOpenOptions::new()
             .write(!is_disk_read_only)
