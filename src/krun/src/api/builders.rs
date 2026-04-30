@@ -44,6 +44,7 @@ pub struct MachineBuilder {
     pub(crate) nested_virt: bool,
     pub(crate) split_irqchip: bool,
     pub(crate) vsock: bool,
+    pub(crate) enable_inet_hijack: bool,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -334,6 +335,7 @@ impl MachineBuilder {
             nested_virt: false,
             split_irqchip: false,
             vsock: false,
+            enable_inet_hijack: false,
         }
     }
 
@@ -382,6 +384,26 @@ impl MachineBuilder {
     /// its own purposes even though TSI would not otherwise require one.
     pub fn vsock(mut self, enabled: bool) -> Self {
         self.vsock = enabled;
+        self
+    }
+
+    /// Enable the automatic TSI INET hijack fallback.
+    ///
+    /// When set to `true` and no virtio-net device is configured,
+    /// `TsiFlags::HIJACK_INET` is enabled so the guest's INET socket
+    /// calls are transparently bridged to the host through vsock. This
+    /// is useful for guests that need outbound connectivity without the
+    /// caller setting up a virtio-net backend.
+    ///
+    /// Defaults to `false` — guests with no virtio-net are air-gapped
+    /// by default. Callers must opt in to TSI when they want host
+    /// network access without an explicit network device.
+    ///
+    /// Note: `HIJACK_UNIX` (used by virtio-fs on Linux for AF_UNIX
+    /// hijack) is gated on `HIJACK_INET` already being set, so leaving
+    /// INET hijack off also leaves the UNIX hijack auto-enable path off.
+    pub fn enable_inet_hijack(mut self, enabled: bool) -> Self {
+        self.enable_inet_hijack = enabled;
         self
     }
 }

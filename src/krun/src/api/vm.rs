@@ -51,6 +51,11 @@ pub struct Vm {
     exit_evt: EventFd,
     /// Shared exit code — written by the VMM, readable by exit observers.
     exit_code: Arc<AtomicI32>,
+    /// Opt in to the automatic `TsiFlags::HIJACK_INET` fallback that
+    /// bridges guest INET sockets to the host via vsock when no
+    /// virtio-net device is configured. Set via
+    /// [`MachineBuilder::enable_inet_hijack`](super::builders::MachineBuilder::enable_inet_hijack).
+    enable_inet_hijack: bool,
     /// Keeps the libkrunfw library loaded so kernel memory pointers remain valid.
     _krunfw_library: Option<libloading::Library>,
 }
@@ -75,6 +80,7 @@ impl Vm {
         exit_observers: Vec<Box<dyn Fn(i32) + Send + 'static>>,
         exit_evt: EventFd,
         exit_code: Arc<AtomicI32>,
+        enable_inet_hijack: bool,
     ) -> Self {
         Self {
             vmr,
@@ -89,6 +95,7 @@ impl Vm {
             exit_observers,
             exit_evt,
             exit_code,
+            enable_inet_hijack,
             _krunfw_library: None,
         }
     }
@@ -259,31 +266,13 @@ impl Vm {
     /// Configure the vsock device.
     ///
     /// The device is only attached when actually needed — either because the
-    /// caller explicitly requested it (`VmBuilder::vsock(true)`), or because
-    /// TSI needs it as a transport (no virtio-net → HIJACK_INET; single root
-    /// virtio-fs on Linux → HIJACK_UNIX). This keeps the per-VM IRQ/MMIO
-    /// budget free when nothing actually uses vsock.
+    /// caller explicitly requested it (`MachineBuilder::vsock(true)`), or
+    /// because the caller opted in to TSI as a transport
+    /// (`MachineBuilder::enable_inet_hijack(true)` with no virtio-net →
+    /// HIJACK_INET; single root virtio-fs on Linux → HIJACK_UNIX). This
+    /// keeps the per-VM IRQ/MMIO budget free when nothing uses vsock.
     fn configure_vsock(&mut self) -> Result<()> {
-        use devices::virtio::TsiFlags;
-
-        let mut tsi_flags = TsiFlags::empty();
-
-        // Enable TSI if no virtio-net configured
-        #[cfg(feature = "net")]
-        if self.vmr.net.list.is_empty() {
-            tsi_flags |= TsiFlags::HIJACK_INET;
-        }
-
-        #[cfg(not(feature = "net"))]
-        {
-            tsi_flags |= TsiFlags::HIJACK_INET;
-        }
-
-        // Enable TSI for AF_UNIX if single root virtio-fs
-        #[cfg(not(feature = "tee"))]
-        {
-            tsi_flags = self.maybe_enable_hijack_unix(tsi_flags);
-        }
+        let tsi_flags = self.compute_tsi_flags();
 
         if !self.vmr.request_vsock && tsi_flags.is_empty() {
             return Ok(());
@@ -302,6 +291,38 @@ impl Vm {
             .map_err(|e| Error::Build(BuildError::DeviceRegistration(format!("vsock: {e:?}"))))?;
 
         Ok(())
+    }
+
+    /// Decide which `TsiFlags` should be enabled for this VM.
+    ///
+    /// Extracted from [`configure_vsock`](Self::configure_vsock) so the
+    /// flag-selection logic can be exercised by unit tests without
+    /// touching `VmResources::set_vsock_device`.
+    fn compute_tsi_flags(&self) -> devices::virtio::TsiFlags {
+        use devices::virtio::TsiFlags;
+
+        let mut tsi_flags = TsiFlags::empty();
+
+        // Enable TSI INET hijack as a fallback when no virtio-net is
+        // configured and the caller opted in via
+        // `MachineBuilder::enable_inet_hijack(true)`. Default is air-gap.
+        #[cfg(feature = "net")]
+        if self.enable_inet_hijack && self.vmr.net.list.is_empty() {
+            tsi_flags |= TsiFlags::HIJACK_INET;
+        }
+
+        #[cfg(not(feature = "net"))]
+        if self.enable_inet_hijack {
+            tsi_flags |= TsiFlags::HIJACK_INET;
+        }
+
+        // Enable TSI for AF_UNIX if single root virtio-fs
+        #[cfg(not(feature = "tee"))]
+        {
+            tsi_flags = self.maybe_enable_hijack_unix(tsi_flags);
+        }
+
+        tsi_flags
     }
 
     fn get_exec_path(&self) -> String {
@@ -439,6 +460,10 @@ mod tests {
     use vmm::vmm_config::fs::FsDeviceConfig;
 
     fn make_vm() -> Vm {
+        make_vm_with(false)
+    }
+
+    fn make_vm_with(enable_inet_hijack: bool) -> Vm {
         Vm::new(
             VmResources::default(),
             Some("debug loglevel=7".to_string()),
@@ -452,6 +477,7 @@ mod tests {
             Vec::new(),
             EventFd::new(EFD_NONBLOCK).unwrap(),
             Arc::new(AtomicI32::new(i32::MAX)),
+            enable_inet_hijack,
         )
     }
 
@@ -498,6 +524,39 @@ mod tests {
 
         let flags = vm.maybe_enable_hijack_unix(TsiFlags::HIJACK_INET);
 
+        assert!(!flags.contains(TsiFlags::HIJACK_UNIX));
+    }
+
+    #[test]
+    fn compute_tsi_flags_air_gaps_by_default_with_no_net() {
+        let vm = make_vm();
+        let flags = vm.compute_tsi_flags();
+        assert!(!flags.contains(TsiFlags::HIJACK_INET));
+    }
+
+    #[test]
+    fn compute_tsi_flags_enables_inet_hijack_when_opted_in() {
+        let vm = make_vm_with(true);
+        let flags = vm.compute_tsi_flags();
+        assert!(flags.contains(TsiFlags::HIJACK_INET));
+    }
+
+    #[cfg(all(not(feature = "tee"), not(target_os = "macos")))]
+    #[test]
+    fn compute_tsi_flags_unix_hijack_follows_inet_hijack() {
+        let mut vm = make_vm();
+        vm.vmr.fs.push(FsDeviceConfig {
+            fs_id: "/dev/root".to_string(),
+            shared_dir: "/tmp/rootfs".to_string(),
+            shm_size: None,
+            allow_root_dir_delete: false,
+        });
+
+        let flags = vm.compute_tsi_flags();
+
+        // `maybe_enable_hijack_unix` gates UNIX hijack on INET hijack
+        // already being set, so the default (no opt-in) drops both.
+        assert!(!flags.contains(TsiFlags::HIJACK_INET));
         assert!(!flags.contains(TsiFlags::HIJACK_UNIX));
     }
 }
