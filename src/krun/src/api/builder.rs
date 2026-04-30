@@ -532,6 +532,7 @@ impl VmBuilder {
             self.exit_observers,
             exit_evt,
             exit_code,
+            self.machine.enable_inet_hijack,
         ))
     }
 }
