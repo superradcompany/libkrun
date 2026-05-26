@@ -12,6 +12,8 @@ use std::slice;
 use libc::c_char;
 
 use arch_gen::x86::mpspec;
+
+use crate::x86_64::layout::IOAPIC_NUM_PINS;
 use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 // This is a workaround to the Rust enforcement specifying that any implementation of a foreign
@@ -43,8 +45,10 @@ unsafe impl ByteValued for MpcTableWrapper {}
 unsafe impl ByteValued for MpcLintsrcWrapper {}
 unsafe impl ByteValued for MpfIntelWrapper {}
 
-// MPTABLE, describing VCPUS.
-const MPTABLE_START: u64 = 0x9fc00;
+// MP floating pointer lives where Linux scans for it; the larger MP
+// configuration table sits lower in base memory and is referenced by physptr.
+const MP_FLOATING_POINTER_START: u64 = 0x9fc00;
+const MPTABLE_START: u64 = 0x9d000;
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Error {
@@ -114,12 +118,11 @@ fn mpf_intel_compute_checksum(v: &mpspec::mpf_intel) -> u8 {
 }
 
 fn compute_mp_size(num_cpus: u8) -> usize {
-    mem::size_of::<MpfIntelWrapper>()
-        + mem::size_of::<MpcTableWrapper>()
+    mem::size_of::<MpcTableWrapper>()
         + mem::size_of::<MpcCpuWrapper>() * (num_cpus as usize)
         + mem::size_of::<MpcIoapicWrapper>()
         + mem::size_of::<MpcBusWrapper>()
-        + mem::size_of::<MpcIntsrcWrapper>() * 16
+        + mem::size_of::<MpcIntsrcWrapper>() * IOAPIC_NUM_PINS
         + mem::size_of::<MpcLintsrcWrapper>() * 2
 }
 
@@ -130,6 +133,7 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
     }
 
     // Used to keep track of the next base pointer into the MP table.
+    let mpf_base = GuestAddress(MP_FLOATING_POINTER_START);
     let mut base_mp = GuestAddress(MPTABLE_START);
 
     let mp_size = compute_mp_size(num_cpus);
@@ -146,6 +150,13 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
     } else {
         return Err(Error::AddressOverflow);
     }
+    if let Some(end_mpf) = mpf_base.checked_add((mem::size_of::<MpfIntelWrapper>() - 1) as u64) {
+        if !mem.address_in_range(end_mpf) {
+            return Err(Error::NotEnoughMemory);
+        }
+    } else {
+        return Err(Error::AddressOverflow);
+    }
 
     let buf: Vec<u8> = vec![0; mp_size];
     mem.read_volatile_from(base_mp, &mut buf.as_slice(), mp_size)
@@ -153,15 +164,13 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
 
     {
         let mut mpf_intel = MpfIntelWrapper(mpspec::mpf_intel::default());
-        let size = mem::size_of::<MpfIntelWrapper>() as u64;
         mpf_intel.0.signature = SMP_MAGIC_IDENT;
         mpf_intel.0.length = 1;
         mpf_intel.0.specification = 4;
-        mpf_intel.0.physptr = (base_mp.raw_value() + size) as u32;
+        mpf_intel.0.physptr = base_mp.raw_value() as u32;
         mpf_intel.0.checksum = mpf_intel_compute_checksum(&mpf_intel.0);
-        mem.write_obj(mpf_intel, base_mp)
+        mem.write_obj(mpf_intel, mpf_base)
             .map_err(|_| Error::WriteMpfIntel)?;
-        base_mp = base_mp.unchecked_add(size);
     }
 
     // We set the location of the mpc_table here but we can't fill it out until we have the length
@@ -214,17 +223,16 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
         base_mp = base_mp.unchecked_add(size);
         checksum = checksum.wrapping_add(compute_checksum(&mpc_ioapic.0));
     }
-    // Per kvm_setup_default_irq_routing() in kernel
-    for i in 0..16 {
+    for i in 0..IOAPIC_NUM_PINS {
         let size = mem::size_of::<MpcIntsrcWrapper>() as u64;
         let mut mpc_intsrc = MpcIntsrcWrapper(mpspec::mpc_intsrc::default());
         mpc_intsrc.0.type_ = mpspec::MP_INTSRC as u8;
         mpc_intsrc.0.irqtype = mpspec::mp_irq_source_types_mp_INT as u8;
         mpc_intsrc.0.irqflag = mpspec::MP_IRQDIR_DEFAULT as u16;
         mpc_intsrc.0.srcbus = 0;
-        mpc_intsrc.0.srcbusirq = i;
+        mpc_intsrc.0.srcbusirq = i as u8;
         mpc_intsrc.0.dstapic = ioapicid;
-        mpc_intsrc.0.dstirq = i;
+        mpc_intsrc.0.dstirq = i as u8;
         mem.write_obj(mpc_intsrc, base_mp)
             .map_err(|_| Error::WriteMpcIntsrc)?;
         base_mp = base_mp.unchecked_add(size);
@@ -301,14 +309,28 @@ mod tests {
         }
     }
 
+    fn mp_table_memory(table_size: usize) -> GuestMemoryMmap {
+        GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(MPTABLE_START), table_size),
+            (
+                GuestAddress(MP_FLOATING_POINTER_START),
+                mem::size_of::<MpfIntelWrapper>(),
+            ),
+        ])
+        .unwrap()
+    }
+
+    fn mpc_table_offset(mem: &GuestMemoryMmap) -> GuestAddress {
+        let mpf_intel: MpfIntelWrapper = mem
+            .read_obj(GuestAddress(MP_FLOATING_POINTER_START))
+            .unwrap();
+        GuestAddress(u64::from(mpf_intel.0.physptr))
+    }
+
     #[test]
     fn bounds_check() {
         let num_cpus = 4;
-        let mem = GuestMemoryMmap::from_ranges(&[(
-            GuestAddress(MPTABLE_START),
-            compute_mp_size(num_cpus),
-        )])
-        .unwrap();
+        let mem = mp_table_memory(compute_mp_size(num_cpus));
 
         setup_mptable(&mem, num_cpus).unwrap();
     }
@@ -316,11 +338,7 @@ mod tests {
     #[test]
     fn bounds_check_fails() {
         let num_cpus = 4;
-        let mem = GuestMemoryMmap::from_ranges(&[(
-            GuestAddress(MPTABLE_START),
-            compute_mp_size(num_cpus) - 1,
-        )])
-        .unwrap();
+        let mem = mp_table_memory(compute_mp_size(num_cpus) - 1);
 
         assert!(setup_mptable(&mem, num_cpus).is_err());
     }
@@ -328,15 +346,13 @@ mod tests {
     #[test]
     fn mpf_intel_checksum() {
         let num_cpus = 1;
-        let mem = GuestMemoryMmap::from_ranges(&[(
-            GuestAddress(MPTABLE_START),
-            compute_mp_size(num_cpus),
-        )])
-        .unwrap();
+        let mem = mp_table_memory(compute_mp_size(num_cpus));
 
         setup_mptable(&mem, num_cpus).unwrap();
 
-        let mpf_intel: MpfIntelWrapper = mem.read_obj(GuestAddress(MPTABLE_START)).unwrap();
+        let mpf_intel: MpfIntelWrapper = mem
+            .read_obj(GuestAddress(MP_FLOATING_POINTER_START))
+            .unwrap();
 
         assert_eq!(
             mpf_intel_compute_checksum(&mpf_intel.0),
@@ -347,16 +363,11 @@ mod tests {
     #[test]
     fn mpc_table_checksum() {
         let num_cpus = 4;
-        let mem = GuestMemoryMmap::from_ranges(&[(
-            GuestAddress(MPTABLE_START),
-            compute_mp_size(num_cpus),
-        )])
-        .unwrap();
+        let mem = mp_table_memory(compute_mp_size(num_cpus));
 
         setup_mptable(&mem, num_cpus).unwrap();
 
-        let mpf_intel: MpfIntelWrapper = mem.read_obj(GuestAddress(MPTABLE_START)).unwrap();
-        let mpc_offset = GuestAddress(u64::from(mpf_intel.0.physptr));
+        let mpc_offset = mpc_table_offset(&mem);
         let mpc_table: MpcTableWrapper = mem.read_obj(mpc_offset).unwrap();
 
         struct Sum(u8);
@@ -381,17 +392,49 @@ mod tests {
     }
 
     #[test]
+    fn intsrc_entries_cover_ioapic_pin_32() {
+        let num_cpus = 1;
+        let mem = mp_table_memory(compute_mp_size(num_cpus));
+
+        setup_mptable(&mem, num_cpus).unwrap();
+
+        let mpc_offset = mpc_table_offset(&mem);
+        let mpc_table: MpcTableWrapper = mem.read_obj(mpc_offset).unwrap();
+        let mpc_end = mpc_offset
+            .checked_add(u64::from(mpc_table.0.length))
+            .unwrap();
+        let mut entry_offset = mpc_offset
+            .checked_add(mem::size_of::<MpcTableWrapper>() as u64)
+            .unwrap();
+        let mut intsrc_count = 0;
+        let mut found_pin_32 = false;
+
+        while entry_offset < mpc_end {
+            let entry_type: u8 = mem.read_obj(entry_offset).unwrap();
+            if u32::from(entry_type) == mpspec::MP_INTSRC {
+                let intsrc: MpcIntsrcWrapper = mem.read_obj(entry_offset).unwrap();
+                intsrc_count += 1;
+                found_pin_32 |= intsrc.0.srcbusirq == 32 && intsrc.0.dstirq == 32;
+            }
+            entry_offset = entry_offset
+                .checked_add(table_entry_size(entry_type) as u64)
+                .unwrap();
+        }
+
+        assert_eq!(intsrc_count, IOAPIC_NUM_PINS);
+        assert!(found_pin_32);
+    }
+
+    #[test]
     fn cpu_entry_count() {
-        let mem = GuestMemoryMmap::from_ranges(&[(
-            GuestAddress(MPTABLE_START),
-            compute_mp_size(MAX_SUPPORTED_CPUS as u8),
-        )])
-        .unwrap();
+        let mem = mp_table_memory(compute_mp_size(MAX_SUPPORTED_CPUS as u8));
 
         for i in 0..MAX_SUPPORTED_CPUS as u8 {
             setup_mptable(&mem, i).unwrap();
 
-            let mpf_intel: MpfIntelWrapper = mem.read_obj(GuestAddress(MPTABLE_START)).unwrap();
+            let mpf_intel: MpfIntelWrapper = mem
+                .read_obj(GuestAddress(MP_FLOATING_POINTER_START))
+                .unwrap();
             let mpc_offset = GuestAddress(u64::from(mpf_intel.0.physptr));
             let mpc_table: MpcTableWrapper = mem.read_obj(mpc_offset).unwrap();
             let mpc_end = mpc_offset
@@ -419,11 +462,7 @@ mod tests {
     #[test]
     fn cpu_entry_count_max() {
         let cpus = MAX_SUPPORTED_CPUS + 1;
-        let mem = GuestMemoryMmap::from_ranges(&[(
-            GuestAddress(MPTABLE_START),
-            compute_mp_size(cpus as u8),
-        )])
-        .unwrap();
+        let mem = mp_table_memory(compute_mp_size(cpus as u8));
 
         let result = setup_mptable(&mem, cpus as u8).unwrap_err();
         assert_eq!(result, Error::TooManyCpus);
