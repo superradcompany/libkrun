@@ -19,7 +19,7 @@ use crate::Error as DeviceError;
 const IOAPIC_BASE: u32 = 0xfec0_0000;
 const APIC_DEFAULT_ADDRESS: u32 = 0xfee0_0000;
 const IRR_WORD_BITS: usize = u64::BITS as usize;
-const IRR_WORDS: usize = (IOAPIC_NUM_PINS + IRR_WORD_BITS - 1) / IRR_WORD_BITS;
+const IRR_WORDS: usize = IOAPIC_NUM_PINS.div_ceil(IRR_WORD_BITS);
 
 const IO_REG_SEL: u64 = 0x00;
 const IO_WIN: u64 = 0x10;
