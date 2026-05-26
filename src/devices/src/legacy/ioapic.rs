@@ -1,3 +1,4 @@
+use arch::x86_64::layout::IOAPIC_NUM_PINS;
 use crossbeam_channel::unbounded;
 #[cfg(not(feature = "tdx"))]
 use kvm_bindings::{kvm_enable_cap, KVM_CAP_SPLIT_IRQCHIP};
@@ -17,7 +18,8 @@ use crate::Error as DeviceError;
 
 const IOAPIC_BASE: u32 = 0xfec0_0000;
 const APIC_DEFAULT_ADDRESS: u32 = 0xfee0_0000;
-const IOAPIC_NUM_PINS: usize = 256;
+const IRR_WORD_BITS: usize = u64::BITS as usize;
+const IRR_WORDS: usize = (IOAPIC_NUM_PINS + IRR_WORD_BITS - 1) / IRR_WORD_BITS;
 
 const IO_REG_SEL: u64 = 0x00;
 const IO_WIN: u64 = 0x10;
@@ -95,7 +97,7 @@ struct MsiMessage {
 pub struct IoApic {
     id: u8,
     ioregsel: u8,
-    irr: u32,
+    irr: [u64; IRR_WORDS],
     ioredtbl: [u64; IOAPIC_NUM_PINS],
     version: u8,
     irq_eoi: [i32; IOAPIC_NUM_PINS],
@@ -123,7 +125,7 @@ impl IoApic {
         let mut ioapic = Self {
             id: 0,
             ioregsel: 0,
-            irr: 0,
+            irr: [0; IRR_WORDS],
             ioredtbl: [1 << IOAPIC_LVT_MASKED_SHIFT; IOAPIC_NUM_PINS],
             version: 0x20,
             irq_eoi: [0; IOAPIC_NUM_PINS],
@@ -250,18 +252,28 @@ impl IoApic {
         }
     }
 
+    fn irr_is_set(&self, index: usize) -> bool {
+        let word = index / IRR_WORD_BITS;
+        let bit = index % IRR_WORD_BITS;
+        self.irr[word] & (1u64 << bit) != 0
+    }
+
+    fn irr_clear(&mut self, index: usize) {
+        let word = index / IRR_WORD_BITS;
+        let bit = index % IRR_WORD_BITS;
+        self.irr[word] &= !(1u64 << bit);
+    }
+
     fn service(&mut self) {
         for i in 0..IOAPIC_NUM_PINS {
-            let mask = 1 << i;
-
-            if self.irr & mask > 0 {
+            if self.irr_is_set(i) {
                 let mut coalesce = 0;
 
                 let entry = self.ioredtbl[i];
                 let info = self.parse_entry(&entry);
                 if info.masked == 0 {
                     if info.trig_mode as u64 == IOAPIC_TRIGGER_EDGE {
-                        self.irr &= !mask;
+                        self.irr_clear(i);
                     } else {
                         coalesce = self.ioredtbl[i] & IOAPIC_LVT_REMOTE_IRR;
                         self.ioredtbl[i] |= IOAPIC_LVT_REMOTE_IRR;
@@ -376,7 +388,14 @@ impl BusDevice for IoApic {
                             | ((IOAPIC_NUM_PINS as u32 - 1) << IOAPIC_VER_ENTRIES_SHIFT)
                     }
                     _ => {
-                        let index = (self.ioregsel as u64 - IOAPIC_REG_REDTBL_BASE) >> 1;
+                        let Some(reg_index) =
+                            (self.ioregsel as u64).checked_sub(IOAPIC_REG_REDTBL_BASE)
+                        else {
+                            debug!("ioapic: read: invalid ioregsel {}", self.ioregsel);
+                            data.fill(0);
+                            return;
+                        };
+                        let index = reg_index >> 1;
                         debug!("ioapic: read: ioredtbl register {index}");
                         let mut val = 0u32;
 
@@ -432,12 +451,14 @@ impl BusDevice for IoApic {
                     // NOTE: these are read-only registers, so they should never be written to
                     IO_APIC_VER | IO_APIC_ARB => debug!("ioapic: write: IOAPIC VERSION"),
                     _ => {
-                        if self.ioregsel < (IO_WIN as u8) {
-                            debug!("invalid write; ignore");
+                        let Some(reg_index) =
+                            (self.ioregsel as u64).checked_sub(IOAPIC_REG_REDTBL_BASE)
+                        else {
+                            debug!("ioapic: write: invalid ioregsel {}", self.ioregsel);
                             return;
-                        }
+                        };
 
-                        let index = (self.ioregsel as u64 - IOAPIC_REG_REDTBL_BASE) >> 1;
+                        let index = reg_index >> 1;
                         debug!("ioapic: write: ioredtbl register {index}");
                         if index >= IOAPIC_NUM_PINS as u64 {
                             warn!("ioapic: write: virq out of pin range {index}");
@@ -469,6 +490,40 @@ impl BusDevice for IoApic {
             }
             IO_EOI => todo!(),
             _ => unreachable!(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_ioapic() -> IoApic {
+        let (irq_sender, _irq_receiver) = unbounded();
+        IoApic {
+            id: 0,
+            ioregsel: 0,
+            irr: [0; IRR_WORDS],
+            ioredtbl: [1 << IOAPIC_LVT_MASKED_SHIFT; IOAPIC_NUM_PINS],
+            version: 0x20,
+            irq_eoi: [0; IOAPIC_NUM_PINS],
+            irq_routes: Vec::new(),
+            irq_sender,
+        }
+    }
+
+    #[test]
+    fn irr_tracks_pins_above_31() {
+        let mut ioapic = test_ioapic();
+
+        for pin in [32, 63, 64, IOAPIC_NUM_PINS - 1] {
+            let word = pin / IRR_WORD_BITS;
+            let bit = pin % IRR_WORD_BITS;
+            ioapic.irr[word] |= 1u64 << bit;
+
+            assert!(ioapic.irr_is_set(pin));
+            ioapic.irr_clear(pin);
+            assert!(!ioapic.irr_is_set(pin));
         }
     }
 }
