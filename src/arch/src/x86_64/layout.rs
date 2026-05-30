@@ -13,7 +13,8 @@ pub const BOOT_STACK_POINTER: u64 = 0x8ff0;
 /// Kernel command line start address.
 pub const CMDLINE_START: u64 = 0x20000;
 /// Kernel command line start address maximum size.
-pub const CMDLINE_MAX_SIZE: usize = 0x10000;
+/// Matches msb-krunfw's `arch/x86/include/asm/setup.h`.
+pub const CMDLINE_MAX_SIZE: usize = 16 * 1024;
 /// Kernel command line static size on SEV.
 pub const CMDLINE_SEV_SIZE: usize = 0x200;
 /// Initrd start address on SEV.

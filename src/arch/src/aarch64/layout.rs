@@ -59,8 +59,8 @@ pub const DRAM_MEM_END: u64 = 0x00FF_8000_0000; // 1024 - 2 = 1022 GB.
 pub const DRAM_MEM_MAX_SIZE: u64 = DRAM_MEM_END - DRAM_MEM_START_KERNEL;
 
 /// Kernel command line maximum size.
-/// As per `arch/arm64/include/uapi/asm/setup.h`.
-pub const CMDLINE_MAX_SIZE: usize = 2048;
+/// Matches msb-krunfw's `arch/arm64/include/uapi/asm/setup.h`.
+pub const CMDLINE_MAX_SIZE: usize = 16 * 1024;
 
 /// Maximum size of the device tree blob as specified in https://www.kernel.org/doc/Documentation/arm64/booting.txt.
 pub const FDT_MAX_SIZE: usize = 0x20_0000;
