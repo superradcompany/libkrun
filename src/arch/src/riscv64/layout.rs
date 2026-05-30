@@ -9,8 +9,8 @@ pub const DRAM_MEM_END: u64 = 0x00FF_8000_0000; // 1024 - 2 = 1022 GB.
 pub const DRAM_MEM_MAX_SIZE: u64 = DRAM_MEM_END - DRAM_MEM_START;
 
 /// Kernel command line maximum size.
-/// As per `arch/riscv/include/uapi/asm/setup.h`.
-pub const CMDLINE_MAX_SIZE: usize = 1024;
+/// Matches msb-krunfw's `arch/riscv/include/uapi/asm/setup.h`.
+pub const CMDLINE_MAX_SIZE: usize = 16 * 1024;
 
 pub const FDT_MAX_SIZE: usize = 0x1_0000;
 
