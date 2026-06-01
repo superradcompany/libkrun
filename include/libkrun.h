@@ -98,6 +98,34 @@ int32_t krun_free_ctx(uint32_t ctx_id);
 int32_t krun_set_vm_config(uint32_t ctx_id, uint8_t num_vcpus, uint32_t ram_mib);
 
 /**
+ * Enables host-driven guest memory ballooning for the microVM.
+ *
+ * The configured RAM from krun_set_vm_config() remains the boot-time memory
+ * ceiling. The guest-usable memory target is controlled by inflating the
+ * virtio-balloon device:
+ *
+ *  initial_mib - guest-usable memory when the VM boots, in MiB.
+ *  min_mib     - lowest guest-usable memory accepted at runtime, in MiB.
+ *
+ * If control_socket_path is not NULL, libkrun creates a Unix stream socket at
+ * that path after the VMM is built. Each connection may write a decimal MiB
+ * target followed by an optional newline. The target is clamped to min_mib and
+ * the configured RAM ceiling before the virtio-balloon config change is
+ * signaled to the guest.
+ *
+ * Arguments:
+ *  "ctx_id"              - the configuration context ID.
+ *  "initial_mib"         - guest-usable memory at boot, in MiB.
+ *  "min_mib"             - minimum guest-usable memory, in MiB.
+ *  "control_socket_path" - optional null-terminated Unix socket path.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_balloon(uint32_t ctx_id, uint32_t initial_mib, uint32_t min_mib,
+                         const char *control_socket_path);
+
+/**
  * Sets the path to be use as root for the microVM. Not available in libkrun-SEV.
  *
  * Arguments:
