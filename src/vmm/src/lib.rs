@@ -59,6 +59,8 @@ use crossbeam_channel::Sender;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use devices::fdt;
 use devices::legacy::IrqChip;
+#[cfg(not(feature = "tee"))]
+use devices::virtio::BalloonControl;
 use devices::virtio::VmmExitObserver;
 use devices::{BusDevice, DeviceType};
 use kernel::cmdline::Cmdline as KernelCmdline;
@@ -209,6 +211,8 @@ pub struct Vmm {
     mmio_device_manager: MMIODeviceManager,
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
+    #[cfg(not(feature = "tee"))]
+    balloon_control: Option<BalloonControl>,
 }
 
 impl Vmm {
@@ -219,6 +223,16 @@ impl Vmm {
         device_id: &str,
     ) -> Option<&Mutex<dyn BusDevice>> {
         self.mmio_device_manager.get_device(device_type, device_id)
+    }
+
+    #[cfg(not(feature = "tee"))]
+    pub fn balloon_control(&self) -> Option<BalloonControl> {
+        self.balloon_control.clone()
+    }
+
+    #[cfg(not(feature = "tee"))]
+    pub fn set_balloon_control(&mut self, control: BalloonControl) {
+        self.balloon_control = Some(control);
     }
 
     /// Starts the microVM vcpus.

@@ -1,6 +1,10 @@
 //! VM handle for entering microVMs.
 
 use std::convert::Infallible;
+#[cfg(not(feature = "tee"))]
+use std::io::{BufRead, BufReader, Write};
+#[cfg(not(feature = "tee"))]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
@@ -12,6 +16,8 @@ use std::env;
 use std::ffi::CString;
 
 use crossbeam_channel::unbounded;
+#[cfg(not(feature = "tee"))]
+use devices::virtio::BalloonControl;
 use log::error;
 use polly::event_manager::EventManager;
 use utils::eventfd::EventFd;
@@ -56,6 +62,7 @@ pub struct Vm {
     /// virtio-net device is configured. Set via
     /// [`MachineBuilder::enable_inet_hijack`](super::builders::MachineBuilder::enable_inet_hijack).
     enable_inet_hijack: bool,
+    balloon_control_socket: Option<PathBuf>,
     /// Keeps the libkrunfw library loaded so kernel memory pointers remain valid.
     _krunfw_library: Option<libloading::Library>,
 }
@@ -81,6 +88,7 @@ impl Vm {
         exit_evt: EventFd,
         exit_code: Arc<AtomicI32>,
         enable_inet_hijack: bool,
+        balloon_control_socket: Option<PathBuf>,
     ) -> Self {
         Self {
             vmr,
@@ -96,6 +104,7 @@ impl Vm {
             exit_evt,
             exit_code,
             enable_inet_hijack,
+            balloon_control_socket,
             _krunfw_library: None,
         }
     }
@@ -164,6 +173,11 @@ impl Vm {
         // Configure vsock
         self.configure_vsock()?;
 
+        #[cfg(not(feature = "tee"))]
+        let balloon_socket = self.balloon_control_socket.take();
+        #[cfg(not(feature = "tee"))]
+        let balloon_ceiling_mib = self.vmr.vm_config().mem_size_mib.unwrap_or(0) as u32;
+
         // Create shutdown EventFd on macOS aarch64 (needed for GPIO shutdown device)
         let shutdown_efd = if cfg!(target_arch = "aarch64") && cfg!(target_os = "macos") {
             Some(
@@ -186,6 +200,17 @@ impl Vm {
             self.exit_code,
         )
         .map_err(|e| Error::Build(BuildError::Start(format!("build_microvm: {e:?}"))))?;
+
+        #[cfg(not(feature = "tee"))]
+        if let Some(socket_path) = balloon_socket {
+            let control = { _vmm.lock().expect("Poisoned VMM mutex").balloon_control() };
+            match control {
+                Some(control) => {
+                    spawn_balloon_control_listener(socket_path, balloon_ceiling_mib, control)
+                }
+                None => log::warn!("balloon control socket configured, but balloon is unavailable"),
+            }
+        }
 
         // Register user exit observers
         {
@@ -402,6 +427,60 @@ impl Vm {
     }
 }
 
+#[cfg(not(feature = "tee"))]
+fn spawn_balloon_control_listener(socket_path: PathBuf, ceiling_mib: u32, control: BalloonControl) {
+    std::thread::spawn(move || {
+        if let Err(err) = std::fs::remove_file(&socket_path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    "balloon: failed to remove stale control socket {}: {err}",
+                    socket_path.display()
+                );
+            }
+        }
+
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(err) => {
+                error!(
+                    "balloon: failed to bind control socket {}: {err}",
+                    socket_path.display()
+                );
+                return;
+            }
+        };
+
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => handle_balloon_command(stream, ceiling_mib, &control),
+                Err(err) => error!("balloon: control socket accept failed: {err}"),
+            }
+        }
+    });
+}
+
+#[cfg(not(feature = "tee"))]
+fn handle_balloon_command(stream: UnixStream, ceiling_mib: u32, control: &BalloonControl) {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    if let Err(err) = reader.read_line(&mut line) {
+        error!("balloon: failed to read control command: {err}");
+        return;
+    }
+
+    let target_mib = match line.trim().parse::<u32>() {
+        Ok(target_mib) => target_mib,
+        Err(err) => {
+            let _ = reader.get_mut().write_all(b"ERR invalid target MiB\n");
+            error!("balloon: invalid control command {:?}: {err}", line.trim());
+            return;
+        }
+    };
+
+    let pages = control.set_target_mib(target_mib, ceiling_mib);
+    let _ = writeln!(reader.get_mut(), "OK {pages}");
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
@@ -478,6 +557,7 @@ mod tests {
             EventFd::new(EFD_NONBLOCK).unwrap(),
             Arc::new(AtomicI32::new(i32::MAX)),
             enable_inet_hijack,
+            None,
         )
     }
 

@@ -6,7 +6,11 @@ use std::sync::Arc;
 #[cfg(any(feature = "tee", feature = "aws-nitro"))]
 use std::sync::Arc;
 
+#[cfg(not(feature = "tee"))]
+use devices::virtio::mib_to_pages;
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
+#[cfg(not(feature = "tee"))]
+use vmm::resources::BalloonResize;
 use vmm::resources::{VirtioConsoleConfigMode, VmResources};
 use vmm::vmm_config::machine_config::VmConfig;
 use vmm::vmm_config::machine_config::VmConfigError;
@@ -20,7 +24,9 @@ use vmm::vmm_config::fs::FsDeviceConfig;
 use super::builders::DiskBuilder;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use super::builders::FsConfig;
-use super::builders::{ConsoleBuilder, ExecBuilder, FsBuilder, KernelBuilder, MachineBuilder};
+use super::builders::{
+    BalloonBuilder, ConsoleBuilder, ExecBuilder, FsBuilder, KernelBuilder, MachineBuilder,
+};
 #[cfg(feature = "net")]
 use super::builders::{NetBuilder, NetConfig};
 
@@ -68,6 +74,7 @@ pub struct VmBuilder {
     fs: FsBuilder,
     console: ConsoleBuilder,
     exec: ExecBuilder,
+    balloon: BalloonBuilder,
     #[cfg(feature = "net")]
     net: NetBuilder,
     #[cfg(feature = "blk")]
@@ -94,6 +101,7 @@ impl VmBuilder {
             fs: FsBuilder::new(),
             console: ConsoleBuilder::new(),
             exec: ExecBuilder::new(),
+            balloon: BalloonBuilder::new(),
             #[cfg(feature = "net")]
             net: NetBuilder::new(),
             #[cfg(feature = "blk")]
@@ -118,6 +126,12 @@ impl VmBuilder {
     /// ```
     pub fn machine(mut self, f: impl FnOnce(MachineBuilder) -> MachineBuilder) -> Self {
         self.machine = f(self.machine);
+        self
+    }
+
+    /// Configure host-driven memory ballooning.
+    pub fn balloon(mut self, f: impl FnOnce(BalloonBuilder) -> BalloonBuilder) -> Self {
+        self.balloon = f(self.balloon);
         self
     }
 
@@ -350,6 +364,55 @@ impl VmBuilder {
         vmr.split_irqchip = self.machine.split_irqchip;
         vmr.request_vsock = self.machine.vsock;
 
+        #[cfg(feature = "tee")]
+        if self.balloon.enabled {
+            return Err(Error::Config(ConfigError::Balloon(
+                "memory ballooning is not supported for encrypted guests".to_string(),
+            )));
+        }
+
+        #[cfg(not(feature = "tee"))]
+        let balloon_control_socket = if self.balloon.enabled {
+            let ceiling_mib = u32::try_from(self.machine.memory_mib).map_err(|_| {
+                Error::Config(ConfigError::Balloon(
+                    "machine memory is too large for balloon sizing".to_string(),
+                ))
+            })?;
+            let initial_mib = self.balloon.initial_mib.unwrap_or(ceiling_mib);
+
+            if initial_mib > ceiling_mib {
+                return Err(Error::Config(ConfigError::Balloon(format!(
+                    "initial memory ({initial_mib} MiB) exceeds configured memory ({ceiling_mib} MiB)"
+                ))));
+            }
+
+            if self.balloon.min_mib > ceiling_mib {
+                return Err(Error::Config(ConfigError::Balloon(format!(
+                    "minimum memory ({} MiB) exceeds configured memory ({ceiling_mib} MiB)",
+                    self.balloon.min_mib
+                ))));
+            }
+
+            if self.balloon.min_mib > initial_mib {
+                return Err(Error::Config(ConfigError::Balloon(format!(
+                    "minimum memory ({} MiB) exceeds initial memory ({initial_mib} MiB)",
+                    self.balloon.min_mib
+                ))));
+            }
+
+            vmr.balloon = BalloonResize {
+                initial_pages: mib_to_pages(ceiling_mib - initial_mib),
+                max_pages: mib_to_pages(ceiling_mib - self.balloon.min_mib),
+            };
+
+            self.balloon.control_socket_path
+        } else {
+            None
+        };
+
+        #[cfg(feature = "tee")]
+        let balloon_control_socket = None;
+
         // Apply filesystem configuration
         #[cfg(not(feature = "tee"))]
         for config in self.fs.configs {
@@ -533,6 +596,7 @@ impl VmBuilder {
             exit_evt,
             exit_code,
             self.machine.enable_inet_hijack,
+            balloon_control_socket,
         ))
     }
 }

@@ -129,6 +129,15 @@ pub enum VsockConfig {
     Disabled,
 }
 
+/// Memory balloon sizing in 4 KiB balloon pages.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct BalloonResize {
+    /// Number of pages initially requested from the guest.
+    pub initial_pages: u32,
+    /// Maximum number of pages that can be requested from the guest.
+    pub max_pages: u32,
+}
+
 /// A data structure that encapsulates the device configurations
 /// held in the Vmm.
 #[derive(Default)]
@@ -157,6 +166,8 @@ pub struct VmResources {
     pub custom_fs: Vec<CustomFsDeviceConfig>,
     /// The vsock device.
     pub vsock: VsockBuilder,
+    /// The virtio-balloon resize range.
+    pub balloon: BalloonResize,
     /// The virtio-blk device.
     #[cfg(feature = "blk")]
     pub block: BlockBuilder,
@@ -426,6 +437,7 @@ mod tests {
             #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
             custom_fs: Default::default(),
             vsock: Default::default(),
+            balloon: Default::default(),
             #[cfg(feature = "net")]
             net_builder: Default::default(),
             gpu_virgl_flags: None,

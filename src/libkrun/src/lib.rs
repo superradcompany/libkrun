@@ -10,6 +10,8 @@ use devices::virtio::gpu::display::DisplayInfo;
 use devices::virtio::net::device::VirtioNetBackend;
 #[cfg(feature = "blk")]
 use devices::virtio::CacheType;
+#[cfg(not(feature = "tee"))]
+use devices::virtio::{mib_to_pages, BalloonControl};
 use env_logger::{Env, Target};
 #[cfg(feature = "gpu")]
 use krun_display::DisplayBackend;
@@ -28,14 +30,20 @@ use std::ffi::CString;
 use std::ffi::{c_void, CStr};
 use std::fs::File;
 use std::io::IsTerminal;
+#[cfg(not(feature = "tee"))]
+use std::io::{BufRead, BufReader, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
+#[cfg(not(feature = "tee"))]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::slice;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use utils::eventfd::EventFd;
+#[cfg(not(feature = "tee"))]
+use vmm::resources::BalloonResize;
 use vmm::resources::{
     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
     VmResources, VsockConfig,
@@ -163,6 +171,8 @@ struct ContextConfig {
     console_output: Option<PathBuf>,
     vmm_uid: Option<libc::uid_t>,
     vmm_gid: Option<libc::gid_t>,
+    #[cfg(not(feature = "tee"))]
+    balloon_control_socket: Option<PathBuf>,
 }
 
 impl ContextConfig {
@@ -571,6 +581,61 @@ pub extern "C" fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -
     }
 
     KRUN_SUCCESS
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(not(feature = "tee"))]
+pub unsafe extern "C" fn krun_set_balloon(
+    ctx_id: u32,
+    initial_mib: u32,
+    min_mib: u32,
+    control_socket_path: *const c_char,
+) -> i32 {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            let Some(ceiling_mib) = cfg.vmr.vm_config().mem_size_mib else {
+                return -libc::EINVAL;
+            };
+            let ceiling_mib = match u32::try_from(ceiling_mib) {
+                Ok(ceiling_mib) => ceiling_mib,
+                Err(_) => return -libc::EINVAL,
+            };
+
+            if initial_mib > ceiling_mib || min_mib > ceiling_mib || min_mib > initial_mib {
+                return -libc::EINVAL;
+            }
+
+            cfg.vmr.balloon = BalloonResize {
+                initial_pages: mib_to_pages(ceiling_mib - initial_mib),
+                max_pages: mib_to_pages(ceiling_mib - min_mib),
+            };
+
+            if !control_socket_path.is_null() {
+                let socket_path = match CStr::from_ptr(control_socket_path).to_str() {
+                    Ok(path) => PathBuf::from(path),
+                    Err(_) => return -libc::EINVAL,
+                };
+                cfg.balloon_control_socket = Some(socket_path);
+            }
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(feature = "tee")]
+pub unsafe extern "C" fn krun_set_balloon(
+    _ctx_id: u32,
+    _initial_mib: u32,
+    _min_mib: u32,
+    _control_socket_path: *const c_char,
+) -> i32 {
+    -libc::EOPNOTSUPP
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -2522,6 +2587,60 @@ pub unsafe extern "C" fn krun_set_kernel_console(ctx_id: u32, console_id: *const
     KRUN_SUCCESS
 }
 
+#[cfg(not(feature = "tee"))]
+fn spawn_balloon_control_listener(socket_path: PathBuf, ceiling_mib: u32, control: BalloonControl) {
+    std::thread::spawn(move || {
+        if let Err(err) = std::fs::remove_file(&socket_path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    "balloon: failed to remove stale control socket {}: {err}",
+                    socket_path.display()
+                );
+            }
+        }
+
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(err) => {
+                error!(
+                    "balloon: failed to bind control socket {}: {err}",
+                    socket_path.display()
+                );
+                return;
+            }
+        };
+
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => handle_balloon_command(stream, ceiling_mib, &control),
+                Err(err) => error!("balloon: control socket accept failed: {err}"),
+            }
+        }
+    });
+}
+
+#[cfg(not(feature = "tee"))]
+fn handle_balloon_command(stream: UnixStream, ceiling_mib: u32, control: &BalloonControl) {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    if let Err(err) = reader.read_line(&mut line) {
+        error!("balloon: failed to read control command: {err}");
+        return;
+    }
+
+    let target_mib = match line.trim().parse::<u32>() {
+        Ok(target_mib) => target_mib,
+        Err(err) => {
+            let _ = reader.get_mut().write_all(b"ERR invalid target MiB\n");
+            error!("balloon: invalid control command {:?}: {err}", line.trim());
+            return;
+        }
+    };
+
+    let pages = control.set_target_mib(target_mib, ceiling_mib);
+    let _ = writeln!(reader.get_mut(), "OK {pages}");
+}
+
 #[no_mangle]
 #[allow(unreachable_code)]
 pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
@@ -2693,6 +2812,11 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     }
 
+    #[cfg(not(feature = "tee"))]
+    let balloon_socket = ctx_cfg.balloon_control_socket.take();
+    #[cfg(not(feature = "tee"))]
+    let balloon_ceiling_mib = ctx_cfg.vmr.vm_config().mem_size_mib.unwrap_or(0) as u32;
+
     let (sender, _receiver) = unbounded();
 
     let exit_evt = match utils::eventfd::EventFd::new(utils::eventfd::EFD_NONBLOCK) {
@@ -2718,6 +2842,17 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             return -libc::EINVAL;
         }
     };
+
+    #[cfg(not(feature = "tee"))]
+    if let Some(socket_path) = balloon_socket {
+        let control = { _vmm.lock().unwrap().balloon_control() };
+        match control {
+            Some(control) => {
+                spawn_balloon_control_listener(socket_path, balloon_ceiling_mib, control)
+            }
+            None => warn!("balloon control socket configured, but balloon is unavailable"),
+        }
+    }
 
     #[cfg(target_os = "macos")]
     if ctx_cfg.gpu_virgl_flags.is_some() {

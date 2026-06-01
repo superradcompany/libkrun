@@ -53,6 +53,9 @@ pub enum ConfigError {
 
     /// Vsock configuration error.
     Vsock(String),
+
+    /// Memory balloon configuration error.
+    Balloon(String),
 }
 
 /// VM build errors.
@@ -114,6 +117,7 @@ impl fmt::Display for ConfigError {
             ConfigError::Block(s) => write!(f, "block device: {}", s),
             ConfigError::Console(s) => write!(f, "console: {}", s),
             ConfigError::Vsock(s) => write!(f, "vsock: {}", s),
+            ConfigError::Balloon(s) => write!(f, "balloon: {}", s),
         }
     }
 }

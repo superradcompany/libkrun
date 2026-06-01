@@ -48,6 +48,23 @@ pub struct MachineBuilder {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Types: Balloon Builder
+//--------------------------------------------------------------------------------------------------
+
+/// Builder for host-driven guest memory ballooning.
+///
+/// `initial_mib` and `min_mib` describe guest-usable memory. The VMM
+/// converts them into reclaimed balloon pages relative to the configured
+/// machine memory ceiling.
+#[derive(Debug, Clone, Default)]
+pub struct BalloonBuilder {
+    pub(crate) enabled: bool,
+    pub(crate) initial_mib: Option<u32>,
+    pub(crate) min_mib: u32,
+    pub(crate) control_socket_path: Option<PathBuf>,
+}
+
+//--------------------------------------------------------------------------------------------------
 // Types: Kernel Builder
 //--------------------------------------------------------------------------------------------------
 
@@ -411,6 +428,46 @@ impl MachineBuilder {
 impl Default for MachineBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods: Balloon Builder
+//--------------------------------------------------------------------------------------------------
+
+impl BalloonBuilder {
+    /// Create a new balloon builder with ballooning disabled.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enable the virtio-balloon device control path.
+    pub fn enable(mut self) -> Self {
+        self.enabled = true;
+        self
+    }
+
+    /// Set the guest-usable memory at boot in MiB.
+    ///
+    /// When unset, the guest boots at the configured machine memory ceiling.
+    pub fn initial_mib(mut self, mib: u32) -> Self {
+        self.enabled = true;
+        self.initial_mib = Some(mib);
+        self
+    }
+
+    /// Set the minimum guest-usable memory in MiB.
+    pub fn min_mib(mut self, mib: u32) -> Self {
+        self.enabled = true;
+        self.min_mib = mib;
+        self
+    }
+
+    /// Set the Unix socket path that accepts runtime memory target commands.
+    pub fn control_socket_path(mut self, path: impl AsRef<Path>) -> Self {
+        self.enabled = true;
+        self.control_socket_path = Some(path.as_ref().to_path_buf());
+        self
     }
 }
 

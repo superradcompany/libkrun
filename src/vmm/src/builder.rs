@@ -980,6 +980,8 @@ pub fn build_microvm(
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
+        #[cfg(not(feature = "tee"))]
+        balloon_control: None,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
@@ -988,7 +990,7 @@ pub fn build_microvm(
     }
 
     #[cfg(not(feature = "tee"))]
-    attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
+    attach_balloon_device(&mut vmm, event_manager, intc.clone(), vm_resources.balloon)?;
     #[cfg(not(feature = "tee"))]
     attach_rng_device(&mut vmm, event_manager, intc.clone())?;
     let mut console_id = 0;
@@ -2289,16 +2291,26 @@ fn attach_balloon_device(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,
     intc: IrqChip,
+    balloon_cfg: crate::resources::BalloonResize,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
-    let balloon = Arc::new(Mutex::new(devices::virtio::Balloon::new().unwrap()));
+    let balloon = Arc::new(Mutex::new(
+        devices::virtio::Balloon::new(balloon_cfg.initial_pages, balloon_cfg.max_pages).unwrap(),
+    ));
 
     event_manager
         .add_subscriber(balloon.clone())
         .map_err(RegisterEvent)?;
 
-    let id = String::from(balloon.lock().unwrap().id());
+    let (id, control) = {
+        let balloon = balloon.lock().unwrap();
+        (String::from(balloon.id()), balloon.control())
+    };
+
+    if balloon_cfg.max_pages > 0 {
+        vmm.set_balloon_control(control);
+    }
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc.clone(), balloon).map_err(RegisterBalloonDevice)?;
