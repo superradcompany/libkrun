@@ -477,6 +477,16 @@ impl HvfVcpu<'_> {
         self.vcpuid
     }
 
+    pub fn exec_time_ns(&self) -> Option<u64> {
+        let mut time = 0;
+        let ret = unsafe { hv_vcpu_get_exec_time(self.vcpuid, &mut time) };
+        if ret == HV_SUCCESS {
+            Some(time)
+        } else {
+            None
+        }
+    }
+
     fn read_reg(&self, reg: u32) -> Result<u64, Error> {
         let val: u64 = 0;
         let ret = unsafe { hv_vcpu_get_reg(self.vcpuid, reg, &val as *const _ as *mut _) };

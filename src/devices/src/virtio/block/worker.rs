@@ -10,6 +10,7 @@ use std::result;
 use std::thread;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
+use utils::metrics::BlockMetricsWriter;
 use virtio_bindings::virtio_blk::*;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
@@ -61,6 +62,7 @@ pub struct BlockWorker {
     mem: GuestMemoryMmap,
     disk: DiskProperties,
     stop_fd: EventFd,
+    metrics: BlockMetricsWriter,
 }
 
 impl BlockWorker {
@@ -70,6 +72,7 @@ impl BlockWorker {
         mem: GuestMemoryMmap,
         disk: DiskProperties,
         stop_fd: EventFd,
+        metrics: BlockMetricsWriter,
     ) -> Self {
         Self {
             device_queue,
@@ -77,6 +80,7 @@ impl BlockWorker {
             mem,
             disk,
             stop_fd,
+            metrics,
         }
     }
 
@@ -105,8 +109,8 @@ impl BlockWorker {
             &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
         );
 
+        let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
-            let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
                     for event in &epoll_events[0..ev_cnt] {
@@ -219,13 +223,19 @@ impl BlockWorker {
     ) -> result::Result<usize, RequestError> {
         match request_header.request_type {
             VIRTIO_BLK_T_IN => {
-                let data_len = writer.available_bytes() - 1;
+                let data_len = writer
+                    .available_bytes()
+                    .checked_sub(1)
+                    .ok_or(RequestError::InvalidDataLength)?;
                 if !data_len.is_multiple_of(512) {
                     Err(RequestError::InvalidDataLength)
                 } else {
-                    writer
-                        .write_from_at(&self.disk, data_len, request_header.sector * 512)
-                        .map_err(RequestError::WritingToDescriptor)
+                    let offset = sector_offset(request_header.sector)?;
+                    let len = writer
+                        .write_from_at(&self.disk, data_len, offset)
+                        .map_err(RequestError::WritingToDescriptor)?;
+                    self.metrics.add_read_bytes(len as u64);
+                    Ok(len)
                 }
             }
             VIRTIO_BLK_T_OUT => {
@@ -233,9 +243,12 @@ impl BlockWorker {
                 if !data_len.is_multiple_of(512) {
                     Err(RequestError::InvalidDataLength)
                 } else {
-                    reader
-                        .read_to_at(&self.disk, data_len, request_header.sector * 512)
-                        .map_err(RequestError::ReadingFromDescriptor)
+                    let offset = sector_offset(request_header.sector)?;
+                    let len = reader
+                        .read_to_at(&self.disk, data_len, offset)
+                        .map_err(RequestError::ReadingFromDescriptor)?;
+                    self.metrics.add_write_bytes(len as u64);
+                    Ok(len)
                 }
             }
             VIRTIO_BLK_T_FLUSH => match self.disk.cache_type() {
@@ -268,8 +281,8 @@ impl BlockWorker {
                     .lock()
                     .unwrap()
                     .discard_to_any(
-                        discard_write_data.sector * 512,
-                        discard_write_data.num_sectors as u64 * 512,
+                        sector_offset(discard_write_data.sector)?,
+                        sector_count_bytes(discard_write_data.num_sectors)?,
                     )
                     .map_err(RequestError::Discarding)?;
                 Ok(0)
@@ -285,8 +298,8 @@ impl BlockWorker {
                         .lock()
                         .unwrap()
                         .discard_to_zero(
-                            discard_write_data.sector * 512,
-                            discard_write_data.num_sectors as u64 * 512,
+                            sector_offset(discard_write_data.sector)?,
+                            sector_count_bytes(discard_write_data.num_sectors)?,
                         )
                         .map_err(RequestError::DiscardingToZero)?;
                 } else {
@@ -295,8 +308,8 @@ impl BlockWorker {
                         .lock()
                         .unwrap()
                         .write_zeroes(
-                            discard_write_data.sector * 512,
-                            discard_write_data.num_sectors as u64 * 512,
+                            sector_offset(discard_write_data.sector)?,
+                            sector_count_bytes(discard_write_data.num_sectors)?,
                         )
                         .map_err(RequestError::WritingZeroes)?;
                 }
@@ -304,5 +317,39 @@ impl BlockWorker {
             }
             _ => Err(RequestError::UnknownRequest),
         }
+    }
+}
+
+fn sector_offset(sector: u64) -> result::Result<u64, RequestError> {
+    sector
+        .checked_mul(512)
+        .ok_or(RequestError::InvalidDataLength)
+}
+
+fn sector_count_bytes(sectors: u32) -> result::Result<u64, RequestError> {
+    u64::from(sectors)
+        .checked_mul(512)
+        .ok_or(RequestError::InvalidDataLength)
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sector_offset_rejects_overflow() {
+        assert!(matches!(
+            sector_offset(u64::MAX),
+            Err(RequestError::InvalidDataLength)
+        ));
+    }
+
+    #[test]
+    fn sector_count_bytes_converts_to_bytes() {
+        assert_eq!(sector_count_bytes(8).unwrap(), 4096);
     }
 }

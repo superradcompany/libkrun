@@ -4,7 +4,7 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 #[cfg(target_os = "linux")]
 use std::env;
@@ -22,6 +22,7 @@ use vmm::vmm_config::vsock::VsockDeviceConfig;
 
 use super::error::{BuildError, Error, Result, RuntimeError};
 use super::exit_handle::ExitHandle;
+use super::metrics::MetricsHandle;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -120,11 +121,23 @@ impl Vm {
         Arc::clone(&self.exit_code)
     }
 
+    /// Get a cloneable handle for VM metrics.
+    ///
+    /// Must be called before [`enter()`](Self::enter) if the caller needs to
+    /// sample metrics while the VM is running, because `enter()` never returns
+    /// on a successful boot.
+    pub fn metrics_handle(&self) -> MetricsHandle {
+        self.vmr.metrics.handle()
+    }
+
     /// Start the VM. This call never returns on success — the VMM calls
     /// `_exit()` when the guest shuts down, killing the entire process.
     ///
     /// Only returns `Err` if something fails before the VMM takes over.
     pub fn enter(mut self) -> Result<Infallible> {
+        let mut trace = BootTrace::new("api");
+        trace.mark("enter.start");
+
         // Set process name on Linux
         #[cfg(target_os = "linux")]
         {
@@ -138,6 +151,7 @@ impl Vm {
         // Create event manager
         let mut event_manager = EventManager::new()
             .map_err(|e| Error::Build(BuildError::Start(format!("EventManager: {e:?}"))))?;
+        trace.mark("event_manager.ready");
 
         // Load kernel from libkrunfw if not already configured
         if self.vmr.external_kernel.is_none()
@@ -147,6 +161,7 @@ impl Vm {
         {
             self.load_krunfw()?;
         }
+        trace.mark("kernel.ready");
 
         // Capture boot start timestamp (epoch nanoseconds) for guest-side timing.
         let boot_start_ns = SystemTime::now()
@@ -160,9 +175,11 @@ impl Vm {
         self.vmr
             .set_kernel_cmdline(kernel_cmdline)
             .map_err(|e| Error::Build(BuildError::Start(format!("kernel cmdline: {e:?}"))))?;
+        trace.mark("kernel_cmdline.ready");
 
         // Configure vsock
         self.configure_vsock()?;
+        trace.mark("vsock.configured");
 
         // Create shutdown EventFd on macOS aarch64 (needed for GPIO shutdown device)
         let shutdown_efd = if cfg!(target_arch = "aarch64") && cfg!(target_os = "macos") {
@@ -186,6 +203,7 @@ impl Vm {
             self.exit_code,
         )
         .map_err(|e| Error::Build(BuildError::Start(format!("build_microvm: {e:?}"))))?;
+        trace.mark("build_microvm.ready");
 
         // Register user exit observers
         {
@@ -194,6 +212,7 @@ impl Vm {
                 vmm.add_exit_observer(observer);
             }
         }
+        trace.mark("observers.ready");
 
         // Start worker threads if needed
         #[cfg(target_os = "macos")]
@@ -211,6 +230,7 @@ impl Vm {
         #[cfg(any(feature = "amd-sev", feature = "tdx"))]
         vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone())
             .map_err(|e| Error::Runtime(RuntimeError::EventLoop(format!("{e:?}"))))?;
+        trace.mark("event_loop.start");
 
         // Run the event loop. On normal guest exit, the VMM calls _exit() directly.
         loop {
@@ -399,6 +419,41 @@ impl Vm {
         }
 
         tsi_flags
+    }
+}
+
+struct BootTrace {
+    enabled: bool,
+    scope: &'static str,
+    start: Instant,
+    last: Instant,
+}
+
+impl BootTrace {
+    fn new(scope: &'static str) -> Self {
+        let now = Instant::now();
+        Self {
+            enabled: std::env::var_os("MSB_KRUN_BOOT_TRACE").is_some(),
+            scope,
+            start: now,
+            last: now,
+        }
+    }
+
+    fn mark(&mut self, label: &'static str) {
+        if !self.enabled {
+            return;
+        }
+
+        let now = Instant::now();
+        eprintln!(
+            "krun.boot scope={} label={} elapsed_us={} delta_us={}",
+            self.scope,
+            label,
+            now.duration_since(self.start).as_micros(),
+            now.duration_since(self.last).as_micros(),
+        );
+        self.last = now;
     }
 }
 

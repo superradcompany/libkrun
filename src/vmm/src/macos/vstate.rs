@@ -23,6 +23,7 @@ use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use devices::legacy::VcpuList;
 use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
 use utils::eventfd::EventFd;
+use utils::metrics::MetricsWriter;
 use vm_memory::{
     Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
 };
@@ -201,6 +202,7 @@ pub struct Vcpu {
 
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
+    metrics: MetricsWriter,
 }
 
 impl Vcpu {
@@ -275,6 +277,7 @@ impl Vcpu {
         exit_evt: EventFd,
         vcpu_list: Arc<VcpuList>,
         nested_enabled: bool,
+        metrics: MetricsWriter,
     ) -> Result<Self> {
         let (event_sender, event_receiver) = unbounded();
         let (response_sender, response_receiver) = unbounded();
@@ -294,6 +297,7 @@ impl Vcpu {
             response_sender,
             vcpu_list,
             nested_enabled,
+            metrics,
         })
     }
 
@@ -458,8 +462,16 @@ impl Vcpu {
             .set_initial_state(entry_addr, self.fdt_addr)
             .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
 
+        let mut last_exec_time_ns = hvf_vcpu.exec_time_ns().unwrap_or(0);
         loop {
-            match self.run_emulation(&mut hvf_vcpu) {
+            let emulation = self.run_emulation(&mut hvf_vcpu);
+            if let Some(exec_time_ns) = hvf_vcpu.exec_time_ns() {
+                self.metrics
+                    .add_vcpu_time_ns(exec_time_ns.saturating_sub(last_exec_time_ns));
+                last_exec_time_ns = exec_time_ns;
+            }
+
+            match emulation {
                 // Emulation ran successfully, continue.
                 Ok(VcpuEmulation::Handled) => (),
                 // Emulation was interrupted by a breakpoint.

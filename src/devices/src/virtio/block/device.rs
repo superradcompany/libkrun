@@ -24,6 +24,7 @@ use imago::{
 };
 use log::{error, warn};
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
+use utils::metrics::BlockMetricsWriter;
 use virtio_bindings::{
     virtio_blk::*, virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX,
 };
@@ -207,6 +208,7 @@ pub struct Block {
     cache_type: CacheType,
     disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
+    metrics: BlockMetricsWriter,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
 
@@ -237,6 +239,7 @@ impl Block {
         is_disk_read_only: bool,
         direct_io: bool,
         sync_mode: SyncMode,
+        metrics: BlockMetricsWriter,
     ) -> io::Result<Block> {
         let disk_image = OpenOptions::new()
             .read(true)
@@ -334,6 +337,7 @@ impl Block {
             cache_type,
             disk_image,
             disk_image_id,
+            metrics,
             avail_features,
             acked_features: 0u64,
             device_state: DeviceState::Inactive,
@@ -436,6 +440,7 @@ impl VirtioDevice for Block {
             mem.clone(),
             disk,
             self.worker_stopfd.try_clone().unwrap(),
+            self.metrics.clone(),
         );
         self.worker_thread = Some(worker.run());
 

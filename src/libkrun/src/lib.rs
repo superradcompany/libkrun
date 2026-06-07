@@ -2317,6 +2317,32 @@ pub extern "C" fn krun_disable_implicit_console(ctx_id: u32) -> i32 {
 }
 
 #[no_mangle]
+pub extern "C" fn krun_set_balloon_device(ctx_id: u32, enable: bool) -> i32 {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            cfg.vmr.enable_balloon = enable;
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn krun_set_rng_device(ctx_id: u32, enable: bool) -> i32 {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            cfg.vmr.enable_rng = enable;
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+#[no_mangle]
 pub extern "C" fn krun_disable_implicit_vsock(ctx_id: u32) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {

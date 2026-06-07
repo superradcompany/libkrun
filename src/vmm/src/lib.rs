@@ -32,6 +32,7 @@ mod linux;
 use crate::linux::vstate;
 #[cfg(target_os = "macos")]
 mod macos;
+mod metrics;
 mod terminal;
 pub mod worker;
 

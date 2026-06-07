@@ -349,6 +349,8 @@ impl VmBuilder {
         vmr.nested_enabled = self.machine.nested_virt;
         vmr.split_irqchip = self.machine.split_irqchip;
         vmr.request_vsock = self.machine.vsock;
+        vmr.enable_balloon = self.machine.balloon;
+        vmr.enable_rng = self.machine.rng;
 
         // Apply filesystem configuration
         #[cfg(not(feature = "tee"))]

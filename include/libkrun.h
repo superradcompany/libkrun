@@ -1041,6 +1041,22 @@ int32_t krun_split_irqchip(uint32_t ctx_id, bool enable);
 int32_t krun_disable_implicit_console(uint32_t ctx_id);
 
 /**
+ * Enables or disables the virtio-balloon device. Enabled by default.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_balloon_device(uint32_t ctx_id, bool enable);
+
+/**
+ * Enables or disables the virtio-rng device. Enabled by default.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_rng_device(uint32_t ctx_id, bool enable);
+
+/**
  * Disable the implicit vsock device.
  *
  * By default, libkrun creates a vsock device automatically. This function

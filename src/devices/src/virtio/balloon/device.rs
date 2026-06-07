@@ -3,6 +3,7 @@ use std::convert::TryInto;
 use std::io::Write;
 
 use utils::eventfd::EventFd;
+use utils::metrics::MetricsWriter;
 use vm_memory::{ByteValued, GuestMemory, GuestMemoryMmap};
 
 use super::super::{
@@ -29,6 +30,8 @@ pub(crate) const AVAIL_FEATURES: u64 = (1 << uapi::VIRTIO_F_VERSION_1 as u64)
     | (1 << uapi::VIRTIO_BALLOON_F_FREE_PAGE_HINT as u64)
     | (1 << uapi::VIRTIO_BALLOON_F_REPORTING as u64);
 
+pub(crate) const VIRTIO_BALLOON_S_AVAIL: u16 = 6;
+
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C, packed)]
 pub struct VirtioBalloonConfig {
@@ -52,10 +55,11 @@ pub struct Balloon {
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
     config: VirtioBalloonConfig,
+    pub(crate) metrics: MetricsWriter,
 }
 
 impl Balloon {
-    pub fn new() -> super::Result<Balloon> {
+    pub fn new(metrics: MetricsWriter) -> super::Result<Balloon> {
         Ok(Balloon {
             queues: None,
             avail_features: AVAIL_FEATURES,
@@ -64,6 +68,7 @@ impl Balloon {
                 .map_err(BalloonError::EventFd)?,
             device_state: DeviceState::Inactive,
             config: VirtioBalloonConfig::default(),
+            metrics,
         })
     }
 

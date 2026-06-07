@@ -44,6 +44,8 @@ pub struct MachineBuilder {
     pub(crate) nested_virt: bool,
     pub(crate) split_irqchip: bool,
     pub(crate) vsock: bool,
+    pub(crate) balloon: bool,
+    pub(crate) rng: bool,
     pub(crate) enable_inet_hijack: bool,
 }
 
@@ -335,6 +337,8 @@ impl MachineBuilder {
             nested_virt: false,
             split_irqchip: false,
             vsock: false,
+            balloon: true,
+            rng: true,
             enable_inet_hijack: false,
         }
     }
@@ -384,6 +388,25 @@ impl MachineBuilder {
     /// its own purposes even though TSI would not otherwise require one.
     pub fn vsock(mut self, enabled: bool) -> Self {
         self.vsock = enabled;
+        self
+    }
+
+    /// Enable or disable the virtio-balloon device.
+    ///
+    /// The device is enabled by default for general-purpose VMs. Latency-sensitive
+    /// guests that never resize memory can disable it to avoid one virtio-mmio
+    /// device and its guest-side probe.
+    pub fn balloon(mut self, enabled: bool) -> Self {
+        self.balloon = enabled;
+        self
+    }
+
+    /// Enable or disable the virtio-rng device.
+    ///
+    /// The device is enabled by default. Guests with a known nonblocking boot
+    /// path can disable it to remove one virtio-mmio device from cold start.
+    pub fn rng(mut self, enabled: bool) -> Self {
+        self.rng = enabled;
         self
     }
 

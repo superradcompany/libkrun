@@ -51,6 +51,9 @@ pub use api::builders::SyncMode;
 pub use api::builders::{ConsoleBuilder, ExecBuilder, FsBuilder, KernelBuilder, MachineBuilder};
 pub use api::error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use api::exit_handle::ExitHandle;
+pub use api::metrics::{
+    BlockDeviceMetrics, BlockMetrics, CpuMetrics, MemoryMetrics, MetricsHandle, VmMetrics,
+};
 pub use api::vm::Vm;
 
 pub use backends::console::ConsolePortBackend;

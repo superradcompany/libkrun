@@ -17,6 +17,7 @@ use std::os::fd::{BorrowedFd, FromRawFd};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use super::{Error, Vmm};
 
@@ -567,6 +568,9 @@ pub fn build_microvm(
     exit_evt: EventFd,
     exit_code: Arc<AtomicI32>,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    let mut trace = BootTrace::new("vmm");
+    trace.mark("build_microvm.start");
+
     let payload = choose_payload(vm_resources)?;
 
     let (guest_memory, arch_memory_info, mut _shm_manager, payload_config) = create_guest_memory(
@@ -577,6 +581,7 @@ pub fn build_microvm(
         vm_resources,
         &payload,
     )?;
+    trace.mark("guest_memory.ready");
 
     let vcpu_config = vm_resources.vcpu_config();
 
@@ -594,6 +599,7 @@ pub fn build_microvm(
     if let Some(cmdline) = &vm_resources.kernel_cmdline.krun_env {
         kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
     }
+    trace.mark("kernel_cmdline.ready");
 
     if let Some(kernel_console) = &vm_resources.kernel_console {
         let cmdline = kernel_cmdline.as_str();
@@ -613,6 +619,7 @@ pub fn build_microvm(
     #[cfg(not(feature = "tee"))]
     #[allow(unused_mut)]
     let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled)?;
+    trace.mark("vm.ready");
 
     #[cfg(feature = "tee")]
     let (_kvm, vm) = {
@@ -855,6 +862,7 @@ pub fn build_microvm(
             &pio_device_manager.io_bus,
             &exit_evt,
             kernel_boot,
+            vm_resources.metrics.clone(),
             #[cfg(feature = "tee")]
             _sender,
         )
@@ -881,6 +889,7 @@ pub fn build_microvm(
             &arch_memory_info,
             payload_config.entry_addr,
             &exit_evt,
+            vm_resources.metrics.clone(),
         )
         .map_err(StartMicrovmError::Internal)?;
 
@@ -929,6 +938,7 @@ pub fn build_microvm(
             &exit_evt,
             vcpu_list.clone(),
             vm_resources.nested_enabled,
+            vm_resources.metrics.clone(),
         )
         .map_err(StartMicrovmError::Internal)?;
 
@@ -951,6 +961,7 @@ pub fn build_microvm(
             &guest_memory,
             payload_config.entry_addr,
             &exit_evt,
+            vm_resources.metrics.clone(),
         )
         .map_err(StartMicrovmError::Internal)?;
 
@@ -965,6 +976,8 @@ pub fn build_microvm(
             serial_device,
         )?;
     }
+
+    trace.mark("arch_devices.ready");
 
     // exit_code is pre-created and shared with callers via Vm::exit_code().
 
@@ -988,9 +1001,24 @@ pub fn build_microvm(
     }
 
     #[cfg(not(feature = "tee"))]
-    attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
+    if vm_resources.enable_balloon {
+        attach_balloon_device(
+            &mut vmm,
+            event_manager,
+            intc.clone(),
+            vm_resources.metrics.clone(),
+        )?;
+        trace.mark("balloon.attached");
+    } else {
+        trace.mark("balloon.skipped");
+    }
     #[cfg(not(feature = "tee"))]
-    attach_rng_device(&mut vmm, event_manager, intc.clone())?;
+    if vm_resources.enable_rng {
+        attach_rng_device(&mut vmm, event_manager, intc.clone())?;
+        trace.mark("rng.attached");
+    } else {
+        trace.mark("rng.skipped");
+    }
     let mut console_id = 0;
     if !vm_resources.disable_implicit_console {
         attach_console_devices(
@@ -1002,6 +1030,9 @@ pub fn build_microvm(
             console_id,
         )?;
         console_id += 1;
+        trace.mark("implicit_console.attached");
+    } else {
+        trace.mark("implicit_console.skipped");
     }
 
     for console_cfg in std::mem::take(&mut vm_resources.virtio_consoles) {
@@ -1015,6 +1046,7 @@ pub fn build_microvm(
         )?;
         console_id += 1;
     }
+    trace.mark("virtio_consoles.ready");
 
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     let export_table: Option<ExportTable> = if cfg!(feature = "gpu") {
@@ -1060,6 +1092,7 @@ pub fn build_microvm(
         #[cfg(target_os = "macos")]
         _sender.clone(),
     )?;
+    trace.mark("fs.ready");
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     attach_custom_fs_devices(
         &mut vmm,
@@ -1071,8 +1104,11 @@ pub fn build_microvm(
         #[cfg(target_os = "macos")]
         _sender,
     )?;
+    trace.mark("custom_fs.ready");
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
+    #[cfg(feature = "blk")]
+    trace.mark("block.ready");
 
     if let Some(vsock) = vm_resources.vsock.get() {
         attach_unixsock_vsock_device(&mut vmm, vsock, event_manager, intc.clone())?;
@@ -1083,10 +1119,15 @@ pub fn build_microvm(
         if tsi_flags.contains(TsiFlags::HIJACK_UNIX) {
             vmm.kernel_cmdline.insert_str("tsi_hijack_unix")?;
         }
+        trace.mark("vsock.ready");
+    } else {
+        trace.mark("vsock.skipped");
     }
 
     #[cfg(feature = "net")]
     attach_net_devices(&mut vmm, &vm_resources.net, intc.clone())?;
+    #[cfg(feature = "net")]
+    trace.mark("net.ready");
     #[cfg(feature = "snd")]
     if vm_resources.snd_device {
         attach_snd_device(&mut vmm, intc.clone())?;
@@ -1108,6 +1149,7 @@ pub fn build_microvm(
         &vm_resources.smbios_oem_strings,
     )
     .map_err(StartMicrovmError::Internal)?;
+    trace.mark("system.configured");
 
     #[cfg(feature = "tee")]
     {
@@ -1145,6 +1187,7 @@ pub fn build_microvm(
 
     vmm.start_vcpus(vcpus)
         .map_err(StartMicrovmError::Internal)?;
+    trace.mark("vcpus.started");
 
     // Clippy thinks we don't need Arc<Mutex<...
     // but we don't want to change the event_manager interface
@@ -1153,8 +1196,44 @@ pub fn build_microvm(
     event_manager
         .add_subscriber(vmm.clone())
         .map_err(StartMicrovmError::RegisterEvent)?;
+    trace.mark("build_microvm.done");
 
     Ok(vmm)
+}
+
+struct BootTrace {
+    enabled: bool,
+    scope: &'static str,
+    start: Instant,
+    last: Instant,
+}
+
+impl BootTrace {
+    fn new(scope: &'static str) -> Self {
+        let now = Instant::now();
+        Self {
+            enabled: std::env::var_os("MSB_KRUN_BOOT_TRACE").is_some(),
+            scope,
+            start: now,
+            last: now,
+        }
+    }
+
+    fn mark(&mut self, label: &'static str) {
+        if !self.enabled {
+            return;
+        }
+
+        let now = Instant::now();
+        eprintln!(
+            "krun.boot scope={} label={} elapsed_us={} delta_us={}",
+            self.scope,
+            label,
+            now.duration_since(self.start).as_micros(),
+            now.duration_since(self.last).as_micros(),
+        );
+        self.last = now;
+    }
 }
 
 fn load_external_kernel(
@@ -1555,6 +1634,12 @@ pub fn create_guest_memory(
         }
     }
 
+    crate::metrics::install_host_resident_memory_sampler(
+        &vm_resources.metrics,
+        &guest_mem,
+        &arch_mem_info,
+    );
+
     let payload_config = PayloadConfig {
         entry_addr,
         initrd_config,
@@ -1765,6 +1850,7 @@ fn create_vcpus_x86_64(
     io_bus: &devices::Bus,
     exit_evt: &EventFd,
     kernel_boot: bool,
+    metrics: utils::metrics::MetricsWriter,
     #[cfg(feature = "tee")] pm_sender: Sender<WorkerMessage>,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
@@ -1776,6 +1862,7 @@ fn create_vcpus_x86_64(
             vm.supported_msrs().clone(),
             io_bus.clone(),
             exit_evt.try_clone().map_err(Error::EventFd)?,
+            metrics.clone(),
             #[cfg(feature = "tee")]
             pm_sender.clone(),
         )
@@ -1796,6 +1883,7 @@ fn create_vcpus_aarch64(
     mem_info: &ArchMemoryInfo,
     entry_addr: GuestAddress,
     exit_evt: &EventFd,
+    metrics: utils::metrics::MetricsWriter,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
     for cpu_index in 0..vcpu_config.vcpu_count {
@@ -1803,6 +1891,7 @@ fn create_vcpus_aarch64(
             cpu_index,
             vm.fd(),
             exit_evt.try_clone().map_err(Error::EventFd)?,
+            metrics.clone(),
         )
         .map_err(Error::Vcpu)?;
 
@@ -1823,6 +1912,7 @@ fn create_vcpus_aarch64(
     exit_evt: &EventFd,
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
+    metrics: utils::metrics::MetricsWriter,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
     let mut boot_senders: HashMap<u64, Sender<u64>> = HashMap::new();
@@ -1842,6 +1932,7 @@ fn create_vcpus_aarch64(
             exit_evt.try_clone().map_err(Error::EventFd)?,
             vcpu_list.clone(),
             nested_enabled,
+            metrics.clone(),
         )
         .map_err(Error::Vcpu)?;
 
@@ -1866,6 +1957,7 @@ fn create_vcpus_riscv64(
     guest_mem: &GuestMemoryMmap,
     entry_addr: GuestAddress,
     exit_evt: &EventFd,
+    metrics: utils::metrics::MetricsWriter,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
     for cpu_index in 0..vcpu_config.vcpu_count {
@@ -1873,6 +1965,7 @@ fn create_vcpus_riscv64(
             cpu_index,
             vm.fd(),
             exit_evt.try_clone().map_err(Error::EventFd)?,
+            metrics.clone(),
         )
         .map_err(Error::Vcpu)?;
 
@@ -2289,10 +2382,11 @@ fn attach_balloon_device(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,
     intc: IrqChip,
+    metrics: utils::metrics::MetricsWriter,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
-    let balloon = Arc::new(Mutex::new(devices::virtio::Balloon::new().unwrap()));
+    let balloon = Arc::new(Mutex::new(devices::virtio::Balloon::new(metrics).unwrap()));
 
     event_manager
         .add_subscriber(balloon.clone())
@@ -2480,6 +2574,7 @@ pub mod tests {
             &bus,
             &EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
             true,
+            utils::metrics::MetricsWriter::default(),
         )
         .unwrap();
         assert_eq!(vcpu_vec.len(), vcpu_count as usize);
@@ -2507,6 +2602,7 @@ pub mod tests {
             &arch_memory_info,
             entry_addr,
             &EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            utils::metrics::MetricsWriter::default(),
         )
         .unwrap();
         assert_eq!(vcpu_vec.len(), vcpu_count as usize);

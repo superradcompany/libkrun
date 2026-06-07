@@ -31,6 +31,7 @@ pub mod builder;
 pub mod builders;
 pub mod error;
 pub mod exit_handle;
+pub mod metrics;
 pub mod vm;
 
 //--------------------------------------------------------------------------------------------------
@@ -47,4 +48,7 @@ pub use builders::NetBuilder;
 pub use builders::{ConsoleBuilder, ExecBuilder, FsBuilder, KernelBuilder, MachineBuilder};
 pub use error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use exit_handle::ExitHandle;
+pub use metrics::{
+    BlockDeviceMetrics, BlockMetrics, CpuMetrics, MemoryMetrics, MetricsHandle, VmMetrics,
+};
 pub use vm::Vm;

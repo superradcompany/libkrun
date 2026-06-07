@@ -2,9 +2,22 @@ use std::os::unix::io::AsRawFd;
 
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
+use vm_memory::{ByteValued, Le16, Le64};
 
-use super::device::{Balloon, DFQ_INDEX, FRQ_INDEX, IFQ_INDEX, PHQ_INDEX, STQ_INDEX};
+use super::device::{
+    Balloon, DFQ_INDEX, FRQ_INDEX, IFQ_INDEX, PHQ_INDEX, STQ_INDEX, VIRTIO_BALLOON_S_AVAIL,
+};
+use crate::virtio::descriptor_utils::Reader;
 use crate::virtio::device::VirtioDevice;
+
+#[derive(Clone, Copy, Default)]
+#[repr(C, packed)]
+struct BalloonStat {
+    tag: Le16,
+    val: Le64,
+}
+
+unsafe impl ByteValued for BalloonStat {}
 
 impl Balloon {
     fn queue_event(&self, idx: usize) -> &std::sync::Arc<utils::eventfd::EventFd> {
@@ -40,7 +53,7 @@ impl Balloon {
     }
 
     pub(crate) fn handle_stq_event(&mut self, event: &EpollEvent) {
-        debug!("balloon: stats queue event (ignored)");
+        debug!("balloon: stats queue event");
 
         let event_set = event.event_set();
         if event_set != EventSet::IN {
@@ -50,6 +63,8 @@ impl Balloon {
 
         if let Err(e) = self.queue_event(STQ_INDEX).read() {
             error!("Failed to read balloon stats queue event: {e:?}");
+        } else if self.process_stq() {
+            self.device_state.signal_used_queue();
         }
     }
 
@@ -81,6 +96,56 @@ impl Balloon {
         } else if self.process_frq() {
             self.device_state.signal_used_queue();
         }
+    }
+
+    fn process_stq(&mut self) -> bool {
+        let mem = match self.device_state {
+            crate::virtio::DeviceState::Activated(ref mem, _) => mem,
+            crate::virtio::DeviceState::Inactive => unreachable!(),
+        };
+        let metrics = self.metrics.clone();
+        let queues = self
+            .queues
+            .as_mut()
+            .expect("queues should exist when activated");
+        let mut have_used = false;
+
+        while let Some(head) = queues[STQ_INDEX].queue.pop(mem) {
+            let index = head.index;
+            let mut reader = match Reader::new(mem, head) {
+                Ok(reader) => reader,
+                Err(e) => {
+                    error!("balloon: invalid stats descriptor chain: {e:?}");
+                    have_used = true;
+                    if let Err(e) = queues[STQ_INDEX].queue.add_used(mem, index, 0) {
+                        error!("balloon: failed to add used stats element: {e:?}");
+                    }
+                    continue;
+                }
+            };
+
+            while reader.available_bytes() >= std::mem::size_of::<BalloonStat>() {
+                match reader.read_obj::<BalloonStat>() {
+                    Ok(stat) => match stat.tag.to_native() {
+                        VIRTIO_BALLOON_S_AVAIL => {
+                            metrics.set_memory_available_bytes(stat.val.to_native())
+                        }
+                        _ => {}
+                    },
+                    Err(e) => {
+                        error!("balloon: failed to read stat: {e:?}");
+                        break;
+                    }
+                }
+            }
+
+            have_used = true;
+            if let Err(e) = queues[STQ_INDEX].queue.add_used(mem, index, 0) {
+                error!("balloon: failed to add used stats element: {e:?}");
+            }
+        }
+
+        have_used
     }
 
     fn handle_activate_event(&self, event_manager: &mut EventManager) {
