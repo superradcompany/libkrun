@@ -1904,6 +1904,7 @@ fn create_vcpus_aarch64(
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
 fn create_vcpus_aarch64(
     _vm: &Vm,
     vcpu_config: &VcpuConfig,

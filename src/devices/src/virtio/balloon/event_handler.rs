@@ -126,12 +126,11 @@ impl Balloon {
 
             while reader.available_bytes() >= std::mem::size_of::<BalloonStat>() {
                 match reader.read_obj::<BalloonStat>() {
-                    Ok(stat) => match stat.tag.to_native() {
-                        VIRTIO_BALLOON_S_AVAIL => {
-                            metrics.set_memory_available_bytes(stat.val.to_native())
+                    Ok(stat) => {
+                        if stat.tag.to_native() == VIRTIO_BALLOON_S_AVAIL {
+                            metrics.set_memory_available_bytes(stat.val.to_native());
                         }
-                        _ => {}
-                    },
+                    }
                     Err(e) => {
                         error!("balloon: failed to read stat: {e:?}");
                         break;

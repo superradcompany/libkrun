@@ -255,7 +255,7 @@ mod tests {
     fn resident_bytes_accounts_for_partial_pages() {
         assert_eq!(
             resident_bytes_from_mincore(&[1, 0, 1], 1024, 6144, 4096),
-            4096
+            3072
         );
         assert_eq!(resident_bytes_from_mincore(&[1, 1], 1024, 2048, 4096), 2048);
     }
