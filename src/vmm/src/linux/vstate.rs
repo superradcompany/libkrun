@@ -59,8 +59,10 @@ use kvm_bindings::{kvm_enable_cap, KVM_CAP_EXIT_HYPERCALL, KVM_MEMORY_EXIT_FLAG_
 use kvm_bindings::{kvm_memory_attributes, KVM_MEMORY_ATTRIBUTE_PRIVATE};
 use kvm_ioctls::{Cap::*, *};
 use utils::eventfd::EventFd;
+use utils::metrics::MetricsWriter;
 use utils::signal::{register_signal_handler, sigrtmin, Killable};
 use utils::sm::StateMachine;
+use utils::time::{get_time, ClockType};
 #[cfg(feature = "tee")]
 use utils::worker_message::{MemoryProperties, WorkerMessage};
 use vm_memory::{
@@ -947,6 +949,8 @@ pub struct Vcpu {
     // The transmitting end of the responses channel owned by the vcpu side.
     response_sender: Sender<VcpuResponse>,
 
+    metrics: MetricsWriter,
+
     #[cfg(feature = "tee")]
     pm_sender: Sender<WorkerMessage>,
 }
@@ -1045,6 +1049,7 @@ impl Vcpu {
     /// * `io_bus` - The io-bus used to access port-io devices.
     /// * `exit_evt` - An `EventFd` that will be written into when this vcpu exits.
     #[cfg(target_arch = "x86_64")]
+    #[allow(clippy::too_many_arguments)]
     pub fn new_x86_64(
         id: u8,
         vm_fd: &VmFd,
@@ -1052,6 +1057,7 @@ impl Vcpu {
         msr_list: MsrList,
         io_bus: devices::Bus,
         exit_evt: EventFd,
+        metrics: MetricsWriter,
         #[cfg(feature = "tee")] pm_sender: Sender<WorkerMessage>,
     ) -> Result<Self> {
         let kvm_vcpu = vm_fd.create_vcpu(id as u64).map_err(Error::VcpuFd)?;
@@ -1079,6 +1085,7 @@ impl Vcpu {
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
             response_sender,
+            metrics,
             #[cfg(feature = "tee")]
             pm_sender,
         })
@@ -1093,7 +1100,12 @@ impl Vcpu {
     /// * `exit_evt` - An `EventFd` that will be written into when this vcpu exits.
     /// * `create_ts` - A timestamp used by the vcpu to calculate its lifetime.
     #[cfg(target_arch = "aarch64")]
-    pub fn new_aarch64(id: u8, vm_fd: &VmFd, exit_evt: EventFd) -> Result<Self> {
+    pub fn new_aarch64(
+        id: u8,
+        vm_fd: &VmFd,
+        exit_evt: EventFd,
+        metrics: MetricsWriter,
+    ) -> Result<Self> {
         let kvm_vcpu = vm_fd.create_vcpu(id as u64).map_err(Error::VcpuFd)?;
         let (event_sender, event_receiver) = unbounded();
         let (response_sender, response_receiver) = unbounded();
@@ -1108,6 +1120,7 @@ impl Vcpu {
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
             response_sender,
+            metrics,
         })
     }
 
@@ -1120,7 +1133,12 @@ impl Vcpu {
     /// * `exit_evt` - An `EventFd` that will be written into when this vcpu exits.
     /// * `create_ts` - A timestamp used by the vcpu to calculate its lifetime.
     #[cfg(target_arch = "riscv64")]
-    pub fn new_riscv64(id: u8, vm_fd: &VmFd, exit_evt: EventFd) -> Result<Self> {
+    pub fn new_riscv64(
+        id: u8,
+        vm_fd: &VmFd,
+        exit_evt: EventFd,
+        metrics: MetricsWriter,
+    ) -> Result<Self> {
         let kvm_vcpu = vm_fd.create_vcpu(id as u64).map_err(Error::VcpuFd)?;
         let (event_sender, event_receiver) = unbounded();
         let (response_sender, response_receiver) = unbounded();
@@ -1134,6 +1152,7 @@ impl Vcpu {
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
             response_sender,
+            metrics,
         })
     }
 
@@ -1570,8 +1589,15 @@ impl Vcpu {
     fn running(&mut self) -> StateMachine<Self> {
         // This loop is here just for optimizing the emulation path.
         // No point in ticking the state machine if there are no external events.
+        let mut last_thread_cpu_ns = get_time(ClockType::ThreadCpu);
         loop {
-            match self.run_emulation() {
+            let emulation = self.run_emulation();
+            let thread_cpu_ns = get_time(ClockType::ThreadCpu);
+            self.metrics
+                .add_vcpu_time_ns(thread_cpu_ns.saturating_sub(last_thread_cpu_ns));
+            last_thread_cpu_ns = thread_cpu_ns;
+
+            match emulation {
                 // Emulation ran successfully, continue.
                 Ok(VcpuEmulation::Handled) => (),
                 // Emulation was interrupted, check external events.
@@ -1832,12 +1858,13 @@ mod tests {
                 vm.supported_msrs().clone(),
                 devices::Bus::new(),
                 exit_evt,
+                MetricsWriter::default(),
             )
             .unwrap();
         }
         #[cfg(target_arch = "aarch64")]
         {
-            vcpu = Vcpu::new_aarch64(1, vm.fd(), exit_evt).unwrap();
+            vcpu = Vcpu::new_aarch64(1, vm.fd(), exit_evt, MetricsWriter::default()).unwrap();
         }
 
         (vm, vcpu, gm)
@@ -1927,6 +1954,7 @@ mod tests {
             0,
             vm.fd(),
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            MetricsWriter::default(),
         )
         .unwrap();
 
@@ -1939,6 +1967,7 @@ mod tests {
             1,
             vm.fd(),
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            MetricsWriter::default(),
         )
         .unwrap();
 

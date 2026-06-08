@@ -34,6 +34,7 @@ use devices::virtio::display::DisplayInfo;
 use kbs_types::Tee;
 #[cfg(feature = "gpu")]
 use krun_display::DisplayBackend;
+use utils::metrics::MetricsWriter;
 
 type Result<E> = std::result::Result<(), E>;
 
@@ -131,7 +132,6 @@ pub enum VsockConfig {
 
 /// A data structure that encapsulates the device configurations
 /// held in the Vmm.
-#[derive(Default)]
 pub struct VmResources {
     /// The vCpu and memory configuration for this microVM.
     vm_config: VmConfig,
@@ -189,11 +189,17 @@ pub struct VmResources {
     pub nested_enabled: bool,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
+    /// Shared metrics state for VMM and device counters.
+    pub metrics: MetricsWriter,
     /// Force-enable the virtio-vsock device even when no TSI transport is
     /// required. When `false`, vsock is only attached if `configure_vsock`
     /// determines it is needed (HIJACK_INET when there's no virtio-net, or
     /// HIJACK_UNIX when there's a single root virtio-fs on Linux).
     pub request_vsock: bool,
+    /// Whether to attach the virtio-balloon device.
+    pub enable_balloon: bool,
+    /// Whether to attach the virtio-rng device.
+    pub enable_rng: bool,
     /// Do not create an implicit console device in the guest
     pub disable_implicit_console: bool,
     /// The console id to use for console= in the kernel cmdline
@@ -202,6 +208,55 @@ pub struct VmResources {
     pub serial_consoles: Vec<SerialConsoleConfig>,
     /// Virtio consoles to attach to the guest
     pub virtio_consoles: Vec<VirtioConsoleConfigMode>,
+}
+
+impl Default for VmResources {
+    fn default() -> Self {
+        Self {
+            vm_config: VmConfig::default(),
+            firmware_config: None,
+            kernel_cmdline: KernelCmdlineConfig::default(),
+            kernel_bundle: None,
+            external_kernel: None,
+            #[cfg(feature = "tee")]
+            qboot_bundle: None,
+            #[cfg(feature = "tee")]
+            initrd_bundle: None,
+            #[cfg(not(feature = "tee"))]
+            fs: Vec::new(),
+            #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+            custom_fs: Vec::new(),
+            vsock: VsockBuilder::default(),
+            #[cfg(feature = "blk")]
+            block: BlockBuilder::default(),
+            #[cfg(feature = "net")]
+            net: NetBuilder::default(),
+            #[cfg(feature = "tee")]
+            tee_config: TeeConfig::default(),
+            gpu_virgl_flags: None,
+            gpu_shm_size: None,
+            #[cfg(feature = "gpu")]
+            display_backend: None,
+            #[cfg(feature = "gpu")]
+            displays: Vec::new(),
+            #[cfg(feature = "input")]
+            input_backends: Vec::new(),
+            #[cfg(feature = "snd")]
+            snd_device: false,
+            console_output: None,
+            smbios_oem_strings: None,
+            nested_enabled: false,
+            split_irqchip: false,
+            metrics: MetricsWriter::default(),
+            request_vsock: false,
+            enable_balloon: true,
+            enable_rng: true,
+            disable_implicit_console: false,
+            kernel_console: None,
+            serial_consoles: Vec::new(),
+            virtio_consoles: Vec::new(),
+        }
+    }
 }
 
 impl VmResources {
@@ -252,6 +307,13 @@ impl VmResources {
         if machine_config.mem_size_mib.is_some() {
             self.vm_config.mem_size_mib = machine_config.mem_size_mib;
         }
+        let memory_total_bytes = self
+            .vm_config
+            .mem_size_mib
+            .unwrap_or(128)
+            .saturating_mul(1024)
+            .saturating_mul(1024) as u64;
+        self.metrics.set_memory_total_bytes(memory_total_bytes);
 
         if machine_config.cpu_template.is_some() {
             self.vm_config.cpu_template = machine_config.cpu_template;
@@ -335,7 +397,7 @@ impl VmResources {
 
     #[cfg(feature = "blk")]
     pub fn add_block_device(&mut self, config: BlockDeviceConfig) -> Result<BlockConfigError> {
-        self.block.insert(config)
+        self.block.insert(config, self.metrics.clone())
     }
 
     /// Sets a vsock device to be attached when the VM starts.
@@ -405,6 +467,7 @@ mod tests {
     use crate::vmm_config::machine_config::{CpuFeaturesTemplate, VmConfig, VmConfigError};
     use crate::vmm_config::vsock::tests::{default_config, TempSockFile};
     use crate::vstate::VcpuConfig;
+    use utils::metrics::MetricsWriter;
     use utils::tempfile::TempFile;
 
     fn default_kernel_cmdline() -> KernelCmdlineConfig {
@@ -442,7 +505,10 @@ mod tests {
             smbios_oem_strings: None,
             nested_enabled: false,
             split_irqchip: false,
+            metrics: MetricsWriter::default(),
             request_vsock: false,
+            enable_balloon: true,
+            enable_rng: true,
             disable_implicit_console: false,
             serial_consoles: Vec::new(),
             virtio_consoles: Vec::new(),

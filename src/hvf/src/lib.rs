@@ -26,9 +26,27 @@ use std::time::Duration;
 use arch::aarch64::sysreg::{sys_reg_name, SYSREG_MASK};
 use log::debug;
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
 extern "C" {
     pub fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
 }
+
+static MACH_TIMEBASE_INFO: LazyLock<MachTimebaseInfo> = LazyLock::new(|| {
+    let mut info = MachTimebaseInfo { numer: 1, denom: 1 };
+    let ret = unsafe { mach_timebase_info(&mut info) };
+    if ret == 0 && info.denom != 0 {
+        info
+    } else {
+        MachTimebaseInfo { numer: 1, denom: 1 }
+    }
+});
 
 const HV_EXIT_REASON_CANCELED: hv_exit_reason_t = 0;
 const HV_EXIT_REASON_EXCEPTION: hv_exit_reason_t = 1;
@@ -174,6 +192,12 @@ pub fn vcpu_request_exit(vcpuid: u64) -> Result<(), Error> {
     } else {
         Ok(())
     }
+}
+
+fn mach_absolute_time_to_ns(ticks: u64) -> u64 {
+    let timebase = *MACH_TIMEBASE_INFO;
+    let ns = (u128::from(ticks) * u128::from(timebase.numer)) / u128::from(timebase.denom);
+    ns.min(u128::from(u64::MAX)) as u64
 }
 
 pub fn vcpu_set_pending_irq(
@@ -475,6 +499,16 @@ impl HvfVcpu<'_> {
 
     pub fn id(&self) -> u64 {
         self.vcpuid
+    }
+
+    pub fn exec_time_ns(&self) -> Option<u64> {
+        let mut time = 0;
+        let ret = unsafe { hv_vcpu_get_exec_time(self.vcpuid, &mut time) };
+        if ret == HV_SUCCESS {
+            Some(mach_absolute_time_to_ns(time))
+        } else {
+            None
+        }
     }
 
     fn read_reg(&self, reg: u32) -> Result<u64, Error> {

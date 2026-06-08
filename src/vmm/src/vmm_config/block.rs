@@ -6,6 +6,7 @@ use devices::virtio::{
     block::{ImageType, SyncMode},
     Block, CacheType,
 };
+use utils::metrics::MetricsWriter;
 
 #[derive(Debug)]
 pub enum BlockConfigError {
@@ -54,13 +55,14 @@ impl BlockBuilder {
         }
     }
 
-    pub fn insert(&mut self, config: BlockDeviceConfig) -> Result<()> {
-        let block_dev = Arc::new(Mutex::new(Self::create_block(config)?));
+    pub fn insert(&mut self, config: BlockDeviceConfig, metrics: MetricsWriter) -> Result<()> {
+        let block_dev = Arc::new(Mutex::new(Self::create_block(config, metrics)?));
         self.list.push_back(block_dev);
         Ok(())
     }
 
-    pub fn create_block(config: BlockDeviceConfig) -> Result<Block> {
+    pub fn create_block(config: BlockDeviceConfig, metrics: MetricsWriter) -> Result<Block> {
+        let device_metrics = metrics.register_block_device(config.block_id.clone());
         devices::virtio::Block::new(
             config.block_id,
             None,
@@ -70,6 +72,7 @@ impl BlockBuilder {
             config.is_disk_read_only,
             config.direct_io,
             config.sync_mode,
+            device_metrics,
         )
         .map_err(BlockConfigError::CreateBlockDevice)
     }

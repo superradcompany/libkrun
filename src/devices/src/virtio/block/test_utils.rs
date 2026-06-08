@@ -3,9 +3,13 @@
 
 use std::os::unix::io::AsRawFd;
 
-use crate::virtio::{Block, CacheType, Queue};
+use crate::virtio::{
+    block::{ImageType, SyncMode},
+    Block, CacheType, Queue,
+};
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
+use utils::metrics::MetricsWriter;
 use utils::tempfile::TempFile;
 
 /// Create a default Block instance to be used in tests.
@@ -21,7 +25,19 @@ pub fn default_block() -> Block {
 pub fn default_block_with_path(path: String) -> Block {
     let id = "test".to_string();
     // The default block device is read-write and non-root.
-    Block::new(id, None, CacheType::Unsafe, path, false, false).unwrap()
+    let metrics = MetricsWriter::default().register_block_device(id.clone());
+    Block::new(
+        id,
+        None,
+        CacheType::Unsafe,
+        path,
+        ImageType::Raw,
+        false,
+        false,
+        SyncMode::None,
+        metrics,
+    )
+    .unwrap()
 }
 
 pub fn invoke_handler_for_queue_event(b: &mut Block) {
