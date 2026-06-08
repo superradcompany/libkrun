@@ -126,6 +126,23 @@ pub fn update_extended_apic_id_entry(
     Ok(())
 }
 
+pub fn update_feature_info_entry(
+    entry: &mut kvm_cpuid_entry2,
+    vm_spec: &VmSpec,
+) -> Result<(), Error> {
+    use crate::cpu_leaf::leaf_0x1::*;
+
+    common::update_feature_info_entry(entry, vm_spec)?;
+
+    // AMD lacks the TSC-deadline timer in hardware, but KVM emulates it
+    // in-kernel regardless of host support, so advertise it like the Intel
+    // transformer. Without it the guest uses the periodic APIC timer, which
+    // hangs under split irqchip because the userspace PIT can't calibrate it.
+    entry.ecx.write_bit(ecx::TSC_DEADLINE_TIMER_BITINDEX, true);
+
+    Ok(())
+}
+
 pub struct AmdCpuidTransformer {}
 
 impl CpuidTransformer for AmdCpuidTransformer {
@@ -137,7 +154,7 @@ impl CpuidTransformer for AmdCpuidTransformer {
 
     fn entry_transformer_fn(&self, entry: &mut kvm_cpuid_entry2) -> Option<EntryTransformerFn> {
         match entry.function {
-            leaf_0x1::LEAF_NUM => Some(common::update_feature_info_entry),
+            leaf_0x1::LEAF_NUM => Some(amd::update_feature_info_entry),
             leaf_0x7::LEAF_NUM => Some(amd::update_structured_extended_entry),
             leaf_0x80000000::LEAF_NUM => Some(amd::update_largest_extended_fn_entry),
             leaf_0x80000001::LEAF_NUM => Some(amd::update_extended_feature_info_entry),
@@ -351,5 +368,28 @@ mod tests {
 
         check_update_extended_apic_id_entry(0, 2, true, 0, 1);
         check_update_extended_apic_id_entry(1, 2, true, 0, 1);
+    }
+
+    #[test]
+    fn test_update_feature_info_entry() {
+        use crate::cpu_leaf::leaf_0x1::*;
+
+        let vm_spec = VmSpec::new(0, 1, false).expect("Error creating vm_spec");
+        let mut entry = kvm_cpuid_entry2 {
+            function: leaf_0x1::LEAF_NUM,
+            index: 0,
+            flags: 0,
+            eax: 0,
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+            padding: [0, 0, 0],
+        };
+
+        assert!(update_feature_info_entry(&mut entry, &vm_spec).is_ok());
+
+        // AMD must advertise the TSC-deadline timer (mirrors the Intel
+        // transformer) so split-irqchip guests don't fall back to the PIT.
+        assert!(entry.ecx.read_bit(ecx::TSC_DEADLINE_TIMER_BITINDEX));
     }
 }
