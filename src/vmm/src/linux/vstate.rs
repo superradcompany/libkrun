@@ -1049,6 +1049,7 @@ impl Vcpu {
     /// * `io_bus` - The io-bus used to access port-io devices.
     /// * `exit_evt` - An `EventFd` that will be written into when this vcpu exits.
     #[cfg(target_arch = "x86_64")]
+    #[allow(clippy::too_many_arguments)]
     pub fn new_x86_64(
         id: u8,
         vm_fd: &VmFd,
