@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[cfg(feature = "tee")]
 use serde::{Deserialize, Serialize};
@@ -198,6 +199,8 @@ pub struct VmResources {
     pub request_vsock: bool,
     /// Whether to attach the virtio-balloon device.
     pub enable_balloon: bool,
+    /// Guest memory stats polling interval for the virtio-balloon device.
+    pub balloon_stats_interval: Option<Duration>,
     /// Whether to attach the virtio-rng device.
     pub enable_rng: bool,
     /// Do not create an implicit console device in the guest
@@ -250,6 +253,7 @@ impl Default for VmResources {
             metrics: MetricsWriter::default(),
             request_vsock: false,
             enable_balloon: true,
+            balloon_stats_interval: Some(Duration::from_secs(1)),
             enable_rng: true,
             disable_implicit_console: false,
             kernel_console: None,
@@ -508,6 +512,7 @@ mod tests {
             metrics: MetricsWriter::default(),
             request_vsock: false,
             enable_balloon: true,
+            balloon_stats_interval: Some(std::time::Duration::from_secs(1)),
             enable_rng: true,
             disable_implicit_console: false,
             serial_consoles: Vec::new(),

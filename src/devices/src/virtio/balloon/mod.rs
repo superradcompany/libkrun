@@ -25,6 +25,8 @@ mod defs {
 pub enum BalloonError {
     /// Failed to create event fd.
     EventFd(std::io::Error),
+    /// Failed to create or configure timer fd.
+    TimerFd(std::io::Error),
 }
 
 type Result<T> = std::result::Result<T, BalloonError>;

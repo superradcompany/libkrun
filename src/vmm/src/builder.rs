@@ -1007,6 +1007,7 @@ pub fn build_microvm(
             event_manager,
             intc.clone(),
             vm_resources.metrics.clone(),
+            vm_resources.balloon_stats_interval,
         )?;
         trace.mark("balloon.attached");
     } else {
@@ -2384,10 +2385,13 @@ fn attach_balloon_device(
     event_manager: &mut EventManager,
     intc: IrqChip,
     metrics: utils::metrics::MetricsWriter,
+    stats_polling_interval: Option<std::time::Duration>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
-    let balloon = Arc::new(Mutex::new(devices::virtio::Balloon::new(metrics).unwrap()));
+    let balloon = Arc::new(Mutex::new(
+        devices::virtio::Balloon::new(metrics, stats_polling_interval).unwrap(),
+    ));
 
     event_manager
         .add_subscriber(balloon.clone())

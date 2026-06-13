@@ -21,12 +21,15 @@ runs:
 
     - name: Set up Homebrew (macOS)
       if: runner.os == 'macOS'
-      uses: Homebrew/actions/setup-homebrew@master
+      uses: Homebrew/actions/setup-homebrew@main
 
     - name: Install packages (macOS)
       if: runner.os == 'macOS'
       shell: bash
-      run: brew tap slp/krun && brew install virglrenderer llvm
+      run: |
+        brew tap slp/krun
+        brew trust slp/krun
+        brew install virglrenderer llvm
 
     - name: Install packages (Linux)
       if: runner.os == 'Linux'

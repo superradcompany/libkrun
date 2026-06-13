@@ -3,6 +3,7 @@
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use devices::virtio::console::port_io::{
     ConsolePortBackend, ConsolePortBackendInputAdapter, ConsolePortBackendOutputAdapter,
@@ -45,6 +46,7 @@ pub struct MachineBuilder {
     pub(crate) split_irqchip: bool,
     pub(crate) vsock: bool,
     pub(crate) balloon: bool,
+    pub(crate) balloon_stats_interval: Option<Duration>,
     pub(crate) rng: bool,
     pub(crate) enable_inet_hijack: bool,
 }
@@ -338,6 +340,7 @@ impl MachineBuilder {
             split_irqchip: false,
             vsock: false,
             balloon: true,
+            balloon_stats_interval: Some(Duration::from_secs(1)),
             rng: true,
             enable_inet_hijack: false,
         }
@@ -398,6 +401,16 @@ impl MachineBuilder {
     /// device and its guest-side probe.
     pub fn balloon(mut self, enabled: bool) -> Self {
         self.balloon = enabled;
+        self
+    }
+
+    /// Set the virtio-balloon guest memory statistics polling interval.
+    ///
+    /// `Some(interval)` advertises and drives the stats queue at the requested
+    /// cadence. `None` disables balloon stats polling while still allowing the
+    /// balloon device itself to be attached.
+    pub fn balloon_stats_interval(mut self, interval: Option<Duration>) -> Self {
+        self.balloon_stats_interval = interval;
         self
     }
 
