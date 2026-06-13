@@ -3,7 +3,7 @@
 
 pub use vmm_sys_util::{errno, tempdir, tempfile, terminal};
 #[cfg(target_os = "linux")]
-pub use vmm_sys_util::{eventfd, ioctl};
+pub use vmm_sys_util::{eventfd, ioctl, timerfd};
 
 pub mod byte_order;
 #[cfg(target_os = "linux")]

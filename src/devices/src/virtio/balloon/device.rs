@@ -4,6 +4,8 @@ use std::io::Write;
 
 use utils::eventfd::EventFd;
 use utils::metrics::MetricsWriter;
+#[cfg(target_os = "linux")]
+use utils::timerfd::TimerFd;
 use vm_memory::{ByteValued, GuestMemory, GuestMemoryMmap};
 
 use super::super::{
@@ -56,6 +58,15 @@ pub struct Balloon {
     pub(crate) device_state: DeviceState,
     config: VirtioBalloonConfig,
     pub(crate) metrics: MetricsWriter,
+    // Index of the stats descriptor the guest has handed us, awaiting return
+    // (add_used + signal) to request the next sample. On Linux that return is
+    // paced by `stats_timer`; elsewhere it happens inline.
+    pub(crate) stats_desc_index: Option<u16>,
+    // Periodic timer that throttles guest-stats requests so the vCPU sleeps
+    // between samples instead of busy-spinning on an unthrottled host<->guest
+    // stats ping-pong. Linux-only (timerfd).
+    #[cfg(target_os = "linux")]
+    pub(crate) stats_timer: TimerFd,
 }
 
 impl Balloon {
@@ -69,6 +80,9 @@ impl Balloon {
             device_state: DeviceState::Inactive,
             config: VirtioBalloonConfig::default(),
             metrics,
+            stats_desc_index: None,
+            #[cfg(target_os = "linux")]
+            stats_timer: TimerFd::new().map_err(|e| BalloonError::Timer(e.into()))?,
         })
     }
 

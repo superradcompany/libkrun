@@ -25,6 +25,9 @@ mod defs {
 pub enum BalloonError {
     /// Failed to create event fd.
     EventFd(std::io::Error),
+    /// Failed to create the stats-request timer fd.
+    #[cfg(target_os = "linux")]
+    Timer(std::io::Error),
 }
 
 type Result<T> = std::result::Result<T, BalloonError>;
