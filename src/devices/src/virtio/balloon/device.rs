@@ -1,9 +1,11 @@
 use std::cmp;
 use std::convert::TryInto;
 use std::io::Write;
+use std::time::Duration;
 
 use utils::eventfd::EventFd;
 use utils::metrics::MetricsWriter;
+use utils::timerfd::TimerFd;
 use vm_memory::{ByteValued, GuestMemory, GuestMemoryMmap};
 
 use super::super::{
@@ -25,12 +27,15 @@ pub(crate) const PHQ_INDEX: usize = 3;
 pub(crate) const FRQ_INDEX: usize = 4;
 
 // Supported features.
-pub(crate) const AVAIL_FEATURES: u64 = (1 << uapi::VIRTIO_F_VERSION_1 as u64)
+pub(crate) const BASE_AVAIL_FEATURES: u64 = (1 << uapi::VIRTIO_F_VERSION_1 as u64)
     | (1 << uapi::VIRTIO_BALLOON_F_STATS_VQ as u64)
     | (1 << uapi::VIRTIO_BALLOON_F_FREE_PAGE_HINT as u64)
     | (1 << uapi::VIRTIO_BALLOON_F_REPORTING as u64);
 
 pub(crate) const VIRTIO_BALLOON_S_AVAIL: u16 = 6;
+pub(crate) const MAX_STATS_TAGS: u32 = 256;
+pub(crate) const MAX_STATS_DESC_LEN: u32 =
+    MAX_STATS_TAGS * std::mem::size_of::<BalloonStat>() as u32;
 
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C, packed)]
@@ -48,6 +53,15 @@ pub struct VirtioBalloonConfig {
 // Safe because it only has data and has no implicit padding.
 unsafe impl ByteValued for VirtioBalloonConfig {}
 
+#[derive(Clone, Copy, Default)]
+#[repr(C, packed)]
+pub(crate) struct BalloonStat {
+    pub(crate) tag: vm_memory::Le16,
+    pub(crate) val: vm_memory::Le64,
+}
+
+unsafe impl ByteValued for BalloonStat {}
+
 pub struct Balloon {
     pub(crate) queues: Option<Vec<DeviceQueue>>,
     pub(crate) avail_features: u64,
@@ -56,24 +70,37 @@ pub struct Balloon {
     pub(crate) device_state: DeviceState,
     config: VirtioBalloonConfig,
     pub(crate) metrics: MetricsWriter,
+    pub(crate) stats_polling_interval: Option<Duration>,
+    pub(crate) stats_timer: TimerFd,
+    pub(crate) stats_desc_index: Option<u16>,
 }
 
 impl Balloon {
-    pub fn new(metrics: MetricsWriter) -> super::Result<Balloon> {
+    pub fn new(
+        metrics: MetricsWriter,
+        stats_polling_interval: Option<Duration>,
+    ) -> super::Result<Balloon> {
         Ok(Balloon {
             queues: None,
-            avail_features: AVAIL_FEATURES,
+            avail_features: BASE_AVAIL_FEATURES,
             acked_features: 0,
             activate_evt: EventFd::new(utils::eventfd::EFD_NONBLOCK)
                 .map_err(BalloonError::EventFd)?,
             device_state: DeviceState::Inactive,
             config: VirtioBalloonConfig::default(),
             metrics,
+            stats_polling_interval,
+            stats_timer: TimerFd::new().map_err(BalloonError::TimerFd)?,
+            stats_desc_index: None,
         })
     }
 
     pub fn id(&self) -> &str {
         defs::BALLOON_DEV_ID
+    }
+
+    pub(crate) fn stats_enabled(&self) -> bool {
+        self.stats_polling_interval.is_some()
     }
 
     pub fn process_frq(&mut self) -> bool {

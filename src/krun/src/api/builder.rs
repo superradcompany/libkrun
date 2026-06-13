@@ -350,6 +350,7 @@ impl VmBuilder {
         vmr.split_irqchip = self.machine.split_irqchip;
         vmr.request_vsock = self.machine.vsock;
         vmr.enable_balloon = self.machine.balloon;
+        vmr.balloon_stats_interval = self.machine.balloon_stats_interval;
         vmr.enable_rng = self.machine.rng;
 
         // Apply filesystem configuration
