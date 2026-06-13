@@ -61,10 +61,23 @@ impl Balloon {
             return;
         }
 
+        // HOTFIX (idle vCPU busy-spin): drain the kick ONLY. Do not call
+        // process_stq() (which add_used()s the stats buffer back to the guest)
+        // or signal_used_queue() here.
+        //
+        // The virtio-balloon stats queue is host-paced: returning the buffer and
+        // signalling makes the Linux guest's `stats_request` callback refill and
+        // kick again *immediately*, so on the next kick we signal again — an
+        // unthrottled host<->guest ping-pong that keeps the vCPU out of HLT and
+        // pins the `fc_vcpu` thread at ~100% on every running microVM, even idle
+        // ones. This restores the pre-0.1.15 behaviour (microsandbox <= 0.5.5).
+        //
+        // Proper follow-up: re-request stats on a periodic TimerFd — mirror
+        // firecracker's `stats_timer` / `process_stats_timer_event` — so
+        // `memory_available_bytes` stays live without spinning. process_stq() is
+        // retained below for that change.
         if let Err(e) = self.queue_event(STQ_INDEX).read() {
             error!("Failed to read balloon stats queue event: {e:?}");
-        } else if self.process_stq() {
-            self.device_state.signal_used_queue();
         }
     }
 
@@ -98,6 +111,10 @@ impl Balloon {
         }
     }
 
+    // Retained for the follow-up timer-throttled stats fix (see handle_stq_event).
+    // Not called by the hotfix, which drains the stats kick without re-driving
+    // the queue to stop the idle-vCPU busy-spin.
+    #[allow(dead_code)]
     fn process_stq(&mut self) -> bool {
         let mem = match self.device_state {
             crate::virtio::DeviceState::Activated(ref mem, _) => mem,
