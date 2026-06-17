@@ -5,6 +5,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -40,6 +41,8 @@ pub struct VmMetrics {
     pub memory: MemoryMetrics,
     /// Block device metrics.
     pub block: BlockMetrics,
+    /// Filesystem metrics.
+    pub filesystem: FilesystemMetrics,
 }
 
 /// CPU metrics.
@@ -84,6 +87,17 @@ pub struct BlockDeviceMetrics {
     pub write_bytes: u64,
 }
 
+/// Filesystem metrics.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FilesystemMetrics {
+    /// Guest-visible used bytes on the microsandbox OCI upper filesystem.
+    pub upper_used_bytes: Option<u64>,
+    /// Guest-visible bytes available to ordinary allocation on the microsandbox OCI upper filesystem.
+    pub upper_free_bytes: Option<u64>,
+    /// Unix milliseconds when the upper filesystem sample was received by the host.
+    pub upper_sampled_at_unix_ms: Option<u64>,
+}
+
 struct MetricsState {
     vcpu_time_ns: AtomicU64,
     vcpu_time_valid: AtomicU64,
@@ -96,6 +110,11 @@ struct MetricsState {
     block_read_bytes: AtomicU64,
     block_write_bytes: AtomicU64,
     block_devices: Mutex<Vec<Arc<BlockDeviceState>>>,
+    filesystem_upper_used_bytes: AtomicU64,
+    filesystem_upper_used_valid: AtomicU64,
+    filesystem_upper_free_bytes: AtomicU64,
+    filesystem_upper_free_valid: AtomicU64,
+    filesystem_upper_sampled_at_unix_ms: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -162,6 +181,20 @@ impl MetricsHandle {
                 } else {
                     Vec::new()
                 },
+            },
+            filesystem: FilesystemMetrics {
+                upper_used_bytes: valid_value(
+                    &self.state.filesystem_upper_used_valid,
+                    &self.state.filesystem_upper_used_bytes,
+                ),
+                upper_free_bytes: valid_value(
+                    &self.state.filesystem_upper_free_valid,
+                    &self.state.filesystem_upper_free_bytes,
+                ),
+                upper_sampled_at_unix_ms: valid_value(
+                    &self.state.filesystem_upper_used_valid,
+                    &self.state.filesystem_upper_sampled_at_unix_ms,
+                ),
             },
         }
     }
@@ -242,6 +275,35 @@ impl MetricsWriter {
         *self.state.memory_host_resident_sampler.lock().unwrap() = Some(Arc::new(sampler));
     }
 
+    /// Set guest-visible OCI upper filesystem used/free bytes.
+    pub fn set_upper_filesystem_bytes(&self, used_bytes: u64, free_bytes: u64) {
+        self.state
+            .filesystem_upper_used_bytes
+            .store(used_bytes, Ordering::Relaxed);
+        self.state
+            .filesystem_upper_free_bytes
+            .store(free_bytes, Ordering::Relaxed);
+        self.state
+            .filesystem_upper_sampled_at_unix_ms
+            .store(unix_timestamp_ms(), Ordering::Relaxed);
+        self.state
+            .filesystem_upper_used_valid
+            .store(1, Ordering::Release);
+        self.state
+            .filesystem_upper_free_valid
+            .store(1, Ordering::Release);
+    }
+
+    /// Clear guest-visible OCI upper filesystem metrics.
+    pub fn clear_upper_filesystem_bytes(&self) {
+        self.state
+            .filesystem_upper_used_valid
+            .store(0, Ordering::Release);
+        self.state
+            .filesystem_upper_free_valid
+            .store(0, Ordering::Release);
+    }
+
     /// Add guest vCPU execution time.
     pub fn add_vcpu_time_ns(&self, ns: u64) {
         self.state.vcpu_time_ns.fetch_add(ns, Ordering::Relaxed);
@@ -303,6 +365,11 @@ impl Default for MetricsState {
             block_read_bytes: AtomicU64::new(0),
             block_write_bytes: AtomicU64::new(0),
             block_devices: Mutex::new(Vec::new()),
+            filesystem_upper_used_bytes: AtomicU64::new(0),
+            filesystem_upper_used_valid: AtomicU64::new(0),
+            filesystem_upper_free_bytes: AtomicU64::new(0),
+            filesystem_upper_free_valid: AtomicU64::new(0),
+            filesystem_upper_sampled_at_unix_ms: AtomicU64::new(0),
         }
     }
 }
@@ -323,6 +390,13 @@ fn valid_value(valid: &AtomicU64, value: &AtomicU64) -> Option<u64> {
     } else {
         Some(value.load(Ordering::Relaxed))
     }
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -461,5 +535,35 @@ mod tests {
         assert_eq!(snapshot.block.read_bytes, 128);
         assert_eq!(snapshot.block.write_bytes, 256);
         assert!(snapshot.block.devices.is_empty());
+    }
+
+    #[test]
+    fn filesystem_metrics_are_unavailable_until_written() {
+        let writer = MetricsWriter::default();
+
+        assert_eq!(
+            writer.handle().snapshot().filesystem,
+            FilesystemMetrics::default()
+        );
+
+        writer.set_upper_filesystem_bytes(4096, 8192);
+
+        let snapshot = writer.handle().snapshot();
+        assert_eq!(snapshot.filesystem.upper_used_bytes, Some(4096));
+        assert_eq!(snapshot.filesystem.upper_free_bytes, Some(8192));
+        assert!(snapshot.filesystem.upper_sampled_at_unix_ms.is_some());
+    }
+
+    #[test]
+    fn filesystem_metrics_can_be_cleared() {
+        let writer = MetricsWriter::default();
+
+        writer.set_upper_filesystem_bytes(4096, 8192);
+        writer.clear_upper_filesystem_bytes();
+
+        assert_eq!(
+            writer.handle().snapshot().filesystem,
+            FilesystemMetrics::default()
+        );
     }
 }

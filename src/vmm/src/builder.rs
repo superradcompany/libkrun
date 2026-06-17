@@ -205,6 +205,8 @@ pub enum StartMicrovmError {
     RegisterInputDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Network Device or add a device to the MMIO Bus.
     RegisterNetDevice(device_manager::mmio::Error),
+    /// Cannot initialize a MMIO microsandbox metrics device or add it to the MMIO Bus.
+    RegisterMsbMetricsDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Rng device or add a device to the MMIO Bus.
     RegisterRngDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Snd device or add a device to the MMIO Bus.
@@ -443,6 +445,14 @@ impl Display for StartMicrovmError {
                 write!(
                     f,
                     "Cannot initialize a MMIO Network Device or add a device to the MMIO Bus. {err_msg}"
+                )
+            }
+            RegisterMsbMetricsDevice(ref err) => {
+                let mut err_msg = format!("{err}");
+                err_msg = err_msg.replace('\"', "");
+                write!(
+                    f,
+                    "Cannot initialize a MMIO microsandbox metrics Device or add a device to the MMIO Bus. {err_msg}"
                 )
             }
             RegisterRngDevice(ref err) => {
@@ -1019,6 +1029,16 @@ pub fn build_microvm(
         trace.mark("rng.attached");
     } else {
         trace.mark("rng.skipped");
+    }
+    #[cfg(not(feature = "tee"))]
+    {
+        attach_msb_metrics_device(
+            &mut vmm,
+            event_manager,
+            intc.clone(),
+            vm_resources.metrics.clone(),
+        )?;
+        trace.mark("msb_metrics.attached");
     }
     let mut console_id = 0;
     if !vm_resources.disable_implicit_console {
@@ -2375,6 +2395,30 @@ fn attach_unixsock_vsock_device(
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc, unix_vsock.clone()).map_err(RegisterVsockDevice)?;
+
+    Ok(())
+}
+
+#[cfg(not(feature = "tee"))]
+fn attach_msb_metrics_device(
+    vmm: &mut Vmm,
+    event_manager: &mut EventManager,
+    intc: IrqChip,
+    metrics: utils::metrics::MetricsWriter,
+) -> std::result::Result<(), StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    let device = Arc::new(Mutex::new(
+        devices::virtio::MsbMetrics::new(metrics).unwrap(),
+    ));
+
+    event_manager
+        .add_subscriber(device.clone())
+        .map_err(RegisterEvent)?;
+
+    let id = String::from(device.lock().unwrap().id());
+
+    attach_mmio_device(vmm, id, intc, device).map_err(RegisterMsbMetricsDevice)?;
 
     Ok(())
 }
