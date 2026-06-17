@@ -52,7 +52,8 @@ pub use api::builders::{ConsoleBuilder, ExecBuilder, FsBuilder, KernelBuilder, M
 pub use api::error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use api::exit_handle::ExitHandle;
 pub use api::metrics::{
-    BlockDeviceMetrics, BlockMetrics, CpuMetrics, MemoryMetrics, MetricsHandle, VmMetrics,
+    BlockDeviceMetrics, BlockMetrics, CpuMetrics, FilesystemMetrics, MemoryMetrics, MetricsHandle,
+    VmMetrics,
 };
 pub use api::vm::Vm;
 

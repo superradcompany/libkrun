@@ -29,6 +29,7 @@ pub mod gpu;
 pub mod input;
 pub mod linux_errno;
 mod mmio;
+pub mod msb_metrics;
 #[cfg(feature = "net")]
 pub mod net;
 mod queue;
@@ -49,6 +50,7 @@ pub use self::fs::*;
 #[cfg(feature = "gpu")]
 pub use self::gpu::*;
 pub use self::mmio::*;
+pub use self::msb_metrics::*;
 #[cfg(feature = "net")]
 pub use self::net::Net;
 pub use self::queue::{Descriptor, DescriptorChain, Queue};

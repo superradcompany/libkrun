@@ -49,6 +49,7 @@ pub use builders::{ConsoleBuilder, ExecBuilder, FsBuilder, KernelBuilder, Machin
 pub use error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use exit_handle::ExitHandle;
 pub use metrics::{
-    BlockDeviceMetrics, BlockMetrics, CpuMetrics, MemoryMetrics, MetricsHandle, VmMetrics,
+    BlockDeviceMetrics, BlockMetrics, CpuMetrics, FilesystemMetrics, MemoryMetrics, MetricsHandle,
+    VmMetrics,
 };
 pub use vm::Vm;
