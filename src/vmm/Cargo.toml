@@ -1,6 +1,6 @@
 [package]
 name = "msb_krun_vmm"
-version = "0.1.16"
+version = "0.1.17"
 authors = ["Amazon Firecracker team <firecracker-devel@amazon.com>"]
 edition = "2021"
 license = "Apache-2.0 AND BSD-3-Clause"
@@ -28,15 +28,15 @@ log = "0.4.0"
 nix = { version = "0.30.1", features = ["fs", "term"] }
 vm-memory = { version = "~0.16", features = ["backend-mmap"] }
 vmm-sys-util = ">=0.14"
-krun_display = { package = "msb_krun_display", version = "0.1.16", path = "../krun_display", optional = true, features = ["bindgen_clang_runtime"] }
-krun_input = { package = "msb_krun_input", version = "0.1.16", path = "../krun_input", optional = true, features = ["bindgen_clang_runtime"] }
+krun_display = { package = "msb_krun_display", version = "0.1.17", path = "../krun_display", optional = true, features = ["bindgen_clang_runtime"] }
+krun_input = { package = "msb_krun_input", version = "0.1.17", path = "../krun_input", optional = true, features = ["bindgen_clang_runtime"] }
 
-arch = { package = "msb_krun_arch", version = "0.1.16", path = "../arch" }
-arch_gen = { package = "msb_krun_arch_gen", version = "0.1.16", path = "../arch_gen" }
-devices = { package = "msb_krun_devices", version = "0.1.16", path = "../devices" }
-kernel = { package = "msb_krun_kernel", version = "0.1.16", path = "../kernel" }
-utils = { package = "msb_krun_utils", version = "0.1.16", path = "../utils" }
-polly = { package = "msb_krun_polly", version = "0.1.16", path = "../polly" }
+arch = { package = "msb_krun_arch", version = "0.1.17", path = "../arch" }
+arch_gen = { package = "msb_krun_arch_gen", version = "0.1.17", path = "../arch_gen" }
+devices = { package = "msb_krun_devices", version = "0.1.17", path = "../devices" }
+kernel = { package = "msb_krun_kernel", version = "0.1.17", path = "../kernel" }
+utils = { package = "msb_krun_utils", version = "0.1.17", path = "../utils" }
+polly = { package = "msb_krun_polly", version = "0.1.17", path = "../polly" }
 
 # Dependencies for amd-sev
 kbs-types = { version = "0.13.0", optional = true }
@@ -48,7 +48,7 @@ bitflags = { version = "2.10.0", optional = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 bzip2 = "0.5"
-cpuid = { package = "msb_krun_cpuid", version = "0.1.16", path = "../cpuid" }
+cpuid = { package = "msb_krun_cpuid", version = "0.1.17", path = "../cpuid" }
 zstd = "0.13"
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -57,7 +57,7 @@ kvm-bindings = { version = ">=0.11", features = ["fam-wrappers"] }
 kvm-ioctls = ">=0.21"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-hvf = { package = "msb_krun_hvf", version = "0.1.16", path = "../hvf" }
+hvf = { package = "msb_krun_hvf", version = "0.1.17", path = "../hvf" }
 
 [dev-dependencies]
-devices = { package = "msb_krun_devices", version = "0.1.16", path = "../devices", features = ["test_utils"] }
+devices = { package = "msb_krun_devices", version = "0.1.17", path = "../devices", features = ["test_utils"] }
