@@ -43,9 +43,11 @@ pub use builder::VmBuilder;
 pub use builders::DiskBuilder;
 #[cfg(feature = "blk")]
 pub use builders::DiskImageFormat;
+#[cfg(not(target_os = "windows"))]
+pub use builders::FsBuilder;
 #[cfg(feature = "net")]
 pub use builders::NetBuilder;
-pub use builders::{ConsoleBuilder, ExecBuilder, FsBuilder, KernelBuilder, MachineBuilder};
+pub use builders::{ConsoleBuilder, ExecBuilder, KernelBuilder, MachineBuilder};
 pub use error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use exit_handle::ExitHandle;
 pub use metrics::{

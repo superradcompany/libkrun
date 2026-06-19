@@ -1,26 +1,33 @@
 //! VM Builder for creating and configuring microVMs using nested builders.
 
 use std::sync::atomic::AtomicI32;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-use std::sync::Arc;
-#[cfg(any(feature = "tee", feature = "aws-nitro"))]
 use std::sync::Arc;
 
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
-use vmm::resources::{VirtioConsoleConfigMode, VmResources};
+#[cfg(not(target_os = "windows"))]
+use vmm::resources::VirtioConsoleConfigMode;
+use vmm::resources::VmResources;
 use vmm::vmm_config::machine_config::VmConfig;
 use vmm::vmm_config::machine_config::VmConfigError;
 
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(all(
+    not(any(feature = "tee", feature = "aws-nitro")),
+    not(target_os = "windows")
+))]
 use vmm::vmm_config::fs::CustomFsDeviceConfig;
-#[cfg(not(feature = "tee"))]
+#[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
 use vmm::vmm_config::fs::FsDeviceConfig;
 
 #[cfg(feature = "blk")]
 use super::builders::DiskBuilder;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(not(target_os = "windows"))]
+use super::builders::FsBuilder;
+#[cfg(all(
+    not(any(feature = "tee", feature = "aws-nitro")),
+    not(target_os = "windows")
+))]
 use super::builders::FsConfig;
-use super::builders::{ConsoleBuilder, ExecBuilder, FsBuilder, KernelBuilder, MachineBuilder};
+use super::builders::{ConsoleBuilder, ExecBuilder, KernelBuilder, MachineBuilder};
 #[cfg(feature = "net")]
 use super::builders::{NetBuilder, NetConfig};
 
@@ -65,6 +72,7 @@ pub struct VmBuilder {
     machine: MachineBuilder,
     kernel: KernelBuilder,
     #[cfg_attr(feature = "tee", allow(dead_code))]
+    #[cfg(not(target_os = "windows"))]
     fs: FsBuilder,
     console: ConsoleBuilder,
     exec: ExecBuilder,
@@ -91,6 +99,7 @@ impl VmBuilder {
         Self {
             machine: MachineBuilder::new(),
             kernel: KernelBuilder::new(),
+            #[cfg(not(target_os = "windows"))]
             fs: FsBuilder::new(),
             console: ConsoleBuilder::new(),
             exec: ExecBuilder::new(),
@@ -168,7 +177,7 @@ impl VmBuilder {
     /// VmBuilder::new()
     ///     .fs(|fs| fs.tag("myfs").custom(Box::new(my_backend)));
     /// ```
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     pub fn fs(mut self, f: impl FnOnce(FsBuilder) -> FsBuilder) -> Self {
         let new_fs = f(FsBuilder::new());
         self.fs.configs.extend(new_fs.configs);
@@ -354,7 +363,7 @@ impl VmBuilder {
         vmr.enable_rng = self.machine.rng;
 
         // Apply filesystem configuration
-        #[cfg(not(feature = "tee"))]
+        #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
         for config in self.fs.configs {
             match config {
                 FsConfig::Path {
@@ -370,7 +379,10 @@ impl VmBuilder {
                     };
                     vmr.fs.push(fs_config);
                 }
-                #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+                #[cfg(all(
+                    not(any(feature = "tee", feature = "aws-nitro")),
+                    not(target_os = "windows")
+                ))]
                 FsConfig::Custom { tag, backend } => {
                     let backend: Box<dyn devices::virtio::fs::DynFileSystem> = backend;
                     let custom_config = CustomFsDeviceConfig {
@@ -405,6 +417,7 @@ impl VmBuilder {
         }
 
         // Apply console port configuration
+        #[cfg(not(target_os = "windows"))]
         if !self.console.ports.is_empty() {
             vmr.virtio_consoles
                 .push(VirtioConsoleConfigMode::Explicit(self.console.ports));

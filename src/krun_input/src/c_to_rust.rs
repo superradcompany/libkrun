@@ -1,11 +1,14 @@
 use crate::{
-    ConfigFeatures, EventProviderFeatures, InputAbsInfo, InputBackendError, InputDeviceIds,
-    InputEvent, InputEventsImpl, InputQueryConfig, header,
+    ConfigFeatures, InputAbsInfo, InputBackendError, InputDeviceIds, InputQueryConfig, header,
 };
+#[cfg(unix)]
+use crate::{EventProviderFeatures, InputEvent, InputEventsImpl};
 use log::{error, warn};
+#[cfg(unix)]
 use static_assertions::assert_not_impl_any;
 use std::ffi::c_void;
 use std::marker::PhantomData;
+#[cfg(unix)]
 use std::os::fd::BorrowedFd;
 use std::ptr::{null, null_mut};
 
@@ -44,10 +47,13 @@ macro_rules! method_call {
     };
 }
 
+#[cfg(unix)]
 pub struct InputEventProviderInstance {
     instance: *mut c_void,
     vtable: header::krun_input_event_provider_vtable,
 }
+
+#[cfg(unix)]
 impl InputEventsImpl for InputEventProviderInstance {
     /// Get the ready event file descriptor that becomes readable when input events are available
     fn get_read_notify_fd(&self) -> Result<BorrowedFd<'_>, InputBackendError> {
@@ -91,8 +97,10 @@ pub struct InputConfigInstance {
 unsafe impl Send for InputConfigInstance {}
 unsafe impl Sync for InputConfigInstance {}
 
+#[cfg(unix)]
 assert_not_impl_any!(InputEventProviderInstance: Sync, Send);
 
+#[cfg(unix)]
 impl Drop for InputEventProviderInstance {
     fn drop(&mut self) {
         let Some(destroy_fn) = self.vtable.destroy else {
@@ -245,6 +253,7 @@ impl InputConfigBackend<'_> {
 
 #[derive(Copy, Clone)]
 #[repr(C)]
+#[cfg(unix)]
 pub struct InputEventProviderBackend<'userdata> {
     pub features: u64,
     pub create_userdata: *const c_void,
@@ -253,9 +262,12 @@ pub struct InputEventProviderBackend<'userdata> {
     pub vtable: header::krun_input_event_provider_vtable,
 }
 
+#[cfg(unix)]
 unsafe impl Send for InputEventProviderBackend<'_> {}
+#[cfg(unix)]
 unsafe impl Sync for InputEventProviderBackend<'_> {}
 
+#[cfg(unix)]
 impl InputEventProviderBackend<'_> {
     /// Create an InputEventsInstance for handling input events
     pub fn create_instance(&self) -> Result<InputEventProviderInstance, InputBackendError> {

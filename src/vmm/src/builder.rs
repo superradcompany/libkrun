@@ -10,10 +10,18 @@ use kernel::cmdline::Cmdline;
 #[cfg(target_os = "macos")]
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
+#[cfg(not(target_os = "windows"))]
 use std::fs::File;
-use std::io::{self, IsTerminal, Read};
+use std::io;
+#[cfg(not(target_os = "windows"))]
+use std::io::IsTerminal;
+#[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+use std::io::Read;
+#[cfg(not(target_os = "windows"))]
 use std::os::fd::AsRawFd;
+#[cfg(not(target_os = "windows"))]
 use std::os::fd::{BorrowedFd, FromRawFd};
+#[cfg(not(target_os = "windows"))]
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
@@ -21,44 +29,59 @@ use std::time::Instant;
 
 use super::{Error, Vmm};
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
+#[cfg(target_os = "windows")]
+use crate::resources::VmResources;
+#[cfg(not(target_os = "windows"))]
 use crate::resources::{
     DefaultVirtioConsoleConfig, PortConfig, TsiFlags, VirtioConsoleConfigMode, VmResources,
 };
-use crate::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
+use crate::vmm_config::external_kernel::ExternalKernel;
+#[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+use crate::vmm_config::external_kernel::KernelFormat;
 #[cfg(feature = "net")]
 use crate::vmm_config::net::NetBuilder;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 use devices::legacy::Cmos;
+#[cfg(target_os = "windows")]
+use devices::legacy::IrqChipT;
 #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
 use devices::legacy::KvmAia;
+#[cfg(not(target_os = "windows"))]
 use devices::legacy::Serial;
 #[cfg(target_os = "macos")]
 use devices::legacy::VcpuList;
 #[cfg(target_os = "macos")]
 use devices::legacy::{GicV3, HvfGicV3};
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 use devices::legacy::{IoApic, IrqChipT, KvmIoapic};
 use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use devices::legacy::{KvmGicV2, KvmGicV3};
-use devices::virtio::{port_io, MmioTransport, PortDescription, VirtioDevice, Vsock};
+#[cfg(not(target_os = "windows"))]
+use devices::virtio::{port_io, PortDescription, Vsock};
+use devices::virtio::{MmioTransport, VirtioDevice};
 
 #[cfg(feature = "tee")]
 use kbs_types::Tee;
 
 use crate::device_manager;
+#[cfg(unix)]
 use crate::exit_signal::register_exit_signal_handlers;
 #[cfg(target_os = "linux")]
 use crate::signal_handler::register_sigint_handler;
 #[cfg(target_os = "linux")]
 use crate::signal_handler::register_sigwinch_handler;
+#[cfg(unix)]
 use crate::terminal::{term_restore_mode, term_set_raw_mode};
 #[cfg(feature = "blk")]
 use crate::vmm_config::block::BlockBuilder;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(all(
+    not(any(feature = "tee", feature = "aws-nitro")),
+    not(target_os = "windows")
+))]
 use crate::vmm_config::fs::{CustomFsDeviceConfig, FsDeviceConfig};
 use crate::vmm_config::kernel_cmdline::DEFAULT_KERNEL_CMDLINE;
 #[cfg(target_os = "linux")]
@@ -72,8 +95,12 @@ use device_manager::shm::ShmManager;
 use devices::virtio::display::DisplayInfo;
 #[cfg(feature = "gpu")]
 use devices::virtio::display::NoopDisplayBackend;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(all(
+    not(any(feature = "tee", feature = "aws-nitro")),
+    not(target_os = "windows")
+))]
 use devices::virtio::{fs::ExportTable, VirtioShmRegion};
+#[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
 use flate2::read::GzDecoder;
 #[cfg(feature = "gpu")]
 use krun_display::DisplayBackend;
@@ -81,21 +108,34 @@ use krun_display::DisplayBackend;
 use krun_display::IntoDisplayBackend;
 #[cfg(feature = "amd-sev")]
 use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
+#[cfg(not(target_os = "windows"))]
 use libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 use linux_loader::loader::{self, KernelLoader};
+#[cfg(not(target_os = "windows"))]
 use nix::unistd::isatty;
 use polly::event_manager::{Error as EventManagerError, EventManager};
 use utils::eventfd::EventFd;
 use utils::worker_message::WorkerMessage;
-#[cfg(all(target_arch = "x86_64", not(feature = "efi"), not(feature = "tee")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(feature = "efi"),
+    not(feature = "tee"),
+    not(target_os = "windows")
+))]
 use vm_memory::mmap::MmapRegion;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(not(target_os = "windows"))]
 use vm_memory::Address;
 use vm_memory::Bytes;
 #[cfg(not(feature = "aws-nitro"))]
+#[cfg(not(target_os = "windows"))]
 use vm_memory::GuestMemory;
-#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(feature = "tee"),
+    not(target_os = "windows")
+))]
 use vm_memory::GuestRegionMmap;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
@@ -117,20 +157,25 @@ pub enum StartMicrovmError {
     /// Failed to create a `RateLimiter` object.
     CreateRateLimiter(io::Error),
     /// Cannot open the file containing the kernel code.
+    #[cfg(not(target_os = "windows"))]
     ElfOpenKernel(io::Error),
     /// Cannot load the kernel into the VM.
+    #[cfg(not(target_os = "windows"))]
     ElfLoadKernel(linux_loader::loader::Error),
     /// The firmware can't be loaded into the provided memory address.
     FirmwareInvalidAddress(vm_memory::GuestMemoryError),
     /// Cannot read firmware contents from file.
     FirmwareRead(io::Error),
     /// Memory regions are overlapping or mmap fails.
-    GuestMemoryMmap(vm_memory::Error),
+    GuestMemoryMmapFromRanges(vm_memory::mmap::FromRangesError),
+    /// Guest memory collection operation failed.
+    GuestMemoryMmap(vm_memory::GuestMemoryError),
     /// The BZIP2 decoder couldn't decompress the kernel.
     ImageBz2Decoder(io::Error),
     /// Cannot find compressed kernel in file.
     ImageBz2Invalid,
     /// Cannot load the kernel from the uncompressed ELF data.
+    #[cfg(not(target_os = "windows"))]
     ImageBz2LoadKernel(linux_loader::loader::Error),
     /// Cannot open the file containing the kernel code.
     ImageBz2OpenKernel(io::Error),
@@ -139,6 +184,7 @@ pub enum StartMicrovmError {
     /// Cannot find compressed kernel in file.
     ImageGzInvalid,
     /// Cannot load the kernel from the uncompressed ELF data.
+    #[cfg(not(target_os = "windows"))]
     ImageGzLoadKernel(linux_loader::loader::Error),
     /// Cannot open the file containing the kernel code.
     ImageGzOpenKernel(io::Error),
@@ -147,6 +193,7 @@ pub enum StartMicrovmError {
     /// Cannot find compressed kernel in file.
     ImageZstdInvalid,
     /// Cannot load the kernel from the uncompressed ELF data.
+    #[cfg(not(target_os = "windows"))]
     ImageZstdLoadKernel(linux_loader::loader::Error),
     /// Cannot open the file containing the kernel code.
     ImageZstdOpenKernel(io::Error),
@@ -251,9 +298,11 @@ impl Display for StartMicrovmError {
                 write!(f, "Cannot create KVM in-kernel IrqChip: {err}")
             }
             CreateRateLimiter(ref err) => write!(f, "Cannot create RateLimiter: {err}"),
+            #[cfg(not(target_os = "windows"))]
             ElfOpenKernel(ref err) => {
                 write!(f, "Cannot open the file containing the kernel code: {err}")
             }
+            #[cfg(not(target_os = "windows"))]
             ElfLoadKernel(ref err) => {
                 write!(f, "Cannot load the kernel into the VM: {err}")
             }
@@ -272,12 +321,19 @@ impl Display for StartMicrovmError {
                 err_msg = err_msg.replace('\"', "");
                 write!(f, "Invalid Memory Configuration: {err_msg}")
             }
+            GuestMemoryMmapFromRanges(ref err) => {
+                // Remove imbricated quotes from error message.
+                let mut err_msg = format!("{err:?}");
+                err_msg = err_msg.replace('\"', "");
+                write!(f, "Invalid Memory Configuration: {err_msg}")
+            }
             ImageBz2Decoder(ref err) => {
                 write!(f, "The BZIP2 decoder couldn't decompress the kernel. {err}")
             }
             ImageBz2Invalid => {
                 write!(f, "Cannot find compressed kernel in file.")
             }
+            #[cfg(not(target_os = "windows"))]
             ImageBz2LoadKernel(ref err) => {
                 write!(
                     f,
@@ -293,6 +349,7 @@ impl Display for StartMicrovmError {
             ImageGzInvalid => {
                 write!(f, "Cannot find compressed kernel in file.")
             }
+            #[cfg(not(target_os = "windows"))]
             ImageGzLoadKernel(ref err) => {
                 write!(
                     f,
@@ -308,6 +365,7 @@ impl Display for StartMicrovmError {
             ImageZstdInvalid => {
                 write!(f, "Cannot find compressed kernel in file.")
             }
+            #[cfg(not(target_os = "windows"))]
             ImageZstdLoadKernel(ref err) => {
                 write!(
                     f,
@@ -527,7 +585,11 @@ impl Display for StartMicrovmError {
 }
 
 pub enum Payload {
-    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(feature = "tee"),
+        not(target_os = "windows")
+    ))]
     KernelMmap,
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     KernelCopy,
@@ -537,6 +599,54 @@ pub enum Payload {
     Firmware,
     #[cfg(feature = "tee")]
     Tee,
+}
+
+#[cfg(target_os = "windows")]
+struct WhpIrqChip;
+
+#[cfg(target_os = "windows")]
+impl devices::BusDevice for WhpIrqChip {}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+impl devices::legacy::gic::GICDevice for WhpIrqChip {
+    fn device_properties(&self) -> Vec<u64> {
+        Vec::new()
+    }
+
+    fn vcpu_count(&self) -> u64 {
+        0
+    }
+
+    fn fdt_compatibility(&self) -> String {
+        "microsoft,whp-placeholder-gic".to_string()
+    }
+
+    fn fdt_maint_irq(&self) -> u32 {
+        0
+    }
+
+    fn version(&self) -> u32 {
+        0
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl IrqChipT for WhpIrqChip {
+    fn get_mmio_addr(&self) -> u64 {
+        0
+    }
+
+    fn get_mmio_size(&self) -> u64 {
+        0
+    }
+
+    fn set_irq(
+        &self,
+        _irq_line: Option<u32>,
+        _interrupt_evt: Option<&EventFd>,
+    ) -> std::result::Result<(), devices::Error> {
+        Ok(())
+    }
 }
 
 fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmError> {
@@ -551,6 +661,9 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
 
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         return Ok(Payload::KernelMmap);
+
+        #[cfg(all(target_os = "windows", target_arch = "x86_64", not(feature = "tee")))]
+        return Err(StartMicrovmError::KernelFormatUnsupported);
 
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         return Ok(Payload::KernelCopy);
@@ -628,7 +741,11 @@ pub fn build_microvm(
 
     #[cfg(not(feature = "tee"))]
     #[allow(unused_mut)]
-    let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled)?;
+    let mut vm = setup_vm(
+        &guest_memory,
+        vm_resources.nested_enabled,
+        vcpu_config.vcpu_count,
+    )?;
     trace.mark("vm.ready");
 
     #[cfg(feature = "tee")]
@@ -744,9 +861,11 @@ pub fn build_microvm(
         m
     };
 
+    #[cfg(not(target_os = "windows"))]
     let mut serial_devices = Vec::new();
 
     // Create the legacy serial device if we're booting from a firmware
+    #[cfg(not(target_os = "windows"))]
     if (cfg!(feature = "efi") || vm_resources.firmware_config.is_some())
         && !vm_resources.disable_implicit_console
     {
@@ -762,8 +881,10 @@ pub fn build_microvm(
     // We can't call to `setup_terminal_raw_mode` until `Vmm` is created,
     // so let's keep track of FDs connected to legacy serial devices here
     // and set raw mode on them later.
+    #[cfg(not(target_os = "windows"))]
     let mut serial_ttys = Vec::new();
 
+    #[cfg(not(target_os = "windows"))]
     for s in &vm_resources.serial_consoles {
         let input = unsafe { BorrowedFd::borrow_raw(s.input_fd) };
         if input.is_terminal() {
@@ -792,11 +913,12 @@ pub fn build_microvm(
     #[cfg(target_os = "macos")]
     let exit_write_fd = exit_evt.get_write_fd();
 
+    #[cfg(unix)]
     register_exit_signal_handlers(exit_write_fd)
         .map_err(Error::EventFd)
         .map_err(StartMicrovmError::Internal)?;
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
     // Safe to unwrap 'serial_device' as it's always 'Some' on x86_64.
     // x86_64 uses the i8042 reset event as the Vmm exit event.
     let mut pio_device_manager = PortIODeviceManager::new(
@@ -840,7 +962,7 @@ pub fn build_microvm(
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
     {
         // Userspace split irqchip is required for >11 virtio IRQs, since KVM's
         // in-kernel IOAPIC is hardcoded at 24 pins (KVM_IOAPIC_NUM_PINS).
@@ -875,6 +997,21 @@ pub fn build_microvm(
             vm_resources.metrics.clone(),
             #[cfg(feature = "tee")]
             _sender,
+        )
+        .map_err(StartMicrovmError::Internal)?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        intc = Arc::new(Mutex::new(IrqChipDevice::new(Box::new(WhpIrqChip))));
+        vcpus = create_vcpus_windows(
+            &vm,
+            &vcpu_config,
+            &guest_memory,
+            &arch_memory_info,
+            payload_config.entry_addr,
+            &exit_evt,
+            vm_resources.metrics.clone(),
         )
         .map_err(StartMicrovmError::Internal)?;
     }
@@ -1001,16 +1138,17 @@ pub fn build_microvm(
         exit_code: exit_code.clone(),
         vm,
         mmio_device_manager,
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
         pio_device_manager,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
+    #[cfg(not(target_os = "windows"))]
     for serial_tty in serial_ttys {
         setup_terminal_raw_mode(&mut vmm, Some(serial_tty), false);
     }
 
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     if vm_resources.enable_balloon {
         attach_balloon_device(
             &mut vmm,
@@ -1023,7 +1161,7 @@ pub fn build_microvm(
     } else {
         trace.mark("balloon.skipped");
     }
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     if vm_resources.enable_rng {
         attach_rng_device(&mut vmm, event_manager, intc.clone())?;
         trace.mark("rng.attached");
@@ -1040,7 +1178,10 @@ pub fn build_microvm(
         )?;
         trace.mark("msb_metrics.attached");
     }
+
+    #[cfg(not(target_os = "windows"))]
     let mut console_id = 0;
+    #[cfg(not(target_os = "windows"))]
     if !vm_resources.disable_implicit_console {
         attach_console_devices(
             &mut vmm,
@@ -1056,6 +1197,7 @@ pub fn build_microvm(
         trace.mark("implicit_console.skipped");
     }
 
+    #[cfg(not(target_os = "windows"))]
     for console_cfg in std::mem::take(&mut vm_resources.virtio_consoles) {
         attach_console_devices(
             &mut vmm,
@@ -1069,7 +1211,10 @@ pub fn build_microvm(
     }
     trace.mark("virtio_consoles.ready");
 
-    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    #[cfg(all(
+        not(any(feature = "tee", feature = "aws-nitro")),
+        not(target_os = "windows")
+    ))]
     let export_table: Option<ExportTable> = if cfg!(feature = "gpu") {
         Some(Default::default())
     } else {
@@ -1101,7 +1246,10 @@ pub fn build_microvm(
         attach_input_devices(&mut vmm, &vm_resources.input_backends, intc.clone())?;
     }
 
-    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    #[cfg(all(
+        not(any(feature = "tee", feature = "aws-nitro")),
+        not(target_os = "windows")
+    ))]
     attach_fs_devices(
         &mut vmm,
         &vm_resources.fs,
@@ -1114,7 +1262,10 @@ pub fn build_microvm(
         _sender.clone(),
     )?;
     trace.mark("fs.ready");
-    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    #[cfg(all(
+        not(any(feature = "tee", feature = "aws-nitro")),
+        not(target_os = "windows")
+    ))]
     attach_custom_fs_devices(
         &mut vmm,
         &vm_resources.custom_fs,
@@ -1131,6 +1282,7 @@ pub fn build_microvm(
     #[cfg(feature = "blk")]
     trace.mark("block.ready");
 
+    #[cfg(not(target_os = "windows"))]
     if let Some(vsock) = vm_resources.vsock.get() {
         attach_unixsock_vsock_device(&mut vmm, vsock, event_manager, intc.clone())?;
         let tsi_flags = vm_resources.vsock.tsi_flags();
@@ -1160,7 +1312,11 @@ pub fn build_microvm(
 
     // Write the kernel command line to guest memory. This is x86_64 specific, since on
     // aarch64 the command line will be specified through the FDT.
-    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(feature = "tee"),
+        not(target_os = "windows")
+    ))]
     load_cmdline(&vmm)?;
 
     vmm.configure_system(
@@ -1257,14 +1413,24 @@ impl BootTrace {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+fn load_external_kernel(
+    _guest_mem: &GuestMemoryMmap,
+    _arch_mem_info: &ArchMemoryInfo,
+    _external_kernel: &ExternalKernel,
+) -> std::result::Result<(GuestAddress, Option<InitrdConfig>, Option<String>), StartMicrovmError> {
+    Err(StartMicrovmError::KernelFormatUnsupported)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
 fn load_external_kernel(
     guest_mem: &GuestMemoryMmap,
     arch_mem_info: &ArchMemoryInfo,
     external_kernel: &ExternalKernel,
 ) -> std::result::Result<(GuestAddress, Option<InitrdConfig>, Option<String>), StartMicrovmError> {
-    let entry_addr = match external_kernel.format {
+    let entry_addr: GuestAddress = match external_kernel.format {
         // Raw images are treated as bundled kernels on x86_64
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
         KernelFormat::Raw => unreachable!(),
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         KernelFormat::Raw => {
@@ -1273,7 +1439,7 @@ fn load_external_kernel(
             guest_mem.write(&data, GuestAddress(0x8000_0000)).unwrap();
             GuestAddress(0x8000_0000)
         }
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
         KernelFormat::Elf => {
             let mut file = File::options()
                 .read(true)
@@ -1306,7 +1472,7 @@ fn load_external_kernel(
                 return Err(StartMicrovmError::PeGzInvalid);
             }
         }
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
         KernelFormat::ImageBz2 => {
             let data: Vec<u8> = std::fs::read(external_kernel.path.clone())
                 .map_err(StartMicrovmError::ImageBz2OpenKernel)?;
@@ -1332,7 +1498,7 @@ fn load_external_kernel(
                 return Err(StartMicrovmError::ImageBz2Invalid);
             }
         }
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
         KernelFormat::ImageGz => {
             let data: Vec<u8> = std::fs::read(external_kernel.path.clone())
                 .map_err(StartMicrovmError::ImageGzOpenKernel)?;
@@ -1358,7 +1524,7 @@ fn load_external_kernel(
                 return Err(StartMicrovmError::ImageGzInvalid);
             }
         }
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
         KernelFormat::ImageZstd => {
             let data: Vec<u8> = std::fs::read(external_kernel.path.clone())
                 .map_err(StartMicrovmError::ImageZstdOpenKernel)?;
@@ -1445,7 +1611,11 @@ fn load_payload(
                 .unwrap();
             Ok((guest_mem, GuestAddress(kernel_entry_addr), None, None))
         }
-        #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+        #[cfg(all(
+            target_arch = "x86_64",
+            not(feature = "tee"),
+            not(target_os = "windows")
+        ))]
         Payload::KernelMmap => {
             let (kernel_entry_addr, kernel_host_addr, kernel_guest_addr, kernel_size) =
                 if let Some(kernel_bundle) = &_vm_resources.kernel_bundle {
@@ -1570,7 +1740,7 @@ pub fn create_guest_memory(
 
     #[cfg(target_arch = "x86_64")]
     let (arch_mem_info, mut arch_mem_regions) = match payload {
-        #[cfg(not(feature = "tee"))]
+        #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
         Payload::KernelMmap => {
             let (kernel_guest_addr, kernel_size) =
                 if let Some(kernel_bundle) = &vm_resources.kernel_bundle {
@@ -1611,7 +1781,7 @@ pub fn create_guest_memory(
 
     let mut shm_manager = ShmManager::new(&arch_mem_info);
 
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     for (index, fs) in vm_resources.fs.iter().enumerate() {
         if let Some(shm_size) = fs.shm_size {
             shm_manager
@@ -1619,7 +1789,10 @@ pub fn create_guest_memory(
                 .map_err(StartMicrovmError::ShmCreate)?;
         }
     }
-    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    #[cfg(all(
+        not(any(feature = "tee", feature = "aws-nitro")),
+        not(target_os = "windows")
+    ))]
     {
         let offset = vm_resources.fs.len();
         for (i, custom) in vm_resources.custom_fs.iter().enumerate() {
@@ -1640,7 +1813,7 @@ pub fn create_guest_memory(
     arch_mem_regions.extend(shm_manager.regions());
 
     let guest_mem = GuestMemoryMmap::from_ranges(&arch_mem_regions)
-        .map_err(StartMicrovmError::GuestMemoryMmap)?;
+        .map_err(StartMicrovmError::GuestMemoryMmapFromRanges)?;
 
     let (guest_mem, entry_addr, initrd_config, cmdline) =
         load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;
@@ -1670,7 +1843,11 @@ pub fn create_guest_memory(
     Ok((guest_mem, arch_mem_info, shm_manager, payload_config))
 }
 
-#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(feature = "tee"),
+    not(target_os = "windows")
+))]
 fn load_cmdline(vmm: &Vmm) -> std::result::Result<(), StartMicrovmError> {
     kernel::loader::load_cmdline(
         vmm.guest_memory(),
@@ -1686,6 +1863,7 @@ fn load_cmdline(vmm: &Vmm) -> std::result::Result<(), StartMicrovmError> {
 pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
     _nested_enabled: bool,
+    _vcpu_count: u8,
 ) -> std::result::Result<Vm, StartMicrovmError> {
     let kvm = KvmContext::new()
         .map_err(Error::KvmContext)
@@ -1722,6 +1900,7 @@ pub(crate) fn setup_vm(
 pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
     nested_enabled: bool,
+    _vcpu_count: u8,
 ) -> std::result::Result<Vm, StartMicrovmError> {
     let mut vm = Vm::new(nested_enabled)
         .map_err(Error::Vm)
@@ -1731,8 +1910,23 @@ pub(crate) fn setup_vm(
         .map_err(StartMicrovmError::Internal)?;
     Ok(vm)
 }
+#[cfg(target_os = "windows")]
+pub(crate) fn setup_vm(
+    guest_memory: &GuestMemoryMmap,
+    _nested_enabled: bool,
+    vcpu_count: u8,
+) -> std::result::Result<Vm, StartMicrovmError> {
+    let mut vm = Vm::new(vcpu_count)
+        .map_err(Error::Vm)
+        .map_err(StartMicrovmError::Internal)?;
+    vm.memory_init(guest_memory)
+        .map_err(Error::Vm)
+        .map_err(StartMicrovmError::Internal)?;
+    Ok(vm)
+}
 
 /// Sets up the serial device.
+#[cfg(not(target_os = "windows"))]
 pub fn setup_serial_device(
     event_manager: &mut EventManager,
     input: Option<Box<dyn devices::legacy::ReadableFd + Send>>,
@@ -1756,7 +1950,7 @@ pub fn setup_serial_device(
     Ok(serial)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 fn attach_legacy_devices(
     vm: &Vm,
     split_irqchip: bool,
@@ -1861,7 +2055,7 @@ fn attach_legacy_devices(
     Ok(())
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 #[allow(clippy::too_many_arguments)]
 fn create_vcpus_x86_64(
     vm: &Vm,
@@ -1892,6 +2086,26 @@ fn create_vcpus_x86_64(
         vcpu.configure_x86_64(guest_mem, entry_addr, vcpu_config, kernel_boot)
             .map_err(Error::Vcpu)?;
 
+        vcpus.push(vcpu);
+    }
+    Ok(vcpus)
+}
+
+#[cfg(target_os = "windows")]
+fn create_vcpus_windows(
+    vm: &Vm,
+    vcpu_config: &VcpuConfig,
+    guest_mem: &GuestMemoryMmap,
+    mem_info: &ArchMemoryInfo,
+    entry_addr: GuestAddress,
+    _exit_evt: &EventFd,
+    _metrics: utils::metrics::MetricsWriter,
+) -> super::Result<Vec<Vcpu>> {
+    let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
+    for cpu_index in 0..vcpu_config.vcpu_count {
+        let mut vcpu = vm.create_vcpu(cpu_index).map_err(Error::Vcpu)?;
+        vcpu.configure_windows(guest_mem, mem_info, entry_addr)
+            .map_err(Error::Vcpu)?;
         vcpus.push(vcpu);
     }
     Ok(vcpus)
@@ -2000,6 +2214,7 @@ fn create_vcpus_riscv64(
 }
 
 /// Attaches an virtio mmio device to the device manager.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn attach_mmio_device(
     vmm: &mut Vmm,
     id: String,
@@ -2015,19 +2230,22 @@ fn attach_mmio_device(
     let (_mmio_base, _irq) =
         vmm.mmio_device_manager
             .register_mmio_device(vmm.vm.fd(), mmio_device, type_id, id)?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let (_mmio_base, _irq) =
         vmm.mmio_device_manager
             .register_mmio_device(mmio_device, type_id, id)?;
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
     vmm.mmio_device_manager
         .add_device_to_cmdline(_cmdline, _mmio_base, _irq)?;
 
     Ok(())
 }
 
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(all(
+    not(any(feature = "tee", feature = "aws-nitro")),
+    not(target_os = "windows")
+))]
 fn attach_fs_devices(
     vmm: &mut Vmm,
     fs_devs: &[FsDeviceConfig],
@@ -2078,7 +2296,10 @@ fn attach_fs_devices(
     Ok(())
 }
 
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(all(
+    not(any(feature = "tee", feature = "aws-nitro")),
+    not(target_os = "windows")
+))]
 fn attach_custom_fs_devices(
     vmm: &mut Vmm,
     custom_fs_devs: &[CustomFsDeviceConfig],
@@ -2127,6 +2348,7 @@ fn attach_custom_fs_devices(
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 fn autoconfigure_console_ports(
     vmm: &mut Vmm,
     vm_resources: &VmResources,
@@ -2242,6 +2464,7 @@ fn autoconfigure_console_ports(
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn setup_terminal_raw_mode(
     vmm: &mut Vmm,
     term_fd: Option<BorrowedFd<'_>>,
@@ -2266,6 +2489,7 @@ fn setup_terminal_raw_mode(
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn create_explicit_ports(
     vmm: &mut Vmm,
     port_configs: Vec<PortConfig>,
@@ -2322,6 +2546,7 @@ fn create_explicit_ports(
     Ok(ports)
 }
 
+#[cfg(not(target_os = "windows"))]
 fn attach_console_devices(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,
@@ -2379,6 +2604,7 @@ fn attach_net_devices(
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 fn attach_unixsock_vsock_device(
     vmm: &mut Vmm,
     unix_vsock: &Arc<Mutex<Vsock>>,
@@ -2423,7 +2649,7 @@ fn attach_msb_metrics_device(
     Ok(())
 }
 
-#[cfg(not(feature = "tee"))]
+#[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
 fn attach_balloon_device(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,
@@ -2467,7 +2693,7 @@ fn attach_block_devices(
     Ok(())
 }
 
-#[cfg(not(feature = "tee"))]
+#[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
 fn attach_rng_device(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,
@@ -2609,7 +2835,7 @@ pub mod tests {
 
         let (guest_memory, _arch_memory_info, _shm_manager, _payload_config) =
             default_guest_memory(128).unwrap();
-        let vm = setup_vm(&guest_memory, false).unwrap();
+        let vm = setup_vm(&guest_memory, false, vcpu_config.vcpu_count).unwrap();
         let _kvmioapic = KvmIoapic::new(&vm.fd()).unwrap();
 
         // Dummy entry_addr, vcpus will not boot.
@@ -2634,7 +2860,7 @@ pub mod tests {
     fn test_create_vcpus_aarch64() {
         let (guest_memory, arch_memory_info, _shm_manager, _payload_config) =
             default_guest_memory(128).unwrap();
-        let vm = setup_vm(&guest_memory, false).unwrap();
+        let vm = setup_vm(&guest_memory, false, vcpu_config.vcpu_count).unwrap();
         let vcpu_count = 2;
 
         let vcpu_config = VcpuConfig {

@@ -44,11 +44,13 @@ pub use api::builders::CacheMode;
 pub use api::builders::DiskBuilder;
 #[cfg(feature = "blk")]
 pub use api::builders::DiskImageFormat;
+#[cfg(not(target_os = "windows"))]
+pub use api::builders::FsBuilder;
 #[cfg(feature = "net")]
 pub use api::builders::NetBuilder;
 #[cfg(feature = "blk")]
 pub use api::builders::SyncMode;
-pub use api::builders::{ConsoleBuilder, ExecBuilder, FsBuilder, KernelBuilder, MachineBuilder};
+pub use api::builders::{ConsoleBuilder, ExecBuilder, KernelBuilder, MachineBuilder};
 pub use api::error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use api::exit_handle::ExitHandle;
 pub use api::metrics::{
@@ -57,9 +59,13 @@ pub use api::metrics::{
 };
 pub use api::vm::Vm;
 
+#[cfg(not(target_os = "windows"))]
 pub use backends::console::ConsolePortBackend;
 
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(all(
+    not(any(feature = "tee", feature = "aws-nitro")),
+    not(target_os = "windows")
+))]
 pub use backends::fs::DynFileSystem;
 
 #[cfg(feature = "net")]

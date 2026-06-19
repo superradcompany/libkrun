@@ -1,20 +1,27 @@
 //! Sub-builders for VmBuilder nested configuration.
 
-use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(not(target_os = "windows"))]
 use devices::virtio::console::port_io::{
     ConsolePortBackend, ConsolePortBackendInputAdapter, ConsolePortBackendOutputAdapter,
 };
+#[cfg(not(target_os = "windows"))]
 use vmm::resources::PortConfig;
 
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(all(
+    not(any(feature = "tee", feature = "aws-nitro")),
+    not(target_os = "windows")
+))]
 use crate::backends::fs::DynFileSystem;
 
 #[cfg(feature = "net")]
 use std::os::fd::OwnedFd;
+#[cfg(not(target_os = "windows"))]
+use std::os::fd::RawFd;
+#[cfg(not(target_os = "windows"))]
+use std::sync::Arc;
 
 #[cfg(feature = "net")]
 use crate::backends::net::NetBackend;
@@ -121,7 +128,10 @@ pub enum FsConfig {
         shm_size: Option<usize>,
     },
     /// Custom filesystem backend.
-    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    #[cfg(all(
+        not(any(feature = "tee", feature = "aws-nitro")),
+        not(target_os = "windows")
+    ))]
     Custom {
         tag: String,
         backend: Box<dyn DynFileSystem + Send + Sync>,
@@ -199,6 +209,7 @@ pub enum NetConfig {
 #[derive(Default)]
 pub struct ConsoleBuilder {
     pub(crate) output: Option<PathBuf>,
+    #[cfg(not(target_os = "windows"))]
     pub(crate) ports: Vec<PortConfig>,
     pub(crate) disable_implicit: bool,
     #[cfg(feature = "snd")]
@@ -546,7 +557,10 @@ impl FsBuilder {
     }
 
     /// Use a custom filesystem backend.
-    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    #[cfg(all(
+        not(any(feature = "tee", feature = "aws-nitro")),
+        not(target_os = "windows")
+    ))]
     pub fn custom(mut self, backend: Box<dyn DynFileSystem + Send + Sync>) -> Self {
         let tag = self
             .current_tag
@@ -687,6 +701,7 @@ impl ConsoleBuilder {
     /// Creates a named port accessible in the guest via `/sys/class/virtio-ports/<name>`.
     /// The host reads from `input_fd` and writes to `output_fd`. Pass the same FD for both
     /// when using a bidirectional socket.
+    #[cfg(not(target_os = "windows"))]
     pub fn port(mut self, name: &str, input_fd: RawFd, output_fd: RawFd) -> Self {
         self.ports.push(PortConfig::InOut {
             name: name.to_string(),
@@ -701,6 +716,7 @@ impl ConsoleBuilder {
     /// Creates a named port accessible in the guest via `/sys/class/virtio-ports/<name>`.
     /// The `tty_fd` must be a valid terminal file descriptor. Terminal raw mode is configured
     /// automatically.
+    #[cfg(not(target_os = "windows"))]
     pub fn port_tty(mut self, name: &str, tty_fd: RawFd) -> Self {
         self.ports.push(PortConfig::Tty {
             name: name.to_string(),
@@ -731,6 +747,7 @@ impl ConsoleBuilder {
     /// VmBuilder::new()
     ///     .console(|c| c.custom("agent", Box::new(my_backend)))
     /// ```
+    #[cfg(not(target_os = "windows"))]
     pub fn custom(mut self, name: &str, backend: Box<dyn ConsolePortBackend>) -> Self {
         let backend: Arc<dyn ConsolePortBackend> = Arc::from(backend);
         let input = Box::new(ConsolePortBackendInputAdapter::new(Arc::clone(&backend)));

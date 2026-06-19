@@ -23,9 +23,13 @@
 // Modules
 //--------------------------------------------------------------------------------------------------
 
+#[cfg(not(target_os = "windows"))]
 pub mod console;
 
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(all(
+    not(any(feature = "tee", feature = "aws-nitro")),
+    not(target_os = "windows")
+))]
 pub mod fs;
 
 #[cfg(feature = "net")]
@@ -35,9 +39,13 @@ pub mod net;
 // Re-Exports
 //--------------------------------------------------------------------------------------------------
 
+#[cfg(not(target_os = "windows"))]
 pub use console::ConsolePortBackend;
 
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(all(
+    not(any(feature = "tee", feature = "aws-nitro")),
+    not(target_os = "windows")
+))]
 pub use fs::DynFileSystem;
 
 #[cfg(feature = "net")]

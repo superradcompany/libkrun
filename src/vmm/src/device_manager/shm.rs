@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use arch::ArchMemoryInfo;
+use utils::align_upwards;
 use vm_memory::GuestAddress;
-use vmm_sys_util::align_upwards;
 
 #[derive(Debug)]
 pub enum Error {

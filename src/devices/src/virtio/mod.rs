@@ -10,42 +10,53 @@ use std;
 use std::any::Any;
 use std::io::Error as IOError;
 
-#[cfg(not(feature = "tee"))]
+#[cfg(all(not(target_os = "windows"), not(feature = "tee")))]
 pub mod balloon;
 #[allow(dead_code)]
 #[allow(non_camel_case_types)]
 pub mod bindings;
 #[cfg(feature = "blk")]
 pub mod block;
+#[cfg(not(target_os = "windows"))]
 pub mod console;
 pub mod descriptor_utils;
 pub mod device;
+#[cfg(not(target_os = "windows"))]
 pub mod file_traits;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(all(
+    not(target_os = "windows"),
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
 pub mod fs;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 #[cfg(feature = "input")]
 pub mod input;
+#[cfg(not(target_os = "windows"))]
 pub mod linux_errno;
 mod mmio;
 pub mod msb_metrics;
 #[cfg(feature = "net")]
 pub mod net;
 mod queue;
-#[cfg(not(feature = "tee"))]
+#[cfg(all(not(target_os = "windows"), not(feature = "tee")))]
 pub mod rng;
 #[cfg(feature = "snd")]
 pub mod snd;
+#[cfg(not(target_os = "windows"))]
 pub mod vsock;
 
-#[cfg(not(feature = "tee"))]
+#[cfg(all(not(target_os = "windows"), not(feature = "tee")))]
 pub use self::balloon::*;
 #[cfg(feature = "blk")]
 pub use self::block::{Block, CacheType};
+#[cfg(not(target_os = "windows"))]
 pub use self::console::*;
 pub use self::device::*;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(all(
+    not(target_os = "windows"),
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
 pub use self::fs::*;
 #[cfg(feature = "gpu")]
 pub use self::gpu::*;
@@ -54,10 +65,11 @@ pub use self::msb_metrics::*;
 #[cfg(feature = "net")]
 pub use self::net::Net;
 pub use self::queue::{Descriptor, DescriptorChain, Queue};
-#[cfg(not(feature = "tee"))]
+#[cfg(all(not(target_os = "windows"), not(feature = "tee")))]
 pub use self::rng::*;
 #[cfg(feature = "snd")]
 pub use self::snd::Snd;
+#[cfg(not(target_os = "windows"))]
 pub use self::vsock::*;
 
 /// When the driver initializes the device, it lets the device know about the

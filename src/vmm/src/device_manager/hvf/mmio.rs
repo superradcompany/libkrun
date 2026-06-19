@@ -5,18 +5,24 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+#![cfg_attr(target_os = "windows", allow(dead_code))]
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
+#[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
 use devices::fdt::DeviceInfoForFDT;
+#[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
 use devices::legacy::IrqChip;
 use devices::{BusDevice, DeviceType};
 use kernel::cmdline as kernel_cmdline;
+#[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
 use polly::event_manager::EventManager;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
 use utils::eventfd::EventFd;
 
+#[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
 use crate::vstate::Vm;
 
 /// Errors for MMIO device manager.
@@ -133,7 +139,7 @@ impl MMIODeviceManager {
         Ok(ret)
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
     /// Register an early console at some MMIO address.
     pub fn register_mmio_serial(
         &mut self,
@@ -179,7 +185,7 @@ impl MMIODeviceManager {
         Ok(())
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
     /// Register a MMIO RTC device.
     pub fn register_mmio_rtc(&mut self, _vm: &Vm, _intc: IrqChip) -> Result<()> {
         if self.irq > self.last_irq {
@@ -210,7 +216,7 @@ impl MMIODeviceManager {
         Ok(())
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
     /// Register a GPIO
     pub fn register_mmio_gpio(
         &mut self,
@@ -258,7 +264,7 @@ impl MMIODeviceManager {
         Ok(())
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
     /// Register a MMIO GIC device.
     pub fn register_mmio_gic(&mut self, _vm: &Vm, intc: IrqChip) -> Result<()> {
         let (mmio_addr, mmio_size) = {
@@ -277,7 +283,7 @@ impl MMIODeviceManager {
         Ok(())
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
     /// Gets the information of the devices registered up to some point in time.
     pub fn get_device_info(&self) -> &HashMap<(DeviceType, String), MMIODeviceInfo> {
         &self.id_to_dev_info
@@ -309,7 +315,7 @@ pub struct MMIODeviceInfo {
     len: u64,
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
 impl DeviceInfoForFDT for MMIODeviceInfo {
     fn addr(&self) -> u64 {
         self.addr

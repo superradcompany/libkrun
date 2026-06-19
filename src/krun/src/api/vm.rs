@@ -15,6 +15,7 @@ use crossbeam_channel::unbounded;
 use log::error;
 use polly::event_manager::EventManager;
 use utils::eventfd::EventFd;
+use vmm::resources::TsiFlags;
 use vmm::resources::VmResources;
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 use vmm::vmm_config::kernel_cmdline::KernelCmdlineConfig;
@@ -318,9 +319,7 @@ impl Vm {
     /// Extracted from [`configure_vsock`](Self::configure_vsock) so the
     /// flag-selection logic can be exercised by unit tests without
     /// touching `VmResources::set_vsock_device`.
-    fn compute_tsi_flags(&self) -> devices::virtio::TsiFlags {
-        use devices::virtio::TsiFlags;
-
+    fn compute_tsi_flags(&self) -> TsiFlags {
         let mut tsi_flags = TsiFlags::empty();
 
         // Enable TSI INET hijack as a fallback when no virtio-net is
@@ -337,7 +336,7 @@ impl Vm {
         }
 
         // Enable TSI for AF_UNIX if single root virtio-fs
-        #[cfg(not(feature = "tee"))]
+        #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
         {
             tsi_flags = self.maybe_enable_hijack_unix(tsi_flags);
         }
@@ -402,20 +401,17 @@ impl Vm {
         }
     }
 
-    #[cfg(not(feature = "tee"))]
-    fn maybe_enable_hijack_unix(
-        &self,
-        mut tsi_flags: devices::virtio::TsiFlags,
-    ) -> devices::virtio::TsiFlags {
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+    fn maybe_enable_hijack_unix(&self, mut tsi_flags: TsiFlags) -> TsiFlags {
         if cfg!(target_os = "macos") {
             return tsi_flags;
         }
 
-        if tsi_flags.contains(devices::virtio::TsiFlags::HIJACK_INET)
+        if tsi_flags.contains(TsiFlags::HIJACK_INET)
             && self.vmr.fs.len() == 1
             && self.vmr.fs[0].fs_id == "/dev/root"
         {
-            tsi_flags |= devices::virtio::TsiFlags::HIJACK_UNIX;
+            tsi_flags |= TsiFlags::HIJACK_UNIX;
         }
 
         tsi_flags
@@ -472,6 +468,8 @@ struct KrunfwBindings {
 const KRUNFW_NAME: &str = "libkrunfw.so.5";
 #[cfg(target_os = "macos")]
 const KRUNFW_NAME: &str = "libkrunfw.5.dylib";
+#[cfg(target_os = "windows")]
+const KRUNFW_NAME: &str = "libkrunfw.dll";
 
 /// Load the libkrunfw library.
 ///
@@ -509,9 +507,9 @@ fn load_krunfw_library(path: Option<&std::path::Path>) -> Result<KrunfwBindings>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use devices::virtio::TsiFlags;
     use utils::eventfd::EFD_NONBLOCK;
-    #[cfg(not(feature = "tee"))]
+    use vmm::resources::TsiFlags;
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     use vmm::vmm_config::fs::FsDeviceConfig;
 
     fn make_vm() -> Vm {
@@ -546,7 +544,7 @@ mod tests {
         assert!(prolog.contains("init=/init.krun"));
     }
 
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     #[test]
     fn maybe_enable_hijack_unix_respects_platform_support() {
         let mut vm = make_vm();
@@ -566,7 +564,11 @@ mod tests {
         assert!(flags.contains(TsiFlags::HIJACK_UNIX));
     }
 
-    #[cfg(all(not(feature = "tee"), not(target_os = "macos")))]
+    #[cfg(all(
+        not(feature = "tee"),
+        not(target_os = "macos"),
+        not(target_os = "windows")
+    ))]
     #[test]
     fn maybe_enable_hijack_unix_requires_root_fs_id() {
         let mut vm = make_vm();
@@ -596,7 +598,11 @@ mod tests {
         assert!(flags.contains(TsiFlags::HIJACK_INET));
     }
 
-    #[cfg(all(not(feature = "tee"), not(target_os = "macos")))]
+    #[cfg(all(
+        not(feature = "tee"),
+        not(target_os = "macos"),
+        not(target_os = "windows")
+    ))]
     #[test]
     fn compute_tsi_flags_unix_hijack_follows_inet_hijack() {
         let mut vm = make_vm();

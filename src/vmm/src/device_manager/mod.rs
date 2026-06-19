@@ -6,6 +6,7 @@
 // found in the THIRD-PARTY file.
 
 /// Legacy Device Manager.
+#[cfg(not(target_os = "windows"))]
 pub mod legacy;
 
 /// Device Shared Memory Region Manager.
@@ -16,7 +17,7 @@ pub mod shm;
 pub mod kvm;
 #[cfg(target_os = "linux")]
 pub use self::kvm::mmio;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod hvf;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub use self::hvf::mmio;

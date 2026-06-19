@@ -12,22 +12,38 @@ use msb_krun::{Result, VmBuilder};
 fn main() -> Result<()> {
     env_logger::init();
 
-    let krunfw_path =
-        std::env::var("KRUNFW_PATH").unwrap_or_else(|_| "libkrunfw.5.dylib".to_string());
+    let krunfw_path = std::env::var("KRUNFW_PATH").unwrap_or_else(|_| {
+        #[cfg(target_os = "macos")]
+        {
+            "libkrunfw.5.dylib".to_string()
+        }
+        #[cfg(target_os = "linux")]
+        {
+            "libkrunfw.so.5".to_string()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            "libkrunfw.dll".to_string()
+        }
+    });
 
+    #[cfg(not(target_os = "windows"))]
     let rootfs_path = format!(
         "{}/rootfs-alpine/{}",
         env!("CARGO_MANIFEST_DIR"),
         std::env::consts::ARCH,
     );
 
+    #[cfg(not(target_os = "windows"))]
     eprintln!("Entering VM (rootfs={rootfs_path})");
+    #[cfg(target_os = "windows")]
+    eprintln!("Entering VM");
 
     let builder = VmBuilder::new()
         .machine(|m| m.vcpus(2).memory_mib(1024))
         .kernel(|k| k.krunfw_path(&krunfw_path));
 
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     let builder = builder.fs(|fs| fs.root(&rootfs_path));
 
     builder

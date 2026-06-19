@@ -1,5 +1,6 @@
 [workspace]
 members = ["src/libkrun", "src/krun_input", "src/krun", "examples/rust_vm"]
+default-members = ["src/libkrun", "src/krun_input", "src/krun", "examples/rust_vm"]
 exclude = ["examples/gtk_display"]
 resolver = "2"
 

@@ -1,13 +1,12 @@
-use crate::header::{
-    KRUN_INPUT_CONFIG_FEATURE_QUERY, KRUN_INPUT_EVENT_PROVIDER_FEATURE_QUEUE,
-    krun_input_config_vtable, krun_input_event_provider_vtable,
-};
-use crate::{
-    InputAbsInfo, InputBackendError, InputConfigBackend, InputDeviceIds, InputEvent,
-    InputEventProviderBackend,
-};
+use crate::header::{KRUN_INPUT_CONFIG_FEATURE_QUERY, krun_input_config_vtable};
+#[cfg(unix)]
+use crate::header::{KRUN_INPUT_EVENT_PROVIDER_FEATURE_QUEUE, krun_input_event_provider_vtable};
+use crate::{InputAbsInfo, InputBackendError, InputConfigBackend, InputDeviceIds};
+#[cfg(unix)]
+use crate::{InputEvent, InputEventProviderBackend};
 use std::ffi::c_void;
 use std::marker::PhantomData;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ptr;
 use std::ptr::null;
@@ -44,6 +43,7 @@ pub trait InputQueryConfig {
     fn query_properties(&self, properties: &mut [u8]) -> Result<u8, InputBackendError>;
 }
 
+#[cfg(unix)]
 pub trait InputEventsImpl {
     /// Get the file descriptor that becomes ready when input events are available
     fn get_read_notify_fd(&self) -> Result<BorrowedFd<'_>, InputBackendError>;
@@ -192,10 +192,12 @@ where
     }
 }
 
+#[cfg(unix)]
 pub trait IntoInputEvents<T: Sync> {
     fn into_input_events(userdata: Option<&T>) -> InputEventProviderBackend<'_>;
 }
 
+#[cfg(unix)]
 impl<I, UserData: Send + Sync> IntoInputEvents<UserData> for I
 where
     I: InputEventsImpl + ObjectNew<UserData>,

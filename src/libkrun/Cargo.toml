@@ -43,7 +43,7 @@ kvm-bindings = { version = ">=0.11", features = ["fam-wrappers"] }
 kvm-ioctls = ">=0.21"
 aws-nitro = { package = "msb_krun_aws_nitro", path = "../aws_nitro", optional = true }
 nitro-enclaves = { version = "0.5.0", optional = true }
-vm-memory = { version = "~0.16", features = ["backend-mmap"] }
+vm-memory = { version = "~0.18", default-features = false, features = ["backend-mmap"] }
 
 [lib]
 name = "krun"

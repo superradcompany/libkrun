@@ -452,7 +452,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -625,9 +625,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "imago"
-version = "0.2.1"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a46885ecbabe024b9e6e3ee9ee3a32ad05adf2b6269f45aa912793d9c54c805"
+checksum = "ae7cfee876c698a1a2ed9c705ab18f21acbed82110f19b51cc458de73426fe2c"
 dependencies = [
  "async-trait",
  "bincode",
@@ -639,7 +639,7 @@ dependencies = [
  "rustc_version",
  "tokio",
  "tracing",
- "vm-memory",
+ "vm-memory 0.18.0",
  "windows-sys 0.61.2",
 ]
 
@@ -736,7 +736,7 @@ dependencies = [
  "sha2",
  "sm3",
  "strum",
- "thiserror 2.0.12",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -800,7 +800,7 @@ dependencies = [
  "nitro-enclaves 0.5.0",
  "once_cell",
  "rand",
- "vm-memory",
+ "vm-memory 0.18.0",
 ]
 
 [[package]]
@@ -858,7 +858,7 @@ version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "870c3814345f050991f99869417779f6062542bcf4ed81db7a1b926ad1306638"
 dependencies = [
- "vm-memory",
+ "vm-memory 0.16.2",
 ]
 
 [[package]]
@@ -941,7 +941,7 @@ dependencies = [
  "msb_krun_utils",
  "msb_krun_vmm",
  "nitro-enclaves 0.6.1",
- "vm-memory",
+ "vm-memory 0.18.0",
 ]
 
 [[package]]
@@ -955,8 +955,7 @@ dependencies = [
  "msb_krun_smbios",
  "msb_krun_utils",
  "tdx",
- "vm-memory",
- "vmm-sys-util 0.14.0",
+ "vm-memory 0.18.0",
 ]
 
 [[package]]
@@ -1011,10 +1010,10 @@ dependencies = [
  "nix 0.30.1",
  "pipewire",
  "rand",
- "thiserror 2.0.12",
+ "thiserror 2.0.18",
  "virtio-bindings",
  "vm-fdt",
- "vm-memory",
+ "vm-memory 0.18.0",
  "zerocopy",
 ]
 
@@ -1026,7 +1025,7 @@ dependencies = [
  "bitflags 2.10.0",
  "log",
  "static_assertions",
- "thiserror 2.0.12",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1048,7 +1047,7 @@ dependencies = [
  "libc",
  "log",
  "static_assertions",
- "thiserror 2.0.12",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1056,7 +1055,7 @@ name = "msb_krun_kernel"
 version = "0.1.17"
 dependencies = [
  "msb_krun_utils",
- "vm-memory",
+ "vm-memory 0.18.0",
 ]
 
 [[package]]
@@ -1088,7 +1087,7 @@ dependencies = [
 name = "msb_krun_smbios"
 version = "0.1.17"
 dependencies = [
- "vm-memory",
+ "vm-memory 0.18.0",
 ]
 
 [[package]]
@@ -1135,8 +1134,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tdx",
- "vm-memory",
- "vmm-sys-util 0.14.0",
+ "vm-memory 0.18.0",
  "windows-sys 0.61.2",
  "zstd",
 ]
@@ -1474,7 +1472,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1697,11 +1695,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.12"
+version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "567b8a2dae586314f7be2a752ec7474332959c6460e02bde30d702a66d488708"
+checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
 dependencies = [
- "thiserror-impl 2.0.12",
+ "thiserror-impl 2.0.18",
 ]
 
 [[package]]
@@ -1717,9 +1715,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.12"
+version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f7cf42b4507d8ea322120659672cf1b9dbb93f8f2d4ecfd6e51350ff5b17a1d"
+checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1885,6 +1883,17 @@ checksum = "1fd5e56d48353c5f54ef50bd158a0452fc82f5383da840f7b8efc31695dd3b9d"
 dependencies = [
  "libc",
  "thiserror 1.0.69",
+ "winapi",
+]
+
+[[package]]
+name = "vm-memory"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b55e753c7725603745cb32b2287ef7ef3da05c03c7702cda3fa8abe25ae0465"
+dependencies = [
+ "libc",
+ "thiserror 2.0.18",
  "winapi",
 ]
 

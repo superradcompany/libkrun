@@ -23,32 +23,32 @@ mod kvmgicv2;
 mod kvmgicv3;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod kvmioapic;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(not(target_os = "windows"), target_arch = "aarch64"))]
 mod rtc_pl031;
 #[cfg(target_os = "macos")]
 mod vcpu;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
 mod x86_64;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
 use x86_64::cmos;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
 use x86_64::serial;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(not(target_os = "windows"), target_arch = "aarch64"))]
 mod aarch64;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(not(target_os = "windows"), target_arch = "aarch64"))]
 use aarch64::gpio;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(not(target_os = "windows"), target_arch = "aarch64"))]
 use aarch64::serial;
 #[cfg(target_arch = "riscv64")]
 mod riscv64;
 #[cfg(target_arch = "riscv64")]
 use riscv64::serial;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
 pub use self::cmos::Cmos;
 #[cfg(target_os = "macos")]
 pub use self::gicv3::GicV3;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(not(target_os = "windows"), target_arch = "aarch64"))]
 pub use self::gpio::Gpio;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use self::hvfgicv3::HvfGicV3;
@@ -67,8 +67,9 @@ pub use self::kvmgicv2::KvmGicV2;
 pub use self::kvmgicv3::KvmGicV3;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use self::kvmioapic::KvmIoapic;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(not(target_os = "windows"), target_arch = "aarch64"))]
 pub use self::rtc_pl031::RTC;
+#[cfg(not(target_os = "windows"))]
 pub use self::serial::Serial;
 #[cfg(target_os = "macos")]
 pub use self::vcpu::VcpuList;
@@ -77,8 +78,10 @@ pub use self::vcpu::VcpuList;
 // which is a composition of the desired bounds. In this case, io::Read and AsRawFd.
 // Run `rustc --explain E0225` for more details.
 /// Trait that composes the `std::io::Read` and `std::os::unix::io::AsRawFd` traits.
+#[cfg(unix)]
 pub trait ReadableFd: std::io::Read + std::os::fd::AsRawFd {}
 
+#[cfg(unix)]
 impl ReadableFd for std::fs::File {}
 
 #[cfg(target_os = "linux")]

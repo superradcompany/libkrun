@@ -7,6 +7,7 @@
 use std::fs::File;
 #[cfg(feature = "tee")]
 use std::io::BufReader;
+#[cfg(not(target_os = "windows"))]
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::vmm_config::block::{BlockBuilder, BlockConfigError, BlockDeviceConfig};
 use crate::vmm_config::external_kernel::ExternalKernel;
 use crate::vmm_config::firmware::FirmwareConfig;
-#[cfg(not(feature = "tee"))]
+#[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
 use crate::vmm_config::fs::*;
 #[cfg(feature = "tee")]
 use crate::vmm_config::kernel_bundle::{InitrdBundle, QbootBundle, QbootBundleError};
@@ -39,8 +40,7 @@ use utils::metrics::MetricsWriter;
 
 type Result<E> = std::result::Result<(), E>;
 
-// Re-export TsiFlags from devices crate
-pub use devices::virtio::TsiFlags;
+pub use crate::vmm_config::vsock::TsiFlags;
 
 /// Errors encountered when configuring microVM resources.
 #[derive(Debug)]
@@ -86,22 +86,26 @@ impl Default for TeeConfig {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 pub struct SerialConsoleConfig {
     pub input_fd: RawFd,
     pub output_fd: RawFd,
 }
 
+#[cfg(not(target_os = "windows"))]
 pub struct DefaultVirtioConsoleConfig {
     pub input_fd: RawFd,
     pub output_fd: RawFd,
     pub err_fd: RawFd,
 }
 
+#[cfg(not(target_os = "windows"))]
 pub enum VirtioConsoleConfigMode {
     Autoconfigure(DefaultVirtioConsoleConfig),
     Explicit(Vec<PortConfig>),
 }
 
+#[cfg(not(target_os = "windows"))]
 pub enum PortConfig {
     Tty {
         name: String,
@@ -151,10 +155,13 @@ pub struct VmResources {
     #[cfg(feature = "tee")]
     pub initrd_bundle: Option<InitrdBundle>,
     /// The fs device.
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     pub fs: Vec<FsDeviceConfig>,
     /// Custom filesystem devices.
-    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    #[cfg(all(
+        not(any(feature = "tee", feature = "aws-nitro")),
+        not(target_os = "windows")
+    ))]
     pub custom_fs: Vec<CustomFsDeviceConfig>,
     /// The vsock device.
     pub vsock: VsockBuilder,
@@ -208,8 +215,10 @@ pub struct VmResources {
     /// The console id to use for console= in the kernel cmdline
     pub kernel_console: Option<String>,
     /// Serial consoles to attach to the guest
+    #[cfg(not(target_os = "windows"))]
     pub serial_consoles: Vec<SerialConsoleConfig>,
     /// Virtio consoles to attach to the guest
+    #[cfg(not(target_os = "windows"))]
     pub virtio_consoles: Vec<VirtioConsoleConfigMode>,
 }
 
@@ -225,9 +234,12 @@ impl Default for VmResources {
             qboot_bundle: None,
             #[cfg(feature = "tee")]
             initrd_bundle: None,
-            #[cfg(not(feature = "tee"))]
+            #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
             fs: Vec::new(),
-            #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+            #[cfg(all(
+                not(any(feature = "tee", feature = "aws-nitro")),
+                not(target_os = "windows")
+            ))]
             custom_fs: Vec::new(),
             vsock: VsockBuilder::default(),
             #[cfg(feature = "blk")]
@@ -257,7 +269,9 @@ impl Default for VmResources {
             enable_rng: true,
             disable_implicit_console: false,
             kernel_console: None,
+            #[cfg(not(target_os = "windows"))]
             serial_consoles: Vec::new(),
+            #[cfg(not(target_os = "windows"))]
             virtio_consoles: Vec::new(),
         }
     }
@@ -341,7 +355,7 @@ impl VmResources {
 
     pub fn set_kernel_bundle(&mut self, kernel_bundle: KernelBundle) -> Result<KernelBundleError> {
         // Safe because this call just returns the page size and doesn't have any side effects.
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let page_size = utils::page_size();
 
         if kernel_bundle.host_addr == 0 || (kernel_bundle.host_addr as usize) & (page_size - 1) != 0
         {
@@ -394,7 +408,7 @@ impl VmResources {
         Ok(())
     }
 
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     pub fn add_fs_device(&mut self, config: FsDeviceConfig) {
         self.fs.push(config)
     }

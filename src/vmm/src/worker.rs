@@ -23,6 +23,9 @@ pub fn start_worker_thread(
     vmm: Arc<Mutex<super::Vmm>>,
     receiver: Receiver<WorkerMessage>,
 ) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    let _ = &vmm;
+
     std::thread::Builder::new()
         .name("vmm worker".into())
         .spawn(move || loop {
@@ -32,12 +35,15 @@ pub fn start_worker_thread(
                 Ok(message) => vmm.lock().unwrap().match_worker_message(message),
                 #[cfg(target_os = "linux")]
                 Ok(message) => vmm.lock().unwrap().match_worker_message(message),
+                #[cfg(target_os = "windows")]
+                Ok(message) => debug!("ignoring unsupported Windows worker message: {message:?}"),
             }
         })?;
     Ok(())
 }
 
 impl super::Vmm {
+    #[cfg(not(target_os = "windows"))]
     fn match_worker_message(&self, msg: WorkerMessage) {
         match msg {
             #[cfg(target_os = "macos")]

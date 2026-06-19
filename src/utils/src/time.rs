@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt;
+#[cfg(windows)]
+use std::sync::OnceLock;
+#[cfg(windows)]
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Constant to convert seconds to nanoseconds.
 pub const NANOS_PER_SECOND: u64 = 1_000_000_000;
@@ -18,6 +22,7 @@ pub enum ClockType {
     ThreadCpu,
 }
 
+#[cfg(unix)]
 impl From<ClockType> for libc::clockid_t {
     fn from(ctype: ClockType) -> libc::clockid_t {
         match ctype {
@@ -49,6 +54,7 @@ pub struct LocalTime {
 
 impl LocalTime {
     /// Returns the [LocalTime](struct.LocalTime.html) structure for the calling moment.
+    #[cfg(unix)]
     pub fn now() -> LocalTime {
         let mut timespec = libc::timespec {
             tv_sec: 0,
@@ -85,6 +91,25 @@ impl LocalTime {
             mon: tm.tm_mon,
             year: tm.tm_year,
             nsec: timespec.tv_nsec,
+        }
+    }
+
+    /// Returns the current UTC timestamp on Windows.
+    #[cfg(windows)]
+    pub fn now() -> LocalTime {
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let (year, mon, mday, hour, min, sec) = unix_seconds_to_utc(duration.as_secs());
+
+        LocalTime {
+            sec,
+            min,
+            hour,
+            mday,
+            mon,
+            year: year - 1900,
+            nsec: duration.subsec_nanos() as i64,
         }
     }
 }
@@ -144,13 +169,30 @@ pub fn timestamp_cycles() -> u64 {
 ///
 /// * `clock_type` - Identifier of the Linux Kernel clock on which to act.
 pub fn get_time(clock_type: ClockType) -> u64 {
-    let mut time_struct = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // Safe because the parameters are valid.
-    unsafe { libc::clock_gettime(clock_type.into(), &mut time_struct) };
-    seconds_to_nanoseconds(time_struct.tv_sec).unwrap() as u64 + (time_struct.tv_nsec as u64)
+    #[cfg(unix)]
+    {
+        let mut time_struct = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // Safe because the parameters are valid.
+        unsafe { libc::clock_gettime(clock_type.into(), &mut time_struct) };
+        seconds_to_nanoseconds(time_struct.tv_sec).unwrap() as u64 + (time_struct.tv_nsec as u64)
+    }
+
+    #[cfg(windows)]
+    {
+        match clock_type {
+            ClockType::Real => SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64,
+            ClockType::Monotonic | ClockType::ProcessCpu | ClockType::ThreadCpu => {
+                static START: OnceLock<Instant> = OnceLock::new();
+                START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+            }
+        }
+    }
 }
 
 /// Converts a timestamp in seconds to an equivalent one in nanoseconds.
@@ -161,6 +203,34 @@ pub fn get_time(clock_type: ClockType) -> u64 {
 /// * `value` - Timestamp in seconds.
 pub fn seconds_to_nanoseconds(value: i64) -> Option<i64> {
     value.checked_mul(NANOS_PER_SECOND as i64)
+}
+
+#[cfg(windows)]
+fn unix_seconds_to_utc(seconds: u64) -> (i32, i32, i32, i32, i32, i32) {
+    let days = (seconds / 86_400) as i64;
+    let seconds_of_day = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = (seconds_of_day / 3600) as i32;
+    let min = ((seconds_of_day % 3600) / 60) as i32;
+    let sec = (seconds_of_day % 60) as i32;
+
+    (year, month - 1, day, hour, min, sec)
+}
+
+#[cfg(windows)]
+fn civil_from_days(days: i64) -> (i32, i32, i32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + i64::from(month <= 2);
+
+    (year as i32, month as i32, day as i32)
 }
 
 #[cfg(test)]

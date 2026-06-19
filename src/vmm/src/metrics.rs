@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use arch::ArchMemoryInfo;
 use utils::metrics::MetricsWriter;
-use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{Address, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -213,12 +213,16 @@ fn mincore(addr: *mut u8, len: usize, residency: &mut [u8]) -> io::Result<()> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn mincore(_addr: *mut u8, _len: usize, _residency: &mut [u8]) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "host-resident memory sampling is not implemented on Windows",
+    ))
+}
+
 fn page_size() -> usize {
-    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    usize::try_from(value)
-        .ok()
-        .filter(|value| *value > 0)
-        .unwrap_or(4096)
+    utils::page_size()
 }
 
 //--------------------------------------------------------------------------------------------------

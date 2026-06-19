@@ -41,6 +41,6 @@ hvf = { package = "msb_krun_hvf", version = "0.1.17", path = "../hvf" }
 [target.'cfg(target_os = "linux")'.dependencies]
 kvm-bindings = { version = ">=0.11", features = ["fam-wrappers"] }
 kvm-ioctls = ">=0.21"
-vm-memory = { version = "~0.16", features = ["backend-mmap"] }
+vm-memory = { version = "~0.18", default-features = false, features = ["backend-mmap"] }
 aws-nitro = { package = "msb_krun_aws_nitro", version = "0.1.17", path = "../aws_nitro", optional = true }
 nitro-enclaves = { version = "0.6.0", optional = true }
