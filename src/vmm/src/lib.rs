@@ -34,10 +34,14 @@ use crate::linux::vstate;
 mod macos;
 mod metrics;
 mod terminal;
+#[cfg(target_os = "windows")]
+mod windows;
 pub mod worker;
 
 #[cfg(target_os = "macos")]
 use macos::vstate;
+#[cfg(target_os = "windows")]
+use windows::vstate;
 
 use std::fmt::{Display, Formatter};
 use std::io;
