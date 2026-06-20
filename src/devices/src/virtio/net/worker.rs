@@ -1,4 +1,6 @@
 use crate::virtio::net::backend::ConnectError;
+#[cfg(windows)]
+use crate::virtio::net::namedpipe::NamedPipe;
 #[cfg(target_os = "linux")]
 use crate::virtio::net::tap::Tap;
 #[cfg(unix)]
@@ -85,6 +87,10 @@ impl NetWorker {
             #[cfg(target_os = "linux")]
             VirtioNetBackend::Tap(tap_name) => {
                 Box::new(Tap::new(tap_name, _vnet_features)?) as Box<dyn NetBackend + Send>
+            }
+            #[cfg(windows)]
+            VirtioNetBackend::NamedPipe(name) => {
+                Box::new(NamedPipe::open(name)?) as Box<dyn NetBackend + Send>
             }
             VirtioNetBackend::Custom(backend) => backend,
         };
@@ -209,7 +215,10 @@ impl NetWorker {
 
     pub(crate) fn process_tx_queue_event(&mut self) {
         match self.tx_q.event.read() {
-            Ok(_) => self.process_tx_loop(),
+            Ok(_) => {
+                log::debug!("virtio-net tx queue event");
+                self.process_tx_loop()
+            }
             Err(e) => {
                 log::error!("Failed to get tx queue event from queue: {e:?}");
             }
@@ -348,6 +357,7 @@ impl NetWorker {
             }
 
             self.tx_frame_len = read_count;
+            log::debug!("virtio-net tx descriptor: head={head_index}, bytes={read_count}");
             match self
                 .backend
                 .write_frame(vnet_hdr_len(), &mut self.tx_frame_buf[..read_count])

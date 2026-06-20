@@ -72,6 +72,8 @@ pub enum VirtioNetBackend {
     UnixgramPath(PathBuf, bool),
     #[cfg(target_os = "linux")]
     Tap(String),
+    #[cfg(windows)]
+    NamedPipe(String),
     Custom(Box<dyn NetBackend + Send>),
 }
 

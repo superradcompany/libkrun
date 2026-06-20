@@ -179,6 +179,9 @@ pub enum NetConfig {
     /// TAP backend (Linux only).
     #[cfg(target_os = "linux")]
     Tap { mac: Option<[u8; 6]>, name: String },
+    /// Windows named-pipe backend connecting to a helper-created message-mode pipe.
+    #[cfg(windows)]
+    NamedPipe { mac: Option<[u8; 6]>, name: String },
     /// Custom network backend.
     Custom {
         mac: Option<[u8; 6]>,
@@ -656,6 +659,17 @@ impl NetBuilder {
     pub fn tap(mut self, name: impl Into<String>) -> Self {
         let mac = self.current_mac.take();
         self.configs.push(NetConfig::Tap {
+            mac,
+            name: name.into(),
+        });
+        self
+    }
+
+    /// Attach a Windows named-pipe network backend.
+    #[cfg(windows)]
+    pub fn named_pipe(mut self, name: impl Into<String>) -> Self {
+        let mac = self.current_mac.take();
+        self.configs.push(NetConfig::NamedPipe {
             mac,
             name: name.into(),
         });

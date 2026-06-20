@@ -6,7 +6,7 @@ use crossbeam_channel::unbounded;
 use devices::virtio::block::{ImageType, SyncMode};
 #[cfg(feature = "gpu")]
 use devices::virtio::gpu::display::DisplayInfo;
-#[cfg(all(feature = "net", unix))]
+#[cfg(feature = "net")]
 use devices::virtio::net::device::VirtioNetBackend;
 #[cfg(feature = "blk")]
 use devices::virtio::CacheType;
@@ -59,7 +59,7 @@ use vmm::vmm_config::kernel_bundle::KernelBundle;
 use vmm::vmm_config::kernel_bundle::{InitrdBundle, QbootBundle};
 use vmm::vmm_config::kernel_cmdline::{KernelCmdlineConfig, DEFAULT_KERNEL_CMDLINE};
 use vmm::vmm_config::machine_config::VmConfig;
-#[cfg(all(feature = "net", unix))]
+#[cfg(feature = "net")]
 use vmm::vmm_config::net::NetworkInterfaceConfig;
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 
@@ -980,21 +980,21 @@ pub unsafe extern "C" fn krun_set_data_disk(ctx_id: u32, c_disk_path: *const c_c
 const NET_FLAG_VFKIT: u32 = 1 << 0;
 
 /* Taken from uapi/linux/virtio_net.h */
-#[cfg(all(feature = "net", unix))]
+#[cfg(feature = "net")]
 const NET_FEATURE_CSUM: u32 = 1 << 0;
-#[cfg(all(feature = "net", unix))]
+#[cfg(feature = "net")]
 const NET_FEATURE_GUEST_CSUM: u32 = 1 << 1;
-#[cfg(all(feature = "net", unix))]
+#[cfg(feature = "net")]
 const NET_FEATURE_GUEST_TSO4: u32 = 1 << 7;
-#[cfg(all(feature = "net", unix))]
+#[cfg(feature = "net")]
 const NET_FEATURE_GUEST_TSO6: u32 = 1 << 8;
-#[cfg(all(feature = "net", unix))]
+#[cfg(feature = "net")]
 const NET_FEATURE_GUEST_UFO: u32 = 1 << 10;
-#[cfg(all(feature = "net", unix))]
+#[cfg(feature = "net")]
 const NET_FEATURE_HOST_TSO4: u32 = 1 << 11;
-#[cfg(all(feature = "net", unix))]
+#[cfg(feature = "net")]
 const NET_FEATURE_HOST_TSO6: u32 = 1 << 12;
-#[cfg(all(feature = "net", unix))]
+#[cfg(feature = "net")]
 const NET_FEATURE_HOST_UFO: u32 = 1 << 14;
 /*
  * These are the flags enabled by default on each virtio-net instance
@@ -1009,7 +1009,7 @@ const NET_COMPAT_FEATURES: u32 = NET_FEATURE_CSUM
     | NET_FEATURE_GUEST_UFO
     | NET_FEATURE_HOST_TSO4
     | NET_FEATURE_HOST_UFO;
-#[cfg(all(feature = "net", unix))]
+#[cfg(feature = "net")]
 const NET_ALL_FEATURES: u32 = NET_FEATURE_CSUM
     | NET_FEATURE_GUEST_CSUM
     | NET_FEATURE_GUEST_TSO4
@@ -1129,6 +1129,52 @@ pub unsafe extern "C" fn krun_add_net_unixgram(
         }
         Entry::Vacant(_) => return -libc::ENOENT,
     }
+    KRUN_SUCCESS
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(all(feature = "net", target_os = "windows"))]
+pub unsafe extern "C" fn krun_add_net_named_pipe(
+    ctx_id: u32,
+    c_name: *const c_char,
+    c_mac: *const u8,
+    features: u32,
+    flags: u32,
+) -> i32 {
+    if c_name.is_null() || c_mac.is_null() {
+        return -libc::EINVAL;
+    }
+
+    let name = match CStr::from_ptr(c_name).to_str() {
+        Ok(name) => name.to_string(),
+        Err(e) => {
+            debug!("Error parsing named pipe name: {e:?}");
+            return -libc::EINVAL;
+        }
+    };
+
+    let mac: [u8; 6] = match slice::from_raw_parts(c_mac, 6).try_into() {
+        Ok(m) => m,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    if (features & !NET_ALL_FEATURES) != 0 {
+        return -libc::EINVAL;
+    }
+
+    if flags != 0 {
+        return -libc::EINVAL;
+    }
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            create_virtio_net(cfg, VirtioNetBackend::NamedPipe(name), mac, features);
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
     KRUN_SUCCESS
 }
 
@@ -2067,7 +2113,7 @@ pub unsafe extern "C" fn krun_set_smbios_oem_strings(
     KRUN_SUCCESS
 }
 
-#[cfg(all(feature = "net", unix))]
+#[cfg(feature = "net")]
 fn create_virtio_net(
     ctx_cfg: &mut ContextConfig,
     backend: VirtioNetBackend,

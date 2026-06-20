@@ -1014,6 +1014,7 @@ dependencies = [
  "virtio-bindings",
  "vm-fdt",
  "vm-memory 0.18.0",
+ "windows-sys 0.61.2",
  "zerocopy",
 ]
 
@@ -1434,6 +1435,15 @@ version = "0.1.0"
 dependencies = [
  "env_logger",
  "msb_krun",
+]
+
+[[package]]
+name = "rust_vm_net"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "msb_krun",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

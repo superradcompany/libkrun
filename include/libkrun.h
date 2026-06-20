@@ -436,6 +436,43 @@ int32_t krun_add_net_unixgram(uint32_t ctx_id,
 
 #endif /* _WIN32 */
 
+#ifdef _WIN32
+
+/**
+ * Adds an independent virtio-net device connected to a Windows
+ * named-pipe-based userspace network helper.
+ *
+ * The helper must create a message-mode named pipe. libkrun connects
+ * to the pipe as a client and sends one Ethernet frame per pipe message.
+ *
+ * The "krun_add_net_*" functions can be called multiple times for
+ * adding multiple virtio-net devices. In the guest the interfaces
+ * will appear in the same order as they are added (that is, the
+ * first added interface will be "eth0", the second "eth1"...)
+ *
+ * Arguments:
+ *  "ctx_id"   - the configuration context ID.
+ *  "c_name"   - a null-terminated string containing the full pipe name,
+ *               for example "\\.\pipe\libkrun-net0".
+ *  "c_mac"    - MAC address as an array of 6 uint8_t entries.
+ *  "features" - virtio-net features for the network interface.
+ *  "flags"    - generic flags for the network interface. Must be zero.
+ *
+ * Notes:
+ * If no network devices are added, networking uses the TSI backend.
+ * This function should be called before krun_set_port_map.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_add_net_named_pipe(uint32_t ctx_id,
+                                const char *c_name,
+                                uint8_t *const c_mac,
+                                uint32_t features,
+                                uint32_t flags);
+
+#endif /* _WIN32 */
+
 /**
  * Adds an independent virtio-net device with the tap backend.
  * Call to this function disables TSI backend.

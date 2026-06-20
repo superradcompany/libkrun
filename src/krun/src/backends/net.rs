@@ -48,3 +48,6 @@ pub use devices::virtio::net::unixgram::Unixgram;
 
 #[cfg(all(feature = "net", unix))]
 pub use devices::virtio::net::unixstream::Unixstream;
+
+#[cfg(all(feature = "net", windows))]
+pub use devices::virtio::net::namedpipe::NamedPipe;

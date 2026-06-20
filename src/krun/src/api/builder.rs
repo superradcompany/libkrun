@@ -204,6 +204,13 @@ impl VmBuilder {
     ///     .net(|n| n.unixgram_path("/tmp/net.sock", true));
     /// ```
     ///
+    /// Windows named pipe:
+    ///
+    /// ```rust,ignore
+    /// VmBuilder::new()
+    ///     .net(|n| n.named_pipe(r"\\.\pipe\libkrun-net0"));
+    /// ```
+    ///
     /// Custom backend:
     ///
     /// ```rust,ignore
@@ -451,6 +458,8 @@ impl VmBuilder {
                 }
                 #[cfg(target_os = "linux")]
                 NetConfig::Tap { mac, name } => (mac, VirtioNetBackend::Tap(name)),
+                #[cfg(windows)]
+                NetConfig::NamedPipe { mac, name } => (mac, VirtioNetBackend::NamedPipe(name)),
                 NetConfig::Custom { mac, backend } => (mac, VirtioNetBackend::Custom(backend)),
             };
 

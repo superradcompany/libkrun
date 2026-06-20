@@ -14,6 +14,8 @@ pub static QUEUE_CONFIG: [QueueConfig; NUM_QUEUES] = [QueueConfig::new(QUEUE_SIZ
 
 pub mod backend;
 pub mod device;
+#[cfg(windows)]
+pub mod namedpipe;
 #[cfg(target_os = "linux")]
 mod tap;
 #[cfg(unix)]
@@ -28,7 +30,6 @@ fn vnet_hdr_len() -> usize {
 
 // This initializes to all 0 the virtio_net_hdr part of a buf and return the length of the header
 // https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html#x1-2050006
-#[cfg(unix)]
 fn write_virtio_net_hdr(buf: &mut [u8]) -> usize {
     let len = vnet_hdr_len();
     buf[0..len].fill(0);
