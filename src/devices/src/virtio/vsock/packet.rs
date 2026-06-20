@@ -193,7 +193,7 @@ pub struct VsockPacket {
     buf_size: usize,
 }
 
-fn get_host_address<T: GuestMemory>(
+fn get_host_address<T: GuestMemory + vm_memory::GuestMemoryBackend>(
     mem: &T,
     guest_addr: GuestAddress,
     size: usize,

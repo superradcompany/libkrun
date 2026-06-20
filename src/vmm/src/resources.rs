@@ -41,7 +41,10 @@ use utils::metrics::MetricsWriter;
 
 type Result<E> = std::result::Result<(), E>;
 
+#[cfg(target_os = "windows")]
 pub use crate::vmm_config::vsock::TsiFlags;
+#[cfg(not(target_os = "windows"))]
+pub use devices::virtio::TsiFlags;
 
 /// Errors encountered when configuring microVM resources.
 #[derive(Debug)]

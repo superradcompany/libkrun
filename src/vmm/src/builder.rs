@@ -142,9 +142,8 @@ use vm_memory::mmap::MmapRegion;
 #[cfg(not(target_os = "windows"))]
 use vm_memory::Address;
 use vm_memory::Bytes;
-#[cfg(not(feature = "aws-nitro"))]
 #[cfg(not(target_os = "windows"))]
-use vm_memory::GuestMemory;
+use vm_memory::GuestMemoryBackend;
 #[cfg(all(
     target_arch = "x86_64",
     not(feature = "tee"),

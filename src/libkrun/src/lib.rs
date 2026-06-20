@@ -1021,7 +1021,7 @@ const NET_ALL_FEATURES: u32 = NET_FEATURE_CSUM
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", unix))]
 pub unsafe extern "C" fn krun_add_net_unixstream(
     ctx_id: u32,
     c_path: *const c_char,
@@ -1030,63 +1030,54 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
     features: u32,
     flags: u32,
 ) -> i32 {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = (ctx_id, c_path, fd, c_mac, features, flags);
-        return -libc::ENOTSUP;
+    let path = if !c_path.is_null() {
+        match CStr::from_ptr(c_path).to_str() {
+            Ok(path) => Some(PathBuf::from(path)),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    if fd >= 0 && path.is_some() {
+        return -libc::EINVAL;
+    }
+    if fd < 0 && path.is_none() {
+        return -libc::EINVAL;
+    }
+    let backend = if let Some(path) = path {
+        VirtioNetBackend::UnixstreamPath(path)
+    } else {
+        VirtioNetBackend::UnixstreamFd(fd)
+    };
+
+    let mac: [u8; 6] = match slice::from_raw_parts(c_mac, 6).try_into() {
+        Ok(m) => m,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    /* The unixstream backend doesn't support any flags */
+    if flags != 0 {
+        return -libc::EINVAL;
     }
 
-    #[cfg(unix)]
-    {
-        let path = if !c_path.is_null() {
-            match CStr::from_ptr(c_path).to_str() {
-                Ok(path) => Some(PathBuf::from(path)),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-
-        if fd >= 0 && path.is_some() {
-            return -libc::EINVAL;
-        }
-        if fd < 0 && path.is_none() {
-            return -libc::EINVAL;
-        }
-        let backend = if let Some(path) = path {
-            VirtioNetBackend::UnixstreamPath(path)
-        } else {
-            VirtioNetBackend::UnixstreamFd(fd)
-        };
-
-        let mac: [u8; 6] = match slice::from_raw_parts(c_mac, 6).try_into() {
-            Ok(m) => m,
-            Err(_) => return -libc::EINVAL,
-        };
-
-        /* The unixstream backend doesn't support any flags */
-        if flags != 0 {
-            return -libc::EINVAL;
-        }
-
-        if (features & !NET_ALL_FEATURES) != 0 {
-            return -libc::EINVAL;
-        }
-
-        match CTX_MAP.lock().unwrap().entry(ctx_id) {
-            Entry::Occupied(mut ctx_cfg) => {
-                let cfg = ctx_cfg.get_mut();
-                create_virtio_net(cfg, backend, mac, features);
-            }
-            Entry::Vacant(_) => return -libc::ENOENT,
-        }
-        KRUN_SUCCESS
+    if (features & !NET_ALL_FEATURES) != 0 {
+        return -libc::EINVAL;
     }
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            create_virtio_net(cfg, backend, mac, features);
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+    KRUN_SUCCESS
 }
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", unix))]
 pub unsafe extern "C" fn krun_add_net_unixgram(
     ctx_id: u32,
     c_path: *const c_char,
@@ -1095,59 +1086,50 @@ pub unsafe extern "C" fn krun_add_net_unixgram(
     features: u32,
     flags: u32,
 ) -> i32 {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = (ctx_id, c_path, fd, c_mac, features, flags);
-        return -libc::ENOTSUP;
+    let path = if !c_path.is_null() {
+        match CStr::from_ptr(c_path).to_str() {
+            Ok(path) => Some(PathBuf::from(path)),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    if fd >= 0 && path.is_some() {
+        return -libc::EINVAL;
+    }
+    if fd < 0 && path.is_none() {
+        return -libc::EINVAL;
     }
 
-    #[cfg(unix)]
-    {
-        let path = if !c_path.is_null() {
-            match CStr::from_ptr(c_path).to_str() {
-                Ok(path) => Some(PathBuf::from(path)),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
+    let mac: [u8; 6] = match slice::from_raw_parts(c_mac, 6).try_into() {
+        Ok(m) => m,
+        Err(_) => return -libc::EINVAL,
+    };
 
-        if fd >= 0 && path.is_some() {
-            return -libc::EINVAL;
-        }
-        if fd < 0 && path.is_none() {
-            return -libc::EINVAL;
-        }
-
-        let mac: [u8; 6] = match slice::from_raw_parts(c_mac, 6).try_into() {
-            Ok(m) => m,
-            Err(_) => return -libc::EINVAL,
-        };
-
-        if (features & !NET_ALL_FEATURES) != 0 {
-            return -libc::EINVAL;
-        }
-
-        if (flags & !NET_FLAG_VFKIT) != 0 {
-            return -libc::EINVAL;
-        }
-        let send_vfkit_magic: bool = flags & NET_FLAG_VFKIT != 0;
-
-        let backend = if let Some(path) = path {
-            VirtioNetBackend::UnixgramPath(path, send_vfkit_magic)
-        } else {
-            VirtioNetBackend::UnixgramFd(fd)
-        };
-
-        match CTX_MAP.lock().unwrap().entry(ctx_id) {
-            Entry::Occupied(mut ctx_cfg) => {
-                let cfg = ctx_cfg.get_mut();
-                create_virtio_net(cfg, backend, mac, features);
-            }
-            Entry::Vacant(_) => return -libc::ENOENT,
-        }
-        KRUN_SUCCESS
+    if (features & !NET_ALL_FEATURES) != 0 {
+        return -libc::EINVAL;
     }
+
+    if (flags & !NET_FLAG_VFKIT) != 0 {
+        return -libc::EINVAL;
+    }
+    let send_vfkit_magic: bool = flags & NET_FLAG_VFKIT != 0;
+
+    let backend = if let Some(path) = path {
+        VirtioNetBackend::UnixgramPath(path, send_vfkit_magic)
+    } else {
+        VirtioNetBackend::UnixgramFd(fd)
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            create_virtio_net(cfg, backend, mac, features);
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+    KRUN_SUCCESS
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -1214,7 +1196,7 @@ pub unsafe extern "C" fn krun_add_net_tap(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", unix))]
 pub unsafe extern "C" fn krun_set_passt_fd(ctx_id: u32, fd: c_int) -> i32 {
     #[cfg(target_os = "windows")]
     {
@@ -1245,7 +1227,7 @@ pub unsafe extern "C" fn krun_set_passt_fd(ctx_id: u32, fd: c_int) -> i32 {
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", unix))]
 pub unsafe extern "C" fn krun_set_gvproxy_path(ctx_id: u32, c_path: *const c_char) -> i32 {
     #[cfg(target_os = "windows")]
     {

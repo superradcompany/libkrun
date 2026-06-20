@@ -12,7 +12,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use utils::eventfd::EventFd;
 use utils::eventfd::EFD_NONBLOCK;
 use vm_memory::bitmap::Bitmap;
-use vm_memory::{VolatileMemoryError, VolatileSlice, WriteVolatile};
+use vm_memory::{VolatileSlice, WriteVolatile};
 
 pub trait PortInput {
     fn read_volatile(&mut self, buf: &mut VolatileSlice) -> Result<usize, io::Error>;
@@ -144,13 +144,20 @@ impl AsRawFd for PortOutputFd {
 
 impl PortOutput for PortOutputFd {
     fn write_volatile(&mut self, buf: &VolatileSlice) -> Result<usize, io::Error> {
-        self.0.write_volatile(buf).map_err(|e| match e {
-            VolatileMemoryError::IOError(e) => e,
-            e => {
-                log::error!("Unsuported error from write_volatile: {e:?}");
-                io::Error::other(e)
-            }
-        })
+        let fd = self.as_raw_fd();
+        let guard = buf.ptr_guard();
+        let src = guard.as_ptr().cast::<libc::c_void>();
+
+        // SAFETY: We got a valid file descriptor from `AsRawFd`. The memory pointed to by `src` is
+        // valid for reads of length `buf.len()` by the invariants upheld by the constructor of
+        // `VolatileSlice`.
+        let bytes_written = unsafe { libc::write(fd, src, buf.len()) };
+
+        if bytes_written < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(bytes_written.try_into().unwrap())
+        }
     }
 
     fn wait_until_writable(&self) {

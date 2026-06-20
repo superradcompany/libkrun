@@ -323,10 +323,6 @@ int32_t krun_add_virtiofs2(uint32_t ctx_id,
                            const char *c_path,
                            uint64_t shm_size);
 
-/* Send the VFKIT magic after establishing the connection,
-   as required by gvproxy in vfkit mode. */
-#define NET_FLAG_VFKIT 1 << 0
-
 /* TSI (Transparent Socket Impersonation) feature flags for vsock */
 #define KRUN_TSI_HIJACK_INET  (1 << 0)
 #define KRUN_TSI_HIJACK_UNIX  (1 << 1)
@@ -340,6 +336,12 @@ int32_t krun_add_virtiofs2(uint32_t ctx_id,
 #define NET_FEATURE_HOST_TSO4 1 << 11
 #define NET_FEATURE_HOST_TSO6 1 << 12
 #define NET_FEATURE_HOST_UFO 1 << 14
+
+#ifndef _WIN32
+
+/* Send the VFKIT magic after establishing the connection,
+   as required by gvproxy in vfkit mode. */
+#define NET_FLAG_VFKIT 1 << 0
 
 /* These are the features enabled by krun_set_passt_fd and krun_set_gvproxy_path. */
 #define COMPAT_NET_FEATURES NET_FEATURE_CSUM | NET_FEATURE_GUEST_CSUM | \
@@ -432,6 +434,8 @@ int32_t krun_add_net_unixgram(uint32_t ctx_id,
                               uint32_t features,
                               uint32_t flags);
 
+#endif /* _WIN32 */
+
 /**
  * Adds an independent virtio-net device with the tap backend.
  * Call to this function disables TSI backend.
@@ -461,6 +465,8 @@ int32_t krun_add_net_tap(uint32_t ctx_id,
                          uint8_t *const c_mac,
                          uint32_t features,
                          uint32_t flags);
+
+#ifndef _WIN32
 
 /**
  * DEPRECATED. Use krun_add_net_unixstream instead.
@@ -500,6 +506,8 @@ int32_t krun_set_passt_fd(uint32_t ctx_id, int fd);
  *  Zero on success or a negative error number on failure.
  */
 int32_t krun_set_gvproxy_path(uint32_t ctx_id, char *c_path);
+
+#endif /* _WIN32 */
 
 /**
  * Sets the MAC address for the virtio-net device when using the passt backend.
