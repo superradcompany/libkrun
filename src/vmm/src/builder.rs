@@ -12,7 +12,10 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 #[cfg(any(
     not(target_os = "windows"),
-    all(target_arch = "aarch64", target_os = "windows")
+    all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        target_os = "windows"
+    )
 ))]
 use std::fs::File;
 use std::io;
@@ -54,7 +57,10 @@ use devices::legacy::IrqChipT;
 use devices::legacy::KvmAia;
 #[cfg(any(
     not(target_os = "windows"),
-    all(target_arch = "aarch64", target_os = "windows")
+    all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        target_os = "windows"
+    )
 ))]
 use devices::legacy::Serial;
 #[cfg(target_os = "macos")]
@@ -146,7 +152,7 @@ use vm_memory::GuestMemory;
 ))]
 use vm_memory::GuestRegionMmap;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
-#[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Hypervisor::{WHvRequestInterrupt, WHV_PARTITION_HANDLE};
 
 #[cfg(target_arch = "aarch64")]
@@ -613,20 +619,20 @@ pub enum Payload {
 
 #[cfg(target_os = "windows")]
 struct WhpIrqChip {
-    #[cfg(target_arch = "aarch64")]
     partition_handle: WHV_PARTITION_HANDLE,
+    #[cfg(target_arch = "aarch64")]
     vcpu_count: u64,
 }
 
 #[cfg(target_os = "windows")]
 impl WhpIrqChip {
     fn new(
-        #[cfg(target_arch = "aarch64")] partition_handle: WHV_PARTITION_HANDLE,
-        vcpu_count: u64,
+        partition_handle: WHV_PARTITION_HANDLE,
+        #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))] vcpu_count: u64,
     ) -> Self {
         Self {
-            #[cfg(target_arch = "aarch64")]
             partition_handle,
+            #[cfg(target_arch = "aarch64")]
             vcpu_count,
         }
     }
@@ -646,6 +652,25 @@ struct WhvArm64InterruptControl {
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
 const WHV_ARM64_INTERRUPT_CONTROL_ASSERTED: u64 = 1 << 34;
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+#[repr(C, align(8))]
+struct WhvX64InterruptControl {
+    interrupt_type: u8,
+    modes: u8,
+    reserved: [u8; 6],
+    destination: u32,
+    vector: u32,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const WHV_X64_INTERRUPT_TYPE_FIXED: u8 = 0;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const WHV_X64_INTERRUPT_DESTINATION_PHYSICAL: u8 = 0;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const WHV_X64_INTERRUPT_TRIGGER_EDGE: u8 = 0;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const X86_LEGACY_IRQ_VECTOR_BASE: u32 = 0x20;
 
 #[cfg(target_os = "windows")]
 impl devices::BusDevice for WhpIrqChip {}
@@ -716,6 +741,38 @@ impl IrqChipT for WhpIrqChip {
                     self.partition_handle,
                     &interrupt as *const WhvArm64InterruptControl as *const _,
                     std::mem::size_of::<WhvArm64InterruptControl>() as u32,
+                )
+            };
+            if hresult < 0 {
+                return Err(devices::Error::IoError(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("WHvRequestInterrupt failed with HRESULT {hresult:#x}"),
+                )));
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let Some(irq_line) = irq_line else {
+                return Err(devices::Error::IoError(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "WHP interrupt line was not set",
+                )));
+            };
+
+            let interrupt = WhvX64InterruptControl {
+                interrupt_type: WHV_X64_INTERRUPT_TYPE_FIXED,
+                modes: WHV_X64_INTERRUPT_DESTINATION_PHYSICAL
+                    | (WHV_X64_INTERRUPT_TRIGGER_EDGE << 4),
+                reserved: [0; 6],
+                destination: 0,
+                vector: X86_LEGACY_IRQ_VECTOR_BASE + irq_line,
+            };
+            let hresult = unsafe {
+                WHvRequestInterrupt(
+                    self.partition_handle,
+                    &interrupt as *const WhvX64InterruptControl as *const _,
+                    std::mem::size_of::<WhvX64InterruptControl>() as u32,
                 )
             };
             if hresult < 0 {
@@ -953,7 +1010,10 @@ pub fn build_microvm(
 
     #[cfg(any(
         not(target_os = "windows"),
-        all(target_arch = "aarch64", target_os = "windows")
+        all(
+            any(target_arch = "aarch64", target_arch = "x86_64"),
+            target_os = "windows"
+        )
     ))]
     let mut serial_devices = Vec::new();
 
@@ -998,7 +1058,10 @@ pub fn build_microvm(
         serial_devices.push(setup_serial_device(event_manager, input, output)?);
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        target_os = "windows"
+    ))]
     if !vm_resources.disable_implicit_console {
         let output: Box<dyn io::Write + Send> = if let Some(console_output_path) =
             &vm_resources.console_output
@@ -1011,13 +1074,22 @@ pub fn build_microvm(
 
         if vm_resources.kernel_console.is_none() {
             if kernel_cmdline.as_str().contains("console=") {
+                #[cfg(target_arch = "aarch64")]
                 let cmdline = kernel_cmdline
                     .as_str()
                     .replace("console=hvc0", "console=ttyAMA0");
+                #[cfg(target_arch = "x86_64")]
+                let cmdline = kernel_cmdline
+                    .as_str()
+                    .replace("console=hvc0", "console=ttyS0")
+                    .replace("console=ttyAMA0", "console=ttyS0");
                 kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
                 kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
             } else {
+                #[cfg(target_arch = "aarch64")]
                 kernel_cmdline.insert("console", "ttyAMA0").unwrap();
+                #[cfg(target_arch = "x86_64")]
+                kernel_cmdline.insert("console", "ttyS0").unwrap();
             }
         }
     }
@@ -1121,10 +1193,11 @@ pub fn build_microvm(
     #[cfg(target_os = "windows")]
     {
         intc = Arc::new(Mutex::new(IrqChipDevice::new(Box::new(WhpIrqChip::new(
-            #[cfg(target_arch = "aarch64")]
             vm.partition_handle(),
             u64::from(vcpu_config.vcpu_count),
         )))));
+        #[cfg(target_arch = "x86_64")]
+        let pio_bus = create_windows_x86_64_pio_bus(intc.clone(), &serial_devices)?;
         vcpus = create_vcpus_windows(
             &vm,
             &vcpu_config,
@@ -1133,6 +1206,8 @@ pub fn build_microvm(
             payload_config.entry_addr,
             &exit_evt,
             vm_resources.metrics.clone(),
+            #[cfg(target_arch = "x86_64")]
+            pio_bus.as_ref(),
         )
         .map_err(StartMicrovmError::Internal)?;
     }
@@ -2093,7 +2168,10 @@ pub(crate) fn setup_vm(
 /// Sets up the serial device.
 #[cfg(any(
     not(target_os = "windows"),
-    all(target_arch = "aarch64", target_os = "windows")
+    all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        target_os = "windows"
+    )
 ))]
 pub fn setup_serial_device(
     event_manager: &mut EventManager,
@@ -2116,6 +2194,32 @@ pub fn setup_serial_device(
         }
     }
     Ok(serial)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+fn create_windows_x86_64_pio_bus(
+    intc: IrqChip,
+    serial: &[Arc<Mutex<Serial>>],
+) -> std::result::Result<Option<devices::Bus>, StartMicrovmError> {
+    let Some(serial) = serial.first() else {
+        return Ok(None);
+    };
+
+    {
+        let mut serial = serial.lock().unwrap();
+        serial.set_intc(intc);
+        serial.set_irq_line(4);
+    }
+
+    let mut pio_bus = devices::Bus::new();
+    pio_bus.insert(serial.clone(), 0x3f8, 0x8).map_err(|err| {
+        StartMicrovmError::Internal(Error::Serial(io::Error::new(
+            io::ErrorKind::Other,
+            format!("failed to register COM1 serial port: {err}"),
+        )))
+    })?;
+
+    Ok(Some(pio_bus))
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
@@ -2286,6 +2390,7 @@ fn create_vcpus_windows(
     entry_addr: GuestAddress,
     exit_evt: &EventFd,
     _metrics: utils::metrics::MetricsWriter,
+    #[cfg(target_arch = "x86_64")] pio_bus: Option<&devices::Bus>,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
     for cpu_index in 0..vcpu_config.vcpu_count {
@@ -2294,6 +2399,10 @@ fn create_vcpus_windows(
             .map_err(Error::Vcpu)?;
         vcpu.configure_windows(guest_mem, mem_info, entry_addr)
             .map_err(Error::Vcpu)?;
+        #[cfg(target_arch = "x86_64")]
+        if let Some(pio_bus) = pio_bus {
+            vcpu.set_pio_bus(pio_bus.clone());
+        }
         vcpus.push(vcpu);
     }
     Ok(vcpus)

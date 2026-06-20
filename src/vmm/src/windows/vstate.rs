@@ -36,14 +36,16 @@ use windows_sys::Win32::System::Hypervisor::{
 use windows_sys::Win32::System::Hypervisor::{
     WHvRunVpExitReasonCanceled, WHvRunVpExitReasonMemoryAccess,
     WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonUnsupportedFeature,
-    WHvRunVpExitReasonX64Halt, WHvTranslateGva, WHvTranslateGvaResultSuccess, X64_RegisterCr0,
-    X64_RegisterCr3, X64_RegisterCr4, X64_RegisterCs, X64_RegisterDs, X64_RegisterEfer,
-    X64_RegisterEs, X64_RegisterFs, X64_RegisterGdtr, X64_RegisterGs, X64_RegisterIdtr,
-    X64_RegisterRFlags, X64_RegisterRbp, X64_RegisterRip, X64_RegisterRsi, X64_RegisterRsp,
-    X64_RegisterSs, X64_RegisterTr, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_MEMORY_ACCESS_INFO,
+    WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess, WHvTranslateGva,
+    WHvTranslateGvaResultSuccess, X64_RegisterCr0, X64_RegisterCr3, X64_RegisterCr4,
+    X64_RegisterCs, X64_RegisterDs, X64_RegisterEfer, X64_RegisterEs, X64_RegisterFs,
+    X64_RegisterGdtr, X64_RegisterGs, X64_RegisterIdtr, X64_RegisterRFlags, X64_RegisterRbp,
+    X64_RegisterRip, X64_RegisterRsi, X64_RegisterRsp, X64_RegisterSs, X64_RegisterTr,
+    WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO,
     WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT, WHV_RUN_VP_EXIT_CONTEXT,
     WHV_TRANSLATE_GVA_FLAGS, WHV_TRANSLATE_GVA_RESULT, WHV_TRANSLATE_GVA_RESULT_CODE,
-    WHV_X64_SEGMENT_REGISTER, WHV_X64_SEGMENT_REGISTER_0, WHV_X64_TABLE_REGISTER,
+    WHV_X64_IO_PORT_ACCESS_CONTEXT, WHV_X64_SEGMENT_REGISTER, WHV_X64_SEGMENT_REGISTER_0,
+    WHV_X64_TABLE_REGISTER,
 };
 
 #[cfg(target_arch = "aarch64")]
@@ -139,6 +141,14 @@ type WhvEmulatorTryMmioEmulation = unsafe extern "system" fn(
     *const WHV_MEMORY_ACCESS_CONTEXT,
     *mut WHV_EMULATOR_STATUS,
 ) -> windows_sys::core::HRESULT;
+#[cfg(target_arch = "x86_64")]
+type WhvEmulatorTryIoEmulation = unsafe extern "system" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const windows_sys::Win32::System::Hypervisor::WHV_VP_EXIT_CONTEXT,
+    *const WHV_X64_IO_PORT_ACCESS_CONTEXT,
+    *mut WHV_EMULATOR_STATUS,
+) -> windows_sys::core::HRESULT;
 
 #[cfg(target_arch = "x86_64")]
 const X86_BOOT_GDT_OFFSET: u64 = 0x500;
@@ -193,6 +203,11 @@ pub enum Error {
     CreateEmulator(windows_sys::core::HRESULT),
     DestroyEmulator(windows_sys::core::HRESULT),
     EmulatorMmio {
+        hresult: windows_sys::core::HRESULT,
+        status: u32,
+    },
+    #[cfg(target_arch = "x86_64")]
+    EmulatorIo {
         hresult: windows_sys::core::HRESULT,
         status: u32,
     },
@@ -302,6 +317,12 @@ impl Display for Error {
                 "WHvEmulatorTryMmioEmulation failed with HRESULT 0x{:08x}, status 0x{status:08x}",
                 *hresult as u32
             ),
+            #[cfg(target_arch = "x86_64")]
+            Error::EmulatorIo { hresult, status } => write!(
+                f,
+                "WHvEmulatorTryIoEmulation failed with HRESULT 0x{:08x}, status 0x{status:08x}",
+                *hresult as u32
+            ),
             #[cfg(target_arch = "aarch64")]
             Error::Arm64Mmio {
                 id,
@@ -397,6 +418,8 @@ pub struct Vcpu {
     partition_handle: WHV_PARTITION_HANDLE,
     guest_mem: Option<GuestMemoryMmap>,
     mmio_bus: Option<devices::Bus>,
+    #[cfg(target_arch = "x86_64")]
+    pio_bus: Option<devices::Bus>,
     exit_evt: EventFd,
     event_sender: Option<Sender<VcpuEvent>>,
     event_receiver: Option<Receiver<VcpuEvent>>,
@@ -436,6 +459,7 @@ struct Emulator {
     handle: *mut core::ffi::c_void,
     destroy_emulator: WhvEmulatorDestroyEmulator,
     try_mmio_emulation: WhvEmulatorTryMmioEmulation,
+    try_io_emulation: WhvEmulatorTryIoEmulation,
 }
 
 struct EmulatorContext {
@@ -444,6 +468,8 @@ struct EmulatorContext {
     #[cfg(target_arch = "x86_64")]
     guest_mem: GuestMemoryMmap,
     mmio_bus: Option<devices::Bus>,
+    #[cfg(target_arch = "x86_64")]
+    pio_bus: Option<devices::Bus>,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -626,6 +652,8 @@ impl Vcpu {
             partition_handle,
             guest_mem: None,
             mmio_bus: None,
+            #[cfg(target_arch = "x86_64")]
+            pio_bus: None,
             exit_evt,
             event_sender: Some(event_sender),
             event_receiver: Some(event_receiver),
@@ -636,6 +664,11 @@ impl Vcpu {
 
     pub fn set_mmio_bus(&mut self, mmio_bus: devices::Bus) {
         self.mmio_bus = Some(mmio_bus);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_pio_bus(&mut self, pio_bus: devices::Bus) {
+        self.pio_bus = Some(pio_bus);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -685,6 +718,8 @@ impl Vcpu {
             .take()
             .expect("guest memory missing before vcpu start");
         let mmio_bus = self.mmio_bus.take();
+        #[cfg(target_arch = "x86_64")]
+        let pio_bus = self.pio_bus.take();
         let exit_evt = self.exit_evt.try_clone().map_err(Error::VcpuThreadSpawn)?;
         self.partition_handle = 0;
 
@@ -696,6 +731,8 @@ impl Vcpu {
                     partition_handle,
                     guest_mem,
                     mmio_bus,
+                    #[cfg(target_arch = "x86_64")]
+                    pio_bus,
                     exit_evt,
                     event_receiver,
                     response_sender,
@@ -928,11 +965,19 @@ impl Emulator {
                     error,
                 })?
         };
+        let try_io_emulation: WhvEmulatorTryIoEmulation = unsafe {
+            *library.get(b"WHvEmulatorTryIoEmulation").map_err(|error| {
+                Error::LoadEmulatorSymbol {
+                    symbol: "WHvEmulatorTryIoEmulation",
+                    error,
+                }
+            })?
+        };
 
         let callbacks = WHV_EMULATOR_CALLBACKS {
             Size: size_of::<WHV_EMULATOR_CALLBACKS>() as u32,
             Reserved: 0,
-            WHvEmulatorIoPortCallback: None,
+            WHvEmulatorIoPortCallback: Some(emulator_io_port_callback),
             WHvEmulatorMemoryCallback: Some(emulator_memory_callback),
             WHvEmulatorGetVirtualProcessorRegisters: Some(emulator_get_registers_callback),
             WHvEmulatorSetVirtualProcessorRegisters: Some(emulator_set_registers_callback),
@@ -949,6 +994,7 @@ impl Emulator {
             handle,
             destroy_emulator,
             try_mmio_emulation,
+            try_io_emulation,
         })
     }
 
@@ -971,6 +1017,30 @@ impl Emulator {
         let status = unsafe { status.AsUINT32 };
         if hresult < 0 || status & WHV_EMULATOR_STATUS_SUCCESS == 0 {
             return Err(Error::EmulatorMmio { hresult, status });
+        }
+
+        Ok(())
+    }
+
+    fn emulate_io(
+        &self,
+        context: &mut EmulatorContext,
+        exit_context: &WHV_RUN_VP_EXIT_CONTEXT,
+        io_access: &WHV_X64_IO_PORT_ACCESS_CONTEXT,
+    ) -> Result<()> {
+        let mut status = WHV_EMULATOR_STATUS { AsUINT32: 0 };
+        let hresult = unsafe {
+            (self.try_io_emulation)(
+                self.handle,
+                context as *mut EmulatorContext as *const _,
+                &exit_context.VpContext,
+                io_access,
+                &mut status,
+            )
+        };
+        let status = unsafe { status.AsUINT32 };
+        if hresult < 0 || status & WHV_EMULATOR_STATUS_SUCCESS == 0 {
+            return Err(Error::EmulatorIo { hresult, status });
         }
 
         Ok(())
@@ -1238,6 +1308,7 @@ fn run_vcpu(
     partition_handle: WHV_PARTITION_HANDLE,
     guest_mem: GuestMemoryMmap,
     mmio_bus: Option<devices::Bus>,
+    #[cfg(target_arch = "x86_64")] pio_bus: Option<devices::Bus>,
     exit_evt: EventFd,
     event_receiver: Receiver<VcpuEvent>,
     response_sender: Sender<VcpuResponse>,
@@ -1257,6 +1328,8 @@ fn run_vcpu(
         #[cfg(target_arch = "x86_64")]
         guest_mem,
         mmio_bus,
+        #[cfg(target_arch = "x86_64")]
+        pio_bus,
     };
     #[cfg(target_arch = "x86_64")]
     let emulator = match Emulator::new() {
@@ -1372,6 +1445,18 @@ fn run_vcpu(
             let memory_access = unsafe { exit_context.Anonymous.MemoryAccess };
             if let Err(err) =
                 emulator.emulate_mmio(&mut emulator_context, &exit_context, &memory_access)
+            {
+                error!("{err}");
+                signal_vcpu_exit(&response_sender, &exit_evt, 1);
+                return;
+            }
+            continue;
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if reason == WHvRunVpExitReasonX64IoPortAccess {
+            let io_access = unsafe { exit_context.Anonymous.IoPortAccess };
+            if let Err(err) = emulator.emulate_io(&mut emulator_context, &exit_context, &io_access)
             {
                 error!("{err}");
                 signal_vcpu_exit(&response_sender, &exit_evt, 1);
@@ -1646,6 +1731,50 @@ fn cancel_run_virtual_processor(partition_handle: WHV_PARTITION_HANDLE, id: u8) 
     }
 
     Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "system" fn emulator_io_port_callback(
+    context: *const core::ffi::c_void,
+    io_access: *mut WHV_EMULATOR_IO_ACCESS_INFO,
+) -> windows_sys::core::HRESULT {
+    let Some(context) = (context as *mut EmulatorContext).as_mut() else {
+        return E_INVALIDARG;
+    };
+    let Some(io_access) = io_access.as_mut() else {
+        return E_INVALIDARG;
+    };
+
+    let len = io_access.AccessSize as usize;
+    if !matches!(len, 1 | 2 | 4) {
+        return E_INVALIDARG;
+    }
+
+    let Some(pio_bus) = &context.pio_bus else {
+        return E_FAIL;
+    };
+
+    let port = u64::from(io_access.Port);
+    match io_access.Direction {
+        WHV_EMULATOR_DIRECTION_READ => {
+            let mut data = io_access.Data.to_le_bytes();
+            if pio_bus.read(context.id.into(), port, &mut data[..len]) {
+                io_access.Data = u32::from_le_bytes(data);
+                S_OK
+            } else {
+                E_FAIL
+            }
+        }
+        WHV_EMULATOR_DIRECTION_WRITE => {
+            let data = io_access.Data.to_le_bytes();
+            if pio_bus.write(context.id.into(), port, &data[..len]) {
+                S_OK
+            } else {
+                E_FAIL
+            }
+        }
+        _ => E_INVALIDARG,
+    }
 }
 
 #[cfg(target_arch = "x86_64")]

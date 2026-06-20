@@ -27,11 +27,11 @@ mod kvmioapic;
 mod rtc_pl031;
 #[cfg(target_os = "macos")]
 mod vcpu;
-#[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 mod x86_64;
 #[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
 use x86_64::cmos;
-#[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 use x86_64::serial;
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
@@ -69,7 +69,11 @@ pub use self::kvmgicv3::KvmGicV3;
 pub use self::kvmioapic::KvmIoapic;
 #[cfg(all(not(target_os = "windows"), target_arch = "aarch64"))]
 pub use self::rtc_pl031::RTC;
-#[cfg(any(not(target_os = "windows"), target_arch = "aarch64"))]
+#[cfg(any(
+    not(target_os = "windows"),
+    target_arch = "aarch64",
+    target_arch = "x86_64"
+))]
 pub use self::serial::Serial;
 #[cfg(target_os = "macos")]
 pub use self::vcpu::VcpuList;
