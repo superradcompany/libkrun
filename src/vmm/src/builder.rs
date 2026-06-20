@@ -146,6 +146,8 @@ use vm_memory::GuestMemory;
 ))]
 use vm_memory::GuestRegionMmap;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
+#[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+use windows_sys::Win32::System::Hypervisor::{WHvRequestInterrupt, WHV_PARTITION_HANDLE};
 
 #[cfg(target_arch = "aarch64")]
 #[allow(dead_code)]
@@ -611,15 +613,39 @@ pub enum Payload {
 
 #[cfg(target_os = "windows")]
 struct WhpIrqChip {
+    #[cfg(target_arch = "aarch64")]
+    partition_handle: WHV_PARTITION_HANDLE,
     vcpu_count: u64,
 }
 
 #[cfg(target_os = "windows")]
 impl WhpIrqChip {
-    fn new(vcpu_count: u64) -> Self {
-        Self { vcpu_count }
+    fn new(
+        #[cfg(target_arch = "aarch64")] partition_handle: WHV_PARTITION_HANDLE,
+        vcpu_count: u64,
+    ) -> Self {
+        Self {
+            #[cfg(target_arch = "aarch64")]
+            partition_handle,
+            vcpu_count,
+        }
     }
 }
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+#[repr(C)]
+struct WhvArm64InterruptControl {
+    target_partition: u64,
+    interrupt_control: u64,
+    destination_address: u64,
+    requested_vector: u32,
+    target_vtl: u8,
+    reserved_z0: u8,
+    reserved_z1: u16,
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+const WHV_ARM64_INTERRUPT_CONTROL_ASSERTED: u64 = 1 << 34;
 
 #[cfg(target_os = "windows")]
 impl devices::BusDevice for WhpIrqChip {}
@@ -664,9 +690,42 @@ impl IrqChipT for WhpIrqChip {
 
     fn set_irq(
         &self,
-        _irq_line: Option<u32>,
+        irq_line: Option<u32>,
         _interrupt_evt: Option<&EventFd>,
     ) -> std::result::Result<(), devices::Error> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let Some(irq_line) = irq_line else {
+                return Err(devices::Error::IoError(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "WHP interrupt line was not set",
+                )));
+            };
+
+            let interrupt = WhvArm64InterruptControl {
+                target_partition: 0,
+                interrupt_control: WHV_ARM64_INTERRUPT_CONTROL_ASSERTED,
+                destination_address: 0,
+                requested_vector: irq_line,
+                target_vtl: 0,
+                reserved_z0: 0,
+                reserved_z1: 0,
+            };
+            let hresult = unsafe {
+                WHvRequestInterrupt(
+                    self.partition_handle,
+                    &interrupt as *const WhvArm64InterruptControl as *const _,
+                    std::mem::size_of::<WhvArm64InterruptControl>() as u32,
+                )
+            };
+            if hresult < 0 {
+                return Err(devices::Error::IoError(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("WHvRequestInterrupt failed with HRESULT {hresult:#x}"),
+                )));
+            }
+        }
+
         Ok(())
     }
 }
@@ -951,11 +1010,15 @@ pub fn build_microvm(
         serial_devices.push(setup_serial_device(event_manager, None, Some(output))?);
 
         if vm_resources.kernel_console.is_none() {
-            let cmdline = kernel_cmdline
-                .as_str()
-                .replace("console=hvc0", "console=ttyAMA0");
-            kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
-            kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
+            if kernel_cmdline.as_str().contains("console=") {
+                let cmdline = kernel_cmdline
+                    .as_str()
+                    .replace("console=hvc0", "console=ttyAMA0");
+                kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
+                kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
+            } else {
+                kernel_cmdline.insert("console", "ttyAMA0").unwrap();
+            }
         }
     }
 
@@ -1058,6 +1121,8 @@ pub fn build_microvm(
     #[cfg(target_os = "windows")]
     {
         intc = Arc::new(Mutex::new(IrqChipDevice::new(Box::new(WhpIrqChip::new(
+            #[cfg(target_arch = "aarch64")]
+            vm.partition_handle(),
             u64::from(vcpu_config.vcpu_count),
         )))));
         vcpus = create_vcpus_windows(

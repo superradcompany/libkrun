@@ -332,22 +332,20 @@ fn create_serial_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt: &mut FdtWriter,
     dev_info: &T,
 ) -> Result<()> {
+    let compatible = b"arm,pl011\0arm,primecell\0";
+    let clock_names = b"uartclk\0apb_pclk\0";
     let serial_reg_prop = generate_prop64(&[dev_info.addr(), dev_info.length()]);
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, dev_info.irq(), IRQ_TYPE_EDGE_RISING]);
+    let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, dev_info.irq(), IRQ_TYPE_LEVEL_HI]);
     #[cfg(target_os = "macos")]
-    let irq = generate_prop32(&[
-        GIC_FDT_IRQ_TYPE_SPI,
-        dev_info.irq() - 32,
-        IRQ_TYPE_EDGE_RISING,
-    ]);
+    let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, dev_info.irq() - 32, IRQ_TYPE_LEVEL_HI]);
 
     let node = fdt.begin_node(&format!("uart@{:x}", dev_info.addr()))?;
-    fdt.property_string("compatible", "arm,pl011")?;
+    fdt.property("compatible", compatible)?;
     fdt.property_string("status", "okay")?;
     fdt.property("reg", &serial_reg_prop)?;
-    fdt.property_u32("clocks", CLOCK_PHANDLE)?;
-    fdt.property_string("clock-names", "apb_pclk")?;
+    fdt.property_array_u32("clocks", &[CLOCK_PHANDLE, CLOCK_PHANDLE])?;
+    fdt.property("clock-names", clock_names)?;
     fdt.property("interrupts", &irq)?;
     fdt.end_node(node)?;
 
