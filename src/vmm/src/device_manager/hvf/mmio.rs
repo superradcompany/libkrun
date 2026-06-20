@@ -11,9 +11,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
-#[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
+#[cfg(target_arch = "aarch64")]
 use devices::fdt::DeviceInfoForFDT;
-#[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
+#[cfg(target_arch = "aarch64")]
 use devices::legacy::IrqChip;
 use devices::{BusDevice, DeviceType};
 use kernel::cmdline as kernel_cmdline;
@@ -22,7 +22,7 @@ use polly::event_manager::EventManager;
 #[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
 use utils::eventfd::EventFd;
 
-#[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
+#[cfg(target_arch = "aarch64")]
 use crate::vstate::Vm;
 
 /// Errors for MMIO device manager.
@@ -139,7 +139,7 @@ impl MMIODeviceManager {
         Ok(ret)
     }
 
-    #[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
+    #[cfg(target_arch = "aarch64")]
     /// Register an early console at some MMIO address.
     pub fn register_mmio_serial(
         &mut self,
@@ -283,7 +283,7 @@ impl MMIODeviceManager {
         Ok(())
     }
 
-    #[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
+    #[cfg(target_arch = "aarch64")]
     /// Gets the information of the devices registered up to some point in time.
     pub fn get_device_info(&self) -> &HashMap<(DeviceType, String), MMIODeviceInfo> {
         &self.id_to_dev_info
@@ -315,7 +315,7 @@ pub struct MMIODeviceInfo {
     len: u64,
 }
 
-#[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
+#[cfg(target_arch = "aarch64")]
 impl DeviceInfoForFDT for MMIODeviceInfo {
     fn addr(&self) -> u64 {
         self.addr

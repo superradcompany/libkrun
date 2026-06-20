@@ -53,13 +53,13 @@ use std::os::fd::AsRawFd;
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::time::Duration;
 
 #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::vstate::VcpuEvent;
 use crate::vstate::{Vcpu, VcpuHandle, VcpuResponse, Vm};
 
@@ -68,7 +68,7 @@ use arch::{ArchMemoryInfo, InitrdConfig};
 use crossbeam_channel::Sender;
 #[cfg(all(
     any(target_arch = "aarch64", target_arch = "riscv64"),
-    not(target_os = "windows")
+    any(target_arch = "aarch64", not(target_os = "windows"))
 ))]
 use devices::fdt;
 use devices::legacy::IrqChip;
@@ -130,7 +130,7 @@ pub enum Error {
     Serial(io::Error),
     #[cfg(all(
         any(target_arch = "aarch64", target_arch = "riscv64"),
-        not(target_os = "windows")
+        any(target_arch = "aarch64", not(target_os = "windows"))
     ))]
     /// Cannot generate or write FDT
     SetupFDT(devices::fdt::Error),
@@ -174,7 +174,7 @@ impl Display for Error {
             Serial(e) => write!(f, "Error writing to the serial console: {e:?}"),
             #[cfg(all(
                 any(target_arch = "aarch64", target_arch = "riscv64"),
-                not(target_os = "windows")
+                any(target_arch = "aarch64", not(target_os = "windows"))
             ))]
             SetupFDT(e) => write!(f, "Error generating or writing FDT: {e:?}"),
             TimerFd(e) => write!(f, "Error creating timer fd: {e}"),
@@ -288,6 +288,20 @@ impl Vmm {
 
     #[cfg(target_os = "windows")]
     pub fn resume_vcpus(&mut self) -> Result<()> {
+        for handle in self.vcpus_handles.iter() {
+            handle
+                .send_event(VcpuEvent::Resume)
+                .map_err(Error::VcpuEvent)?;
+        }
+        for handle in self.vcpus_handles.iter() {
+            match handle
+                .response_receiver()
+                .recv_timeout(Duration::from_millis(1000))
+            {
+                Ok(VcpuResponse::Resumed) => (),
+                _ => return Err(Error::VcpuResume),
+            }
+        }
         Ok(())
     }
 
@@ -299,7 +313,7 @@ impl Vmm {
         initrd: &Option<InitrdConfig>,
         _smbios_oem_strings: &Option<Vec<String>>,
     ) -> Result<()> {
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
         let _ = (vcpus, initrd);
 
         #[cfg(target_arch = "x86_64")]
@@ -321,7 +335,7 @@ impl Vmm {
             .map_err(Error::ConfigureSystem)?;
         }
 
-        #[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
+        #[cfg(target_arch = "aarch64")]
         {
             let vcpu_mpidr = vcpus.iter().map(|cpu| cpu.get_mpidr()).collect();
             fdt::create_fdt(

@@ -544,6 +544,7 @@ impl VmBuilder {
             self.exec.workdir,
             rlimits,
             self.kernel.krunfw_path,
+            self.kernel.initramfs_path,
             self.kernel.init_path,
             self.exit_observers,
             exit_evt,

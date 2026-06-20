@@ -1118,6 +1118,7 @@ dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
+ "libloading",
  "linux-loader",
  "log",
  "msb_krun_arch",

@@ -2,7 +2,8 @@
 //!
 //! Prerequisites:
 //! - libkrunfw shared library (set KRUNFW_PATH or install system-wide)
-//! - The rootfs-alpine git submodule initialized
+//! - The rootfs-alpine git submodule initialized on Unix hosts
+//! - On Windows, set KRUN_INITRAMFS_PATH to a Linux initramfs image
 //!
 //! On macOS, the binary must be codesigned with the hypervisor entitlement:
 //!   cd examples && make rust_vm
@@ -39,9 +40,25 @@ fn main() -> Result<()> {
     #[cfg(target_os = "windows")]
     eprintln!("Entering VM");
 
-    let builder = VmBuilder::new()
-        .machine(|m| m.vcpus(2).memory_mib(1024))
-        .kernel(|k| k.krunfw_path(&krunfw_path));
+    #[cfg(target_os = "windows")]
+    let initramfs_path = std::env::var("KRUN_INITRAMFS_PATH").ok();
+
+    let builder = VmBuilder::new().machine(|m| m.vcpus(2).memory_mib(1024));
+
+    #[cfg(target_os = "windows")]
+    let builder = builder.kernel(|k| {
+        let k = k.krunfw_path(&krunfw_path);
+        if let Some(initramfs_path) = &initramfs_path {
+            k.initramfs_path(initramfs_path)
+                .init_path("/init")
+                .cmdline("root=/dev/ram0 rw")
+        } else {
+            k
+        }
+    });
+
+    #[cfg(not(target_os = "windows"))]
+    let builder = builder.kernel(|k| k.krunfw_path(&krunfw_path));
 
     #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     let builder = builder.fs(|fs| fs.root(&rootfs_path));

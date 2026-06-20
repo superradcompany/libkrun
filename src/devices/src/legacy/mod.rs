@@ -33,11 +33,11 @@ mod x86_64;
 use x86_64::cmos;
 #[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
 use x86_64::serial;
-#[cfg(all(not(target_os = "windows"), target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 mod aarch64;
 #[cfg(all(not(target_os = "windows"), target_arch = "aarch64"))]
 use aarch64::gpio;
-#[cfg(all(not(target_os = "windows"), target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 use aarch64::serial;
 #[cfg(target_arch = "riscv64")]
 mod riscv64;
@@ -69,7 +69,7 @@ pub use self::kvmgicv3::KvmGicV3;
 pub use self::kvmioapic::KvmIoapic;
 #[cfg(all(not(target_os = "windows"), target_arch = "aarch64"))]
 pub use self::rtc_pl031::RTC;
-#[cfg(not(target_os = "windows"))]
+#[cfg(any(not(target_os = "windows"), target_arch = "aarch64"))]
 pub use self::serial::Serial;
 #[cfg(target_os = "macos")]
 pub use self::vcpu::VcpuList;
@@ -83,6 +83,12 @@ pub trait ReadableFd: std::io::Read + std::os::fd::AsRawFd {}
 
 #[cfg(unix)]
 impl ReadableFd for std::fs::File {}
+
+#[cfg(windows)]
+pub trait ReadableFd: std::io::Read {}
+
+#[cfg(windows)]
+impl<T: std::io::Read> ReadableFd for T {}
 
 #[cfg(target_os = "linux")]
 #[derive(Clone)]

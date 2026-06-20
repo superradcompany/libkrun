@@ -78,6 +78,7 @@ pub struct MachineBuilder {
 pub struct KernelBuilder {
     pub(crate) cmdline: Option<String>,
     pub(crate) krunfw_path: Option<PathBuf>,
+    pub(crate) initramfs_path: Option<PathBuf>,
     pub(crate) init_path: Option<String>,
 }
 
@@ -487,6 +488,15 @@ impl KernelBuilder {
     /// When not set, the OS dynamic linker's default search path is used.
     pub fn krunfw_path(mut self, path: impl AsRef<Path>) -> Self {
         self.krunfw_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Set an explicit path to an initramfs image.
+    ///
+    /// The image is copied into guest memory and advertised through the device
+    /// tree on architectures that support direct kernel boot.
+    pub fn initramfs_path(mut self, path: impl AsRef<Path>) -> Self {
+        self.initramfs_path = Some(path.as_ref().to_path_buf());
         self
     }
 

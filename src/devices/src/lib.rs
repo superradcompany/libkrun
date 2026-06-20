@@ -15,8 +15,8 @@ use std::io;
 
 mod bus;
 #[cfg(all(
-    not(target_os = "windows"),
-    any(target_arch = "aarch64", target_arch = "riscv64")
+    any(target_arch = "aarch64", target_arch = "riscv64"),
+    any(target_arch = "aarch64", not(target_os = "windows"))
 ))]
 pub mod fdt;
 pub mod legacy;
@@ -44,16 +44,16 @@ pub enum DeviceType {
     /// Device Type: Virtio.
     Virtio(u32),
     /// Device Type: GPIO (PL061).
-    #[cfg(all(not(target_os = "windows"), target_arch = "aarch64"))]
+    #[cfg(target_arch = "aarch64")]
     Gpio,
     /// Device Type: Serial.
     #[cfg(all(
-        not(target_os = "windows"),
-        any(target_arch = "aarch64", target_arch = "riscv64")
+        any(target_arch = "aarch64", target_arch = "riscv64"),
+        any(target_arch = "aarch64", not(target_os = "windows"))
     ))]
     Serial,
     /// Device Type: RTC.
-    #[cfg(all(not(target_os = "windows"), target_arch = "aarch64"))]
+    #[cfg(target_arch = "aarch64")]
     RTC,
 }
 

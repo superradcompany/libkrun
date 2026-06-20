@@ -17,6 +17,7 @@ use polly::event_manager::EventManager;
 use utils::eventfd::EventFd;
 use vmm::resources::TsiFlags;
 use vmm::resources::VmResources;
+use vmm::vmm_config::kernel_bundle::InitrdBundle;
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 use vmm::vmm_config::kernel_cmdline::KernelCmdlineConfig;
 use vmm::vmm_config::vsock::VsockDeviceConfig;
@@ -47,6 +48,7 @@ pub struct Vm {
     workdir: Option<String>,
     rlimits: Option<String>,
     krunfw_path: Option<PathBuf>,
+    initramfs_path: Option<PathBuf>,
     init_path: Option<String>,
     exit_observers: Vec<Box<dyn Fn(i32) + Send + 'static>>,
     /// Pre-created exit event fd for triggering VM shutdown.
@@ -60,6 +62,8 @@ pub struct Vm {
     enable_inet_hijack: bool,
     /// Keeps the libkrunfw library loaded so kernel memory pointers remain valid.
     _krunfw_library: Option<libloading::Library>,
+    /// Keeps an explicit initramfs allocation alive until it is copied to guest memory.
+    _initramfs_data: Option<Vec<u8>>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -78,6 +82,7 @@ impl Vm {
         workdir: Option<String>,
         rlimits: Option<String>,
         krunfw_path: Option<PathBuf>,
+        initramfs_path: Option<PathBuf>,
         init_path: Option<String>,
         exit_observers: Vec<Box<dyn Fn(i32) + Send + 'static>>,
         exit_evt: EventFd,
@@ -93,12 +98,14 @@ impl Vm {
             workdir,
             rlimits,
             krunfw_path,
+            initramfs_path,
             init_path,
             exit_observers,
             exit_evt,
             exit_code,
             enable_inet_hijack,
             _krunfw_library: None,
+            _initramfs_data: None,
         }
     }
 
@@ -277,6 +284,19 @@ impl Vm {
         self.vmr
             .set_kernel_bundle(kernel_bundle)
             .map_err(|e| Error::Build(BuildError::Krunfw(format!("{e:?}"))))?;
+
+        if let Some(initramfs_path) = &self.initramfs_path {
+            let initramfs_data = std::fs::read(initramfs_path)?;
+            let initrd_bundle = InitrdBundle {
+                host_addr: initramfs_data.as_ptr() as u64,
+                size: initramfs_data.len(),
+            };
+
+            self.vmr
+                .set_initrd_bundle(initrd_bundle)
+                .map_err(|e| Error::Build(BuildError::Krunfw(format!("{e:?}"))))?;
+            self._initramfs_data = Some(initramfs_data);
+        }
 
         // Keep the library alive so the kernel memory pointers remain valid.
         self._krunfw_library = Some(krunfw.library);

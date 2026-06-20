@@ -10,7 +10,10 @@ use kernel::cmdline::Cmdline;
 #[cfg(target_os = "macos")]
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
-#[cfg(not(target_os = "windows"))]
+#[cfg(any(
+    not(target_os = "windows"),
+    all(target_arch = "aarch64", target_os = "windows")
+))]
 use std::fs::File;
 use std::io;
 #[cfg(not(target_os = "windows"))]
@@ -49,7 +52,10 @@ use devices::legacy::Cmos;
 use devices::legacy::IrqChipT;
 #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
 use devices::legacy::KvmAia;
-#[cfg(not(target_os = "windows"))]
+#[cfg(any(
+    not(target_os = "windows"),
+    all(target_arch = "aarch64", target_os = "windows")
+))]
 use devices::legacy::Serial;
 #[cfg(target_os = "macos")]
 use devices::legacy::VcpuList;
@@ -89,6 +95,8 @@ use crate::vstate::KvmContext;
 #[cfg(all(target_os = "linux", feature = "tee"))]
 use crate::vstate::MeasuredRegion;
 use crate::vstate::{Error as VstateError, Vcpu, VcpuConfig, Vm};
+#[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+use crate::windows::vstate::{WHP_GICD_BASE, WHP_GICD_SIZE, WHP_GICR_BASE, WHP_GICR_SIZE};
 use arch::{ArchMemoryInfo, InitrdConfig};
 use device_manager::shm::ShmManager;
 #[cfg(feature = "gpu")]
@@ -602,7 +610,16 @@ pub enum Payload {
 }
 
 #[cfg(target_os = "windows")]
-struct WhpIrqChip;
+struct WhpIrqChip {
+    vcpu_count: u64,
+}
+
+#[cfg(target_os = "windows")]
+impl WhpIrqChip {
+    fn new(vcpu_count: u64) -> Self {
+        Self { vcpu_count }
+    }
+}
 
 #[cfg(target_os = "windows")]
 impl devices::BusDevice for WhpIrqChip {}
@@ -610,23 +627,28 @@ impl devices::BusDevice for WhpIrqChip {}
 #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
 impl devices::legacy::gic::GICDevice for WhpIrqChip {
     fn device_properties(&self) -> Vec<u64> {
-        Vec::new()
+        vec![
+            WHP_GICD_BASE,
+            WHP_GICD_SIZE,
+            WHP_GICR_BASE,
+            WHP_GICR_SIZE * self.vcpu_count,
+        ]
     }
 
     fn vcpu_count(&self) -> u64 {
-        0
+        self.vcpu_count
     }
 
     fn fdt_compatibility(&self) -> String {
-        "microsoft,whp-placeholder-gic".to_string()
+        "arm,gic-v3".to_string()
     }
 
     fn fdt_maint_irq(&self) -> u32 {
-        0
+        9
     }
 
     fn version(&self) -> u32 {
-        0
+        3
     }
 }
 
@@ -706,7 +728,16 @@ pub fn build_microvm(
     )?;
     trace.mark("guest_memory.ready");
 
-    let vcpu_config = vm_resources.vcpu_config();
+    #[allow(unused_mut)]
+    let mut vcpu_config = vm_resources.vcpu_config();
+    #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+    if vcpu_config.vcpu_count > 1 {
+        debug!(
+            "WHP ARM64 PSCI bring-up is not implemented yet; booting with one vCPU instead of {}",
+            vcpu_config.vcpu_count
+        );
+        vcpu_config.vcpu_count = 1;
+    }
 
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[allow(unused_mut)]
@@ -861,7 +892,10 @@ pub fn build_microvm(
         m
     };
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(any(
+        not(target_os = "windows"),
+        all(target_arch = "aarch64", target_os = "windows")
+    ))]
     let mut serial_devices = Vec::new();
 
     // Create the legacy serial device if we're booting from a firmware
@@ -903,6 +937,26 @@ pub fn build_microvm(
         };
 
         serial_devices.push(setup_serial_device(event_manager, input, output)?);
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+    if !vm_resources.disable_implicit_console {
+        let output: Box<dyn io::Write + Send> = if let Some(console_output_path) =
+            &vm_resources.console_output
+        {
+            Box::new(File::create(console_output_path).map_err(StartMicrovmError::OpenConsoleFile)?)
+        } else {
+            Box::new(io::stdout())
+        };
+        serial_devices.push(setup_serial_device(event_manager, None, Some(output))?);
+
+        if vm_resources.kernel_console.is_none() {
+            let cmdline = kernel_cmdline
+                .as_str()
+                .replace("console=hvc0", "console=ttyAMA0");
+            kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
+            kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
+        }
     }
 
     // Register signal handlers with the pre-created exit EventFd.
@@ -1003,7 +1057,9 @@ pub fn build_microvm(
 
     #[cfg(target_os = "windows")]
     {
-        intc = Arc::new(Mutex::new(IrqChipDevice::new(Box::new(WhpIrqChip))));
+        intc = Arc::new(Mutex::new(IrqChipDevice::new(Box::new(WhpIrqChip::new(
+            u64::from(vcpu_config.vcpu_count),
+        )))));
         vcpus = create_vcpus_windows(
             &vm,
             &vcpu_config,
@@ -1014,6 +1070,17 @@ pub fn build_microvm(
             vm_resources.metrics.clone(),
         )
         .map_err(StartMicrovmError::Internal)?;
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+    {
+        attach_legacy_devices(
+            &vm,
+            &mut mmio_device_manager,
+            &mut kernel_cmdline,
+            intc.clone(),
+            serial_devices,
+        )?;
     }
 
     #[cfg(feature = "tdx")]
@@ -1609,7 +1676,33 @@ fn load_payload(
             guest_mem
                 .write(kernel_data, GuestAddress(kernel_guest_addr))
                 .unwrap();
-            Ok((guest_mem, GuestAddress(kernel_entry_addr), None, None))
+
+            let initrd_config = if let Some(initrd_bundle) = &_vm_resources.initrd_bundle {
+                let initrd_data = unsafe {
+                    std::slice::from_raw_parts(
+                        initrd_bundle.host_addr as *mut u8,
+                        initrd_bundle.size,
+                    )
+                };
+
+                guest_mem
+                    .write(initrd_data, GuestAddress(_arch_mem_info.initrd_addr))
+                    .map_err(|_| StartMicrovmError::InitrdLoad)?;
+
+                Some(InitrdConfig {
+                    address: GuestAddress(_arch_mem_info.initrd_addr),
+                    size: initrd_data.len(),
+                })
+            } else {
+                None
+            };
+
+            Ok((
+                guest_mem,
+                GuestAddress(kernel_entry_addr),
+                initrd_config,
+                None,
+            ))
         }
         #[cfg(all(
             target_arch = "x86_64",
@@ -1776,7 +1869,14 @@ pub fn create_guest_memory(
         Payload::ExternalKernel(external_kernel) => {
             arch::arch_memory_regions(mem_size, external_kernel.initramfs_size, None)
         }
-        _ => arch::arch_memory_regions(mem_size, 0, firmware_size),
+        _ => {
+            let initrd_size = vm_resources
+                .initrd_bundle
+                .as_ref()
+                .map(|initrd| initrd.size as u64)
+                .unwrap_or(0);
+            arch::arch_memory_regions(mem_size, initrd_size, firmware_size)
+        }
     };
 
     let mut shm_manager = ShmManager::new(&arch_mem_info);
@@ -1926,7 +2026,10 @@ pub(crate) fn setup_vm(
 }
 
 /// Sets up the serial device.
-#[cfg(not(target_os = "windows"))]
+#[cfg(any(
+    not(target_os = "windows"),
+    all(target_arch = "aarch64", target_os = "windows")
+))]
 pub fn setup_serial_device(
     event_manager: &mut EventManager,
     input: Option<Box<dyn devices::legacy::ReadableFd + Send>>,
@@ -1948,6 +2051,24 @@ pub fn setup_serial_device(
         }
     }
     Ok(serial)
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+fn attach_legacy_devices(
+    vm: &Vm,
+    mmio_device_manager: &mut MMIODeviceManager,
+    kernel_cmdline: &mut kernel::cmdline::Cmdline,
+    intc: IrqChip,
+    serial: Vec<Arc<Mutex<Serial>>>,
+) -> std::result::Result<(), StartMicrovmError> {
+    for s in serial {
+        mmio_device_manager
+            .register_mmio_serial(vm, kernel_cmdline, intc.clone(), s)
+            .map_err(Error::RegisterMMIODevice)
+            .map_err(StartMicrovmError::Internal)?;
+    }
+
+    Ok(())
 }
 
 #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
@@ -2098,12 +2219,14 @@ fn create_vcpus_windows(
     guest_mem: &GuestMemoryMmap,
     mem_info: &ArchMemoryInfo,
     entry_addr: GuestAddress,
-    _exit_evt: &EventFd,
+    exit_evt: &EventFd,
     _metrics: utils::metrics::MetricsWriter,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
     for cpu_index in 0..vcpu_config.vcpu_count {
-        let mut vcpu = vm.create_vcpu(cpu_index).map_err(Error::Vcpu)?;
+        let mut vcpu = vm
+            .create_vcpu(cpu_index, exit_evt.try_clone().map_err(Error::EventFd)?)
+            .map_err(Error::Vcpu)?;
         vcpu.configure_windows(guest_mem, mem_info, entry_addr)
             .map_err(Error::Vcpu)?;
         vcpus.push(vcpu);
