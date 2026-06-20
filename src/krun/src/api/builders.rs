@@ -16,7 +16,7 @@ use vmm::resources::PortConfig;
 ))]
 use crate::backends::fs::DynFileSystem;
 
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", unix))]
 use std::os::fd::OwnedFd;
 #[cfg(not(target_os = "windows"))]
 use std::os::fd::RawFd;
@@ -161,16 +161,20 @@ pub struct NetBuilder {
 #[cfg(feature = "net")]
 pub enum NetConfig {
     /// Unixgram backend from a pre-opened fd.
+    #[cfg(unix)]
     UnixgramFd { mac: Option<[u8; 6]>, fd: OwnedFd },
     /// Unixgram backend connecting to a socket path.
+    #[cfg(unix)]
     UnixgramPath {
         mac: Option<[u8; 6]>,
         path: PathBuf,
         send_vfkit_magic: bool,
     },
     /// Unixstream backend from a pre-opened fd.
+    #[cfg(unix)]
     UnixstreamFd { mac: Option<[u8; 6]>, fd: OwnedFd },
     /// Unixstream backend connecting to a socket path.
+    #[cfg(unix)]
     UnixstreamPath { mac: Option<[u8; 6]>, path: PathBuf },
     /// TAP backend (Linux only).
     #[cfg(target_os = "linux")]
@@ -609,6 +613,7 @@ impl NetBuilder {
     }
 
     /// Attach a unixgram network backend from a pre-opened fd.
+    #[cfg(unix)]
     pub fn unixgram(mut self, fd: OwnedFd) -> Self {
         let mac = self.current_mac.take();
         self.configs.push(NetConfig::UnixgramFd { mac, fd });
@@ -616,6 +621,7 @@ impl NetBuilder {
     }
 
     /// Attach a unixgram network backend connecting to a socket path.
+    #[cfg(unix)]
     pub fn unixgram_path(mut self, path: impl AsRef<Path>, send_vfkit_magic: bool) -> Self {
         let mac = self.current_mac.take();
         self.configs.push(NetConfig::UnixgramPath {
@@ -627,6 +633,7 @@ impl NetBuilder {
     }
 
     /// Attach a unixstream network backend from a pre-opened fd.
+    #[cfg(unix)]
     pub fn unixstream(mut self, fd: OwnedFd) -> Self {
         let mac = self.current_mac.take();
         self.configs.push(NetConfig::UnixstreamFd { mac, fd });
@@ -634,6 +641,7 @@ impl NetBuilder {
     }
 
     /// Attach a unixstream network backend connecting to a socket path.
+    #[cfg(unix)]
     pub fn unixstream_path(mut self, path: impl AsRef<Path>) -> Self {
         let mac = self.current_mac.take();
         self.configs.push(NetConfig::UnixstreamPath {

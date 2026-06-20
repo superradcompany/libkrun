@@ -43,7 +43,7 @@ use vmm::vmm_config::block::BlockDeviceConfig;
 
 #[cfg(feature = "net")]
 use devices::virtio::net::device::VirtioNetBackend;
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", unix))]
 use std::os::fd::IntoRawFd;
 #[cfg(feature = "net")]
 use vmm::vmm_config::net::NetworkInterfaceConfig;
@@ -431,17 +431,21 @@ impl VmBuilder {
         #[cfg(feature = "net")]
         for (i, config) in self.net.configs.into_iter().enumerate() {
             let (mac, backend) = match config {
+                #[cfg(unix)]
                 NetConfig::UnixgramFd { mac, fd } => {
                     (mac, VirtioNetBackend::UnixgramFd(fd.into_raw_fd()))
                 }
+                #[cfg(unix)]
                 NetConfig::UnixgramPath {
                     mac,
                     path,
                     send_vfkit_magic,
                 } => (mac, VirtioNetBackend::UnixgramPath(path, send_vfkit_magic)),
+                #[cfg(unix)]
                 NetConfig::UnixstreamFd { mac, fd } => {
                     (mac, VirtioNetBackend::UnixstreamFd(fd.into_raw_fd()))
                 }
+                #[cfg(unix)]
                 NetConfig::UnixstreamPath { mac, path } => {
                     (mac, VirtioNetBackend::UnixstreamPath(path))
                 }

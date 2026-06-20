@@ -6,7 +6,6 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use std::os::fd::RawFd;
 //! use krun::backends::net::{NetBackend, ReadError, WriteError};
 //!
 //! struct MyNetBackend {
@@ -32,10 +31,8 @@
 //!         Ok(())
 //!     }
 //!
-//!     fn raw_socket_fd(&self) -> RawFd {
-//!         // Return the raw fd for epoll registration
-//!         todo!()
-//!     }
+//!     // Unix backends can implement raw_socket_fd(); Windows backends expose
+//!     // readiness through event_source().
 //! }
 //! ```
 
@@ -46,8 +43,8 @@
 #[cfg(feature = "net")]
 pub use devices::virtio::net::backend::{ConnectError, NetBackend, ReadError, WriteError};
 
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", unix))]
 pub use devices::virtio::net::unixgram::Unixgram;
 
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", unix))]
 pub use devices::virtio::net::unixstream::Unixstream;

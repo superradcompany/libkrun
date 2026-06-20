@@ -1,15 +1,23 @@
 use std::io;
+#[cfg(unix)]
 use std::os::fd::RawFd;
+
+use utils::event::{EventSource, EventToken};
+
+#[cfg(unix)]
+type BackendError = nix::Error;
+#[cfg(windows)]
+type BackendError = io::Error;
 
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum ConnectError {
-    InvalidAddress(nix::Error),
-    CreateSocket(nix::Error),
-    Binding(nix::Error),
-    SendingMagic(nix::Error),
+    InvalidAddress(BackendError),
+    CreateSocket(BackendError),
+    Binding(BackendError),
+    SendingMagic(BackendError),
     // Tap backend errors.
-    OpenNetTun(nix::Error),
+    OpenNetTun(BackendError),
     TunSetIff(io::Error),
     TunSetVnetHdrSz(io::Error),
     TunSetOffload(io::Error),
@@ -21,7 +29,7 @@ pub enum ReadError {
     /// Nothing was written
     NothingRead,
     /// Another internal error occurred
-    Internal(nix::Error),
+    Internal(BackendError),
 }
 
 #[allow(dead_code)]
@@ -34,7 +42,7 @@ pub enum WriteError {
     /// Passt doesnt seem to be running (received EPIPE)
     ProcessNotRunning,
     /// Another internal error occurred
-    Internal(nix::Error),
+    Internal(BackendError),
 }
 
 pub trait NetBackend {
@@ -42,5 +50,15 @@ pub trait NetBackend {
     fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError>;
     fn has_unfinished_write(&self) -> bool;
     fn try_finish_write(&mut self, hdr_len: usize, buf: &[u8]) -> Result<(), WriteError>;
+
+    #[cfg(unix)]
     fn raw_socket_fd(&self) -> RawFd;
+
+    #[cfg(unix)]
+    fn event_source(&self, token: EventToken) -> EventSource {
+        EventSource::fd(self.raw_socket_fd(), token)
+    }
+
+    #[cfg(windows)]
+    fn event_source(&self, token: EventToken) -> EventSource;
 }
