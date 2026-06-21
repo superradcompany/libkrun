@@ -7,7 +7,6 @@ use std::time::Duration;
 use devices::virtio::console::port_io::{
     ConsolePortBackend, ConsolePortBackendInputAdapter, ConsolePortBackendOutputAdapter,
 };
-#[cfg(not(target_os = "windows"))]
 use vmm::resources::PortConfig;
 
 #[cfg(all(
@@ -217,7 +216,6 @@ pub enum NetConfig {
 #[derive(Default)]
 pub struct ConsoleBuilder {
     pub(crate) output: Option<PathBuf>,
-    #[cfg(not(target_os = "windows"))]
     pub(crate) ports: Vec<PortConfig>,
     pub(crate) disable_implicit: bool,
     #[cfg(feature = "snd")]
@@ -714,6 +712,29 @@ impl ConsoleBuilder {
         self
     }
 
+    /// Add an output-only virtio-console device backed by a host file.
+    ///
+    /// On Windows this creates a real guest console port, so guests can use it as `hvc0` when the implicit serial console is disabled or `krun_set_kernel_console` selects it.
+    #[cfg(target_os = "windows")]
+    pub fn virtio_output(mut self, path: impl AsRef<Path>) -> Self {
+        self.ports.push(PortConfig::ConsoleOutputFile {
+            path: path.as_ref().to_path_buf(),
+        });
+        self
+    }
+
+    /// Add a bidirectional virtio-console port backed by a Windows named pipe.
+    ///
+    /// The guest sees the port as `/dev/virtio-ports/<name>`. The host connects to `pipe_name` as a client, so the helper should create the pipe server first.
+    #[cfg(target_os = "windows")]
+    pub fn named_pipe(mut self, name: &str, pipe_name: impl Into<String>) -> Self {
+        self.ports.push(PortConfig::NamedPipe {
+            name: name.to_string(),
+            pipe_name: pipe_name.into(),
+        });
+        self
+    }
+
     /// Enable the virtio-snd device.
     #[cfg(feature = "snd")]
     pub fn sound(mut self, enabled: bool) -> Self {
@@ -1001,6 +1022,41 @@ impl From<SyncMode> for devices::virtio::block::SyncMode {
             SyncMode::None => devices::virtio::block::SyncMode::None,
             SyncMode::Relaxed => devices::virtio::block::SyncMode::Relaxed,
             SyncMode::Full => devices::virtio::block::SyncMode::Full,
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_virtio_output_records_file_backed_console_port() {
+        let path = PathBuf::from(r"C:\logs\guest-console.log");
+        let mut builder = ConsoleBuilder::new().virtio_output(&path);
+
+        assert_eq!(builder.ports.len(), 1);
+        match builder.ports.pop().unwrap() {
+            PortConfig::ConsoleOutputFile { path: actual } => assert_eq!(actual, path),
+            _ => panic!("unexpected console port config"),
+        }
+    }
+
+    #[test]
+    fn windows_named_pipe_records_pipe_backed_console_port() {
+        let mut builder = ConsoleBuilder::new().named_pipe("agent", r"\\.\pipe\msb-agent-console");
+
+        assert_eq!(builder.ports.len(), 1);
+        match builder.ports.pop().unwrap() {
+            PortConfig::NamedPipe { name, pipe_name } => {
+                assert_eq!(name, "agent");
+                assert_eq!(pipe_name, r"\\.\pipe\msb-agent-console");
+            }
+            _ => panic!("unexpected console port config"),
         }
     }
 }

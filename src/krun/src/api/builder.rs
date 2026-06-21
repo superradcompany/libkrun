@@ -4,7 +4,6 @@ use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
 
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
-#[cfg(not(target_os = "windows"))]
 use vmm::resources::VirtioConsoleConfigMode;
 use vmm::resources::VmResources;
 use vmm::vmm_config::machine_config::VmConfig;
@@ -427,7 +426,6 @@ impl VmBuilder {
         }
 
         // Apply console port configuration
-        #[cfg(not(target_os = "windows"))]
         if !self.console.ports.is_empty() {
             vmr.virtio_consoles
                 .push(VirtioConsoleConfigMode::Explicit(self.console.ports));

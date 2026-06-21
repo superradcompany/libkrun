@@ -38,12 +38,12 @@ use super::{Error, Vmm};
 #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
-#[cfg(target_os = "windows")]
-use crate::resources::VmResources;
 #[cfg(not(target_os = "windows"))]
 use crate::resources::{
     DefaultVirtioConsoleConfig, PortConfig, TsiFlags, VirtioConsoleConfigMode, VmResources,
 };
+#[cfg(target_os = "windows")]
+use crate::resources::{PortConfig, VirtioConsoleConfigMode, VmResources};
 use crate::vmm_config::external_kernel::ExternalKernel;
 #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
 use crate::vmm_config::external_kernel::KernelFormat;
@@ -72,6 +72,8 @@ use devices::legacy::{IoApic, IrqChipT, KvmIoapic};
 use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use devices::legacy::{KvmGicV2, KvmGicV3};
+#[cfg(target_os = "windows")]
+use devices::virtio::{port_io, PortDescription};
 #[cfg(not(target_os = "windows"))]
 use devices::virtio::{port_io, PortDescription, Vsock};
 use devices::virtio::{MmioTransport, VirtioDevice};
@@ -238,6 +240,8 @@ pub enum StartMicrovmError {
     OpenBlockDevice(io::Error),
     /// Cannot open console output file.
     OpenConsoleFile(io::Error),
+    /// Cannot open console named pipe.
+    OpenConsolePipe(io::Error),
     /// The GZIP decoder couldn't decompress the kernel.
     PeGzDecoder(io::Error),
     /// Cannot open the file containing the kernel code.
@@ -435,6 +439,12 @@ impl Display for StartMicrovmError {
                 err_msg = err_msg.replace('\"', "");
 
                 write!(f, "Cannot open the console output file. {err_msg}")
+            }
+            OpenConsolePipe(ref err) => {
+                let mut err_msg = format!("{err:?}");
+                err_msg = err_msg.replace('\"', "");
+
+                write!(f, "Cannot open the console named pipe. {err_msg}")
             }
             PeGzDecoder(ref err) => {
                 write!(f, "The GZIP decoder couldn't decompress the kernel. {err}")
@@ -1401,6 +1411,11 @@ pub fn build_microvm(
         trace.mark("implicit_console.skipped");
     }
 
+    #[cfg(target_os = "windows")]
+    let mut console_id = 0;
+    #[cfg(target_os = "windows")]
+    trace.mark("implicit_console.skipped");
+
     #[cfg(not(target_os = "windows"))]
     for console_cfg in std::mem::take(&mut vm_resources.virtio_consoles) {
         attach_console_devices(
@@ -1409,6 +1424,17 @@ pub fn build_microvm(
             intc.clone(),
             vm_resources,
             Some(console_cfg),
+            console_id,
+        )?;
+        console_id += 1;
+    }
+    #[cfg(target_os = "windows")]
+    for console_cfg in std::mem::take(&mut vm_resources.virtio_consoles) {
+        attach_console_devices(
+            &mut vmm,
+            event_manager,
+            intc.clone(),
+            console_cfg,
             console_id,
         )?;
         console_id += 1;
@@ -2831,6 +2857,43 @@ fn create_explicit_ports(
     Ok(ports)
 }
 
+#[cfg(target_os = "windows")]
+fn create_explicit_ports(
+    port_configs: Vec<PortConfig>,
+) -> std::result::Result<Vec<PortDescription>, StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    let mut ports = Vec::with_capacity(port_configs.len());
+
+    for port_cfg in port_configs {
+        let port_desc = match port_cfg {
+            PortConfig::ConsoleOutputFile { path } => {
+                let file = File::create(path).map_err(OpenConsoleFile)?;
+
+                PortDescription::console(
+                    Some(port_io::input_empty().unwrap()),
+                    Some(port_io::output_file(file).unwrap()),
+                    port_io::term_fixed_size(0, 0),
+                )
+            }
+            PortConfig::NamedPipe { name, pipe_name } => {
+                let (input, output) = port_io::named_pipe(&pipe_name).map_err(OpenConsolePipe)?;
+
+                PortDescription {
+                    name: name.into(),
+                    input: Some(input),
+                    output: Some(output),
+                    terminal: None,
+                }
+            }
+        };
+
+        ports.push(port_desc);
+    }
+
+    Ok(ports)
+}
+
 #[cfg(not(target_os = "windows"))]
 fn attach_console_devices(
     vmm: &mut Vmm,
@@ -2868,6 +2931,34 @@ fn attach_console_devices(
         .map_err(RegisterFsSigwinch)?;
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
+    attach_mmio_device(vmm, format!("hvc{id_number}"), intc, console)
+        .map_err(RegisterConsoleDevice)?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn attach_console_devices(
+    vmm: &mut Vmm,
+    event_manager: &mut EventManager,
+    intc: IrqChip,
+    cfg: VirtioConsoleConfigMode,
+    id_number: u32,
+) -> std::result::Result<(), StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    let ports = match cfg {
+        VirtioConsoleConfigMode::Explicit(ports) => create_explicit_ports(ports)?,
+    };
+
+    let console = Arc::new(Mutex::new(devices::virtio::Console::new(ports).unwrap()));
+
+    vmm.exit_observers.push(console.clone());
+
+    event_manager
+        .add_subscriber(console.clone())
+        .map_err(RegisterEvent)?;
+
     attach_mmio_device(vmm, format!("hvc{id_number}"), intc, console)
         .map_err(RegisterConsoleDevice)?;
 
@@ -3088,8 +3179,10 @@ fn attach_snd_device(vmm: &mut Vmm, intc: IrqChip) -> std::result::Result<(), St
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    #[cfg(not(target_os = "windows"))]
     use crate::vmm_config::kernel_bundle::KernelBundle;
 
+    #[cfg(not(target_os = "windows"))]
     fn default_guest_memory(
         mem_size_mib: usize,
     ) -> std::result::Result<
@@ -3108,7 +3201,28 @@ pub mod tests {
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(target_os = "windows")]
+    fn windows_explicit_console_output_file_creates_console_port() {
+        let path = std::env::temp_dir().join(format!(
+            "msb-krun-vmm-console-output-{}.log",
+            std::process::id()
+        ));
+
+        let ports =
+            create_explicit_ports(vec![PortConfig::ConsoleOutputFile { path: path.clone() }])
+                .unwrap();
+
+        assert_eq!(ports.len(), 1);
+        assert!(ports[0].name.is_empty());
+        assert!(ports[0].input.is_some());
+        assert!(ports[0].output.is_some());
+        assert!(ports[0].terminal.is_some());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
     fn test_create_vcpus_x86_64() {
         let vcpu_count = 2;
 
@@ -3180,8 +3294,11 @@ pub mod tests {
         let err = Internal(Error::Serial(io::Error::from_raw_os_error(0)));
         let _ = format!("{err}{err:?}");
 
-        let err = InvalidKernelBundle(vm_memory::mmap::MmapRegionError::InvalidPointer);
-        let _ = format!("{err}{err:?}");
+        #[cfg(not(target_os = "windows"))]
+        {
+            let err = InvalidKernelBundle(vm_memory::mmap::MmapRegionError::InvalidPointer);
+            let _ = format!("{err}{err:?}");
+        }
 
         let err = KernelCmdline(String::from("dummy --cmdline"));
         let _ = format!("{err}{err:?}");

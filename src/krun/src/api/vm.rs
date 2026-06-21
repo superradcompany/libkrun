@@ -553,6 +553,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             EventFd::new(EFD_NONBLOCK).unwrap(),
             Arc::new(AtomicI32::new(i32::MAX)),

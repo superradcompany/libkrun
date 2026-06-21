@@ -2,7 +2,8 @@ use std::cmp;
 use std::io::Write;
 use std::iter::zip;
 use std::mem::{size_of, size_of_val};
-use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use utils::eventfd::EventFd;
@@ -112,6 +113,7 @@ impl Console {
         defs::CONSOLE_DEV_ID
     }
 
+    #[cfg(unix)]
     pub fn get_sigwinch_fd(&self) -> RawFd {
         self.sigwinch_evt.as_raw_fd()
     }

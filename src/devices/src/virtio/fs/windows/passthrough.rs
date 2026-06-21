@@ -1,9 +1,10 @@
 use std::collections::btree_map;
 use std::collections::BTreeMap;
 use std::convert::TryInto;
-use std::ffi::CStr;
+use std::ffi::{CStr, OsStr};
 use std::fs::{File, FileType, OpenOptions as StdOpenOptions};
 use std::io;
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,16 +14,23 @@ use std::time::Duration;
 use crossbeam_channel::{unbounded, Sender};
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_DIR_NOT_EMPTY, ERROR_FILE_EXISTS,
-    ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
+    ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME, ERROR_PATH_NOT_FOUND, ERROR_PRIVILEGE_NOT_HELD,
+    ERROR_SHARING_VIOLATION,
 };
-use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY;
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateSymbolicLinkW, FILE_ATTRIBUTE_READONLY, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
+    SYMBOLIC_LINK_FLAG_DIRECTORY,
+};
 
-use crate::windows::memory_mapping::{WindowsFileMappingAccess, WindowsFileMappingView};
+use crate::windows::memory_mapping::{
+    discard_file_range, is_unsupported_discard_error, WindowsFileMappingAccess,
+    WindowsFileMappingView,
+};
 
 use super::super::bindings;
 use super::super::filesystem::{
-    Context, DirEntry, Entry, ExportTable, Extensions, FileSystem, FsOptions, OpenOptions,
-    SetattrValid, ZeroCopyReader, ZeroCopyWriter,
+    Context, DirEntry, Entry, ExportTable, Extensions, FileSystem, FsOptions, GetxattrReply,
+    ListxattrReply, OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
 use super::super::fuse;
 use utils::worker_message::WorkerMessage;
@@ -55,6 +63,9 @@ const LINUX_EOPNOTSUPP: i32 = 95;
 const LINUX_O_ACCMODE: i32 = 0o3;
 const LINUX_O_WRONLY: i32 = 0o1;
 const LINUX_O_RDWR: i32 = 0o2;
+
+const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
 
 const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
@@ -384,6 +395,30 @@ impl PassthroughFs {
         Ok(())
     }
 
+    fn do_symlink(&self, linkname: &CStr, parent: Inode, name: &CStr) -> io::Result<Entry> {
+        let path = self.child_path(parent, name)?;
+        let parent_path = path.parent().ok_or_else(|| linux_error(LINUX_EINVAL))?;
+        let metadata = std::fs::symlink_metadata(parent_path).map_err(host_error)?;
+        if !metadata.file_type().is_dir() {
+            return Err(linux_error(LINUX_ENOTDIR));
+        }
+
+        let target = cstr_to_symlink_target(linkname)?;
+        create_windows_symlink(&path, &target, symlink_target_is_directory(&path, &target))?;
+        self.entry_for_path(path, 1)
+    }
+
+    fn do_readlink(&self, inode: Inode) -> io::Result<Vec<u8>> {
+        let data = self.inode(inode)?;
+        let metadata = std::fs::symlink_metadata(&data.path).map_err(host_error)?;
+        if !metadata.file_type().is_symlink() {
+            return Err(linux_error(LINUX_EINVAL));
+        }
+
+        let target = std::fs::read_link(&data.path).map_err(host_error)?;
+        Ok(path_to_guest_bytes(&target))
+    }
+
     fn do_readdir<F>(
         &self,
         inode: Inode,
@@ -552,6 +587,43 @@ impl PassthroughFs {
 
         Ok(())
     }
+
+    fn do_fallocate(
+        &self,
+        inode: Inode,
+        handle: Handle,
+        mode: u32,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<()> {
+        let handle_data = self.handle(inode, handle)?;
+        let file = match &handle_data.kind {
+            HandleKind::File(file) => file.write().unwrap(),
+            HandleKind::Directory(_) => return Err(linux_error(LINUX_EISDIR)),
+        };
+
+        match mode {
+            0 => {
+                let len = offset
+                    .checked_add(length)
+                    .ok_or_else(|| linux_error(LINUX_EINVAL))?;
+                if file.metadata().map_err(host_error)?.len() < len {
+                    file.set_len(len).map_err(host_error)?;
+                }
+                Ok(())
+            }
+            mode if mode == (FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE) => {
+                discard_file_range(&file, offset, length).map_err(|error| {
+                    if is_unsupported_discard_error(&error) {
+                        linux_error(LINUX_EOPNOTSUPP)
+                    } else {
+                        host_error(error)
+                    }
+                })
+            }
+            _ => Err(linux_error(LINUX_EOPNOTSUPP)),
+        }
+    }
 }
 
 impl DirStream {
@@ -638,6 +710,7 @@ impl FileSystem for PassthroughFs {
         if inode == self.init_inode {
             return Err(linux_error(LINUX_EACCES));
         }
+        validate_setattr(valid)?;
 
         let data = self.inode(inode)?;
         reject_symlink(&data.path)?;
@@ -674,6 +747,21 @@ impl FileSystem for PassthroughFs {
         }
 
         self.do_getattr(inode)
+    }
+
+    fn readlink(&self, _ctx: Context, inode: Inode) -> io::Result<Vec<u8>> {
+        self.do_readlink(inode)
+    }
+
+    fn symlink(
+        &self,
+        _ctx: Context,
+        linkname: &CStr,
+        parent: Inode,
+        name: &CStr,
+        _extensions: Extensions,
+    ) -> io::Result<Entry> {
+        self.do_symlink(linkname, parent, name)
     }
 
     fn mknod(
@@ -857,6 +945,18 @@ impl FileSystem for PassthroughFs {
         }
     }
 
+    fn fallocate(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        mode: u32,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<()> {
+        self.do_fallocate(inode, handle, mode, offset, length)
+    }
+
     fn setupmapping(
         &self,
         _ctx: Context,
@@ -944,6 +1044,35 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<()> {
         self.do_release(inode, handle)
     }
+
+    fn setxattr(
+        &self,
+        _ctx: Context,
+        _inode: Inode,
+        _name: &CStr,
+        _value: &[u8],
+        _flags: u32,
+    ) -> io::Result<()> {
+        Err(linux_error(LINUX_EOPNOTSUPP))
+    }
+
+    fn getxattr(
+        &self,
+        _ctx: Context,
+        _inode: Inode,
+        _name: &CStr,
+        _size: u32,
+    ) -> io::Result<GetxattrReply> {
+        Err(linux_error(LINUX_EOPNOTSUPP))
+    }
+
+    fn listxattr(&self, _ctx: Context, _inode: Inode, _size: u32) -> io::Result<ListxattrReply> {
+        Err(linux_error(LINUX_EOPNOTSUPP))
+    }
+
+    fn removexattr(&self, _ctx: Context, _inode: Inode, _name: &CStr) -> io::Result<()> {
+        Err(linux_error(LINUX_EOPNOTSUPP))
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1028,6 +1157,16 @@ fn validate_directory_open(flags: u32) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_setattr(valid: SetattrValid) -> io::Result<()> {
+    let supported = SetattrValid::SIZE | SetattrValid::MODE | SetattrValid::KILL_SUIDGID;
+    let unsupported = SetattrValid::from_bits_truncate(valid.bits() & !supported.bits());
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(linux_error(LINUX_EOPNOTSUPP))
+    }
 }
 
 fn checked_mapping_guest_addr(
@@ -1164,6 +1303,59 @@ fn reject_symlink(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn create_windows_symlink(link: &Path, target: &Path, directory: bool) -> io::Result<()> {
+    let link = path_to_wide(link);
+    let target = path_to_wide(target);
+    let mut flags = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+    if directory {
+        flags |= SYMBOLIC_LINK_FLAG_DIRECTORY;
+    }
+
+    // SAFETY: Both pointers reference nul-terminated UTF-16 buffers that live for the call.
+    let created = unsafe { CreateSymbolicLinkW(link.as_ptr(), target.as_ptr(), flags) };
+    if created {
+        Ok(())
+    } else {
+        Err(host_error(io::Error::last_os_error()))
+    }
+}
+
+fn symlink_target_is_directory(link: &Path, target: &Path) -> bool {
+    let resolved = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        link.parent().unwrap_or_else(|| Path::new("")).join(target)
+    };
+
+    std::fs::metadata(resolved)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
+}
+
+fn cstr_to_symlink_target(target: &CStr) -> io::Result<PathBuf> {
+    let target = target.to_str().map_err(|_| linux_error(LINUX_EINVAL))?;
+    if target.is_empty() {
+        return Err(linux_error(LINUX_EINVAL));
+    }
+
+    Ok(PathBuf::from(target))
+}
+
+fn path_to_wide(path: &Path) -> Vec<u16> {
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+fn path_to_guest_bytes(path: &Path) -> Vec<u8> {
+    os_str_to_guest_bytes(path.as_os_str())
+}
+
+fn os_str_to_guest_bytes(path: &OsStr) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
+}
+
 fn cstr_to_component(name: &CStr) -> io::Result<&str> {
     let component = name.to_str().map_err(|_| linux_error(LINUX_EINVAL))?;
     if component.is_empty()
@@ -1270,6 +1462,7 @@ fn host_error(error: io::Error) -> io::Error {
             LINUX_ENOENT
         }
         Some(code) if code == ERROR_ACCESS_DENIED as i32 => LINUX_EACCES,
+        Some(code) if code == ERROR_PRIVILEGE_NOT_HELD as i32 => LINUX_EACCES,
         Some(code) if code == ERROR_ALREADY_EXISTS as i32 || code == ERROR_FILE_EXISTS as i32 => {
             LINUX_EEXIST
         }
@@ -1301,6 +1494,7 @@ mod tests {
     use std::fs;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::windows::fs::FileExt;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -1384,6 +1578,13 @@ mod tests {
             uid: 0,
             gid: 0,
             pid: 0,
+        }
+    }
+
+    fn expect_linux_error<T>(result: io::Result<T>, errno: i32) {
+        match result {
+            Ok(_) => panic!("expected linux errno {errno}"),
+            Err(error) => assert_eq!(error.raw_os_error(), Some(errno)),
         }
     }
 
@@ -1527,6 +1728,36 @@ mod tests {
             .readonly());
 
         passthrough
+            .setattr(
+                context(),
+                entry.inode,
+                attr,
+                Some(handle),
+                SetattrValid::KILL_SUIDGID,
+            )
+            .unwrap();
+        expect_linux_error(
+            passthrough.setattr(
+                context(),
+                entry.inode,
+                attr,
+                Some(handle),
+                SetattrValid::UID | SetattrValid::GID,
+            ),
+            LINUX_EOPNOTSUPP,
+        );
+        expect_linux_error(
+            passthrough.setattr(
+                context(),
+                entry.inode,
+                attr,
+                Some(handle),
+                SetattrValid::ATIME | SetattrValid::MTIME,
+            ),
+            LINUX_EOPNOTSUPP,
+        );
+
+        passthrough
             .release(context(), entry.inode, 0, handle, false, false, None)
             .unwrap();
     }
@@ -1589,6 +1820,470 @@ mod tests {
             .rmdir(context(), fuse::ROOT_ID, dir_name)
             .unwrap();
         assert!(!temp.path.join("nested").exists());
+    }
+
+    #[test]
+    fn sparse_high_offset_write_reads_zero_holes() {
+        let temp = TempDir::new();
+        let passthrough = PassthroughFs::new(Config {
+            root_dir: temp.path.to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        passthrough.init(FsOptions::empty()).unwrap();
+
+        let name = CStr::from_bytes_with_nul(b"sparse.bin\0").unwrap();
+        let flags = (bindings::LINUX_O_CREAT | LINUX_O_RDWR) as u32;
+        let (entry, handle, _) = passthrough
+            .create(
+                context(),
+                fuse::ROOT_ID,
+                name,
+                S_IFREG | 0o644,
+                false,
+                flags,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        let handle = handle.unwrap();
+
+        let head = b"HEAD";
+        let tail = b"TAIL";
+        let tail_offset = 16 * 1024 * 1024 + 123;
+
+        let mut head_reader = SourceReader {
+            bytes: head.to_vec(),
+            pos: 0,
+        };
+        assert_eq!(
+            passthrough
+                .write(
+                    context(),
+                    entry.inode,
+                    handle,
+                    &mut head_reader,
+                    head.len() as u32,
+                    0,
+                    None,
+                    false,
+                    false,
+                    flags,
+                )
+                .unwrap(),
+            head.len()
+        );
+
+        let mut tail_reader = SourceReader {
+            bytes: tail.to_vec(),
+            pos: 0,
+        };
+        assert_eq!(
+            passthrough
+                .write(
+                    context(),
+                    entry.inode,
+                    handle,
+                    &mut tail_reader,
+                    tail.len() as u32,
+                    tail_offset,
+                    None,
+                    false,
+                    false,
+                    flags,
+                )
+                .unwrap(),
+            tail.len()
+        );
+        passthrough
+            .fsync(context(), entry.inode, false, handle)
+            .unwrap();
+
+        let (attr, _) = passthrough
+            .getattr(context(), entry.inode, Some(handle))
+            .unwrap();
+        assert_eq!(attr.st_size, tail_offset as i64 + tail.len() as i64);
+
+        let mut head_writer = CaptureWriter { bytes: Vec::new() };
+        assert_eq!(
+            passthrough
+                .read(
+                    context(),
+                    entry.inode,
+                    handle,
+                    &mut head_writer,
+                    head.len() as u32,
+                    0,
+                    None,
+                    flags,
+                )
+                .unwrap(),
+            head.len()
+        );
+        assert_eq!(head_writer.bytes, head);
+
+        let mut hole_writer = CaptureWriter { bytes: Vec::new() };
+        assert_eq!(
+            passthrough
+                .read(
+                    context(),
+                    entry.inode,
+                    handle,
+                    &mut hole_writer,
+                    32,
+                    1024 * 1024,
+                    None,
+                    flags,
+                )
+                .unwrap(),
+            32
+        );
+        assert_eq!(hole_writer.bytes, vec![0; 32]);
+
+        let mut tail_writer = CaptureWriter { bytes: Vec::new() };
+        assert_eq!(
+            passthrough
+                .read(
+                    context(),
+                    entry.inode,
+                    handle,
+                    &mut tail_writer,
+                    (8 + tail.len()) as u32,
+                    tail_offset - 8,
+                    None,
+                    flags,
+                )
+                .unwrap(),
+            8 + tail.len()
+        );
+        assert_eq!(tail_writer.bytes[..8], [0; 8]);
+        assert_eq!(&tail_writer.bytes[8..], tail);
+
+        passthrough
+            .release(context(), entry.inode, 0, handle, false, false, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn fallocate_extends_and_punches_holes_when_supported() {
+        let temp = TempDir::new();
+        let passthrough = PassthroughFs::new(Config {
+            root_dir: temp.path.to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        passthrough.init(FsOptions::empty()).unwrap();
+
+        let name = CStr::from_bytes_with_nul(b"fallocate.bin\0").unwrap();
+        let flags = (bindings::LINUX_O_CREAT | LINUX_O_RDWR) as u32;
+        let (entry, handle, _) = passthrough
+            .create(
+                context(),
+                fuse::ROOT_ID,
+                name,
+                S_IFREG | 0o644,
+                false,
+                flags,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        let handle = handle.unwrap();
+
+        passthrough
+            .fallocate(context(), entry.inode, handle, 0, 0, 4096)
+            .unwrap();
+        let (attr, _) = passthrough
+            .getattr(context(), entry.inode, Some(handle))
+            .unwrap();
+        assert_eq!(attr.st_size, 4096);
+
+        let payload = vec![0xa5; 4096];
+        let mut reader = SourceReader {
+            bytes: payload,
+            pos: 0,
+        };
+        assert_eq!(
+            passthrough
+                .write(
+                    context(),
+                    entry.inode,
+                    handle,
+                    &mut reader,
+                    4096,
+                    0,
+                    None,
+                    false,
+                    false,
+                    flags,
+                )
+                .unwrap(),
+            4096
+        );
+
+        expect_linux_error(
+            passthrough.fallocate(context(), entry.inode, handle, 0x08, 0, 4096),
+            LINUX_EOPNOTSUPP,
+        );
+
+        match passthrough.fallocate(
+            context(),
+            entry.inode,
+            handle,
+            FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+            1024,
+            512,
+        ) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(LINUX_EOPNOTSUPP) => {
+                eprintln!("skipping hole-punch assertion because this filesystem does not support sparse zero-data controls");
+                passthrough
+                    .release(context(), entry.inode, 0, handle, false, false, None)
+                    .unwrap();
+                return;
+            }
+            Err(error) => panic!("hole punch failed: {error:?}"),
+        }
+
+        let (attr, _) = passthrough
+            .getattr(context(), entry.inode, Some(handle))
+            .unwrap();
+        assert_eq!(attr.st_size, 4096);
+
+        let mut writer = CaptureWriter { bytes: Vec::new() };
+        assert_eq!(
+            passthrough
+                .read(
+                    context(),
+                    entry.inode,
+                    handle,
+                    &mut writer,
+                    544,
+                    1008,
+                    None,
+                    flags,
+                )
+                .unwrap(),
+            544
+        );
+        assert_eq!(writer.bytes[..16], [0xa5; 16]);
+        assert_eq!(writer.bytes[16..528], [0; 512]);
+        assert_eq!(writer.bytes[528..], [0xa5; 16]);
+
+        passthrough
+            .release(context(), entry.inode, 0, handle, false, false, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn concurrent_non_overlapping_writes_are_stable() {
+        let temp = TempDir::new();
+        let passthrough = Arc::new(
+            PassthroughFs::new(Config {
+                root_dir: temp.path.to_string_lossy().into_owned(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        passthrough.init(FsOptions::empty()).unwrap();
+
+        let name = CStr::from_bytes_with_nul(b"concurrent.bin\0").unwrap();
+        let flags = (bindings::LINUX_O_CREAT | LINUX_O_RDWR) as u32;
+        let (entry, handle, _) = passthrough
+            .create(
+                context(),
+                fuse::ROOT_ID,
+                name,
+                S_IFREG | 0o644,
+                false,
+                flags,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        passthrough
+            .release(
+                context(),
+                entry.inode,
+                0,
+                handle.unwrap(),
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+
+        let mut workers = Vec::new();
+        for index in 0..8 {
+            let passthrough = passthrough.clone();
+            workers.push(std::thread::spawn(move || {
+                let offset = index as u64 * 1024 * 1024 + 4093;
+                let payload = vec![b'A' + index as u8; 8192];
+                let (handle, _) = passthrough
+                    .open(context(), entry.inode, false, LINUX_O_RDWR as u32)
+                    .unwrap();
+                let handle = handle.unwrap();
+                let mut reader = SourceReader {
+                    bytes: payload.clone(),
+                    pos: 0,
+                };
+
+                assert_eq!(
+                    passthrough
+                        .write(
+                            context(),
+                            entry.inode,
+                            handle,
+                            &mut reader,
+                            payload.len() as u32,
+                            offset,
+                            None,
+                            false,
+                            false,
+                            LINUX_O_RDWR as u32,
+                        )
+                        .unwrap(),
+                    payload.len()
+                );
+                passthrough
+                    .fsync(context(), entry.inode, true, handle)
+                    .unwrap();
+                passthrough
+                    .release(context(), entry.inode, 0, handle, false, false, None)
+                    .unwrap();
+
+                (offset, payload)
+            }));
+        }
+
+        let mut expected = Vec::new();
+        for worker in workers {
+            expected.push(worker.join().unwrap());
+        }
+
+        let (handle, _) = passthrough
+            .open(context(), entry.inode, false, LINUX_O_RDWR as u32)
+            .unwrap();
+        let handle = handle.unwrap();
+        for (offset, payload) in expected {
+            let mut writer = CaptureWriter { bytes: Vec::new() };
+            assert_eq!(
+                passthrough
+                    .read(
+                        context(),
+                        entry.inode,
+                        handle,
+                        &mut writer,
+                        payload.len() as u32,
+                        offset,
+                        None,
+                        LINUX_O_RDWR as u32,
+                    )
+                    .unwrap(),
+                payload.len()
+            );
+            assert_eq!(writer.bytes, payload);
+        }
+        passthrough
+            .release(context(), entry.inode, 0, handle, false, false, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn symlink_and_readlink_round_trip() {
+        let temp = TempDir::new();
+        fs::write(temp.path.join("target.txt"), b"target").unwrap();
+
+        let passthrough = PassthroughFs::new(Config {
+            root_dir: temp.path.to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        passthrough.init(FsOptions::empty()).unwrap();
+
+        let target = CStr::from_bytes_with_nul(b"target.txt\0").unwrap();
+        let link = CStr::from_bytes_with_nul(b"link.txt\0").unwrap();
+        let entry = match passthrough.symlink(
+            context(),
+            target,
+            fuse::ROOT_ID,
+            link,
+            Extensions::default(),
+        ) {
+            Ok(entry) => entry,
+            Err(error) if error.raw_os_error() == Some(LINUX_EACCES) => {
+                eprintln!("skipping symlink test because this machine denies symlink creation");
+                return;
+            }
+            Err(error) => panic!("symlink failed: {error:?}"),
+        };
+
+        assert_eq!(entry.attr.st_mode & S_IFMT, S_IFLNK);
+        assert!(fs::symlink_metadata(temp.path.join("link.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            passthrough.readlink(context(), entry.inode).unwrap(),
+            b"target.txt"
+        );
+        expect_linux_error(
+            passthrough.open(context(), entry.inode, false, 0),
+            LINUX_ELOOP,
+        );
+    }
+
+    #[test]
+    fn symlink_target_directory_detection_uses_link_parent() {
+        let temp = TempDir::new();
+        fs::create_dir(temp.path.join("dir-target")).unwrap();
+        fs::write(temp.path.join("file-target"), b"target").unwrap();
+
+        let link = temp.path.join("link");
+        assert!(symlink_target_is_directory(&link, Path::new("dir-target")));
+        assert!(!symlink_target_is_directory(
+            &link,
+            Path::new("file-target")
+        ));
+        assert!(!symlink_target_is_directory(
+            &link,
+            Path::new("missing-target")
+        ));
+    }
+
+    #[test]
+    fn xattrs_return_not_supported() {
+        let temp = TempDir::new();
+        fs::write(temp.path.join("hello.txt"), b"hello").unwrap();
+
+        let passthrough = PassthroughFs::new(Config {
+            root_dir: temp.path.to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        passthrough.init(FsOptions::empty()).unwrap();
+
+        let file = CStr::from_bytes_with_nul(b"hello.txt\0").unwrap();
+        let entry = passthrough.lookup(context(), fuse::ROOT_ID, file).unwrap();
+        let name = CStr::from_bytes_with_nul(b"user.test\0").unwrap();
+
+        expect_linux_error(passthrough.readlink(context(), entry.inode), LINUX_EINVAL);
+        expect_linux_error(
+            passthrough.setxattr(context(), entry.inode, name, b"value", 0),
+            LINUX_EOPNOTSUPP,
+        );
+        expect_linux_error(
+            passthrough.getxattr(context(), entry.inode, name, 0),
+            LINUX_EOPNOTSUPP,
+        );
+        expect_linux_error(
+            passthrough.listxattr(context(), entry.inode, 0),
+            LINUX_EOPNOTSUPP,
+        );
+        expect_linux_error(
+            passthrough.removexattr(context(), entry.inode, name),
+            LINUX_EOPNOTSUPP,
+        );
     }
 
     #[test]

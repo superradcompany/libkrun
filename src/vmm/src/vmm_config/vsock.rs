@@ -154,7 +154,7 @@ impl VsockBuilder {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "windows")))]
 pub(crate) mod tests {
     use super::*;
     use utils::tempfile::TempFile;

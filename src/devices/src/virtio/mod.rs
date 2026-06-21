@@ -17,7 +17,6 @@ pub mod balloon;
 pub mod bindings;
 #[cfg(feature = "blk")]
 pub mod block;
-#[cfg(not(target_os = "windows"))]
 pub mod console;
 pub mod descriptor_utils;
 pub mod device;
@@ -55,7 +54,6 @@ pub mod vsock;
 pub use self::balloon::*;
 #[cfg(feature = "blk")]
 pub use self::block::{Block, CacheType};
-#[cfg(not(target_os = "windows"))]
 pub use self::console::*;
 pub use self::device::*;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]

@@ -1436,6 +1436,7 @@ version = "0.1.0"
 dependencies = [
  "env_logger",
  "msb_krun",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

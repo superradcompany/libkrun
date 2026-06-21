@@ -9,7 +9,7 @@
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, RawHandle};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -31,35 +31,72 @@ pub struct EventFd {
 #[derive(Debug)]
 struct EventHandle {
     handle: HANDLE,
+    counter: Mutex<u64>,
+    nonblocking: bool,
+    semaphore: bool,
 }
 
 impl EventFd {
-    pub fn new(_flag: i32) -> io::Result<Self> {
+    pub fn new(flag: i32) -> io::Result<Self> {
         let handle = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
 
         Ok(Self {
-            inner: Arc::new(EventHandle { handle }),
+            inner: Arc::new(EventHandle {
+                handle,
+                counter: Mutex::new(0),
+                nonblocking: flag & EFD_NONBLOCK != 0,
+                semaphore: flag & EFD_SEMAPHORE != 0,
+            }),
         })
     }
 
-    pub fn write(&self, _v: u64) -> io::Result<()> {
-        if unsafe { SetEvent(self.inner.handle) } == 0 {
-            return Err(io::Error::last_os_error());
+    pub fn write(&self, v: u64) -> io::Result<()> {
+        if v == 0 {
+            return Ok(());
         }
 
-        Ok(())
+        let mut counter = self.inner.counter.lock().unwrap();
+        *counter = counter.saturating_add(v);
+        set_event(self.inner.handle)
     }
 
     pub fn read(&self) -> io::Result<u64> {
-        match unsafe { WaitForSingleObject(self.inner.handle, ZERO_TIMEOUT_MS) } {
+        let timeout = if self.inner.nonblocking {
+            ZERO_TIMEOUT_MS
+        } else {
+            u32::MAX
+        };
+
+        match unsafe { WaitForSingleObject(self.inner.handle, timeout) } {
             WAIT_OBJECT_0 => {
-                if unsafe { ResetEvent(self.inner.handle) } == 0 {
-                    return Err(io::Error::last_os_error());
+                let mut counter = self.inner.counter.lock().unwrap();
+                if *counter == 0 {
+                    reset_event(self.inner.handle)?;
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "event counter is empty",
+                    ));
                 }
-                Ok(1)
+
+                let value = if self.inner.semaphore {
+                    *counter -= 1;
+                    1
+                } else {
+                    let value = *counter;
+                    *counter = 0;
+                    value
+                };
+
+                if *counter == 0 {
+                    reset_event(self.inner.handle)?;
+                } else {
+                    set_event(self.inner.handle)?;
+                }
+
+                Ok(value)
             }
             WAIT_TIMEOUT => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -97,3 +134,57 @@ impl Drop for EventHandle {
 
 unsafe impl Send for EventFd {}
 unsafe impl Sync for EventFd {}
+
+fn set_event(handle: HANDLE) -> io::Result<()> {
+    if unsafe { SetEvent(handle) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+fn reset_event(handle: HANDLE) -> io::Result<()> {
+    if unsafe { ResetEvent(handle) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_write_preserves_counter_value() {
+        let event = EventFd::new(EFD_NONBLOCK).unwrap();
+
+        event.write(1).unwrap();
+        event.write(4).unwrap();
+
+        assert_eq!(event.read().unwrap(), 5);
+        assert_eq!(event.read().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn clone_reads_shared_counter() {
+        let event = EventFd::new(EFD_NONBLOCK).unwrap();
+        let clone = event.try_clone().unwrap();
+
+        event.write(7).unwrap();
+
+        assert_eq!(clone.read().unwrap(), 7);
+        assert_eq!(event.read().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn semaphore_reads_one_count_at_a_time() {
+        let event = EventFd::new(EFD_NONBLOCK | EFD_SEMAPHORE).unwrap();
+
+        event.write(2).unwrap();
+
+        assert_eq!(event.read().unwrap(), 1);
+        assert_eq!(event.read().unwrap(), 1);
+        assert_eq!(event.read().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+}

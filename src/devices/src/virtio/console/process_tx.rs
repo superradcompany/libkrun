@@ -71,6 +71,7 @@ fn pop_head_blocking<'mem>(
     }
 }
 
+#[allow(deprecated)]
 fn write_desc_to_output(
     desc: DescriptorChain,
     output: &mut (dyn PortOutput + Send),

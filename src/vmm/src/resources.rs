@@ -109,6 +109,11 @@ pub enum VirtioConsoleConfigMode {
     Explicit(Vec<PortConfig>),
 }
 
+#[cfg(target_os = "windows")]
+pub enum VirtioConsoleConfigMode {
+    Explicit(Vec<PortConfig>),
+}
+
 #[cfg(not(target_os = "windows"))]
 pub enum PortConfig {
     Tty {
@@ -125,6 +130,12 @@ pub enum PortConfig {
         input: Box<dyn devices::virtio::port_io::PortInput + Send>,
         output: Box<dyn devices::virtio::port_io::PortOutput + Send>,
     },
+}
+
+#[cfg(target_os = "windows")]
+pub enum PortConfig {
+    ConsoleOutputFile { path: PathBuf },
+    NamedPipe { name: String, pipe_name: String },
 }
 
 /// Configuration for the vsock device
@@ -221,7 +232,6 @@ pub struct VmResources {
     #[cfg(not(target_os = "windows"))]
     pub serial_consoles: Vec<SerialConsoleConfig>,
     /// Virtio consoles to attach to the guest
-    #[cfg(not(target_os = "windows"))]
     pub virtio_consoles: Vec<VirtioConsoleConfigMode>,
 }
 
@@ -273,7 +283,6 @@ impl Default for VmResources {
             kernel_console: None,
             #[cfg(not(target_os = "windows"))]
             serial_consoles: Vec::new(),
-            #[cfg(not(target_os = "windows"))]
             virtio_consoles: Vec::new(),
         }
     }
@@ -476,7 +485,7 @@ impl VmResources {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "windows")))]
 mod tests {
     #[cfg(feature = "gpu")]
     use crate::resources::DisplayBackendConfig;
@@ -529,6 +538,7 @@ mod tests {
             balloon_stats_interval: Some(std::time::Duration::from_secs(1)),
             enable_rng: true,
             disable_implicit_console: false,
+            #[cfg(not(target_os = "windows"))]
             serial_consoles: Vec::new(),
             virtio_consoles: Vec::new(),
             kernel_console: None,

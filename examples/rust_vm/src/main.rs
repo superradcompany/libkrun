@@ -9,6 +9,9 @@
 //! - Optional disk settings: KRUN_DISK_ID and KRUN_DISK_READ_ONLY
 //! - To attach a virtio-fs directory, set KRUN_FS_PATH and optionally KRUN_FS_TAG
 //! - Optional virtio-fs DAX setting: KRUN_FS_SHM_SIZE
+//! - On Windows, set KRUN_VIRTIO_CONSOLE_OUTPUT to test explicit file-backed virtio-console output
+//! - On Windows, set KRUN_VIRTIO_CONSOLE_PIPE and optionally KRUN_VIRTIO_CONSOLE_PORT to test a named-pipe virtio-console port
+//! - On Windows, set KRUN_VIRTIO_CONSOLE_PIPE_SMOKE to start a built-in named-pipe virtio-console smoke helper
 //!
 //! On macOS, the binary must be codesigned with the hypervisor entitlement:
 //!   cd examples && make rust_vm
@@ -16,6 +19,29 @@
 #[cfg(feature = "blk")]
 use msb_krun::{CacheMode, DiskImageFormat, SyncMode};
 use msb_krun::{ConfigError, Error, Result, VmBuilder};
+#[cfg(target_os = "windows")]
+use std::ffi::OsStr;
+#[cfg(target_os = "windows")]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+#[cfg(target_os = "windows")]
+use std::ptr;
+#[cfg(target_os = "windows")]
+use std::sync::{mpsc, Arc, Mutex};
+#[cfg(target_os = "windows")]
+use std::thread;
+#[cfg(target_os = "windows")]
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Storage::FileSystem::{ReadFile, PIPE_ACCESS_DUPLEX};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_WAIT,
+};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -40,6 +66,18 @@ const FS_PATH_ENV: &str = "KRUN_FS_PATH";
 const FS_TAG_ENV: &str = "KRUN_FS_TAG";
 const FS_SHM_SIZE_ENV: &str = "KRUN_FS_SHM_SIZE";
 const DEFAULT_FS_TAG: &str = "hostshare";
+#[cfg(target_os = "windows")]
+const VIRTIO_CONSOLE_OUTPUT_ENV: &str = "KRUN_VIRTIO_CONSOLE_OUTPUT";
+#[cfg(target_os = "windows")]
+const VIRTIO_CONSOLE_PIPE_ENV: &str = "KRUN_VIRTIO_CONSOLE_PIPE";
+#[cfg(target_os = "windows")]
+const VIRTIO_CONSOLE_PIPE_SMOKE_ENV: &str = "KRUN_VIRTIO_CONSOLE_PIPE_SMOKE";
+#[cfg(target_os = "windows")]
+const VIRTIO_CONSOLE_PORT_ENV: &str = "KRUN_VIRTIO_CONSOLE_PORT";
+#[cfg(target_os = "windows")]
+const DEFAULT_VIRTIO_CONSOLE_PORT: &str = "agent";
+#[cfg(target_os = "windows")]
+const VIRTIO_CONSOLE_SMOKE_BUFFER_SIZE: usize = 4096;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -59,6 +97,13 @@ struct SmokeFsConfig {
     path: String,
     tag: String,
     shm_size: Option<usize>,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct ConsoleSmokeState {
+    received: Option<Vec<u8>>,
+    error: Option<String>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -114,6 +159,17 @@ fn main() -> Result<()> {
     let initramfs_path = std::env::var("KRUN_INITRAMFS_PATH").ok();
 
     let builder = VmBuilder::new().machine(|m| m.vcpus(2).memory_mib(1024));
+
+    #[cfg(target_os = "windows")]
+    let builder = if let Ok(path) = std::env::var(VIRTIO_CONSOLE_OUTPUT_ENV) {
+        eprintln!("Attaching virtio-console output {path}");
+        builder.console(|c| c.virtio_output(path).disable_implicit())
+    } else {
+        builder
+    };
+
+    #[cfg(target_os = "windows")]
+    let (builder, console_smoke_state) = configure_windows_virtio_console(builder)?;
 
     let builder = if let Some(fs) = smoke_fs_config_from_env()? {
         eprintln!("Attaching virtio-fs {} ({})", fs.path, fs.tag);
@@ -186,8 +242,10 @@ fn main() -> Result<()> {
                 .args(["Hello from libkrun VM!"])
                 .env("HOME", "/root")
         })
-        .on_exit(|exit_code| {
+        .on_exit(move |exit_code| {
             eprintln!("[on_exit] VM exiting with code {exit_code}");
+            #[cfg(target_os = "windows")]
+            report_windows_virtio_console_smoke(&console_smoke_state);
         })
         .build()?
         .enter()?;
@@ -306,6 +364,185 @@ fn parse_usize_env(name: &str, value: &str) -> Result<usize> {
     }
 
     Ok(value)
+}
+
+#[cfg(target_os = "windows")]
+fn configure_windows_virtio_console(
+    builder: VmBuilder,
+) -> Result<(VmBuilder, Option<Arc<Mutex<ConsoleSmokeState>>>)> {
+    let port_name = std::env::var(VIRTIO_CONSOLE_PORT_ENV)
+        .unwrap_or_else(|_| DEFAULT_VIRTIO_CONSOLE_PORT.to_string());
+
+    if let Ok(pipe_name) = std::env::var(VIRTIO_CONSOLE_PIPE_ENV) {
+        eprintln!("Attaching virtio-console named pipe {port_name} ({pipe_name})");
+        return Ok((
+            builder.console(|c| c.named_pipe(&port_name, pipe_name)),
+            None,
+        ));
+    }
+
+    if std::env::var_os(VIRTIO_CONSOLE_PIPE_SMOKE_ENV).is_none() {
+        return Ok((builder, None));
+    }
+
+    let pipe_name = unique_console_smoke_pipe_name();
+    let state = Arc::new(Mutex::new(ConsoleSmokeState::default()));
+    let (ready_tx, ready_rx) = mpsc::channel();
+
+    spawn_named_pipe_console_smoke_server(pipe_name.clone(), Arc::clone(&state), ready_tx);
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("named-pipe console smoke helper did not start: {err}"),
+            )
+        })??;
+
+    eprintln!("Attaching virtio-console named-pipe smoke helper {port_name} at {pipe_name}");
+
+    Ok((
+        builder.console(|c| c.named_pipe(&port_name, pipe_name)),
+        Some(state),
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_named_pipe_console_smoke_server(
+    pipe_name: String,
+    state: Arc<Mutex<ConsoleSmokeState>>,
+    ready_tx: mpsc::Sender<std::io::Result<()>>,
+) {
+    thread::Builder::new()
+        .name("rust-vm-named-pipe-console-smoke".to_string())
+        .spawn(move || {
+            if let Err(err) = run_named_pipe_console_smoke_server(&pipe_name, &state, ready_tx) {
+                state.lock().unwrap().error = Some(err.to_string());
+                eprintln!("named-pipe console smoke helper failed: {err}");
+            }
+        })
+        .expect("failed to spawn named-pipe console smoke helper");
+}
+
+#[cfg(target_os = "windows")]
+fn run_named_pipe_console_smoke_server(
+    pipe_name: &str,
+    state: &Arc<Mutex<ConsoleSmokeState>>,
+    ready_tx: mpsc::Sender<std::io::Result<()>>,
+) -> std::io::Result<()> {
+    let wide_name = wide_null(pipe_name);
+    let handle = unsafe {
+        CreateNamedPipeW(
+            wide_name.as_ptr(),
+            PIPE_ACCESS_DUPLEX,
+            PIPE_WAIT,
+            1,
+            VIRTIO_CONSOLE_SMOKE_BUFFER_SIZE as u32,
+            VIRTIO_CONSOLE_SMOKE_BUFFER_SIZE as u32,
+            0,
+            ptr::null(),
+        )
+    };
+
+    if handle == INVALID_HANDLE_VALUE {
+        let err = std::io::Error::last_os_error();
+        let _ = ready_tx.send(Err(std::io::Error::new(err.kind(), err.to_string())));
+        return Err(err);
+    }
+
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle as _) };
+    ready_tx.send(Ok(())).unwrap();
+
+    let connected = unsafe { ConnectNamedPipe(handle.as_raw_handle() as HANDLE, ptr::null_mut()) };
+    if connected == 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
+            return Err(err);
+        }
+    }
+    eprintln!("named-pipe console smoke helper accepted libkrun connection");
+
+    loop {
+        let mut bytes = vec![0u8; VIRTIO_CONSOLE_SMOKE_BUFFER_SIZE];
+        let mut bytes_read = 0;
+        let ok = unsafe {
+            ReadFile(
+                handle.as_raw_handle() as HANDLE,
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+                &mut bytes_read,
+                ptr::null_mut(),
+            )
+        };
+
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if bytes_read == 0 {
+            continue;
+        }
+
+        bytes.truncate(bytes_read as usize);
+        eprintln!(
+            "named-pipe console smoke observed guest bytes: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        state.lock().unwrap().received = Some(bytes);
+        break;
+    }
+
+    unsafe {
+        DisconnectNamedPipe(handle.as_raw_handle() as HANDLE);
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn report_windows_virtio_console_smoke(state: &Option<Arc<Mutex<ConsoleSmokeState>>>) {
+    let Some(state) = state else {
+        return;
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        {
+            let state = state.lock().unwrap();
+            if state.received.is_some() || state.error.is_some() || Instant::now() >= deadline {
+                break;
+            }
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let state = state.lock().unwrap();
+    if let Some(bytes) = &state.received {
+        eprintln!(
+            "[on_exit] named-pipe console smoke captured: {}",
+            String::from_utf8_lossy(bytes)
+        );
+    } else if let Some(error) = &state.error {
+        eprintln!("[on_exit] named-pipe console smoke did not capture guest bytes: {error}");
+    } else {
+        eprintln!("[on_exit] named-pipe console smoke did not capture guest bytes");
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn unique_console_smoke_pipe_name() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+
+    format!(r"\\.\pipe\libkrun-rust-vm-console-smoke-{timestamp}")
+}
+
+#[cfg(target_os = "windows")]
+fn wide_null(value: &str) -> Vec<u16> {
+    OsStr::new(value).encode_wide().chain(Some(0)).collect()
 }
 
 //--------------------------------------------------------------------------------------------------

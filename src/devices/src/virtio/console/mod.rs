@@ -7,9 +7,36 @@ mod port_queue_mapping;
 mod process_rx;
 mod process_tx;
 
+use polly::event_manager::Pollable;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+use utils::eventfd::EventFd;
+
 pub use self::defs::uapi::VIRTIO_ID_CONSOLE as TYPE_CONSOLE;
 pub use self::device::Console;
 pub use self::port::PortDescription;
+
+#[cfg(unix)]
+pub(crate) fn eventfd_pollable(event: &EventFd) -> Pollable {
+    event.as_raw_fd()
+}
+
+#[cfg(windows)]
+pub(crate) fn eventfd_pollable(event: &EventFd) -> Pollable {
+    event.as_raw_handle()
+}
+
+#[cfg(unix)]
+pub(crate) fn pollable_token(pollable: Pollable) -> u64 {
+    pollable as u64
+}
+
+#[cfg(windows)]
+pub(crate) fn pollable_token(pollable: Pollable) -> u64 {
+    pollable as usize as u64
+}
 
 mod defs {
     pub const CONSOLE_DEV_ID: &str = "virtio_console";

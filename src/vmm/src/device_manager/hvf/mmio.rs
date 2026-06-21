@@ -328,7 +328,7 @@ impl DeviceInfoForFDT for MMIODeviceInfo {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "windows")))]
 mod tests {
     use super::super::super::builder;
     use super::*;

@@ -13,3 +13,6 @@ tdx = ["tee", "msb_krun/tdx"]
 [dependencies]
 env_logger = "0.11"
 msb_krun = { path = "../../src/krun" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Pipes"] }

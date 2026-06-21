@@ -84,6 +84,7 @@ fn pop_head_blocking<'mem>(
     }
 }
 
+#[allow(deprecated)]
 fn read_to_desc(
     desc: DescriptorChain,
     input: &mut (dyn PortInput + Send),

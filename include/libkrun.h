@@ -323,9 +323,13 @@ int32_t krun_add_virtiofs2(uint32_t ctx_id,
                            const char *c_path,
                            uint64_t shm_size);
 
+#ifndef _WIN32
+
 /* TSI (Transparent Socket Impersonation) feature flags for vsock */
 #define KRUN_TSI_HIJACK_INET  (1 << 0)
 #define KRUN_TSI_HIJACK_UNIX  (1 << 1)
+
+#endif /* _WIN32 */
 
 /* Taken from uapi/linux/virtio_net.h */
 #define NET_FEATURE_CSUM 1 << 0
@@ -459,8 +463,8 @@ int32_t krun_add_net_unixgram(uint32_t ctx_id,
  *  "flags"    - generic flags for the network interface. Must be zero.
  *
  * Notes:
- * If no network devices are added, networking uses the TSI backend.
- * This function should be called before krun_set_port_map.
+ * This function configures a concrete virtio-net backend. Windows TSI/vsock
+ * port mapping is not exposed until the Windows vsock transport is implemented.
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
@@ -472,6 +476,8 @@ int32_t krun_add_net_named_pipe(uint32_t ctx_id,
                                 uint32_t flags);
 
 #endif /* _WIN32 */
+
+#ifndef _WIN32
 
 /**
  * Adds an independent virtio-net device with the tap backend.
@@ -502,8 +508,6 @@ int32_t krun_add_net_tap(uint32_t ctx_id,
                          uint8_t *const c_mac,
                          uint32_t features,
                          uint32_t flags);
-
-#ifndef _WIN32
 
 /**
  * DEPRECATED. Use krun_add_net_unixstream instead.
@@ -558,6 +562,8 @@ int32_t krun_set_gvproxy_path(uint32_t ctx_id, char *c_path);
  */
 int32_t krun_set_net_mac(uint32_t ctx_id, uint8_t *const c_mac);
 
+#ifndef _WIN32
+
 /**
  * Configures a map of host to guest TCP ports for the microVM.
  *
@@ -584,6 +590,8 @@ int32_t krun_set_net_mac(uint32_t ctx_id, uint8_t *const c_mac);
  * as an API of libkrun (but you can still do port mapping using command line arguments of passt)
  */
 int32_t krun_set_port_map(uint32_t ctx_id, const char *const port_map[]);
+
+#endif /* _WIN32 */
 
 /* Flags for virglrenderer.  Copied from virglrenderer bindings. */
 #define VIRGLRENDERER_USE_EGL 1 << 0
@@ -884,6 +892,8 @@ int32_t krun_set_env(uint32_t ctx_id, const char *const envp[]);
  */
 int32_t krun_set_tee_config_file(uint32_t ctx_id, const char *filepath);
 
+#ifndef _WIN32
+
 /**
  * Adds a port-path pairing for guest IPC with a process in the host.
  *
@@ -931,6 +941,8 @@ int32_t krun_add_vsock_port2(uint32_t ctx_id,
  *  Zero on success or a negative error number on failure.
  */
 int32_t krun_add_vsock(uint32_t ctx_id, uint32_t tsi_features);
+
+#endif /* _WIN32 */
 
 /**
  * Returns the eventfd file descriptor to signal the guest to shut down orderly. This must be
@@ -1101,6 +1113,8 @@ int32_t krun_set_balloon_device(uint32_t ctx_id, bool enable);
  */
 int32_t krun_set_rng_device(uint32_t ctx_id, bool enable);
 
+#ifndef _WIN32
+
 /**
  * Disable the implicit vsock device.
  *
@@ -1115,6 +1129,8 @@ int32_t krun_set_rng_device(uint32_t ctx_id, bool enable);
  */
 int32_t krun_disable_implicit_vsock(uint32_t ctx_id);
 
+#endif /* _WIN32 */
+
 /*
  * Specify the value of `console=` in the kernel commandline.
  *
@@ -1126,6 +1142,8 @@ int32_t krun_disable_implicit_vsock(uint32_t ctx_id);
  *  Zero on success or a negative error number on failure.
  */
 int32_t krun_set_kernel_console(uint32_t ctx_id, const char *console_id);
+
+#ifndef _WIN32
 
 /*
  * Adds a virtio-console device to the guest.
@@ -1241,6 +1259,8 @@ int32_t krun_add_console_port_inout(uint32_t ctx_id,
                                      const char *name,
                                      int input_fd,
                                      int output_fd);
+
+#endif /* _WIN32 */
 
 /**
  * Configure block device to be used as root filesystem.

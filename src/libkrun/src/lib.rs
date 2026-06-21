@@ -41,11 +41,13 @@ use std::slice;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use utils::eventfd::EventFd;
+use vmm::resources::VmResources;
 #[cfg(not(target_os = "windows"))]
 use vmm::resources::{
     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, VirtioConsoleConfigMode,
 };
-use vmm::resources::{TsiFlags, VmResources, VsockConfig};
+#[cfg(not(target_os = "windows"))]
+use vmm::resources::{TsiFlags, VsockConfig};
 #[cfg(feature = "blk")]
 use vmm::vmm_config::block::{BlockDeviceConfig, BlockRootConfig};
 #[cfg(not(feature = "tee"))]
@@ -61,6 +63,7 @@ use vmm::vmm_config::kernel_cmdline::{KernelCmdlineConfig, DEFAULT_KERNEL_CMDLIN
 use vmm::vmm_config::machine_config::VmConfig;
 #[cfg(feature = "net")]
 use vmm::vmm_config::net::NetworkInterfaceConfig;
+#[cfg(not(target_os = "windows"))]
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 
 #[cfg(feature = "aws-nitro")]
@@ -151,7 +154,9 @@ struct ContextConfig {
     #[cfg(feature = "net")]
     legacy_mac: Option<[u8; 6]>,
     net_index: u8,
+    #[cfg(not(target_os = "windows"))]
     tsi_port_map: Option<HashMap<u16, u16>>,
+    #[cfg(not(target_os = "windows"))]
     vsock_config: VsockConfig,
     #[cfg(feature = "blk")]
     block_cfgs: Vec<BlockDeviceConfig>,
@@ -163,6 +168,7 @@ struct ContextConfig {
     block_root: Option<BlockRootConfig>,
     #[cfg(feature = "tee")]
     tee_config_file: Option<PathBuf>,
+    #[cfg(not(target_os = "windows"))]
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     shutdown_efd: Option<EventFd>,
     gpu_virgl_flags: Option<u32>,
@@ -296,6 +302,7 @@ impl ContextConfig {
         self.legacy_mac = Some(mac);
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn set_port_map(&mut self, new_port_map: HashMap<u16, u16>) -> Result<(), ()> {
         if self.net_index != 0 {
             return Err(());
@@ -315,6 +322,7 @@ impl ContextConfig {
         self.tee_config_file.clone()
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn add_vsock_port(&mut self, port: u32, filepath: PathBuf, listen: bool) {
         if let Some(ref mut map) = &mut self.unix_ipc_port_map {
             map.insert(port, (filepath, listen));
@@ -1209,7 +1217,7 @@ pub unsafe extern "C" fn krun_add_net_tap(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(all(not(target_os = "linux"), feature = "net"))]
+#[cfg(all(not(any(target_os = "linux", target_os = "windows")), feature = "net"))]
 pub unsafe extern "C" fn krun_add_net_tap(
     _ctx_id: u32,
     _c_tap_name: *const c_char,
@@ -1309,6 +1317,7 @@ pub unsafe extern "C" fn krun_set_net_mac(ctx_id: u32, c_mac: *const u8) -> i32 
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
+#[cfg(not(target_os = "windows"))]
 pub unsafe extern "C" fn krun_set_port_map(ctx_id: u32, c_port_map: *const *const c_char) -> i32 {
     let mut port_map = HashMap::new();
     let port_map_array: &[*const c_char] = slice::from_raw_parts(c_port_map, MAX_ARGS);
@@ -1538,6 +1547,7 @@ pub unsafe extern "C" fn krun_set_tee_config_file(ctx_id: u32, c_filepath: *cons
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
+#[cfg(not(target_os = "windows"))]
 pub unsafe extern "C" fn krun_add_vsock_port(
     ctx_id: u32,
     port: u32,
@@ -1548,6 +1558,7 @@ pub unsafe extern "C" fn krun_add_vsock_port(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
+#[cfg(not(target_os = "windows"))]
 pub unsafe extern "C" fn krun_add_vsock_port2(
     ctx_id: u32,
     port: u32,
@@ -2511,6 +2522,7 @@ pub extern "C" fn krun_set_rng_device(ctx_id: u32, enable: bool) -> i32 {
 }
 
 #[no_mangle]
+#[cfg(not(target_os = "windows"))]
 pub extern "C" fn krun_disable_implicit_vsock(ctx_id: u32) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
@@ -2524,6 +2536,7 @@ pub extern "C" fn krun_disable_implicit_vsock(ctx_id: u32) -> i32 {
 }
 
 #[no_mangle]
+#[cfg(not(target_os = "windows"))]
 pub extern "C" fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32 {
     let tsi_flags = match TsiFlags::from_bits(tsi_features) {
         Some(flags) => flags,
@@ -2580,18 +2593,6 @@ pub unsafe extern "C" fn krun_add_virtio_console_default(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(target_os = "windows")]
-pub unsafe extern "C" fn krun_add_virtio_console_default(
-    _ctx_id: u32,
-    _input_fd: libc::c_int,
-    _output_fd: libc::c_int,
-    _err_fd: libc::c_int,
-) -> i32 {
-    -libc::ENOTSUP
-}
-
-#[allow(clippy::missing_safety_doc)]
-#[no_mangle]
 #[cfg(not(target_os = "windows"))]
 pub unsafe extern "C" fn krun_add_virtio_console_multiport(ctx_id: u32) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
@@ -2613,13 +2614,6 @@ pub unsafe extern "C" fn krun_add_virtio_console_multiport(ctx_id: u32) -> i32 {
 #[no_mangle]
 #[cfg(target_os = "windows")]
 pub extern "C" fn krun_get_shutdown_eventfd(_ctx_id: u32) -> i32 {
-    -libc::ENOTSUP
-}
-
-#[allow(clippy::missing_safety_doc)]
-#[no_mangle]
-#[cfg(target_os = "windows")]
-pub unsafe extern "C" fn krun_add_virtio_console_multiport(_ctx_id: u32) -> i32 {
     -libc::ENOTSUP
 }
 
@@ -2670,18 +2664,6 @@ pub unsafe extern "C" fn krun_add_console_port_tty(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(target_os = "windows")]
-pub unsafe extern "C" fn krun_add_console_port_tty(
-    _ctx_id: u32,
-    _console_id: u32,
-    _name: *const libc::c_char,
-    _tty_fd: libc::c_int,
-) -> i32 {
-    -libc::ENOTSUP
-}
-
-#[allow(clippy::missing_safety_doc)]
-#[no_mangle]
 #[cfg(not(target_os = "windows"))]
 pub unsafe extern "C" fn krun_add_console_port_inout(
     ctx_id: u32,
@@ -2721,19 +2703,6 @@ pub unsafe extern "C" fn krun_add_console_port_inout(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(target_os = "windows")]
-pub unsafe extern "C" fn krun_add_console_port_inout(
-    _ctx_id: u32,
-    _console_id: u32,
-    _name: *const c_char,
-    _input_fd: c_int,
-    _output_fd: c_int,
-) -> i32 {
-    -libc::ENOTSUP
-}
-
-#[allow(clippy::missing_safety_doc)]
-#[no_mangle]
 #[cfg(not(target_os = "windows"))]
 pub unsafe extern "C" fn krun_add_serial_console_default(
     ctx_id: u32,
@@ -2752,17 +2721,6 @@ pub unsafe extern "C" fn krun_add_serial_console_default(
     }
 
     KRUN_SUCCESS
-}
-
-#[allow(clippy::missing_safety_doc)]
-#[no_mangle]
-#[cfg(target_os = "windows")]
-pub unsafe extern "C" fn krun_add_serial_console_default(
-    _ctx_id: u32,
-    _input_fd: c_int,
-    _output_fd: c_int,
-) -> i32 {
-    -libc::ENOTSUP
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -2885,6 +2843,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
     match &ctx_cfg.vsock_config {
         VsockConfig::Disabled => (),
         VsockConfig::Explicit { tsi_flags } => {
@@ -2902,8 +2861,6 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             // Check if TSI should be enabled based on network configuration
             #[cfg(all(feature = "net", unix))]
             let enable_tsi = ctx_cfg.vmr.net.list.is_empty() && ctx_cfg.legacy_net_cfg.is_none();
-            #[cfg(all(feature = "net", target_os = "windows"))]
-            let enable_tsi = ctx_cfg.vmr.net.list.is_empty();
             #[cfg(not(feature = "net"))]
             let enable_tsi = true;
 
