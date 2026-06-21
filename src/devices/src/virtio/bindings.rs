@@ -33,21 +33,60 @@ pub const LINUX_XATTR_REPLACE: libc::c_int = 2;
 pub type stat64 = libc::stat;
 #[cfg(target_os = "linux")]
 pub use libc::stat64;
+#[cfg(target_os = "windows")]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct stat64 {
+    pub st_ino: u64,
+    pub st_size: i64,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_mtime: i64,
+    pub st_ctime: i64,
+    pub st_atime_nsec: i64,
+    pub st_mtime_nsec: i64,
+    pub st_ctime_nsec: i64,
+    pub st_mode: u32,
+    pub st_nlink: u64,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_rdev: u64,
+    pub st_blksize: i64,
+}
 
 #[cfg(target_os = "macos")]
 pub type off64_t = libc::off_t;
 #[cfg(target_os = "linux")]
 pub use libc::off64_t;
+#[cfg(target_os = "windows")]
+#[allow(non_camel_case_types)]
+pub type off64_t = i64;
 
 #[cfg(target_os = "macos")]
 pub type statvfs64 = libc::statvfs;
 #[cfg(target_os = "linux")]
 pub use libc::statvfs64;
+#[cfg(target_os = "windows")]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct statvfs64 {
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_bsize: u64,
+    pub f_namemax: u64,
+    pub f_frsize: u64,
+}
 
 #[cfg(target_os = "macos")]
 pub type ino64_t = libc::ino_t;
 #[cfg(target_os = "linux")]
 pub use libc::ino64_t;
+#[cfg(target_os = "windows")]
+#[allow(non_camel_case_types)]
+pub type ino64_t = u64;
 
 #[cfg(target_os = "linux")]
 pub unsafe fn pread64(

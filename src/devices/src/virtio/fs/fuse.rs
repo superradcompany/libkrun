@@ -581,6 +581,8 @@ impl Attr {
             mode: st.st_mode,
             #[cfg(target_os = "macos")]
             mode: st.st_mode as u32,
+            #[cfg(target_os = "windows")]
+            mode: st.st_mode,
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             nlink: st.st_nlink as u32,
             #[cfg(all(
@@ -589,6 +591,8 @@ impl Attr {
             ))]
             nlink: st.st_nlink,
             #[cfg(target_os = "macos")]
+            nlink: st.st_nlink as u32,
+            #[cfg(target_os = "windows")]
             nlink: st.st_nlink as u32,
             uid: st.st_uid,
             gid: st.st_gid,
@@ -640,6 +644,22 @@ impl From<bindings::statvfs64> for Kstatfs {
             bavail: st.f_bavail as u64,
             files: st.f_files as u64,
             ffree: st.f_ffree as u64,
+            bsize: st.f_bsize as u32,
+            namelen: st.f_namemax as u32,
+            frsize: st.f_frsize as u32,
+            ..Default::default()
+        }
+    }
+}
+#[cfg(target_os = "windows")]
+impl From<bindings::statvfs64> for Kstatfs {
+    fn from(st: bindings::statvfs64) -> Self {
+        Kstatfs {
+            blocks: st.f_blocks,
+            bfree: st.f_bfree,
+            bavail: st.f_bavail,
+            files: st.f_files,
+            ffree: st.f_ffree,
             bsize: st.f_bsize as u32,
             namelen: st.f_namemax as u32,
             frsize: st.f_frsize as u32,

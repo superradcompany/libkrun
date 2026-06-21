@@ -4,9 +4,9 @@
 //! that uses `u64` directly for `Inode` and `Handle` instead of associated types,
 //! and `DynFileSystemAdapter` which bridges `DynFileSystem` back to `FileSystem`.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crossbeam_channel::Sender;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use utils::worker_message::WorkerMessage;
 
 use std::ffi::CStr;
@@ -390,7 +390,9 @@ pub trait DynFileSystem: Send + Sync {
         moffset: u64,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
@@ -402,7 +404,9 @@ pub trait DynFileSystem: Send + Sync {
         requests: Vec<RemovemappingOne>,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
@@ -829,7 +833,9 @@ impl FileSystem for DynFileSystemAdapter {
         moffset: u64,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> io::Result<()> {
         self.0.setupmapping(
             ctx,
@@ -841,7 +847,7 @@ impl FileSystem for DynFileSystemAdapter {
             moffset,
             host_shm_base,
             shm_size,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender,
         )
     }
@@ -852,14 +858,16 @@ impl FileSystem for DynFileSystemAdapter {
         requests: Vec<RemovemappingOne>,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> io::Result<()> {
         self.0.removemapping(
             ctx,
             requests,
             host_shm_base,
             shm_size,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender,
         )
     }
