@@ -15,13 +15,8 @@ use vm_memory::{ByteValued, GuestMemoryMmap};
 use super::super::{
     ActivateResult, DeviceQueue, DeviceState, FsError, QueueConfig, VirtioDevice, VirtioShmRegion,
 };
-use super::dyn_filesystem::DynFileSystem;
-#[cfg(not(target_os = "windows"))]
-use super::dyn_filesystem::DynFileSystemAdapter;
-use super::passthrough;
-#[cfg(not(target_os = "windows"))]
-use super::passthrough::PassthroughFs;
-#[cfg(not(target_os = "windows"))]
+use super::dyn_filesystem::{DynFileSystem, DynFileSystemAdapter};
+use super::passthrough::{self, PassthroughFs};
 use super::worker::FsWorker;
 use super::ExportTable;
 use super::{defs, defs::uapi};
@@ -45,13 +40,11 @@ impl Default for VirtioFsConfig {
 
 unsafe impl ByteValued for VirtioFsConfig {}
 
-#[cfg_attr(target_os = "windows", allow(dead_code))]
 enum FsBackend {
     Passthrough(passthrough::Config),
     Custom(Arc<dyn DynFileSystem>),
 }
 
-#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub struct Fs {
     avail_features: u64,
     acked_features: u64,
@@ -207,64 +200,54 @@ impl VirtioDevice for Fs {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
-        #[cfg(target_os = "windows")]
-        {
-            let _ = (mem, interrupt, queues);
-            error!("virtio-fs activation is not implemented on Windows yet");
-            return Err(super::super::ActivateError::BadActivate);
+        if self.worker_thread.is_some() {
+            panic!("virtio_fs: worker thread already exists");
         }
 
-        #[cfg(not(target_os = "windows"))]
-        {
-            if self.worker_thread.is_some() {
-                panic!("virtio_fs: worker thread already exists");
-            }
-
-            // Extract queues and eventfds from DeviceQueues.
-            let mut worker_queues = Vec::with_capacity(queues.len());
-            let mut queue_evts = Vec::with_capacity(queues.len());
-            for dq in queues {
-                worker_queues.push(dq.queue);
-                queue_evts.push(dq.event);
-            }
-
-            let join_handle = match &self.backend {
-                FsBackend::Passthrough(cfg) => {
-                    let worker = FsWorker::new(
-                        PassthroughFs::new(cfg.clone()).unwrap(),
-                        worker_queues,
-                        queue_evts,
-                        interrupt.clone(),
-                        mem.clone(),
-                        self.shm_region.clone(),
-                        self.worker_stopfd.try_clone().unwrap(),
-                        self.exit_code.clone(),
-                        #[cfg(target_os = "macos")]
-                        self.map_sender.clone(),
-                    );
-                    worker.run()
-                }
-                FsBackend::Custom(dyn_fs) => {
-                    let worker = FsWorker::new(
-                        DynFileSystemAdapter::new(Arc::clone(dyn_fs)),
-                        worker_queues,
-                        queue_evts,
-                        interrupt.clone(),
-                        mem.clone(),
-                        self.shm_region.clone(),
-                        self.worker_stopfd.try_clone().unwrap(),
-                        self.exit_code.clone(),
-                        #[cfg(target_os = "macos")]
-                        self.map_sender.clone(),
-                    );
-                    worker.run()
-                }
-            };
-            self.worker_thread = Some(join_handle);
-
-            self.device_state = DeviceState::Activated(mem, interrupt);
-            Ok(())
+        // Extract queues and eventfds from DeviceQueues.
+        let mut worker_queues = Vec::with_capacity(queues.len());
+        let mut queue_evts = Vec::with_capacity(queues.len());
+        for dq in queues {
+            worker_queues.push(dq.queue);
+            queue_evts.push(dq.event);
         }
+
+        let join_handle = match &self.backend {
+            FsBackend::Passthrough(cfg) => {
+                let worker = FsWorker::new(
+                    PassthroughFs::new(cfg.clone()).unwrap(),
+                    worker_queues,
+                    queue_evts,
+                    interrupt.clone(),
+                    mem.clone(),
+                    self.shm_region.clone(),
+                    self.worker_stopfd.try_clone().unwrap(),
+                    self.exit_code.clone(),
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
+                    self.map_sender.clone(),
+                );
+                worker.run()
+            }
+            FsBackend::Custom(dyn_fs) => {
+                let worker = FsWorker::new(
+                    DynFileSystemAdapter::new(Arc::clone(dyn_fs)),
+                    worker_queues,
+                    queue_evts,
+                    interrupt.clone(),
+                    mem.clone(),
+                    self.shm_region.clone(),
+                    self.worker_stopfd.try_clone().unwrap(),
+                    self.exit_code.clone(),
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
+                    self.map_sender.clone(),
+                );
+                worker.run()
+            }
+        };
+        self.worker_thread = Some(join_handle);
+
+        self.device_state = DeviceState::Activated(mem, interrupt);
+        Ok(())
     }
 
     fn is_activated(&self) -> bool {
