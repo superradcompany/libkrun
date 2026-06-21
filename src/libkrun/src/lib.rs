@@ -52,7 +52,7 @@ use vmm::vmm_config::block::{BlockDeviceConfig, BlockRootConfig};
 use vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(not(feature = "tee"))]
 use vmm::vmm_config::firmware::FirmwareConfig;
-#[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+#[cfg(not(feature = "tee"))]
 use vmm::vmm_config::fs::FsDeviceConfig;
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 #[cfg(feature = "tee")]
@@ -668,46 +668,13 @@ pub unsafe extern "C" fn krun_set_root(_ctx_id: u32, _c_root_path: *const c_char
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+#[cfg(not(feature = "tee"))]
 pub unsafe extern "C" fn krun_add_virtiofs(
     ctx_id: u32,
     c_tag: *const c_char,
     c_path: *const c_char,
 ) -> i32 {
-    let tag = match CStr::from_ptr(c_tag).to_str() {
-        Ok(tag) => tag,
-        Err(_) => return -libc::EINVAL,
-    };
-    let path = match CStr::from_ptr(c_path).to_str() {
-        Ok(path) => path,
-        Err(_) => return -libc::EINVAL,
-    };
-
-    match CTX_MAP.lock().unwrap().entry(ctx_id) {
-        Entry::Occupied(mut ctx_cfg) => {
-            let cfg = ctx_cfg.get_mut();
-            cfg.vmr.add_fs_device(FsDeviceConfig {
-                fs_id: tag.to_string(),
-                shared_dir: path.to_string(),
-                shm_size: None,
-                allow_root_dir_delete: false,
-            });
-        }
-        Entry::Vacant(_) => return -libc::ENOENT,
-    }
-
-    KRUN_SUCCESS
-}
-
-#[allow(clippy::missing_safety_doc)]
-#[no_mangle]
-#[cfg(all(not(feature = "tee"), target_os = "windows"))]
-pub unsafe extern "C" fn krun_add_virtiofs(
-    _ctx_id: u32,
-    _c_tag: *const c_char,
-    _c_path: *const c_char,
-) -> i32 {
-    -libc::ENOTSUP
+    add_virtiofs_device(ctx_id, c_tag, c_path, None)
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -754,6 +721,42 @@ pub unsafe extern "C" fn krun_add_virtiofs2(
     _shm_size: u64,
 ) -> i32 {
     -libc::ENOTSUP
+}
+
+#[cfg(not(feature = "tee"))]
+unsafe fn add_virtiofs_device(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_path: *const c_char,
+    shm_size: Option<usize>,
+) -> i32 {
+    if c_tag.is_null() || c_path.is_null() {
+        return -libc::EINVAL;
+    }
+
+    let tag = match CStr::from_ptr(c_tag).to_str() {
+        Ok(tag) => tag,
+        Err(_) => return -libc::EINVAL,
+    };
+    let path = match CStr::from_ptr(c_path).to_str() {
+        Ok(path) => path,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            cfg.vmr.add_fs_device(FsDeviceConfig {
+                fs_id: tag.to_string(),
+                shared_dir: path.to_string(),
+                shm_size,
+                allow_root_dir_delete: false,
+            });
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -3053,5 +3056,71 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
 
             -libc::EINVAL
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn add_virtiofs_adds_path_backed_device() {
+        let ctx_id = krun_create_ctx() as u32;
+        let tag = std::ffi::CString::new("hostshare").unwrap();
+        let path = std::ffi::CString::new("C:\\host\\share").unwrap();
+
+        let ret = unsafe { krun_add_virtiofs(ctx_id, tag.as_ptr(), path.as_ptr()) };
+        assert_eq!(ret, KRUN_SUCCESS);
+
+        {
+            let ctx_map = CTX_MAP.lock().unwrap();
+            let ctx = ctx_map.get(&ctx_id).unwrap();
+            assert_eq!(ctx.vmr.fs.len(), 1);
+            assert_eq!(ctx.vmr.fs[0].fs_id, "hostshare");
+            assert_eq!(ctx.vmr.fs[0].shared_dir, "C:\\host\\share");
+            assert_eq!(ctx.vmr.fs[0].shm_size, None);
+            assert!(!ctx.vmr.fs[0].allow_root_dir_delete);
+        }
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn add_virtiofs_rejects_unknown_context() {
+        let tag = std::ffi::CString::new("hostshare").unwrap();
+        let path = std::ffi::CString::new("C:\\host\\share").unwrap();
+
+        let ret = unsafe { krun_add_virtiofs(u32::MAX, tag.as_ptr(), path.as_ptr()) };
+        assert_eq!(ret, -libc::ENOENT);
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn add_virtiofs_rejects_null_pointers() {
+        let ctx_id = krun_create_ctx() as u32;
+        let tag = std::ffi::CString::new("hostshare").unwrap();
+        let path = std::ffi::CString::new("C:\\host\\share").unwrap();
+
+        let null_tag = unsafe { krun_add_virtiofs(ctx_id, std::ptr::null(), path.as_ptr()) };
+        let null_path = unsafe { krun_add_virtiofs(ctx_id, tag.as_ptr(), std::ptr::null()) };
+
+        assert_eq!(null_tag, -libc::EINVAL);
+        assert_eq!(null_path, -libc::EINVAL);
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(all(not(feature = "tee"), target_os = "windows"))]
+    #[test]
+    fn add_virtiofs2_waits_for_windows_dax_support() {
+        let ctx_id = krun_create_ctx() as u32;
+        let tag = std::ffi::CString::new("hostshare").unwrap();
+        let path = std::ffi::CString::new("C:\\host\\share").unwrap();
+
+        let ret = unsafe { krun_add_virtiofs2(ctx_id, tag.as_ptr(), path.as_ptr(), 1 << 29) };
+
+        assert_eq!(ret, -libc::ENOTSUP);
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
     }
 }
