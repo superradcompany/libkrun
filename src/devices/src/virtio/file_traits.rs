@@ -695,7 +695,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use imago::{raw::Raw, DynStorage, SyncFormatAccess};
+    use imago::format::PreallocateMode;
+    use imago::qcow2::Qcow2;
+    use imago::vmdk::Vmdk;
+    use imago::{
+        raw::Raw, DenyImplicitOpenGate, DynStorage, FormatCreateBuilder, FormatDriverBuilder,
+        PermissiveImplicitOpenGate, Storage, StorageCreateOptions, SyncFormatAccess,
+    };
     use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
     use crate::virtio::block::device::CacheType;
@@ -769,6 +775,151 @@ mod tests {
         assert_eq!(actual, payload);
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn windows_qcow2_write_falls_back_for_unallocated_range() {
+        let path = temp_image_path("qcow2-write-fallback");
+        let disk = create_qcow2_disk(&path, PreallocateMode::None);
+        let mem: GuestMemoryMmap<()> =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let payload = vec![0x6du8; 512];
+        mem.write_slice(&payload, GuestAddress(0x100)).unwrap();
+
+        let source = mem.get_slice(GuestAddress(0x100), payload.len()).unwrap();
+        assert_eq!(
+            disk.windows_formatted_write_vectored_at_volatile(&[source], 0)
+                .unwrap(),
+            None
+        );
+        assert_eq!(disk.write_vectored_at_volatile(&[source], 0).unwrap(), 512);
+
+        let target = mem.get_slice(GuestAddress(0x400), payload.len()).unwrap();
+        assert_eq!(disk.read_vectored_at_volatile(&[target], 0).unwrap(), 512);
+
+        let mut actual = vec![0u8; payload.len()];
+        mem.read_slice(&mut actual, GuestAddress(0x400)).unwrap();
+        assert_eq!(actual, payload);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn windows_qcow2_write_uses_allocated_writable_raw_mapping() {
+        let path = temp_image_path("qcow2-write-direct");
+        let disk = create_qcow2_disk(&path, PreallocateMode::None);
+        let mem: GuestMemoryMmap<()> =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+
+        let first = vec![0x2au8; 512];
+        mem.write_slice(&first, GuestAddress(0x100)).unwrap();
+        let first_source = mem.get_slice(GuestAddress(0x100), first.len()).unwrap();
+        assert_eq!(
+            disk.write_vectored_at_volatile(&[first_source], 0).unwrap(),
+            512
+        );
+
+        let replacement = vec![0x8eu8; 512];
+        mem.write_slice(&replacement, GuestAddress(0x500)).unwrap();
+        let replacement_source = mem
+            .get_slice(GuestAddress(0x500), replacement.len())
+            .unwrap();
+        assert_eq!(
+            disk.windows_formatted_write_vectored_at_volatile(&[replacement_source], 0)
+                .unwrap(),
+            Some(512)
+        );
+
+        let target = mem
+            .get_slice(GuestAddress(0x900), replacement.len())
+            .unwrap();
+        assert_eq!(disk.read_vectored_at_volatile(&[target], 0).unwrap(), 512);
+
+        let mut actual = vec![0u8; replacement.len()];
+        mem.read_slice(&mut actual, GuestAddress(0x900)).unwrap();
+        assert_eq!(actual, replacement);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn windows_vmdk_read_uses_flat_raw_mapping() {
+        let descriptor_path = temp_image_path("vmdk-read");
+        let flat_path = descriptor_path.with_extension("flat");
+        let flat_name = flat_path.file_name().unwrap().to_string_lossy();
+        let payload = (0..1024)
+            .map(|byte| ((byte * 7) % 251) as u8)
+            .collect::<Vec<_>>();
+
+        let mut flat_file = File::create(&flat_path).unwrap();
+        flat_file.write_all(&payload).unwrap();
+        flat_file.set_len(payload.len() as u64).unwrap();
+        drop(flat_file);
+
+        let descriptor = format!(
+            "# Disk DescriptorFile\n\
+             version=1\n\
+             CID=fffffffe\n\
+             parentCID=ffffffff\n\
+             createType=\"monolithicFlat\"\n\
+             RW 2 FLAT \"{flat_name}\" 0\n\
+             ddb.geometry.cylinders = \"1\"\n\
+             ddb.geometry.heads = \"1\"\n\
+             ddb.geometry.sectors = \"2\"\n"
+        );
+        let mut descriptor_file = File::create(&descriptor_path).unwrap();
+        descriptor_file.write_all(descriptor.as_bytes()).unwrap();
+        drop(descriptor_file);
+
+        let disk = create_vmdk_disk(&descriptor_path);
+        let mem: GuestMemoryMmap<()> =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let target = mem.get_slice(GuestAddress(0x180), 512).unwrap();
+
+        assert_eq!(
+            disk.windows_formatted_read_vectored_at_volatile(&[target], 128)
+                .unwrap(),
+            Some(512)
+        );
+
+        let mut actual = vec![0u8; 512];
+        mem.read_slice(&mut actual, GuestAddress(0x180)).unwrap();
+        assert_eq!(actual, payload[128..640]);
+
+        std::fs::remove_file(descriptor_path).unwrap();
+        std::fs::remove_file(flat_path).unwrap();
+    }
+
+    fn create_qcow2_disk(path: &std::path::Path, preallocate: PreallocateMode) -> DiskProperties {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let qcow2 = runtime
+            .block_on(async {
+                let storage = Box::<dyn DynStorage>::create_open(
+                    StorageCreateOptions::new().filename(path).overwrite(true),
+                )
+                .await?;
+                Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::create_builder(storage)
+                    .size(4096)
+                    .cluster_size(512)
+                    .preallocate(preallocate)
+                    .create_open(DenyImplicitOpenGate::default(), |image| {
+                        Ok(Qcow2::builder(image).backing(None).write(true))
+                    })
+                    .await
+            })
+            .unwrap();
+        let disk_image = Arc::new(Mutex::new(SyncFormatAccess::new(qcow2).unwrap()));
+        DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe).unwrap()
+    }
+
+    fn create_vmdk_disk(path: &std::path::Path) -> DiskProperties {
+        let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder_path(path)
+            .open_sync(PermissiveImplicitOpenGate::default())
+            .unwrap();
+        let disk_image = Arc::new(Mutex::new(SyncFormatAccess::new(vmdk).unwrap()));
+        DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe).unwrap()
     }
 
     fn temp_image_path(test_name: &str) -> std::path::PathBuf {
