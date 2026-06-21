@@ -1456,7 +1456,7 @@ pub fn build_microvm(
         export_table,
         intc.clone(),
         exit_code.clone(),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         _sender.clone(),
     )?;
     trace.mark("fs.ready");
@@ -2538,7 +2538,7 @@ fn attach_fs_devices(
     #[cfg(not(feature = "tee"))] export_table: Option<ExportTable>,
     intc: IrqChip,
     exit_code: Arc<AtomicI32>,
-    #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: Sender<WorkerMessage>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
@@ -2571,7 +2571,7 @@ fn attach_fs_devices(
             fs.lock().unwrap().set_export_table(export_table.clone());
         }
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         fs.lock().unwrap().set_map_sender(map_sender.clone());
 
         // The device mutex mustn't be locked here otherwise it will deadlock.

@@ -4,17 +4,20 @@ use std::convert::TryInto;
 use std::ffi::CStr;
 use std::fs::{File, FileType, OpenOptions as StdOpenOptions};
 use std::io;
-use std::os::windows::fs::MetadataExt;
+use std::os::windows::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use crossbeam_channel::{unbounded, Sender};
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_DIR_NOT_EMPTY, ERROR_FILE_EXISTS,
     ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY;
+
+use crate::windows::memory_mapping::{WindowsFileMappingAccess, WindowsFileMappingView};
 
 use super::super::bindings;
 use super::super::filesystem::{
@@ -22,6 +25,7 @@ use super::super::filesystem::{
     SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
 use super::super::fuse;
+use utils::worker_message::WorkerMessage;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -82,6 +86,7 @@ pub struct PassthroughFs {
     handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
     next_handle: AtomicU64,
     init_handle: u64,
+    map_windows: Mutex<BTreeMap<u64, WindowsFileMappingView>>,
     root: PathBuf,
     _cfg: Config,
 }
@@ -142,6 +147,7 @@ impl PassthroughFs {
             handles: RwLock::new(BTreeMap::new()),
             next_handle: AtomicU64::new(1),
             init_handle: 0,
+            map_windows: Mutex::new(BTreeMap::new()),
             root,
             _cfg: cfg,
         })
@@ -464,6 +470,88 @@ impl PassthroughFs {
     fn cfg_attr_timeout(&self) -> Duration {
         Duration::from_secs(5)
     }
+
+    fn do_setupmapping(
+        &self,
+        inode: Inode,
+        handle: Handle,
+        foffset: u64,
+        len: u64,
+        flags: u64,
+        moffset: u64,
+        guest_shm_base: u64,
+        shm_size: u64,
+        map_sender: &Option<Sender<WorkerMessage>>,
+    ) -> io::Result<()> {
+        let sender = map_sender
+            .as_ref()
+            .ok_or_else(|| linux_error(bindings::LINUX_ENOSYS))?;
+        let guest_addr = checked_mapping_guest_addr(moffset, len, guest_shm_base, shm_size)?;
+        let len: usize = len.try_into().map_err(|_| linux_error(LINUX_EINVAL))?;
+        let access = mapping_access(flags);
+
+        debug!(
+            "setupmapping: ino {inode:?} handle={handle} foffset={foffset:x} moffset={moffset:x} len={len} flags={flags:x}"
+        );
+        if self.map_windows.lock().unwrap().contains_key(&guest_addr) {
+            return Err(linux_error(LINUX_EBUSY));
+        }
+
+        let view = if inode == self.init_inode {
+            init_mapping_view(foffset, len, access)?
+        } else {
+            let data = self.inode(inode)?;
+            reject_symlink(&data.path)?;
+            let metadata = std::fs::symlink_metadata(&data.path).map_err(host_error)?;
+            if metadata.file_type().is_dir() {
+                return Err(linux_error(LINUX_EISDIR));
+            }
+
+            mapping_view_for_path(&data.path, foffset, len, access)?
+        };
+
+        let host_addr = view.host_addr();
+        debug!("setupmapping: ino {inode:?} guest_addr={guest_addr:x} len={len}");
+        request_mapping(
+            sender,
+            host_addr,
+            guest_addr,
+            len as u64,
+            access == WindowsFileMappingAccess::ReadWrite,
+        )?;
+
+        self.map_windows.lock().unwrap().insert(guest_addr, view);
+        Ok(())
+    }
+
+    fn do_removemapping(
+        &self,
+        requests: Vec<fuse::RemovemappingOne>,
+        guest_shm_base: u64,
+        shm_size: u64,
+        map_sender: &Option<Sender<WorkerMessage>>,
+    ) -> io::Result<()> {
+        let sender = map_sender
+            .as_ref()
+            .ok_or_else(|| linux_error(bindings::LINUX_ENOSYS))?;
+
+        for req in requests {
+            let guest_addr =
+                checked_mapping_guest_addr(req.moffset, req.len, guest_shm_base, shm_size)?;
+            debug!("removemapping: guest_addr={guest_addr:x} len={}", req.len);
+
+            let view = self
+                .map_windows
+                .lock()
+                .unwrap()
+                .remove(&guest_addr)
+                .ok_or_else(|| linux_error(LINUX_EINVAL))?;
+            request_unmapping(sender, guest_addr, req.len)?;
+            drop(view);
+        }
+
+        Ok(())
+    }
 }
 
 impl DirStream {
@@ -491,6 +579,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn destroy(&self) {
+        self.map_windows.lock().unwrap().clear();
         self.handles.write().unwrap().clear();
         self.inodes.write().unwrap().by_inode.clear();
         self.inodes.write().unwrap().by_path.clear();
@@ -768,6 +857,43 @@ impl FileSystem for PassthroughFs {
         }
     }
 
+    fn setupmapping(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        foffset: u64,
+        len: u64,
+        flags: u64,
+        moffset: u64,
+        guest_shm_base: u64,
+        shm_size: u64,
+        map_sender: &Option<Sender<WorkerMessage>>,
+    ) -> io::Result<()> {
+        self.do_setupmapping(
+            inode,
+            handle,
+            foffset,
+            len,
+            flags,
+            moffset,
+            guest_shm_base,
+            shm_size,
+            map_sender,
+        )
+    }
+
+    fn removemapping(
+        &self,
+        _ctx: Context,
+        requests: Vec<fuse::RemovemappingOne>,
+        guest_shm_base: u64,
+        shm_size: u64,
+        map_sender: &Option<Sender<WorkerMessage>>,
+    ) -> io::Result<()> {
+        self.do_removemapping(requests, guest_shm_base, shm_size, map_sender)
+    }
+
     fn release(
         &self,
         _ctx: Context,
@@ -902,6 +1028,131 @@ fn validate_directory_open(flags: u32) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn checked_mapping_guest_addr(
+    moffset: u64,
+    len: u64,
+    guest_shm_base: u64,
+    shm_size: u64,
+) -> io::Result<u64> {
+    let end = moffset
+        .checked_add(len)
+        .ok_or_else(|| linux_error(LINUX_EINVAL))?;
+    if end > shm_size {
+        return Err(linux_error(LINUX_EINVAL));
+    }
+
+    guest_shm_base
+        .checked_add(moffset)
+        .ok_or_else(|| linux_error(LINUX_EINVAL))
+}
+
+fn mapping_access(flags: u64) -> WindowsFileMappingAccess {
+    if flags & fuse::SetupmappingFlags::WRITE.bits() != 0 {
+        WindowsFileMappingAccess::ReadWrite
+    } else {
+        WindowsFileMappingAccess::ReadOnly
+    }
+}
+
+fn mapping_view_for_path(
+    path: &Path,
+    foffset: u64,
+    len: usize,
+    access: WindowsFileMappingAccess,
+) -> io::Result<WindowsFileMappingView> {
+    let mut options = StdOpenOptions::new();
+    options.read(true);
+    if access == WindowsFileMappingAccess::ReadWrite {
+        options.write(true);
+    }
+    let file = options.open(path).map_err(host_error)?;
+
+    let end = foffset
+        .checked_add(len as u64)
+        .ok_or_else(|| linux_error(LINUX_EINVAL))?;
+    if access == WindowsFileMappingAccess::ReadOnly
+        && end > file.metadata().map_err(host_error)?.len()
+    {
+        return read_only_oversized_mapping_view(&file, foffset, len);
+    }
+
+    WindowsFileMappingView::map_file(&file, foffset, len, access).map_err(host_error)
+}
+
+fn read_only_oversized_mapping_view(
+    file: &File,
+    foffset: u64,
+    len: usize,
+) -> io::Result<WindowsFileMappingView> {
+    let mut view = WindowsFileMappingView::map_anonymous(len, WindowsFileMappingAccess::ReadWrite)
+        .map_err(host_error)?;
+    let file_len = file.metadata().map_err(host_error)?.len();
+    if foffset < file_len {
+        let to_copy: usize = len.min((file_len - foffset).try_into().unwrap_or(usize::MAX));
+        let mut bytes = vec![0u8; to_copy];
+        let read = file.seek_read(&mut bytes, foffset).map_err(host_error)?;
+        view.copy_from_slice(&bytes[..read]).map_err(host_error)?;
+    }
+
+    Ok(view)
+}
+
+fn init_mapping_view(
+    foffset: u64,
+    len: usize,
+    access: WindowsFileMappingAccess,
+) -> io::Result<WindowsFileMappingView> {
+    let mut view = WindowsFileMappingView::map_anonymous(len, access).map_err(host_error)?;
+    let foffset: usize = foffset.try_into().map_err(|_| linux_error(LINUX_EINVAL))?;
+    if foffset < INIT_BINARY.len() {
+        let to_copy = len.min(INIT_BINARY.len() - foffset);
+        view.copy_from_slice(&INIT_BINARY[foffset..foffset + to_copy])
+            .map_err(host_error)?;
+    }
+
+    Ok(view)
+}
+
+fn request_mapping(
+    sender: &Sender<WorkerMessage>,
+    host_addr: u64,
+    guest_addr: u64,
+    len: u64,
+    writable: bool,
+) -> io::Result<()> {
+    let (reply_sender, reply_receiver) = unbounded();
+    sender
+        .send(WorkerMessage::DaxAddMapping(
+            reply_sender,
+            host_addr,
+            guest_addr,
+            len,
+            writable,
+        ))
+        .map_err(|_| linux_error(LINUX_EIO))?;
+    if reply_receiver.recv().map_err(|_| linux_error(LINUX_EIO))? {
+        Ok(())
+    } else {
+        Err(linux_error(LINUX_EINVAL))
+    }
+}
+
+fn request_unmapping(sender: &Sender<WorkerMessage>, guest_addr: u64, len: u64) -> io::Result<()> {
+    let (reply_sender, reply_receiver) = unbounded();
+    sender
+        .send(WorkerMessage::GpuRemoveMapping(
+            reply_sender,
+            guest_addr,
+            len,
+        ))
+        .map_err(|_| linux_error(LINUX_EIO))?;
+    if reply_receiver.recv().map_err(|_| linux_error(LINUX_EIO))? {
+        Ok(())
+    } else {
+        Err(linux_error(LINUX_EINVAL))
+    }
 }
 
 fn reject_symlink(path: &Path) -> io::Result<()> {
@@ -1338,5 +1589,77 @@ mod tests {
             .rmdir(context(), fuse::ROOT_ID, dir_name)
             .unwrap();
         assert!(!temp.path.join("nested").exists());
+    }
+
+    #[test]
+    fn setupmapping_and_removemapping_manage_file_view() {
+        let temp = TempDir::new();
+        fs::write(temp.path.join("dax.txt"), b"windows-dax").unwrap();
+
+        let passthrough = PassthroughFs::new(Config {
+            root_dir: temp.path.to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        passthrough.init(FsOptions::empty()).unwrap();
+
+        let name = CStr::from_bytes_with_nul(b"dax.txt\0").unwrap();
+        let entry = passthrough.lookup(context(), fuse::ROOT_ID, name).unwrap();
+        let (handle, _) = passthrough.open(context(), entry.inode, false, 0).unwrap();
+        let handle = handle.unwrap();
+        let (sender, receiver) = unbounded();
+        let map_sender = Some(sender);
+        let worker = std::thread::spawn(move || {
+            match receiver.recv().unwrap() {
+                WorkerMessage::DaxAddMapping(reply, host_addr, guest_addr, len, writable) => {
+                    assert_ne!(host_addr, 0);
+                    assert_eq!(guest_addr, 0x3000);
+                    assert_eq!(len, 11);
+                    assert!(!writable);
+                    reply.send(true).unwrap();
+                }
+                _ => panic!("unexpected worker message"),
+            }
+            match receiver.recv().unwrap() {
+                WorkerMessage::GpuRemoveMapping(reply, guest_addr, len) => {
+                    assert_eq!(guest_addr, 0x3000);
+                    assert_eq!(len, 11);
+                    reply.send(true).unwrap();
+                }
+                _ => panic!("unexpected worker message"),
+            }
+        });
+
+        passthrough
+            .setupmapping(
+                context(),
+                entry.inode,
+                handle,
+                0,
+                11,
+                fuse::SetupmappingFlags::READ.bits(),
+                0x2000,
+                0x1000,
+                0x8000,
+                &map_sender,
+            )
+            .unwrap();
+        passthrough
+            .removemapping(
+                context(),
+                vec![fuse::RemovemappingOne {
+                    moffset: 0x2000,
+                    len: 11,
+                }],
+                0x1000,
+                0x8000,
+                &map_sender,
+            )
+            .unwrap();
+
+        worker.join().unwrap();
+        passthrough
+            .release(context(), entry.inode, 0, handle, false, false, None)
+            .unwrap();
     }
 }

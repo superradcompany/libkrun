@@ -7,7 +7,9 @@ use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, HANDLE};
+use windows_sys::Win32::Foundation::{
+    ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::System::Ioctl::{
     FILE_ZERO_DATA_INFORMATION, FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA,
 };
@@ -60,6 +62,51 @@ impl WindowsFileMappingAccess {
 }
 
 impl WindowsFileMappingView {
+    pub(crate) fn map_anonymous(len: usize, access: WindowsFileMappingAccess) -> io::Result<Self> {
+        if len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot map an empty Windows anonymous view",
+            ));
+        }
+
+        let len_u64 = len as u64;
+        let mapping = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                ptr::null(),
+                access.page_protection(),
+                (len_u64 >> 32) as u32,
+                len_u64 as u32,
+                ptr::null(),
+            )
+        };
+        if mapping.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mapping = unsafe { OwnedHandle::from_raw_handle(mapping.cast()) };
+        let base_addr = unsafe {
+            MapViewOfFile(
+                mapping.as_raw_handle() as HANDLE,
+                access.file_map_access(),
+                0,
+                0,
+                len,
+            )
+        };
+        if base_addr.Value.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Self {
+            _mapping: mapping,
+            base_addr: base_addr.Value,
+            view_delta: 0,
+            len,
+        })
+    }
+
     pub(crate) fn map_file(
         file: &File,
         offset: u64,
@@ -139,6 +186,23 @@ impl WindowsFileMappingView {
         } else {
             Ok(())
         }
+    }
+
+    pub(crate) fn copy_from_slice(&mut self, data: &[u8]) -> io::Result<()> {
+        if data.len() > self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source slice is larger than Windows file mapping view",
+            ));
+        }
+
+        if !data.is_empty() {
+            unsafe {
+                ptr::copy_nonoverlapping(data.as_ptr(), self.host_ptr(), data.len());
+            }
+        }
+
+        Ok(())
     }
 
     fn host_ptr(&self) -> *mut u8 {
@@ -345,6 +409,25 @@ mod tests {
 
         drop(file);
         remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn anonymous_mapping_view_can_be_seeded() {
+        let expected = b"anonymous-dax";
+        let mut view =
+            WindowsFileMappingView::map_anonymous(4096, WindowsFileMappingAccess::ReadWrite)
+                .unwrap();
+
+        view.copy_from_slice(expected).unwrap();
+
+        unsafe {
+            assert_eq!(&view.as_slice()[..expected.len()], expected);
+            assert!(view.as_slice()[expected.len()..64]
+                .iter()
+                .all(|byte| *byte == 0));
+        }
+        assert_eq!(view.len(), 4096);
+        assert_ne!(view.host_addr(), 0);
     }
 
     #[test]

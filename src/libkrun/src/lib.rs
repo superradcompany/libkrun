@@ -679,48 +679,19 @@ pub unsafe extern "C" fn krun_add_virtiofs(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+#[cfg(not(feature = "tee"))]
 pub unsafe extern "C" fn krun_add_virtiofs2(
     ctx_id: u32,
     c_tag: *const c_char,
     c_path: *const c_char,
     shm_size: u64,
 ) -> i32 {
-    let tag = match CStr::from_ptr(c_tag).to_str() {
-        Ok(tag) => tag,
-        Err(_) => return -libc::EINVAL,
-    };
-    let path = match CStr::from_ptr(c_path).to_str() {
-        Ok(path) => path,
+    let shm_size = match shm_size.try_into() {
+        Ok(shm_size) => shm_size,
         Err(_) => return -libc::EINVAL,
     };
 
-    match CTX_MAP.lock().unwrap().entry(ctx_id) {
-        Entry::Occupied(mut ctx_cfg) => {
-            let cfg = ctx_cfg.get_mut();
-            cfg.vmr.add_fs_device(FsDeviceConfig {
-                fs_id: tag.to_string(),
-                shared_dir: path.to_string(),
-                shm_size: Some(shm_size.try_into().unwrap()),
-                allow_root_dir_delete: false,
-            });
-        }
-        Entry::Vacant(_) => return -libc::ENOENT,
-    }
-
-    KRUN_SUCCESS
-}
-
-#[allow(clippy::missing_safety_doc)]
-#[no_mangle]
-#[cfg(all(not(feature = "tee"), target_os = "windows"))]
-pub unsafe extern "C" fn krun_add_virtiofs2(
-    _ctx_id: u32,
-    _c_tag: *const c_char,
-    _c_path: *const c_char,
-    _shm_size: u64,
-) -> i32 {
-    -libc::ENOTSUP
+    add_virtiofs_device(ctx_id, c_tag, c_path, Some(shm_size))
 }
 
 #[cfg(not(feature = "tee"))]
@@ -3023,6 +2994,11 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
     }
 
+    #[cfg(all(not(feature = "tee"), target_os = "windows"))]
+    if ctx_cfg.vmr.fs.iter().any(|fs| fs.shm_size.is_some()) {
+        vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
+    }
+
     #[cfg(any(feature = "amd-sev", feature = "tdx"))]
     vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
 
@@ -3113,14 +3089,22 @@ mod tests {
 
     #[cfg(all(not(feature = "tee"), target_os = "windows"))]
     #[test]
-    fn add_virtiofs2_waits_for_windows_dax_support() {
+    fn add_virtiofs2_adds_shm_backed_path_device() {
         let ctx_id = krun_create_ctx() as u32;
         let tag = std::ffi::CString::new("hostshare").unwrap();
         let path = std::ffi::CString::new("C:\\host\\share").unwrap();
 
         let ret = unsafe { krun_add_virtiofs2(ctx_id, tag.as_ptr(), path.as_ptr(), 1 << 29) };
 
-        assert_eq!(ret, -libc::ENOTSUP);
+        assert_eq!(ret, KRUN_SUCCESS);
+        {
+            let ctx_map = CTX_MAP.lock().unwrap();
+            let ctx = ctx_map.get(&ctx_id).unwrap();
+            assert_eq!(ctx.vmr.fs.len(), 1);
+            assert_eq!(ctx.vmr.fs[0].fs_id, "hostshare");
+            assert_eq!(ctx.vmr.fs[0].shared_dir, "C:\\host\\share");
+            assert_eq!(ctx.vmr.fs[0].shm_size, Some(1 << 29));
+        }
         assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
     }
 }

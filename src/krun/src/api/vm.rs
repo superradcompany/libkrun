@@ -235,6 +235,12 @@ impl Vm {
                 .map_err(|e| Error::Runtime(RuntimeError::EventLoop(format!("{e:?}"))))?;
         }
 
+        #[cfg(all(not(feature = "tee"), target_os = "windows"))]
+        if self.vmr.fs.iter().any(|fs| fs.shm_size.is_some()) {
+            vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone())
+                .map_err(|e| Error::Runtime(RuntimeError::EventLoop(format!("{e:?}"))))?;
+        }
+
         #[cfg(any(feature = "amd-sev", feature = "tdx"))]
         vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone())
             .map_err(|e| Error::Runtime(RuntimeError::EventLoop(format!("{e:?}"))))?;

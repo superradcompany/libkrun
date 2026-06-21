@@ -40,6 +40,10 @@ impl super::Vmm {
         match msg {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             WorkerMessage::GpuAddMapping(s, h, g, l) => self.add_mapping(s, h, g, l),
+            #[cfg(target_os = "windows")]
+            WorkerMessage::DaxAddMapping(s, h, g, l, w) => {
+                self.add_mapping_with_writable(s, h, g, l, w)
+            }
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             WorkerMessage::GpuRemoveMapping(s, g, l) => self.remove_mapping(s, g, l),
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

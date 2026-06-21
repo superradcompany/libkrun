@@ -8,6 +8,7 @@
 //!   KRUN_DISK_FORMAT to raw, qcow2, or vmdk
 //! - Optional disk settings: KRUN_DISK_ID and KRUN_DISK_READ_ONLY
 //! - To attach a virtio-fs directory, set KRUN_FS_PATH and optionally KRUN_FS_TAG
+//! - Optional virtio-fs DAX setting: KRUN_FS_SHM_SIZE
 //!
 //! On macOS, the binary must be codesigned with the hypervisor entitlement:
 //!   cd examples && make rust_vm
@@ -37,6 +38,7 @@ const DEFAULT_DISK_ID: &str = "smoke";
 
 const FS_PATH_ENV: &str = "KRUN_FS_PATH";
 const FS_TAG_ENV: &str = "KRUN_FS_TAG";
+const FS_SHM_SIZE_ENV: &str = "KRUN_FS_SHM_SIZE";
 const DEFAULT_FS_TAG: &str = "hostshare";
 
 //--------------------------------------------------------------------------------------------------
@@ -56,6 +58,7 @@ struct SmokeDiskConfig {
 struct SmokeFsConfig {
     path: String,
     tag: String,
+    shm_size: Option<usize>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -114,7 +117,14 @@ fn main() -> Result<()> {
 
     let builder = if let Some(fs) = smoke_fs_config_from_env()? {
         eprintln!("Attaching virtio-fs {} ({})", fs.path, fs.tag);
-        builder.fs(|f| f.tag(&fs.tag).path(&fs.path))
+        builder.fs(|f| {
+            let f = f.tag(&fs.tag);
+            if let Some(shm_size) = fs.shm_size {
+                f.shm_size(shm_size).path(&fs.path)
+            } else {
+                f.path(&fs.path)
+            }
+        })
     } else {
         builder
     };
@@ -202,8 +212,17 @@ fn smoke_fs_config_from_lookup(
             "{FS_TAG_ENV} must not be empty"
         ))));
     }
+    let shm_size = if let Some(value) = get(FS_SHM_SIZE_ENV) {
+        Some(parse_usize_env(FS_SHM_SIZE_ENV, &value)?)
+    } else {
+        None
+    };
 
-    Ok(Some(SmokeFsConfig { path, tag }))
+    Ok(Some(SmokeFsConfig {
+        path,
+        tag,
+        shm_size,
+    }))
 }
 
 #[cfg(feature = "blk")]
@@ -272,6 +291,21 @@ fn parse_bool_env(name: &str, value: &str) -> Result<bool> {
 #[cfg(feature = "blk")]
 fn block_config_error(message: String) -> Error {
     Error::Config(ConfigError::Block(message))
+}
+
+fn parse_usize_env(name: &str, value: &str) -> Result<usize> {
+    let value = value.trim().parse::<usize>().map_err(|_| {
+        Error::Config(ConfigError::Filesystem(format!(
+            "{name} must be a positive integer"
+        )))
+    })?;
+    if value == 0 {
+        return Err(Error::Config(ConfigError::Filesystem(format!(
+            "{name} must be a positive integer"
+        ))));
+    }
+
+    Ok(value)
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -365,6 +399,7 @@ mod fs_tests {
 
         assert_eq!(config.path, "share");
         assert_eq!(config.tag, DEFAULT_FS_TAG);
+        assert_eq!(config.shm_size, None);
     }
 
     #[test]
@@ -379,5 +414,21 @@ mod fs_tests {
 
         assert_eq!(config.path, "share");
         assert_eq!(config.tag, "data");
+        assert_eq!(config.shm_size, None);
+    }
+
+    #[test]
+    fn fs_env_parses_shm_size() {
+        let config = smoke_fs_config_from_lookup(|name| match name {
+            FS_PATH_ENV => Some("share".to_string()),
+            FS_SHM_SIZE_ENV => Some("536870912".to_string()),
+            _ => None,
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(config.path, "share");
+        assert_eq!(config.tag, DEFAULT_FS_TAG);
+        assert_eq!(config.shm_size, Some(536870912));
     }
 }

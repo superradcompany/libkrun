@@ -636,6 +636,17 @@ impl Vm {
         guest_addr: u64,
         len: u64,
     ) {
+        self.add_mapping_with_writable(reply_sender, host_addr, guest_addr, len, true);
+    }
+
+    pub fn add_mapping_with_writable(
+        &self,
+        reply_sender: Sender<bool>,
+        host_addr: u64,
+        guest_addr: u64,
+        len: u64,
+        writable: bool,
+    ) {
         debug!("add_mapping: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
 
         if let Err(err) = unmap_gpa_range(self.partition.handle, guest_addr, len) {
@@ -644,7 +655,10 @@ impl Vm {
             return;
         }
 
-        let flags = WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite;
+        let mut flags = WHvMapGpaRangeFlagRead;
+        if writable {
+            flags |= WHvMapGpaRangeFlagWrite;
+        }
         if let Err(err) = map_gpa_range_with_flags(
             self.partition.handle,
             host_addr as *const u8,

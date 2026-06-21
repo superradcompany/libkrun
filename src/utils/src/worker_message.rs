@@ -16,6 +16,8 @@ pub enum WorkerMessage {
     IrqLine(crossbeam_channel::Sender<bool>, u32, bool),
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     GpuAddMapping(crossbeam_channel::Sender<bool>, u64, u64, u64),
+    #[cfg(target_os = "windows")]
+    DaxAddMapping(crossbeam_channel::Sender<bool>, u64, u64, u64, bool),
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     GpuRemoveMapping(crossbeam_channel::Sender<bool>, u64, u64),
     ConvertMemory(crossbeam_channel::Sender<bool>, MemoryProperties),
