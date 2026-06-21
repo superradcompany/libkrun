@@ -2,7 +2,7 @@ use std::collections::btree_map;
 use std::collections::BTreeMap;
 use std::convert::TryInto;
 use std::ffi::CStr;
-use std::fs::{File, FileType};
+use std::fs::{File, FileType, OpenOptions as StdOpenOptions};
 use std::io;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -11,14 +11,15 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME,
-    ERROR_PATH_NOT_FOUND,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_DIR_NOT_EMPTY, ERROR_FILE_EXISTS,
+    ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY;
 
 use super::super::bindings;
 use super::super::filesystem::{
-    Context, DirEntry, Entry, ExportTable, FileSystem, FsOptions, OpenOptions, ZeroCopyWriter,
+    Context, DirEntry, Entry, ExportTable, Extensions, FileSystem, FsOptions, OpenOptions,
+    SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
 use super::super::fuse;
 
@@ -37,11 +38,13 @@ const DT_LNK: u32 = 10;
 const LINUX_EIO: i32 = 5;
 const LINUX_EBADF: i32 = 9;
 const LINUX_EACCES: i32 = 13;
+const LINUX_EBUSY: i32 = 16;
 const LINUX_EEXIST: i32 = 17;
 const LINUX_ENOENT: i32 = 2;
 const LINUX_ENOTDIR: i32 = 20;
 const LINUX_EISDIR: i32 = 21;
 const LINUX_EINVAL: i32 = 22;
+const LINUX_ENOTEMPTY: i32 = 39;
 const LINUX_ELOOP: i32 = 40;
 const LINUX_EOPNOTSUPP: i32 = 95;
 
@@ -97,6 +100,7 @@ struct InodeData {
 
 struct HandleData {
     inode: Inode,
+    flags: u32,
     kind: HandleKind,
     dirstream: Mutex<DirStream>,
 }
@@ -214,7 +218,7 @@ impl PassthroughFs {
 
     fn do_open(&self, inode: Inode, flags: u32) -> io::Result<(Option<Handle>, OpenOptions)> {
         let data = self.inode(inode)?;
-        validate_read_only_open(flags)?;
+        let options = open_options_from_flags(flags, false)?;
         reject_symlink(&data.path)?;
 
         let metadata = std::fs::symlink_metadata(&data.path).map_err(host_error)?;
@@ -222,10 +226,11 @@ impl PassthroughFs {
             return Err(linux_error(LINUX_EISDIR));
         }
 
-        let file = File::open(&data.path).map_err(host_error)?;
+        let file = options.open(&data.path).map_err(host_error)?;
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let data = HandleData {
             inode,
+            flags,
             kind: HandleKind::File(RwLock::new(file)),
             dirstream: Mutex::new(DirStream::default()),
         };
@@ -235,7 +240,7 @@ impl PassthroughFs {
     }
 
     fn do_opendir(&self, inode: Inode, flags: u32) -> io::Result<(Option<Handle>, OpenOptions)> {
-        validate_read_only_open(flags)?;
+        validate_directory_open(flags)?;
 
         let data = self.inode(inode)?;
         let metadata = std::fs::symlink_metadata(&data.path).map_err(host_error)?;
@@ -246,6 +251,7 @@ impl PassthroughFs {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let data = HandleData {
             inode,
+            flags,
             kind: HandleKind::Directory(data.path.clone()),
             dirstream: Mutex::new(DirStream::default()),
         };
@@ -264,6 +270,112 @@ impl PassthroughFs {
         }
 
         Err(linux_error(LINUX_EBADF))
+    }
+
+    fn handle(&self, inode: Inode, handle: Handle) -> io::Result<Arc<HandleData>> {
+        self.handles
+            .read()
+            .unwrap()
+            .get(&handle)
+            .filter(|data| data.inode == inode)
+            .cloned()
+            .ok_or_else(|| linux_error(LINUX_EBADF))
+    }
+
+    fn forget_path(&self, path: &Path) {
+        let mut inodes = self.inodes.write().unwrap();
+        if let Some(data) = inodes.by_path.remove(path) {
+            inodes.by_inode.remove(&data.inode);
+        }
+    }
+
+    fn entry_for_path(&self, path: PathBuf, lookup_count: u64) -> io::Result<Entry> {
+        let metadata = std::fs::symlink_metadata(&path).map_err(host_error)?;
+        let inode_data = self.intern_path(path, lookup_count);
+        let attr = stat_from_metadata(&metadata, inode_data.inode);
+
+        Ok(Entry {
+            inode: inode_data.inode,
+            generation: 0,
+            attr,
+            attr_flags: 0,
+            attr_timeout: self.cfg_attr_timeout(),
+            entry_timeout: self.cfg_entry_timeout(),
+        })
+    }
+
+    fn do_create(
+        &self,
+        parent: Inode,
+        name: &CStr,
+        flags: u32,
+    ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
+        let path = self.child_path(parent, name)?;
+        let parent = path.parent().ok_or_else(|| linux_error(LINUX_EINVAL))?;
+        let metadata = std::fs::symlink_metadata(parent).map_err(host_error)?;
+        if !metadata.file_type().is_dir() {
+            return Err(linux_error(LINUX_ENOTDIR));
+        }
+
+        let options = open_options_from_flags(flags, true)?;
+        let file = options.open(&path).map_err(host_error)?;
+        let entry = self.entry_for_path(path, 1)?;
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        let data = HandleData {
+            inode: entry.inode,
+            flags,
+            kind: HandleKind::File(RwLock::new(file)),
+            dirstream: Mutex::new(DirStream::default()),
+        };
+
+        self.handles.write().unwrap().insert(handle, Arc::new(data));
+        Ok((entry, Some(handle), OpenOptions::empty()))
+    }
+
+    fn do_mkdir(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
+        let path = self.child_path(parent, name)?;
+        std::fs::create_dir(&path).map_err(host_error)?;
+        self.entry_for_path(path, 1)
+    }
+
+    fn do_unlink(&self, parent: Inode, name: &CStr) -> io::Result<()> {
+        let path = self.child_path(parent, name)?;
+        std::fs::remove_file(&path).map_err(host_error)?;
+        self.forget_path(&path);
+        Ok(())
+    }
+
+    fn do_rmdir(&self, parent: Inode, name: &CStr) -> io::Result<()> {
+        let path = self.child_path(parent, name)?;
+        std::fs::remove_dir(&path).map_err(host_error)?;
+        self.forget_path(&path);
+        Ok(())
+    }
+
+    fn do_rename(
+        &self,
+        olddir: Inode,
+        oldname: &CStr,
+        newdir: Inode,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        if flags & bindings::LINUX_RENAME_EXCHANGE as u32 != 0
+            || flags & bindings::LINUX_RENAME_WHITEOUT as u32 != 0
+        {
+            return Err(linux_error(LINUX_EOPNOTSUPP));
+        }
+
+        let old_path = self.child_path(olddir, oldname)?;
+        let new_path = self.child_path(newdir, newname)?;
+        if flags & bindings::LINUX_RENAME_NOREPLACE as u32 != 0 && new_path.exists() {
+            return Err(linux_error(LINUX_EEXIST));
+        }
+
+        std::fs::rename(&old_path, &new_path).map_err(host_error)?;
+        self.forget_path(&old_path);
+        self.forget_path(&new_path);
+        Ok(())
     }
 
     fn do_readdir<F>(
@@ -426,6 +538,110 @@ impl FileSystem for PassthroughFs {
         self.do_getattr(inode)
     }
 
+    fn setattr(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        attr: bindings::stat64,
+        handle: Option<Handle>,
+        valid: SetattrValid,
+    ) -> io::Result<(bindings::stat64, Duration)> {
+        if inode == self.init_inode {
+            return Err(linux_error(LINUX_EACCES));
+        }
+
+        let data = self.inode(inode)?;
+        reject_symlink(&data.path)?;
+
+        if valid.contains(SetattrValid::SIZE) {
+            let size: u64 = attr
+                .st_size
+                .try_into()
+                .map_err(|_| linux_error(LINUX_EINVAL))?;
+            if let Some(handle) = handle {
+                let handle_data = self.handle(inode, handle)?;
+                match &handle_data.kind {
+                    HandleKind::File(file) => {
+                        file.write().unwrap().set_len(size).map_err(host_error)?
+                    }
+                    HandleKind::Directory(_) => return Err(linux_error(LINUX_EISDIR)),
+                }
+            } else {
+                StdOpenOptions::new()
+                    .write(true)
+                    .open(&data.path)
+                    .map_err(host_error)?
+                    .set_len(size)
+                    .map_err(host_error)?;
+            }
+        }
+
+        if valid.contains(SetattrValid::MODE) {
+            let mut permissions = std::fs::metadata(&data.path)
+                .map_err(host_error)?
+                .permissions();
+            permissions.set_readonly(attr.st_mode & 0o222 == 0);
+            std::fs::set_permissions(&data.path, permissions).map_err(host_error)?;
+        }
+
+        self.do_getattr(inode)
+    }
+
+    fn mknod(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        name: &CStr,
+        mode: u32,
+        _rdev: u32,
+        _umask: u32,
+        _extensions: Extensions,
+    ) -> io::Result<Entry> {
+        if mode & S_IFMT != S_IFREG {
+            return Err(linux_error(LINUX_EOPNOTSUPP));
+        }
+
+        let path = self.child_path(inode, name)?;
+        StdOpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(host_error)?;
+        self.entry_for_path(path, 1)
+    }
+
+    fn mkdir(
+        &self,
+        _ctx: Context,
+        parent: Inode,
+        name: &CStr,
+        _mode: u32,
+        _umask: u32,
+        _extensions: Extensions,
+    ) -> io::Result<Entry> {
+        self.do_mkdir(parent, name)
+    }
+
+    fn unlink(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
+        self.do_unlink(parent, name)
+    }
+
+    fn rmdir(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
+        self.do_rmdir(parent, name)
+    }
+
+    fn rename(
+        &self,
+        _ctx: Context,
+        olddir: Inode,
+        oldname: &CStr,
+        newdir: Inode,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        self.do_rename(olddir, oldname, newdir, newname, flags)
+    }
+
     fn open(
         &self,
         _ctx: Context,
@@ -438,6 +654,20 @@ impl FileSystem for PassthroughFs {
         }
 
         self.do_open(inode, flags)
+    }
+
+    fn create(
+        &self,
+        _ctx: Context,
+        parent: Inode,
+        name: &CStr,
+        _mode: u32,
+        _kill_priv: bool,
+        flags: u32,
+        _umask: u32,
+        _extensions: Extensions,
+    ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
+        self.do_create(parent, name, flags)
     }
 
     fn read<W: io::Write + ZeroCopyWriter>(
@@ -476,6 +706,66 @@ impl FileSystem for PassthroughFs {
         };
 
         w.write_from(&file, size as usize, offset)
+    }
+
+    fn write<R: io::Read + ZeroCopyReader>(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        mut r: R,
+        size: u32,
+        offset: u64,
+        _lock_owner: Option<u64>,
+        _delayed_write: bool,
+        _kill_priv: bool,
+        _flags: u32,
+    ) -> io::Result<usize> {
+        if inode == self.init_inode {
+            return Err(linux_error(LINUX_EACCES));
+        }
+
+        let handle_data = self.handle(inode, handle)?;
+        let file = match &handle_data.kind {
+            HandleKind::File(file) => file.write().unwrap(),
+            HandleKind::Directory(_) => return Err(linux_error(LINUX_EISDIR)),
+        };
+
+        let offset = if handle_data.flags & bindings::LINUX_O_APPEND as u32 != 0 {
+            file.metadata().map_err(host_error)?.len()
+        } else {
+            offset
+        };
+        r.read_to(&file, size as usize, offset).map_err(host_error)
+    }
+
+    fn flush(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        handle: Handle,
+        _lock_owner: u64,
+    ) -> io::Result<()> {
+        if inode == self.init_inode && handle == self.init_handle {
+            return Ok(());
+        }
+
+        let handle_data = self.handle(inode, handle)?;
+        match &handle_data.kind {
+            HandleKind::File(file) => file.read().unwrap().sync_data().map_err(host_error),
+            HandleKind::Directory(_) => Ok(()),
+        }
+    }
+
+    fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
+        let handle_data = self.handle(inode, handle)?;
+        match &handle_data.kind {
+            HandleKind::File(file) if datasync => {
+                file.read().unwrap().sync_data().map_err(host_error)
+            }
+            HandleKind::File(file) => file.read().unwrap().sync_all().map_err(host_error),
+            HandleKind::Directory(_) => Ok(()),
+        }
     }
 
     fn release(
@@ -549,19 +839,66 @@ fn forget_one(inodes: &mut InodeTable, inode: Inode, count: u64) {
     }
 }
 
-fn validate_read_only_open(flags: u32) -> io::Result<()> {
+fn open_options_from_flags(flags: u32, create: bool) -> io::Result<StdOpenOptions> {
     let flags = flags as i32;
+    if flags & bindings::LINUX_O_DIRECT != 0 {
+        return Err(linux_error(LINUX_EOPNOTSUPP));
+    }
+    if !create && flags & (bindings::LINUX_O_CREAT | bindings::LINUX_O_EXCL) != 0 {
+        return Err(linux_error(LINUX_EINVAL));
+    }
+    if flags & bindings::LINUX_O_DIRECTORY != 0 {
+        return Err(linux_error(LINUX_EISDIR));
+    }
+
     let accmode = flags & LINUX_O_ACCMODE;
-    if accmode == LINUX_O_WRONLY || accmode == LINUX_O_RDWR {
+    let mut options = StdOpenOptions::new();
+    match accmode {
+        0 => {
+            options.read(true);
+        }
+        LINUX_O_WRONLY => {
+            options.write(true);
+        }
+        LINUX_O_RDWR => {
+            options.read(true).write(true);
+        }
+        _ => return Err(linux_error(LINUX_EINVAL)),
+    };
+
+    if flags & bindings::LINUX_O_APPEND != 0 {
+        options.append(true);
+    }
+    if flags & bindings::LINUX_O_TRUNC != 0 {
+        if accmode == 0 {
+            return Err(linux_error(LINUX_EACCES));
+        }
+        options.truncate(true);
+    }
+
+    if create {
+        if flags & bindings::LINUX_O_EXCL != 0 {
+            options.create_new(true);
+        } else {
+            options.create(true);
+        }
+        if accmode == 0 {
+            options.write(true);
+        }
+    }
+
+    Ok(options)
+}
+
+fn validate_directory_open(flags: u32) -> io::Result<()> {
+    let flags = flags as i32;
+    if flags & bindings::LINUX_O_DIRECT != 0 {
         return Err(linux_error(LINUX_EOPNOTSUPP));
     }
 
-    let unsupported = bindings::LINUX_O_CREAT
-        | bindings::LINUX_O_TRUNC
-        | bindings::LINUX_O_APPEND
-        | bindings::LINUX_O_DIRECT;
-    if (flags & unsupported) != 0 {
-        return Err(linux_error(LINUX_EOPNOTSUPP));
+    let accmode = flags & LINUX_O_ACCMODE;
+    if accmode == LINUX_O_WRONLY || accmode == LINUX_O_RDWR {
+        return Err(linux_error(LINUX_EACCES));
     }
 
     Ok(())
@@ -682,7 +1019,11 @@ fn host_error(error: io::Error) -> io::Error {
             LINUX_ENOENT
         }
         Some(code) if code == ERROR_ACCESS_DENIED as i32 => LINUX_EACCES,
-        Some(code) if code == ERROR_ALREADY_EXISTS as i32 => LINUX_EEXIST,
+        Some(code) if code == ERROR_ALREADY_EXISTS as i32 || code == ERROR_FILE_EXISTS as i32 => {
+            LINUX_EEXIST
+        }
+        Some(code) if code == ERROR_DIR_NOT_EMPTY as i32 => LINUX_ENOTEMPTY,
+        Some(code) if code == ERROR_SHARING_VIOLATION as i32 => LINUX_EBUSY,
         Some(code) if code == ERROR_INVALID_NAME as i32 => LINUX_EINVAL,
         _ => match error.kind() {
             io::ErrorKind::NotFound => LINUX_ENOENT,
@@ -708,6 +1049,7 @@ fn linux_error(errno: i32) -> io::Error {
 mod tests {
     use std::fs;
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::windows::fs::FileExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -718,6 +1060,11 @@ mod tests {
 
     struct CaptureWriter {
         bytes: Vec<u8>,
+    }
+
+    struct SourceReader {
+        bytes: Vec<u8>,
+        pos: usize,
     }
 
     impl TempDir {
@@ -756,6 +1103,28 @@ mod tests {
             file.seek(SeekFrom::Start(offset))?;
             let mut take = file.take(count as u64);
             take.read_to_end(&mut self.bytes)
+        }
+    }
+
+    impl Read for SourceReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let len = buf.len().min(self.bytes.len().saturating_sub(self.pos));
+            buf[..len].copy_from_slice(&self.bytes[self.pos..self.pos + len]);
+            self.pos += len;
+            Ok(len)
+        }
+    }
+
+    impl ZeroCopyReader for SourceReader {
+        fn read_to(&mut self, file: &File, count: usize, offset: u64) -> io::Result<usize> {
+            let len = count.min(self.bytes.len().saturating_sub(self.pos));
+            if len == 0 {
+                return Ok(0);
+            }
+
+            let written = file.seek_write(&self.bytes[self.pos..self.pos + len], offset)?;
+            self.pos += written;
+            Ok(written)
         }
     }
 
@@ -822,5 +1191,152 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["alpha.txt", "nested"]);
         fs.releasedir(context(), fuse::ROOT_ID, 0, handle).unwrap();
+    }
+
+    #[test]
+    fn create_write_fsync_and_truncate_file() {
+        let temp = TempDir::new();
+        let passthrough = PassthroughFs::new(Config {
+            root_dir: temp.path.to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        passthrough.init(FsOptions::empty()).unwrap();
+
+        let name = CStr::from_bytes_with_nul(b"created.txt\0").unwrap();
+        let flags = (bindings::LINUX_O_CREAT | bindings::LINUX_O_TRUNC | LINUX_O_RDWR) as u32;
+        let (entry, handle, _) = passthrough
+            .create(
+                context(),
+                fuse::ROOT_ID,
+                name,
+                S_IFREG | 0o644,
+                false,
+                flags,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        let handle = handle.unwrap();
+
+        let payload = b"hello writable virtiofs";
+        let mut reader = SourceReader {
+            bytes: payload.to_vec(),
+            pos: 0,
+        };
+        let written = passthrough
+            .write(
+                context(),
+                entry.inode,
+                handle,
+                &mut reader,
+                payload.len() as u32,
+                0,
+                None,
+                false,
+                false,
+                flags,
+            )
+            .unwrap();
+
+        assert_eq!(written, payload.len());
+        passthrough
+            .fsync(context(), entry.inode, false, handle)
+            .unwrap();
+        assert_eq!(fs::read(temp.path.join("created.txt")).unwrap(), payload);
+
+        let mut attr = bindings::stat64 {
+            st_size: 5,
+            ..Default::default()
+        };
+        passthrough
+            .setattr(
+                context(),
+                entry.inode,
+                attr,
+                Some(handle),
+                SetattrValid::SIZE,
+            )
+            .unwrap();
+        assert_eq!(fs::read(temp.path.join("created.txt")).unwrap(), b"hello");
+
+        attr.st_mode = S_IFREG | 0o444;
+        passthrough
+            .setattr(
+                context(),
+                entry.inode,
+                attr,
+                Some(handle),
+                SetattrValid::MODE,
+            )
+            .unwrap();
+        assert!(fs::metadata(temp.path.join("created.txt"))
+            .unwrap()
+            .permissions()
+            .readonly());
+
+        passthrough
+            .release(context(), entry.inode, 0, handle, false, false, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn mkdir_rename_unlink_and_rmdir() {
+        let temp = TempDir::new();
+        let passthrough = PassthroughFs::new(Config {
+            root_dir: temp.path.to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        passthrough.init(FsOptions::empty()).unwrap();
+
+        let dir_name = CStr::from_bytes_with_nul(b"nested\0").unwrap();
+        let dir = passthrough
+            .mkdir(
+                context(),
+                fuse::ROOT_ID,
+                dir_name,
+                S_IFDIR | 0o755,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        assert!(temp.path.join("nested").is_dir());
+
+        let file_name = CStr::from_bytes_with_nul(b"file.txt\0").unwrap();
+        let flags = (bindings::LINUX_O_CREAT | LINUX_O_RDWR) as u32;
+        let (entry, handle, _) = passthrough
+            .create(
+                context(),
+                dir.inode,
+                file_name,
+                S_IFREG | 0o644,
+                false,
+                flags,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        let handle = handle.unwrap();
+        passthrough
+            .release(context(), entry.inode, 0, handle, false, false, None)
+            .unwrap();
+
+        let renamed = CStr::from_bytes_with_nul(b"renamed.txt\0").unwrap();
+        passthrough
+            .rename(context(), dir.inode, file_name, fuse::ROOT_ID, renamed, 0)
+            .unwrap();
+        assert!(!temp.path.join("nested").join("file.txt").exists());
+        assert!(temp.path.join("renamed.txt").is_file());
+
+        passthrough
+            .unlink(context(), fuse::ROOT_ID, renamed)
+            .unwrap();
+        assert!(!temp.path.join("renamed.txt").exists());
+
+        passthrough
+            .rmdir(context(), fuse::ROOT_ID, dir_name)
+            .unwrap();
+        assert!(!temp.path.join("nested").exists());
     }
 }
