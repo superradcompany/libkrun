@@ -4,14 +4,67 @@
 //! - libkrunfw shared library (set KRUNFW_PATH or install system-wide)
 //! - The rootfs-alpine git submodule initialized on Unix hosts
 //! - On Windows, set KRUN_INITRAMFS_PATH to a Linux initramfs image
-//! - To attach a raw block disk, build with `--features blk` and set KRUN_RAW_DISK_PATH
+//! - To attach a block disk, build with `--features blk`, set KRUN_DISK_PATH, and set
+//!   KRUN_DISK_FORMAT to raw, qcow2, or vmdk
+//! - Optional disk settings: KRUN_DISK_ID and KRUN_DISK_READ_ONLY
 //!
 //! On macOS, the binary must be codesigned with the hypervisor entitlement:
 //!   cd examples && make rust_vm
 
 #[cfg(feature = "blk")]
-use msb_krun::{CacheMode, DiskImageFormat, SyncMode};
+use msb_krun::{CacheMode, ConfigError, DiskImageFormat, Error, SyncMode};
 use msb_krun::{Result, VmBuilder};
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(feature = "blk")]
+const DISK_PATH_ENV: &str = "KRUN_DISK_PATH";
+
+#[cfg(feature = "blk")]
+const DISK_FORMAT_ENV: &str = "KRUN_DISK_FORMAT";
+
+#[cfg(feature = "blk")]
+const DISK_READ_ONLY_ENV: &str = "KRUN_DISK_READ_ONLY";
+
+#[cfg(feature = "blk")]
+const DISK_ID_ENV: &str = "KRUN_DISK_ID";
+
+#[cfg(feature = "blk")]
+const DEFAULT_DISK_ID: &str = "smoke";
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(feature = "blk")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SmokeDiskConfig {
+    path: String,
+    id: String,
+    format: DiskImageFormat,
+    read_only: bool,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(feature = "blk")]
+impl SmokeDiskConfig {
+    fn format_name(&self) -> &'static str {
+        match self.format {
+            DiskImageFormat::Raw => "raw",
+            DiskImageFormat::Qcow2 => "qcow2",
+            DiskImageFormat::Vmdk => "vmdk",
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -49,12 +102,22 @@ fn main() -> Result<()> {
     let builder = VmBuilder::new().machine(|m| m.vcpus(2).memory_mib(1024));
 
     #[cfg(feature = "blk")]
-    let builder = if let Ok(raw_disk_path) = std::env::var("KRUN_RAW_DISK_PATH") {
-        eprintln!("Attaching raw block disk {raw_disk_path}");
+    let builder = if let Some(disk) = smoke_disk_config_from_env()? {
+        eprintln!(
+            "Attaching {} block disk {} ({})",
+            disk.format_name(),
+            disk.path,
+            if disk.read_only {
+                "read-only"
+            } else {
+                "read-write"
+            }
+        );
         builder.disk(|d| {
-            d.path(raw_disk_path)
-                .id("smoke")
-                .format(DiskImageFormat::Raw)
+            d.path(&disk.path)
+                .id(&disk.id)
+                .format(disk.format)
+                .read_only(disk.read_only)
                 .cache(CacheMode::Writeback)
                 .sync(SyncMode::Full)
         })
@@ -63,8 +126,12 @@ fn main() -> Result<()> {
     };
 
     #[cfg(not(feature = "blk"))]
-    if std::env::var_os("KRUN_RAW_DISK_PATH").is_some() {
-        eprintln!("KRUN_RAW_DISK_PATH is set, but rust_vm was built without --features blk");
+    if std::env::var_os("KRUN_DISK_PATH").is_some()
+        || std::env::var_os("KRUN_DISK_FORMAT").is_some()
+        || std::env::var_os("KRUN_DISK_READ_ONLY").is_some()
+        || std::env::var_os("KRUN_DISK_ID").is_some()
+    {
+        eprintln!("KRUN_DISK_* is set, but rust_vm was built without --features blk");
     }
 
     #[cfg(target_os = "windows")]
@@ -98,4 +165,143 @@ fn main() -> Result<()> {
         .enter()?;
 
     unreachable!()
+}
+
+#[cfg(feature = "blk")]
+fn smoke_disk_config_from_env() -> Result<Option<SmokeDiskConfig>> {
+    smoke_disk_config_from_lookup(|name| std::env::var(name).ok())
+}
+
+#[cfg(feature = "blk")]
+fn smoke_disk_config_from_lookup(
+    mut get: impl FnMut(&str) -> Option<String>,
+) -> Result<Option<SmokeDiskConfig>> {
+    let Some(path) = get(DISK_PATH_ENV) else {
+        return Ok(None);
+    };
+
+    let Some(format) = get(DISK_FORMAT_ENV) else {
+        return Err(block_config_error(format!(
+            "{DISK_FORMAT_ENV} must be set when {DISK_PATH_ENV} is set"
+        )));
+    };
+
+    let format = parse_disk_format(&format)?;
+    let read_only = if let Some(value) = get(DISK_READ_ONLY_ENV) {
+        parse_bool_env(DISK_READ_ONLY_ENV, &value)?
+    } else {
+        matches!(format, DiskImageFormat::Vmdk)
+    };
+
+    if matches!(format, DiskImageFormat::Vmdk) && !read_only {
+        return Err(block_config_error(format!(
+            "{DISK_READ_ONLY_ENV}=0 cannot be used with {DISK_FORMAT_ENV}=vmdk"
+        )));
+    }
+
+    Ok(Some(SmokeDiskConfig {
+        path,
+        id: get(DISK_ID_ENV).unwrap_or_else(|| DEFAULT_DISK_ID.to_string()),
+        format,
+        read_only,
+    }))
+}
+
+#[cfg(feature = "blk")]
+fn parse_disk_format(value: &str) -> Result<DiskImageFormat> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "raw" => Ok(DiskImageFormat::Raw),
+        "qcow2" => Ok(DiskImageFormat::Qcow2),
+        "vmdk" => Ok(DiskImageFormat::Vmdk),
+        _ => Err(block_config_error(format!(
+            "{DISK_FORMAT_ENV} must be raw, qcow2, or vmdk"
+        ))),
+    }
+}
+
+#[cfg(feature = "blk")]
+fn parse_bool_env(name: &str, value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(block_config_error(format!(
+            "{name} must be 1/0, true/false, yes/no, or on/off"
+        ))),
+    }
+}
+
+#[cfg(feature = "blk")]
+fn block_config_error(message: String) -> Error {
+    Error::Config(ConfigError::Block(message))
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "blk"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_env_is_optional() {
+        assert_eq!(smoke_disk_config_from_lookup(|_| None).unwrap(), None);
+    }
+
+    #[test]
+    fn disk_env_parses_qcow2() {
+        let config = smoke_disk_config_from_lookup(|name| match name {
+            DISK_PATH_ENV => Some("disk.qcow2".to_string()),
+            DISK_FORMAT_ENV => Some("qcow2".to_string()),
+            DISK_ID_ENV => Some("data".to_string()),
+            _ => None,
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(config.path, "disk.qcow2");
+        assert_eq!(config.id, "data");
+        assert_eq!(config.format, DiskImageFormat::Qcow2);
+        assert!(!config.read_only);
+    }
+
+    #[test]
+    fn disk_env_defaults_vmdk_to_read_only() {
+        let config = smoke_disk_config_from_lookup(|name| match name {
+            DISK_PATH_ENV => Some("disk.vmdk".to_string()),
+            DISK_FORMAT_ENV => Some("vmdk".to_string()),
+            _ => None,
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(config.format, DiskImageFormat::Vmdk);
+        assert!(config.read_only);
+    }
+
+    #[test]
+    fn disk_env_rejects_writable_vmdk() {
+        let error = smoke_disk_config_from_lookup(|name| match name {
+            DISK_PATH_ENV => Some("disk.vmdk".to_string()),
+            DISK_FORMAT_ENV => Some("vmdk".to_string()),
+            DISK_READ_ONLY_ENV => Some("0".to_string()),
+            _ => None,
+        })
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("KRUN_DISK_READ_ONLY=0 cannot be used"));
+    }
+
+    #[test]
+    fn disk_env_requires_format_with_path() {
+        let error = smoke_disk_config_from_lookup(|name| match name {
+            DISK_PATH_ENV => Some("disk.raw".to_string()),
+            _ => None,
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("KRUN_DISK_FORMAT must be set"));
+    }
 }

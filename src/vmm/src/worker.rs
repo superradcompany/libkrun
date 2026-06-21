@@ -23,34 +23,26 @@ pub fn start_worker_thread(
     vmm: Arc<Mutex<super::Vmm>>,
     receiver: Receiver<WorkerMessage>,
 ) -> io::Result<()> {
-    #[cfg(target_os = "windows")]
-    let _ = &vmm;
-
     std::thread::Builder::new()
         .name("vmm worker".into())
         .spawn(move || loop {
             match receiver.recv() {
                 Err(e) => error!("error receiving message from vmm worker thread: {e:?}"),
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                 Ok(message) => vmm.lock().unwrap().match_worker_message(message),
-                #[cfg(target_os = "linux")]
-                Ok(message) => vmm.lock().unwrap().match_worker_message(message),
-                #[cfg(target_os = "windows")]
-                Ok(message) => debug!("ignoring unsupported Windows worker message: {message:?}"),
             }
         })?;
     Ok(())
 }
 
 impl super::Vmm {
-    #[cfg(not(target_os = "windows"))]
     fn match_worker_message(&self, msg: WorkerMessage) {
         match msg {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             WorkerMessage::GpuAddMapping(s, h, g, l) => self.add_mapping(s, h, g, l),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             WorkerMessage::GpuRemoveMapping(s, g, l) => self.remove_mapping(s, g, l),
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             WorkerMessage::GsiRoute(sender, entries) => {
                 let mut routing = kvm_bindings::KvmIrqRouting::new(entries.len()).unwrap();
                 let routing_entries = routing.as_mut_slice();
@@ -59,7 +51,7 @@ impl super::Vmm {
                     .send(self.vm.fd().set_gsi_routing(&routing).is_ok())
                     .unwrap();
             }
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             WorkerMessage::IrqLine(sender, irq, active) => {
                 sender
                     .send(self.vm.fd().set_irq_line(irq, active).is_ok())

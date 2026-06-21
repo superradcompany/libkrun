@@ -275,11 +275,18 @@ pub struct ExecBuilder {
 //--------------------------------------------------------------------------------------------------
 
 /// Supported disk image formats.
+///
+/// VMDK images are currently read-only.
 #[cfg(feature = "blk")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiskImageFormat {
+    /// A raw block image.
     Raw,
+
+    /// A qcow2 image.
     Qcow2,
+
+    /// A VMDK image. VMDK is currently read-only.
     Vmdk,
 }
 

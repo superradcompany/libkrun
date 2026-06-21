@@ -30,7 +30,8 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeProcessorCount,
     WHvRunVirtualProcessor, WHvRunVpExitReasonNone, WHvSetPartitionProperty,
     WHvSetVirtualProcessorRegisters, WHvSetupPartition, WHvUnmapGpaRange, WHV_CAPABILITY,
-    WHV_PARTITION_HANDLE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON,
+    WHV_MAP_GPA_RANGE_FLAGS, WHV_PARTITION_HANDLE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE,
+    WHV_RUN_VP_EXIT_REASON,
 };
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::Hypervisor::{
@@ -628,6 +629,47 @@ impl Vm {
         Ok(())
     }
 
+    pub fn add_mapping(
+        &self,
+        reply_sender: Sender<bool>,
+        host_addr: u64,
+        guest_addr: u64,
+        len: u64,
+    ) {
+        debug!("add_mapping: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
+
+        if let Err(err) = unmap_gpa_range(self.partition.handle, guest_addr, len) {
+            error!("{err}");
+            reply_sender.send(false).unwrap();
+            return;
+        }
+
+        let flags = WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite;
+        if let Err(err) = map_gpa_range_with_flags(
+            self.partition.handle,
+            host_addr as *const u8,
+            guest_addr,
+            len,
+            flags,
+        ) {
+            error!("{err}");
+            reply_sender.send(false).unwrap();
+        } else {
+            reply_sender.send(true).unwrap();
+        }
+    }
+
+    pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
+        debug!("remove_mapping: guest_addr={guest_addr:x}, len={len}");
+
+        if let Err(err) = unmap_gpa_range(self.partition.handle, guest_addr, len) {
+            error!("{err}");
+            reply_sender.send(false).unwrap();
+        } else {
+            reply_sender.send(true).unwrap();
+        }
+    }
+
     pub fn partition_handle(&self) -> WHV_PARTITION_HANDLE {
         self.partition.handle
     }
@@ -1170,10 +1212,33 @@ fn map_gpa_range(
     size: u64,
 ) -> Result<()> {
     let flags = WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute;
+    map_gpa_range_with_flags(partition, host_addr, guest_addr, size, flags)
+}
+
+fn map_gpa_range_with_flags(
+    partition: WHV_PARTITION_HANDLE,
+    host_addr: *const u8,
+    guest_addr: u64,
+    size: u64,
+    flags: WHV_MAP_GPA_RANGE_FLAGS,
+) -> Result<()> {
     let hresult = unsafe { WHvMapGpaRange(partition, host_addr.cast(), guest_addr, size, flags) };
 
     if hresult < 0 {
         return Err(Error::MapGpaRange {
+            guest_addr,
+            size,
+            hresult,
+        });
+    }
+
+    Ok(())
+}
+
+fn unmap_gpa_range(partition: WHV_PARTITION_HANDLE, guest_addr: u64, size: u64) -> Result<()> {
+    let hresult = unsafe { WHvUnmapGpaRange(partition, guest_addr, size) };
+    if hresult < 0 {
+        return Err(Error::UnmapGpaRange {
             guest_addr,
             size,
             hresult,

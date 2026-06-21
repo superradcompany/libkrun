@@ -230,6 +230,7 @@ impl VmBuilder {
     /// deterministic guest names by attach order (`/dev/vda`, `/dev/vdb`,
     /// ...). For stable addressing across reorderings, set a custom `id()` —
     /// the guest can then reach the disk via `/dev/disk/by-id/virtio-<id>`.
+    /// VMDK images must be configured as read-only.
     ///
     /// # Examples
     ///

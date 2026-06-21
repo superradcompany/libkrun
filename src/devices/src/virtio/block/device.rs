@@ -398,6 +398,13 @@ impl Block {
         sync_mode: SyncMode,
         metrics: BlockMetricsWriter,
     ) -> io::Result<Block> {
+        if matches!(disk_image_format, ImageType::Vmdk) && !is_disk_read_only {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "VMDK write support is not available; configure the disk as read-only",
+            ));
+        }
+
         let disk_image = OpenOptions::new()
             .read(true)
             .write(!is_disk_read_only)
@@ -634,5 +641,39 @@ impl VirtioDevice for Block {
         }
         self.device_state = DeviceState::Inactive;
         true
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use utils::metrics::MetricsWriter;
+
+    use super::*;
+
+    #[test]
+    fn writable_vmdk_is_rejected() {
+        let result = Block::new(
+            "vmdk".to_string(),
+            None,
+            CacheType::Unsafe,
+            "missing.vmdk".to_string(),
+            ImageType::Vmdk,
+            false,
+            false,
+            SyncMode::None,
+            MetricsWriter::default().register_block_device("vmdk".to_string()),
+        );
+
+        let error = match result {
+            Ok(_) => panic!("writable VMDK should be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("VMDK write support"));
     }
 }

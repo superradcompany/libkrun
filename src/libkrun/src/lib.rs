@@ -832,6 +832,9 @@ pub unsafe extern "C" fn krun_add_disk2(
         Ok(format) => format,
         Err(_) => return -libc::EINVAL,
     };
+    if format == ImageType::Vmdk && !read_only {
+        return -libc::ENOTSUP;
+    }
 
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
@@ -882,6 +885,9 @@ pub unsafe extern "C" fn krun_add_disk3(
         Ok(fmt) => fmt,
         Err(_) => return -libc::EINVAL,
     };
+    if format == ImageType::Vmdk && !read_only {
+        return -libc::ENOTSUP;
+    }
 
     let sync_mode = match SyncMode::try_from(sync_mode) {
         Ok(mode) => mode,

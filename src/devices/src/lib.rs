@@ -21,6 +21,8 @@ mod bus;
 pub mod fdt;
 pub mod legacy;
 pub mod virtio;
+#[cfg(target_os = "windows")]
+pub(crate) mod windows;
 
 pub use self::bus::{Bus, BusDevice, Error as BusError};
 

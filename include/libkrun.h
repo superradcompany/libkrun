@@ -167,12 +167,12 @@ int32_t krun_add_disk(uint32_t ctx_id, const char *block_id, const char *disk_pa
 /* Supported disk image formats */
 #define KRUN_DISK_FORMAT_RAW 0
 #define KRUN_DISK_FORMAT_QCOW2 1
-/* Note: Only supports FLAT/ZERO formats without delta links */
+/* Note: Only supports FLAT/ZERO formats without delta links. VMDK is read-only. */
 #define KRUN_DISK_FORMAT_VMDK 2
 
 /**
  * Adds a disk image to be used as a general partition for the microVM. The supported
- * image formats are: "raw" and "qcow2".
+ * image formats are: "raw", "qcow2", and "vmdk". VMDK images must be read-only.
  *
  * This API is mutually exclusive with the deprecated krun_set_root_disk and
  * krun_set_data_disk methods and must not be used together.
@@ -207,9 +207,9 @@ int32_t krun_add_disk(uint32_t ctx_id, const char *block_id, const char *disk_pa
  *  "ctx_id"      - the configuration context ID.
  *  "block_id"    - a null-terminated string representing the partition.
  *  "disk_path"   - a null-terminated string representing the path leading to the disk image.
- *  "disk_format" - the disk image format (i.e. KRUN_DISK_FORMAT_{RAW, QCOW2})
- *  "read_only"   - whether the mount should be read-only. Required if the caller does not have
- *                  write permissions (for disk images in /usr/share).
+ *  "disk_format" - the disk image format (i.e. KRUN_DISK_FORMAT_{RAW, QCOW2, VMDK})
+ *  "read_only"   - whether the mount should be read-only. Required for VMDK and if the caller
+ *                  does not have write permissions (for disk images in /usr/share).
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
@@ -255,9 +255,9 @@ int32_t krun_add_disk2(uint32_t ctx_id,
  *  "ctx_id"      - the configuration context ID.
  *  "block_id"    - a null-terminated string representing the partition.
  *  "disk_path"   - a null-terminated string representing the path leading to the disk image.
- *  "disk_format" - the disk image format (i.e. KRUN_DISK_FORMAT_{RAW, QCOW2})
- *  "read_only"   - whether the mount should be read-only. Required if the caller does not have
- *                  write permissions (for disk images in /usr/share).
+ *  "disk_format" - the disk image format (i.e. KRUN_DISK_FORMAT_{RAW, QCOW2, VMDK})
+ *  "read_only"   - whether the mount should be read-only. Required for VMDK and if the caller
+ *                  does not have write permissions (for disk images in /usr/share).
  *  "direct_io"   - whether to bypass the host caches.
  *  "sync_mode"   - whether to enable VIRTIO_BLK_F_FLUSH. On macOS, an additional relaxed sync
  *                  mode is available, which is enabled by default, and will not ask the drive
