@@ -7,13 +7,14 @@
 //! - To attach a block disk, build with `--features blk`, set KRUN_DISK_PATH, and set
 //!   KRUN_DISK_FORMAT to raw, qcow2, or vmdk
 //! - Optional disk settings: KRUN_DISK_ID and KRUN_DISK_READ_ONLY
+//! - To attach a virtio-fs directory, set KRUN_FS_PATH and optionally KRUN_FS_TAG
 //!
 //! On macOS, the binary must be codesigned with the hypervisor entitlement:
 //!   cd examples && make rust_vm
 
 #[cfg(feature = "blk")]
-use msb_krun::{CacheMode, ConfigError, DiskImageFormat, Error, SyncMode};
-use msb_krun::{Result, VmBuilder};
+use msb_krun::{CacheMode, DiskImageFormat, SyncMode};
+use msb_krun::{ConfigError, Error, Result, VmBuilder};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -34,6 +35,10 @@ const DISK_ID_ENV: &str = "KRUN_DISK_ID";
 #[cfg(feature = "blk")]
 const DEFAULT_DISK_ID: &str = "smoke";
 
+const FS_PATH_ENV: &str = "KRUN_FS_PATH";
+const FS_TAG_ENV: &str = "KRUN_FS_TAG";
+const DEFAULT_FS_TAG: &str = "hostshare";
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -45,6 +50,12 @@ struct SmokeDiskConfig {
     id: String,
     format: DiskImageFormat,
     read_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SmokeFsConfig {
+    path: String,
+    tag: String,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -100,6 +111,13 @@ fn main() -> Result<()> {
     let initramfs_path = std::env::var("KRUN_INITRAMFS_PATH").ok();
 
     let builder = VmBuilder::new().machine(|m| m.vcpus(2).memory_mib(1024));
+
+    let builder = if let Some(fs) = smoke_fs_config_from_env()? {
+        eprintln!("Attaching virtio-fs {} ({})", fs.path, fs.tag);
+        builder.fs(|f| f.tag(&fs.tag).path(&fs.path))
+    } else {
+        builder
+    };
 
     #[cfg(feature = "blk")]
     let builder = if let Some(disk) = smoke_disk_config_from_env()? {
@@ -165,6 +183,27 @@ fn main() -> Result<()> {
         .enter()?;
 
     unreachable!()
+}
+
+fn smoke_fs_config_from_env() -> Result<Option<SmokeFsConfig>> {
+    smoke_fs_config_from_lookup(|name| std::env::var(name).ok())
+}
+
+fn smoke_fs_config_from_lookup(
+    mut get: impl FnMut(&str) -> Option<String>,
+) -> Result<Option<SmokeFsConfig>> {
+    let Some(path) = get(FS_PATH_ENV) else {
+        return Ok(None);
+    };
+
+    let tag = get(FS_TAG_ENV).unwrap_or_else(|| DEFAULT_FS_TAG.to_string());
+    if tag.trim().is_empty() {
+        return Err(Error::Config(ConfigError::Filesystem(format!(
+            "{FS_TAG_ENV} must not be empty"
+        ))));
+    }
+
+    Ok(Some(SmokeFsConfig { path, tag }))
 }
 
 #[cfg(feature = "blk")]
@@ -303,5 +342,42 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("KRUN_DISK_FORMAT must be set"));
+    }
+}
+
+#[cfg(test)]
+mod fs_tests {
+    use super::*;
+
+    #[test]
+    fn fs_env_is_optional() {
+        assert_eq!(smoke_fs_config_from_lookup(|_| None).unwrap(), None);
+    }
+
+    #[test]
+    fn fs_env_defaults_tag() {
+        let config = smoke_fs_config_from_lookup(|name| match name {
+            FS_PATH_ENV => Some("share".to_string()),
+            _ => None,
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(config.path, "share");
+        assert_eq!(config.tag, DEFAULT_FS_TAG);
+    }
+
+    #[test]
+    fn fs_env_parses_tag() {
+        let config = smoke_fs_config_from_lookup(|name| match name {
+            FS_PATH_ENV => Some("share".to_string()),
+            FS_TAG_ENV => Some("data".to_string()),
+            _ => None,
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(config.path, "share");
+        assert_eq!(config.tag, "data");
     }
 }

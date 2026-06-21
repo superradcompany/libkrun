@@ -15,17 +15,19 @@ use vmm::vmm_config::machine_config::VmConfigError;
     not(target_os = "windows")
 ))]
 use vmm::vmm_config::fs::CustomFsDeviceConfig;
-#[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+#[cfg(not(feature = "tee"))]
 use vmm::vmm_config::fs::FsDeviceConfig;
 
 #[cfg(feature = "blk")]
 use super::builders::DiskBuilder;
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(feature = "tee"))]
 use super::builders::FsBuilder;
 #[cfg(all(
     not(any(feature = "tee", feature = "aws-nitro")),
     not(target_os = "windows")
 ))]
+use super::builders::FsConfig;
+#[cfg(all(not(feature = "tee"), target_os = "windows"))]
 use super::builders::FsConfig;
 use super::builders::{ConsoleBuilder, ExecBuilder, KernelBuilder, MachineBuilder};
 #[cfg(feature = "net")]
@@ -72,7 +74,7 @@ pub struct VmBuilder {
     machine: MachineBuilder,
     kernel: KernelBuilder,
     #[cfg_attr(feature = "tee", allow(dead_code))]
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(feature = "tee"))]
     fs: FsBuilder,
     console: ConsoleBuilder,
     exec: ExecBuilder,
@@ -99,7 +101,7 @@ impl VmBuilder {
         Self {
             machine: MachineBuilder::new(),
             kernel: KernelBuilder::new(),
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(feature = "tee"))]
             fs: FsBuilder::new(),
             console: ConsoleBuilder::new(),
             exec: ExecBuilder::new(),
@@ -177,7 +179,7 @@ impl VmBuilder {
     /// VmBuilder::new()
     ///     .fs(|fs| fs.tag("myfs").custom(Box::new(my_backend)));
     /// ```
-    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+    #[cfg(not(feature = "tee"))]
     pub fn fs(mut self, f: impl FnOnce(FsBuilder) -> FsBuilder) -> Self {
         let new_fs = f(FsBuilder::new());
         self.fs.configs.extend(new_fs.configs);
@@ -371,7 +373,7 @@ impl VmBuilder {
         vmr.enable_rng = self.machine.rng;
 
         // Apply filesystem configuration
-        #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+        #[cfg(not(feature = "tee"))]
         for config in self.fs.configs {
             match config {
                 FsConfig::Path {

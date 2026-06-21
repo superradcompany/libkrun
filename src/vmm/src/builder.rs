@@ -94,7 +94,9 @@ use crate::vmm_config::block::BlockBuilder;
     not(any(feature = "tee", feature = "aws-nitro")),
     not(target_os = "windows")
 ))]
-use crate::vmm_config::fs::{CustomFsDeviceConfig, FsDeviceConfig};
+use crate::vmm_config::fs::CustomFsDeviceConfig;
+#[cfg(not(feature = "tee"))]
+use crate::vmm_config::fs::FsDeviceConfig;
 use crate::vmm_config::kernel_cmdline::DEFAULT_KERNEL_CMDLINE;
 #[cfg(target_os = "linux")]
 use crate::vstate::KvmContext;
@@ -109,10 +111,7 @@ use device_manager::shm::ShmManager;
 use devices::virtio::display::DisplayInfo;
 #[cfg(feature = "gpu")]
 use devices::virtio::display::NoopDisplayBackend;
-#[cfg(all(
-    not(any(feature = "tee", feature = "aws-nitro")),
-    not(target_os = "windows")
-))]
+#[cfg(not(feature = "tee"))]
 use devices::virtio::{fs::ExportTable, VirtioShmRegion};
 #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
 use flate2::read::GzDecoder;
@@ -138,11 +137,10 @@ use utils::worker_message::WorkerMessage;
     not(target_os = "windows")
 ))]
 use vm_memory::mmap::MmapRegion;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(feature = "tee"))]
 use vm_memory::Address;
 use vm_memory::Bytes;
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(feature = "tee"))]
 use vm_memory::GuestMemoryBackend;
 #[cfg(all(
     target_arch = "x86_64",
@@ -1417,10 +1415,7 @@ pub fn build_microvm(
     }
     trace.mark("virtio_consoles.ready");
 
-    #[cfg(all(
-        not(any(feature = "tee", feature = "aws-nitro")),
-        not(target_os = "windows")
-    ))]
+    #[cfg(not(feature = "tee"))]
     let export_table: Option<ExportTable> = if cfg!(feature = "gpu") {
         Some(Default::default())
     } else {
@@ -1452,10 +1447,7 @@ pub fn build_microvm(
         attach_input_devices(&mut vmm, &vm_resources.input_backends, intc.clone())?;
     }
 
-    #[cfg(all(
-        not(any(feature = "tee", feature = "aws-nitro")),
-        not(target_os = "windows")
-    ))]
+    #[cfg(not(feature = "tee"))]
     attach_fs_devices(
         &mut vmm,
         &vm_resources.fs,
@@ -2020,7 +2012,7 @@ pub fn create_guest_memory(
 
     let mut shm_manager = ShmManager::new(&arch_mem_info);
 
-    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+    #[cfg(not(feature = "tee"))]
     for (index, fs) in vm_resources.fs.iter().enumerate() {
         if let Some(shm_size) = fs.shm_size {
             shm_manager
@@ -2538,10 +2530,7 @@ fn attach_mmio_device(
     Ok(())
 }
 
-#[cfg(all(
-    not(any(feature = "tee", feature = "aws-nitro")),
-    not(target_os = "windows")
-))]
+#[cfg(not(feature = "tee"))]
 fn attach_fs_devices(
     vmm: &mut Vmm,
     fs_devs: &[FsDeviceConfig],

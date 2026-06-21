@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::vmm_config::block::{BlockBuilder, BlockConfigError, BlockDeviceConfig};
 use crate::vmm_config::external_kernel::ExternalKernel;
 use crate::vmm_config::firmware::FirmwareConfig;
-#[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+#[cfg(not(feature = "tee"))]
 use crate::vmm_config::fs::*;
 use crate::vmm_config::kernel_bundle::InitrdBundle;
 use crate::vmm_config::kernel_bundle::{KernelBundle, KernelBundleError};
@@ -158,7 +158,7 @@ pub struct VmResources {
     /// The parameters for the initrd bundle to be loaded in this microVM.
     pub initrd_bundle: Option<InitrdBundle>,
     /// The fs device.
-    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+    #[cfg(not(feature = "tee"))]
     pub fs: Vec<FsDeviceConfig>,
     /// Custom filesystem devices.
     #[cfg(all(
@@ -236,7 +236,7 @@ impl Default for VmResources {
             #[cfg(feature = "tee")]
             qboot_bundle: None,
             initrd_bundle: None,
-            #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+            #[cfg(not(feature = "tee"))]
             fs: Vec::new(),
             #[cfg(all(
                 not(any(feature = "tee", feature = "aws-nitro")),
@@ -408,7 +408,7 @@ impl VmResources {
         Ok(())
     }
 
-    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+    #[cfg(not(feature = "tee"))]
     pub fn add_fs_device(&mut self, config: FsDeviceConfig) {
         self.fs.push(config)
     }
