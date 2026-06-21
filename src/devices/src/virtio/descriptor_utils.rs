@@ -18,8 +18,10 @@ use vm_memory::{
     VolatileSlice,
 };
 
+#[cfg(any(not(target_os = "windows"), feature = "blk"))]
+use super::file_traits::FileReadWriteAtVolatile;
 #[cfg(not(target_os = "windows"))]
-use super::file_traits::{FileReadWriteAtVolatile, FileReadWriteVolatile};
+use super::file_traits::FileReadWriteVolatile;
 
 #[derive(Debug)]
 pub enum Error {
@@ -258,7 +260,7 @@ impl<'a> Reader<'a> {
     /// Returns the number of bytes read from the descriptor chain buffer.
     /// The number of bytes read can be less than `count` if there isn't
     /// enough data in the descriptor chain buffer.
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(any(not(target_os = "windows"), feature = "blk"))]
     pub fn read_to_at<F: FileReadWriteAtVolatile>(
         &mut self,
         dst: F,
@@ -408,7 +410,7 @@ impl<'a> Writer<'a> {
     /// Returns the number of bytes written to the descriptor chain buffer.
     /// The number of bytes written can be less than `count` if
     /// there isn't enough data in the descriptor chain buffer.
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(any(not(target_os = "windows"), feature = "blk"))]
     pub fn write_from_at<F: FileReadWriteAtVolatile>(
         &mut self,
         src: F,

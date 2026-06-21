@@ -754,6 +754,7 @@ dependencies = [
  "log",
  "nix",
  "vmm-sys-util",
+ "windows-sys",
 ]
 
 [[package]]

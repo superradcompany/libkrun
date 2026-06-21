@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [features]
+blk = ["msb_krun/blk"]
 tee = ["msb_krun/tee"]
 amd-sev = ["tee", "msb_krun/amd-sev"]
 tdx = ["tee", "msb_krun/tdx"]

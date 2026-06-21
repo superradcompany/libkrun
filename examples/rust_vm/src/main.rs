@@ -4,10 +4,13 @@
 //! - libkrunfw shared library (set KRUNFW_PATH or install system-wide)
 //! - The rootfs-alpine git submodule initialized on Unix hosts
 //! - On Windows, set KRUN_INITRAMFS_PATH to a Linux initramfs image
+//! - To attach a raw block disk, build with `--features blk` and set KRUN_RAW_DISK_PATH
 //!
 //! On macOS, the binary must be codesigned with the hypervisor entitlement:
 //!   cd examples && make rust_vm
 
+#[cfg(feature = "blk")]
+use msb_krun::{CacheMode, DiskImageFormat, SyncMode};
 use msb_krun::{Result, VmBuilder};
 
 fn main() -> Result<()> {
@@ -44,6 +47,25 @@ fn main() -> Result<()> {
     let initramfs_path = std::env::var("KRUN_INITRAMFS_PATH").ok();
 
     let builder = VmBuilder::new().machine(|m| m.vcpus(2).memory_mib(1024));
+
+    #[cfg(feature = "blk")]
+    let builder = if let Ok(raw_disk_path) = std::env::var("KRUN_RAW_DISK_PATH") {
+        eprintln!("Attaching raw block disk {raw_disk_path}");
+        builder.disk(|d| {
+            d.path(raw_disk_path)
+                .id("smoke")
+                .format(DiskImageFormat::Raw)
+                .cache(CacheMode::Writeback)
+                .sync(SyncMode::Full)
+        })
+    } else {
+        builder
+    };
+
+    #[cfg(not(feature = "blk"))]
+    if std::env::var_os("KRUN_RAW_DISK_PATH").is_some() {
+        eprintln!("KRUN_RAW_DISK_PATH is set, but rust_vm was built without --features blk");
+    }
 
     #[cfg(target_os = "windows")]
     let builder = builder.kernel(|k| {

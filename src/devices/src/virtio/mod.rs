@@ -21,7 +21,7 @@ pub mod block;
 pub mod console;
 pub mod descriptor_utils;
 pub mod device;
-#[cfg(not(target_os = "windows"))]
+#[cfg(any(not(target_os = "windows"), feature = "blk"))]
 pub mod file_traits;
 #[cfg(all(
     not(target_os = "windows"),

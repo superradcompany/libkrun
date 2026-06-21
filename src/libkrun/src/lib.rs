@@ -17,7 +17,7 @@ use krun_display::DisplayBackend;
 use libc::{c_char, c_int, size_t};
 use once_cell::sync::Lazy;
 use polly::event_manager::EventManager;
-#[cfg(all(feature = "blk", not(feature = "tee")))]
+#[cfg(all(feature = "blk", not(feature = "tee"), not(target_os = "windows")))]
 use rand::distr::{Alphanumeric, SampleString};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -198,7 +198,7 @@ impl ContextConfig {
         }
     }
 
-    #[cfg(all(feature = "blk", not(feature = "tee")))]
+    #[cfg(all(feature = "blk", not(feature = "tee"), not(target_os = "windows")))]
     fn set_block_root(&mut self, device: String, fstype: Option<String>, options: Option<String>) {
         self.block_root = Some(BlockRootConfig {
             device,

@@ -309,9 +309,9 @@ fn create_virtio_node<T: DeviceInfoForFDT + Clone + Debug>(
     dev_info: &T,
 ) -> Result<()> {
     let device_reg_prop = generate_prop64(&[dev_info.addr(), dev_info.length()]);
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, dev_info.irq(), IRQ_TYPE_EDGE_RISING]);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let irq = generate_prop32(&[
         GIC_FDT_IRQ_TYPE_SPI,
         dev_info.irq() - 32,
@@ -335,9 +335,9 @@ fn create_serial_node<T: DeviceInfoForFDT + Clone + Debug>(
     let compatible = b"arm,pl011\0arm,primecell\0";
     let clock_names = b"uartclk\0apb_pclk\0";
     let serial_reg_prop = generate_prop64(&[dev_info.addr(), dev_info.length()]);
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, dev_info.irq(), IRQ_TYPE_LEVEL_HI]);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, dev_info.irq() - 32, IRQ_TYPE_LEVEL_HI]);
 
     let node = fdt.begin_node(&format!("uart@{:x}", dev_info.addr()))?;
@@ -358,9 +358,9 @@ fn create_rtc_node<T: DeviceInfoForFDT + Clone + Debug>(
 ) -> Result<()> {
     let compatible = b"arm,pl031\0arm,primecell\0";
     let rtc_reg_prop = generate_prop64(&[dev_info.addr(), dev_info.length()]);
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, dev_info.irq(), IRQ_TYPE_LEVEL_HI]);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, dev_info.irq() - 32, IRQ_TYPE_LEVEL_HI]);
     let rtc_node = fdt.begin_node(&format!("rtc@{:x}", dev_info.addr()))?;
     fdt.property("compatible", compatible)?;

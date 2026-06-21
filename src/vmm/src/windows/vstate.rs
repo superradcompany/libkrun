@@ -117,6 +117,8 @@ const WHV_ARM64_RESET_TYPE_REBOOT: u32 = 1;
 const AARCH64_EXCEPTION_CLASS_DATA_ABORT_LOWER: u64 = 0b100100;
 #[cfg(target_arch = "aarch64")]
 const AARCH64_ESR_ISV: u64 = 1 << 24;
+#[cfg(target_arch = "aarch64")]
+const AARCH64_ZERO_REGISTER_INDEX: u8 = 31;
 
 #[cfg(target_arch = "x86_64")]
 const WHV_EMULATOR_DIRECTION_READ: u8 = 0;
@@ -1644,11 +1646,7 @@ fn handle_arm64_mmio(
     };
 
     if is_write {
-        let value = get_vcpu_register_u64(
-            context.partition_handle,
-            context.id,
-            arm64_general_register(register_index),
-        )?;
+        let value = arm64_mmio_write_register_value(context, register_index)?;
         let data = value.to_ne_bytes();
         if !mmio_bus.write(context.id.into(), guest_addr, &data[..size]) {
             return Err(Error::Arm64Mmio {
@@ -1669,7 +1667,7 @@ fn handle_arm64_mmio(
             });
         }
 
-        if register_index != 31 {
+        if register_index != AARCH64_ZERO_REGISTER_INDEX {
             let mut value = u64::from_ne_bytes(data);
             let sign_extend = (syndrome >> 21) & 0x1 != 0;
             if sign_extend {
@@ -1702,7 +1700,21 @@ fn handle_arm64_mmio(
 }
 
 #[cfg(target_arch = "aarch64")]
+fn arm64_mmio_write_register_value(context: &EmulatorContext, register_index: u8) -> Result<u64> {
+    if register_index == AARCH64_ZERO_REGISTER_INDEX {
+        return Ok(0);
+    }
+
+    get_vcpu_register_u64(
+        context.partition_handle,
+        context.id,
+        arm64_general_register(register_index),
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
 fn arm64_general_register(index: u8) -> WHV_REGISTER_NAME {
+    debug_assert!(index < AARCH64_ZERO_REGISTER_INDEX);
     WHV_ARM64_REGISTER_X0 + i32::from(index)
 }
 
