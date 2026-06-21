@@ -12,7 +12,7 @@ use std::os::unix::io::AsRawFd;
 #[cfg(feature = "blk")]
 use imago::io_buffers::{IoVector, IoVectorMut};
 #[cfg(all(feature = "blk", windows))]
-use imago::{FormatReadPlanStep, StorageExt};
+use imago::{FormatReadPlanStep, Mapping, StorageExt};
 use vm_memory::VolatileSlice;
 
 #[cfg(unix)]
@@ -484,6 +484,11 @@ impl FileReadWriteAtVolatile for DiskProperties {
             return result;
         }
 
+        #[cfg(windows)]
+        if let Some(result) = self.windows_formatted_write_vectored_at_volatile(bufs, offset)? {
+            return Ok(result);
+        }
+
         let ptr_guards = bufs
             .iter()
             .map(|slice| slice.ptr_guard())
@@ -561,13 +566,85 @@ impl DiskProperties {
                     offset: storage_offset,
                     ..
                 } => self
-                    .windows_formatted_read_runtime
+                    .windows_formatted_io_runtime
                     .block_on(storage.readv(chunk, *storage_offset))?,
                 FormatReadPlanStep::Zero { .. } | FormatReadPlanStep::Eof { .. } => {
                     chunk.fill(0);
                 }
                 _ => return Ok(None),
             }
+        }
+
+        Ok(Some(
+            full_length
+                .try_into()
+                .map_err(|e| Error::new(ErrorKind::InvalidData, e))?,
+        ))
+    }
+
+    fn windows_formatted_write_vectored_at_volatile(
+        &self,
+        bufs: &[VolatileSlice],
+        offset: u64,
+    ) -> Result<Option<usize>> {
+        let full_length = volatile_slices_len(bufs)?;
+        if full_length == 0 {
+            return Ok(Some(0));
+        }
+
+        let file = self.file.lock().unwrap();
+        if offset >= file.size() || full_length > file.size() - offset {
+            return Ok(None);
+        }
+
+        let mut steps = Vec::new();
+        let mut image_offset = offset;
+        let mut remaining_len = full_length;
+        while remaining_len > 0 {
+            let (mapping, mapped_len) = file.get_mapping_sync(image_offset, remaining_len)?;
+            let step_len = std::cmp::min(mapped_len, remaining_len);
+            if step_len == 0 {
+                return Ok(None);
+            }
+
+            match mapping {
+                Mapping::Raw {
+                    storage,
+                    offset: storage_offset,
+                    writable: true,
+                    ..
+                } => steps.push((storage, storage_offset, step_len)),
+                _ => return Ok(None),
+            }
+
+            image_offset = image_offset
+                .checked_add(step_len)
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "write mapping overflow"))?;
+            remaining_len -= step_len;
+        }
+
+        let ptr_guards = bufs
+            .iter()
+            .map(|slice| slice.ptr_guard())
+            .collect::<Vec<_>>();
+        let buffers = ptr_guards
+            .iter()
+            .map(|guard| {
+                let slice = if guard.len() == 0 {
+                    &[]
+                } else {
+                    unsafe { std::slice::from_raw_parts(guard.as_ptr(), guard.len()) }
+                };
+                IoSlice::new(slice)
+            })
+            .collect::<Vec<_>>();
+        let mut remaining = IoVector::from(buffers);
+
+        for (storage, storage_offset, len) in steps {
+            let (chunk, rest) = remaining.split_at(len);
+            remaining = rest;
+            self.windows_formatted_io_runtime
+                .block_on(storage.writev(chunk, storage_offset))?;
         }
 
         Ok(Some(
@@ -614,6 +691,7 @@ fn planned_read_step_len(step: &FormatReadPlanStep<'_, Box<dyn imago::DynStorage
 #[cfg(all(test, feature = "blk", windows))]
 mod tests {
     use std::io::Write;
+    use std::os::windows::fs::FileExt;
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -652,6 +730,43 @@ mod tests {
         mem.read_slice(&mut actual, GuestAddress(0x100)).unwrap();
         assert_eq!(&actual[..payload.len()], &payload);
         assert_eq!(&actual[payload.len()..], vec![0; 512]);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn windows_formatted_write_uses_writable_raw_mapping() {
+        let path = temp_image_path("planned-write");
+        let file = File::create(&path).unwrap();
+        file.set_len(1024).unwrap();
+        drop(file);
+
+        let raw = Raw::<Box<dyn DynStorage>>::open_path_sync(&path, true).unwrap();
+        let disk_image = Arc::new(Mutex::new(SyncFormatAccess::new(raw).unwrap()));
+        let disk = DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe).unwrap();
+
+        let mem: GuestMemoryMmap<()> =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let payload = (0..512).map(|byte| (byte % 193) as u8).collect::<Vec<_>>();
+        mem.write_slice(&payload[..256], GuestAddress(0x100))
+            .unwrap();
+        mem.write_slice(&payload[256..], GuestAddress(0x400))
+            .unwrap();
+
+        let first = mem.get_slice(GuestAddress(0x100), 256).unwrap();
+        let second = mem.get_slice(GuestAddress(0x400), 256).unwrap();
+        assert_eq!(
+            disk.windows_formatted_write_vectored_at_volatile(&[first, second], 128)
+                .unwrap(),
+            Some(payload.len())
+        );
+
+        let mut actual = vec![0u8; payload.len()];
+        File::open(&path)
+            .unwrap()
+            .seek_read(&mut actual, 128)
+            .unwrap();
+        assert_eq!(actual, payload);
 
         std::fs::remove_file(path).unwrap();
     }

@@ -79,7 +79,7 @@ pub(crate) struct DiskProperties {
     #[cfg(windows)]
     windows_raw_file: Option<Arc<WindowsRawFile>>,
     #[cfg(windows)]
-    pub(crate) windows_formatted_read_runtime: tokio::runtime::Runtime,
+    pub(crate) windows_formatted_io_runtime: tokio::runtime::Runtime,
     nsectors: u64,
     image_id: Vec<u8>,
 }
@@ -109,8 +109,7 @@ impl DiskProperties {
             #[cfg(windows)]
             windows_raw_file: None,
             #[cfg(windows)]
-            windows_formatted_read_runtime: tokio::runtime::Builder::new_current_thread()
-                .build()?,
+            windows_formatted_io_runtime: tokio::runtime::Builder::new_current_thread().build()?,
         })
     }
 
