@@ -78,6 +78,8 @@ pub(crate) struct DiskProperties {
     pub(crate) file: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
     #[cfg(windows)]
     windows_raw_file: Option<Arc<WindowsRawFile>>,
+    #[cfg(windows)]
+    pub(crate) windows_formatted_read_runtime: tokio::runtime::Runtime,
     nsectors: u64,
     image_id: Vec<u8>,
 }
@@ -106,6 +108,9 @@ impl DiskProperties {
             file: disk_image,
             #[cfg(windows)]
             windows_raw_file: None,
+            #[cfg(windows)]
+            windows_formatted_read_runtime: tokio::runtime::Builder::new_current_thread()
+                .build()?,
         })
     }
 

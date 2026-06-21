@@ -11,6 +11,8 @@ use std::os::unix::io::AsRawFd;
 
 #[cfg(feature = "blk")]
 use imago::io_buffers::{IoVector, IoVectorMut};
+#[cfg(all(feature = "blk", windows))]
+use imago::{FormatReadPlanStep, StorageExt};
 use vm_memory::VolatileSlice;
 
 #[cfg(unix)]
@@ -439,6 +441,11 @@ impl FileReadWriteAtVolatile for DiskProperties {
             return result;
         }
 
+        #[cfg(windows)]
+        if let Some(result) = self.windows_formatted_read_vectored_at_volatile(bufs, offset)? {
+            return Ok(result);
+        }
+
         let ptr_guards = bufs
             .iter()
             .map(|slice| slice.ptr_guard_mut())
@@ -499,5 +506,165 @@ impl FileReadWriteAtVolatile for DiskProperties {
             .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
         self.file.lock().unwrap().writev(iovec, offset)?;
         Ok(full_length)
+    }
+}
+
+#[cfg(all(feature = "blk", windows))]
+impl DiskProperties {
+    fn windows_formatted_read_vectored_at_volatile(
+        &self,
+        bufs: &[VolatileSlice],
+        offset: u64,
+    ) -> Result<Option<usize>> {
+        let full_length = volatile_slices_len(bufs)?;
+        if full_length == 0 {
+            return Ok(Some(0));
+        }
+
+        let file = self.file.lock().unwrap();
+        let plan = file.plan_read(offset, full_length)?;
+        if plan
+            .steps()
+            .iter()
+            .any(|step| !planned_read_step_supported(step))
+        {
+            return Ok(None);
+        }
+
+        let ptr_guards = bufs
+            .iter()
+            .map(|slice| slice.ptr_guard_mut())
+            .collect::<Vec<_>>();
+        let buffers = ptr_guards
+            .iter()
+            .map(|guard| {
+                let slice = if guard.len() == 0 {
+                    &mut []
+                } else {
+                    unsafe { std::slice::from_raw_parts_mut(guard.as_ptr(), guard.len()) }
+                };
+                IoSliceMut::new(slice)
+            })
+            .collect::<Vec<_>>();
+        let mut remaining = IoVectorMut::from(buffers);
+
+        for step in plan.steps() {
+            let Some(len) = planned_read_step_len(step) else {
+                return Ok(None);
+            };
+            let (mut chunk, rest) = remaining.split_at(len);
+            remaining = rest;
+
+            match step {
+                FormatReadPlanStep::Raw {
+                    storage,
+                    offset: storage_offset,
+                    ..
+                } => self
+                    .windows_formatted_read_runtime
+                    .block_on(storage.readv(chunk, *storage_offset))?,
+                FormatReadPlanStep::Zero { .. } | FormatReadPlanStep::Eof { .. } => {
+                    chunk.fill(0);
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        Ok(Some(
+            full_length
+                .try_into()
+                .map_err(|e| Error::new(ErrorKind::InvalidData, e))?,
+        ))
+    }
+}
+
+#[cfg(all(feature = "blk", windows))]
+fn volatile_slices_len(bufs: &[VolatileSlice]) -> Result<u64> {
+    bufs.iter().try_fold(0u64, |total, slice| {
+        total
+            .checked_add(slice.len() as u64)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "volatile slice length overflow"))
+    })
+}
+
+#[cfg(all(feature = "blk", windows))]
+fn planned_read_step_supported(step: &FormatReadPlanStep<'_, Box<dyn imago::DynStorage>>) -> bool {
+    matches!(
+        step,
+        FormatReadPlanStep::Raw { .. }
+            | FormatReadPlanStep::Zero { .. }
+            | FormatReadPlanStep::Eof { .. }
+    )
+}
+
+#[cfg(all(feature = "blk", windows))]
+fn planned_read_step_len(step: &FormatReadPlanStep<'_, Box<dyn imago::DynStorage>>) -> Option<u64> {
+    match step {
+        FormatReadPlanStep::Raw { len, .. }
+        | FormatReadPlanStep::Zero { len, .. }
+        | FormatReadPlanStep::Eof { len, .. } => Some(*len),
+        _ => None,
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "blk", windows))]
+mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use imago::{raw::Raw, DynStorage, SyncFormatAccess};
+    use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
+
+    use crate::virtio::block::device::CacheType;
+
+    use super::*;
+
+    #[test]
+    fn windows_formatted_read_plan_handles_raw_and_eof_ranges() {
+        let path = temp_image_path("planned-raw-eof");
+        let payload = (0..512).map(|byte| (byte % 251) as u8).collect::<Vec<_>>();
+
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&payload).unwrap();
+        file.set_len(payload.len() as u64).unwrap();
+        drop(file);
+
+        let raw = Raw::<Box<dyn DynStorage>>::open_path_sync(&path, true).unwrap();
+        let disk_image = Arc::new(Mutex::new(SyncFormatAccess::new(raw).unwrap()));
+        let disk = DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe).unwrap();
+
+        let mem: GuestMemoryMmap<()> =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let target = mem.get_slice(GuestAddress(0x100), 1024).unwrap();
+
+        assert_eq!(
+            disk.windows_formatted_read_vectored_at_volatile(&[target], 0)
+                .unwrap(),
+            Some(1024)
+        );
+
+        let mut actual = vec![0xff; 1024];
+        mem.read_slice(&mut actual, GuestAddress(0x100)).unwrap();
+        assert_eq!(&actual[..payload.len()], &payload);
+        assert_eq!(&actual[payload.len()..], vec![0; 512]);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn temp_image_path(test_name: &str) -> std::path::PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        std::env::temp_dir().join(format!(
+            "libkrun-formatted-block-{test_name}-{}-{timestamp}.img",
+            std::process::id()
+        ))
     }
 }

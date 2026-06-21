@@ -452,7 +452,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -622,26 +622,6 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
-
-[[package]]
-name = "imago"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae7cfee876c698a1a2ed9c705ab18f21acbed82110f19b51cc458de73426fe2c"
-dependencies = [
- "async-trait",
- "bincode",
- "cfg-if",
- "libc",
- "miniz_oxide",
- "nix 0.30.1",
- "page_size",
- "rustc_version",
- "tokio",
- "tracing",
- "vm-memory 0.18.0",
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "indexmap"
@@ -923,6 +903,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "msb-imago"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16db000f7280d4c8a78b8b95f64a41006d447fd116ecd69d984d93774cb85d09"
+dependencies = [
+ "async-trait",
+ "bincode",
+ "cfg-if",
+ "libc",
+ "miniz_oxide",
+ "nix 0.30.1",
+ "page_size",
+ "rustc_version",
+ "tokio",
+ "tracing",
+ "vm-memory 0.18.0",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "msb_krun"
 version = "0.1.17"
 dependencies = [
@@ -993,13 +993,13 @@ dependencies = [
  "capng",
  "caps",
  "crossbeam-channel",
- "imago",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
  "libloading",
  "log",
  "lru",
+ "msb-imago",
  "msb_krun_arch",
  "msb_krun_display",
  "msb_krun_hvf",
@@ -1011,6 +1011,7 @@ dependencies = [
  "pipewire",
  "rand",
  "thiserror 2.0.18",
+ "tokio",
  "virtio-bindings",
  "vm-fdt",
  "vm-memory 0.18.0",
@@ -1483,7 +1484,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

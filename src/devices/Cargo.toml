@@ -41,7 +41,7 @@ arch = { package = "msb_krun_arch", version = "0.1.17", path = "../arch" }
 utils = { package = "msb_krun_utils", version = "0.1.17", path = "../utils" }
 polly = { package = "msb_krun_polly", version = "0.1.17", path = "../polly" }
 rutabaga_gfx = { package = "msb_krun_rutabaga_gfx", version = "0.1.17", path = "../rutabaga_gfx", features = ["virgl_renderer", "virgl_renderer_next"], optional = true }
-imago = { version = "0.2.1", features = ["sync-wrappers", "vm-memory"] }
+imago = { package = "msb-imago", version = "0.1.0", features = ["sync-wrappers", "vm-memory"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hvf = { package = "msb_krun_hvf", version = "0.1.17", path = "../hvf" }
@@ -55,6 +55,7 @@ kvm-bindings = { version = ">=0.11", features = ["fam-wrappers"] }
 kvm-ioctls = ">=0.21"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+tokio = { version = "1", features = ["rt"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [target.'cfg(any(target_arch = "aarch64", target_arch = "riscv64"))'.dependencies]
