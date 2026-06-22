@@ -44,7 +44,6 @@ pub use api::builders::CacheMode;
 pub use api::builders::DiskBuilder;
 #[cfg(feature = "blk")]
 pub use api::builders::DiskImageFormat;
-#[cfg(not(target_os = "windows"))]
 pub use api::builders::FsBuilder;
 #[cfg(feature = "net")]
 pub use api::builders::NetBuilder;
@@ -62,10 +61,7 @@ pub use api::vm::Vm;
 #[cfg(not(target_os = "windows"))]
 pub use backends::console::ConsolePortBackend;
 
-#[cfg(all(
-    not(any(feature = "tee", feature = "aws-nitro")),
-    not(target_os = "windows")
-))]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use backends::fs::DynFileSystem;
 
 #[cfg(feature = "net")]

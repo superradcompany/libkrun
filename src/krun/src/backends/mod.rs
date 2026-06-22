@@ -26,10 +26,7 @@
 #[cfg(not(target_os = "windows"))]
 pub mod console;
 
-#[cfg(all(
-    not(any(feature = "tee", feature = "aws-nitro")),
-    not(target_os = "windows")
-))]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub mod fs;
 
 #[cfg(feature = "net")]
@@ -42,10 +39,7 @@ pub mod net;
 #[cfg(not(target_os = "windows"))]
 pub use console::ConsolePortBackend;
 
-#[cfg(all(
-    not(any(feature = "tee", feature = "aws-nitro")),
-    not(target_os = "windows")
-))]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use fs::DynFileSystem;
 
 #[cfg(feature = "net")]

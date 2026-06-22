@@ -9,10 +9,7 @@ use devices::virtio::console::port_io::{
 };
 use vmm::resources::PortConfig;
 
-#[cfg(all(
-    not(any(feature = "tee", feature = "aws-nitro")),
-    not(target_os = "windows")
-))]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use crate::backends::fs::DynFileSystem;
 
 #[cfg(all(feature = "net", unix))]
@@ -128,10 +125,7 @@ pub enum FsConfig {
         shm_size: Option<usize>,
     },
     /// Custom filesystem backend.
-    #[cfg(all(
-        not(any(feature = "tee", feature = "aws-nitro")),
-        not(target_os = "windows")
-    ))]
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     Custom {
         tag: String,
         backend: Box<dyn DynFileSystem + Send + Sync>,
@@ -579,10 +573,7 @@ impl FsBuilder {
     }
 
     /// Use a custom filesystem backend.
-    #[cfg(all(
-        not(any(feature = "tee", feature = "aws-nitro")),
-        not(target_os = "windows")
-    ))]
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     pub fn custom(mut self, backend: Box<dyn DynFileSystem + Send + Sync>) -> Self {
         let tag = self
             .current_tag

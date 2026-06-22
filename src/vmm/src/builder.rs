@@ -92,10 +92,7 @@ use crate::signal_handler::register_sigwinch_handler;
 use crate::terminal::{term_restore_mode, term_set_raw_mode};
 #[cfg(feature = "blk")]
 use crate::vmm_config::block::BlockBuilder;
-#[cfg(all(
-    not(any(feature = "tee", feature = "aws-nitro")),
-    not(target_os = "windows")
-))]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use crate::vmm_config::fs::CustomFsDeviceConfig;
 #[cfg(not(feature = "tee"))]
 use crate::vmm_config::fs::FsDeviceConfig;
@@ -1486,10 +1483,7 @@ pub fn build_microvm(
         _sender.clone(),
     )?;
     trace.mark("fs.ready");
-    #[cfg(all(
-        not(any(feature = "tee", feature = "aws-nitro")),
-        not(target_os = "windows")
-    ))]
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     attach_custom_fs_devices(
         &mut vmm,
         &vm_resources.custom_fs,
@@ -2046,10 +2040,7 @@ pub fn create_guest_memory(
                 .map_err(StartMicrovmError::ShmCreate)?;
         }
     }
-    #[cfg(all(
-        not(any(feature = "tee", feature = "aws-nitro")),
-        not(target_os = "windows")
-    ))]
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     {
         let offset = vm_resources.fs.len();
         for (i, custom) in vm_resources.custom_fs.iter().enumerate() {
@@ -2607,10 +2598,7 @@ fn attach_fs_devices(
     Ok(())
 }
 
-#[cfg(all(
-    not(any(feature = "tee", feature = "aws-nitro")),
-    not(target_os = "windows")
-))]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 fn attach_custom_fs_devices(
     vmm: &mut Vmm,
     custom_fs_devs: &[CustomFsDeviceConfig],

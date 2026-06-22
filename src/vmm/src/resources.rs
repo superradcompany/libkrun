@@ -172,10 +172,7 @@ pub struct VmResources {
     #[cfg(not(feature = "tee"))]
     pub fs: Vec<FsDeviceConfig>,
     /// Custom filesystem devices.
-    #[cfg(all(
-        not(any(feature = "tee", feature = "aws-nitro")),
-        not(target_os = "windows")
-    ))]
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     pub custom_fs: Vec<CustomFsDeviceConfig>,
     /// The vsock device.
     pub vsock: VsockBuilder,
@@ -248,10 +245,7 @@ impl Default for VmResources {
             initrd_bundle: None,
             #[cfg(not(feature = "tee"))]
             fs: Vec::new(),
-            #[cfg(all(
-                not(any(feature = "tee", feature = "aws-nitro")),
-                not(target_os = "windows")
-            ))]
+            #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
             custom_fs: Vec::new(),
             vsock: VsockBuilder::default(),
             #[cfg(feature = "blk")]

@@ -9,10 +9,7 @@ use vmm::resources::VmResources;
 use vmm::vmm_config::machine_config::VmConfig;
 use vmm::vmm_config::machine_config::VmConfigError;
 
-#[cfg(all(
-    not(any(feature = "tee", feature = "aws-nitro")),
-    not(target_os = "windows")
-))]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use vmm::vmm_config::fs::CustomFsDeviceConfig;
 #[cfg(not(feature = "tee"))]
 use vmm::vmm_config::fs::FsDeviceConfig;
@@ -21,12 +18,7 @@ use vmm::vmm_config::fs::FsDeviceConfig;
 use super::builders::DiskBuilder;
 #[cfg(not(feature = "tee"))]
 use super::builders::FsBuilder;
-#[cfg(all(
-    not(any(feature = "tee", feature = "aws-nitro")),
-    not(target_os = "windows")
-))]
-use super::builders::FsConfig;
-#[cfg(all(not(feature = "tee"), target_os = "windows"))]
+#[cfg(not(feature = "tee"))]
 use super::builders::FsConfig;
 use super::builders::{ConsoleBuilder, ExecBuilder, KernelBuilder, MachineBuilder};
 #[cfg(feature = "net")]
@@ -388,10 +380,7 @@ impl VmBuilder {
                     };
                     vmr.fs.push(fs_config);
                 }
-                #[cfg(all(
-                    not(any(feature = "tee", feature = "aws-nitro")),
-                    not(target_os = "windows")
-                ))]
+                #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
                 FsConfig::Custom { tag, backend } => {
                     let backend: Box<dyn devices::virtio::fs::DynFileSystem> = backend;
                     let custom_config = CustomFsDeviceConfig {
