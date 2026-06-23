@@ -10,7 +10,7 @@ use std;
 use std::any::Any;
 use std::io::Error as IOError;
 
-#[cfg(all(not(target_os = "windows"), not(feature = "tee")))]
+#[cfg(not(feature = "tee"))]
 pub mod balloon;
 #[allow(dead_code)]
 #[allow(non_camel_case_types)]
@@ -50,7 +50,7 @@ pub mod snd;
 #[cfg(not(target_os = "windows"))]
 pub mod vsock;
 
-#[cfg(all(not(target_os = "windows"), not(feature = "tee")))]
+#[cfg(not(feature = "tee"))]
 pub use self::balloon::*;
 #[cfg(feature = "blk")]
 pub use self::block::{Block, CacheType};

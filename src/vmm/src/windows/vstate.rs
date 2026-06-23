@@ -17,10 +17,11 @@ use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 
 use arch::ArchMemoryInfo;
 use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
-use utils::eventfd::EventFd;
+use utils::{eventfd::EventFd, metrics::MetricsWriter};
 #[cfg(target_arch = "x86_64")]
 use vm_memory::Bytes;
 use vm_memory::{Address, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
+use windows_sys::Win32::Foundation::FILETIME;
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::Foundation::{E_FAIL, E_INVALIDARG, S_OK};
 use windows_sys::Win32::System::Hypervisor::{
@@ -48,6 +49,7 @@ use windows_sys::Win32::System::Hypervisor::{
     WHV_X64_IO_PORT_ACCESS_CONTEXT, WHV_X64_SEGMENT_REGISTER, WHV_X64_SEGMENT_REGISTER_0,
     WHV_X64_TABLE_REGISTER,
 };
+use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
 
 #[cfg(target_arch = "aarch64")]
 const AARCH64_PSR_MODE_EL1H: u64 = 0x0000_0005;
@@ -424,6 +426,7 @@ pub struct Vcpu {
     #[cfg(target_arch = "x86_64")]
     pio_bus: Option<devices::Bus>,
     exit_evt: EventFd,
+    metrics: MetricsWriter,
     event_sender: Option<Sender<VcpuEvent>>,
     event_receiver: Option<Receiver<VcpuEvent>>,
     response_sender: Option<Sender<VcpuResponse>>,
@@ -688,15 +691,20 @@ impl Vm {
         self.partition.handle
     }
 
-    pub fn create_vcpu(&self, id: u8, exit_evt: EventFd) -> Result<Vcpu> {
-        Vcpu::new(id, self.partition.handle, exit_evt)
+    pub fn create_vcpu(&self, id: u8, exit_evt: EventFd, metrics: MetricsWriter) -> Result<Vcpu> {
+        Vcpu::new(id, self.partition.handle, exit_evt, metrics)
     }
 }
 
 impl Vcpu {
     pub fn register_kick_signal_handler() {}
 
-    pub fn new(id: u8, partition_handle: WHV_PARTITION_HANDLE, exit_evt: EventFd) -> Result<Self> {
+    pub fn new(
+        id: u8,
+        partition_handle: WHV_PARTITION_HANDLE,
+        exit_evt: EventFd,
+        metrics: MetricsWriter,
+    ) -> Result<Self> {
         let hresult = unsafe { WHvCreateVirtualProcessor(partition_handle, id as u32, 0) };
         if hresult < 0 {
             return Err(Error::CreateVirtualProcessor { id, hresult });
@@ -713,6 +721,7 @@ impl Vcpu {
             #[cfg(target_arch = "x86_64")]
             pio_bus: None,
             exit_evt,
+            metrics,
             event_sender: Some(event_sender),
             event_receiver: Some(event_receiver),
             response_sender: Some(response_sender),
@@ -779,6 +788,7 @@ impl Vcpu {
         #[cfg(target_arch = "x86_64")]
         let pio_bus = self.pio_bus.take();
         let exit_evt = self.exit_evt.try_clone().map_err(Error::VcpuThreadSpawn)?;
+        let metrics = self.metrics.clone();
         self.partition_handle = 0;
 
         let vcpu_thread = thread::Builder::new()
@@ -792,6 +802,7 @@ impl Vcpu {
                     #[cfg(target_arch = "x86_64")]
                     pio_bus,
                     exit_evt,
+                    metrics,
                     event_receiver,
                     response_sender,
                 )
@@ -1391,6 +1402,7 @@ fn run_vcpu(
     mmio_bus: Option<devices::Bus>,
     #[cfg(target_arch = "x86_64")] pio_bus: Option<devices::Bus>,
     exit_evt: EventFd,
+    metrics: MetricsWriter,
     event_receiver: Receiver<VcpuEvent>,
     response_sender: Sender<VcpuResponse>,
 ) {
@@ -1452,6 +1464,7 @@ fn run_vcpu(
         #[cfg(target_arch = "x86_64")]
         let exit_context_size = size_of::<WHV_RUN_VP_EXIT_CONTEXT>() as u32;
 
+        let cpu_time_before = current_thread_cpu_time_ns();
         let hresult = unsafe {
             WHvRunVirtualProcessor(
                 partition_handle,
@@ -1460,6 +1473,9 @@ fn run_vcpu(
                 exit_context_size,
             )
         };
+        if let (Some(before), Some(after)) = (cpu_time_before, current_thread_cpu_time_ns()) {
+            metrics.add_vcpu_time_ns(after.saturating_sub(before));
+        }
         if hresult < 0 {
             error!("{}", Error::RunVirtualProcessor { id, hresult });
             signal_vcpu_exit(&response_sender, &exit_evt, 1);
@@ -1558,6 +1574,31 @@ fn run_vcpu(
         signal_vcpu_exit(&response_sender, &exit_evt, 1);
         return;
     }
+}
+
+fn current_thread_cpu_time_ns() -> Option<u64> {
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let ok = unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+
+    Some(filetime_100ns(&kernel).saturating_add(filetime_100ns(&user)) * 100)
+}
+
+fn filetime_100ns(time: &FILETIME) -> u64 {
+    (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
 }
 
 fn signal_vcpu_exit(response_sender: &Sender<VcpuResponse>, exit_evt: &EventFd, exit_code: u8) {

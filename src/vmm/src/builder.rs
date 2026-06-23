@@ -1359,7 +1359,7 @@ pub fn build_microvm(
         setup_terminal_raw_mode(&mut vmm, Some(serial_tty), false);
     }
 
-    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+    #[cfg(not(feature = "tee"))]
     if vm_resources.enable_balloon {
         attach_balloon_device(
             &mut vmm,
@@ -2397,13 +2397,17 @@ fn create_vcpus_windows(
     mem_info: &ArchMemoryInfo,
     entry_addr: GuestAddress,
     exit_evt: &EventFd,
-    _metrics: utils::metrics::MetricsWriter,
+    metrics: utils::metrics::MetricsWriter,
     #[cfg(target_arch = "x86_64")] pio_bus: Option<&devices::Bus>,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
     for cpu_index in 0..vcpu_config.vcpu_count {
         let mut vcpu = vm
-            .create_vcpu(cpu_index, exit_evt.try_clone().map_err(Error::EventFd)?)
+            .create_vcpu(
+                cpu_index,
+                exit_evt.try_clone().map_err(Error::EventFd)?,
+                metrics.clone(),
+            )
             .map_err(Error::Vcpu)?;
         vcpu.configure_windows(guest_mem, mem_info, entry_addr)
             .map_err(Error::Vcpu)?;
@@ -3013,7 +3017,7 @@ fn attach_msb_metrics_device(
     Ok(())
 }
 
-#[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+#[cfg(not(feature = "tee"))]
 fn attach_balloon_device(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,

@@ -1,5 +1,4 @@
 use std::cmp;
-use std::convert::TryInto;
 use std::io::Write;
 use std::time::Duration;
 
@@ -125,13 +124,9 @@ impl Balloon {
                     "balloon: should release guest_addr={:?} host_addr={:p} len={}",
                     desc.addr, host_addr, desc.len
                 );
-                unsafe {
-                    libc::madvise(
-                        host_addr as *mut libc::c_void,
-                        desc.len.try_into().unwrap(),
-                        libc::MADV_DONTNEED,
-                    )
-                };
+                if let Err(e) = discard_guest_pages(host_addr, desc.len) {
+                    error!("balloon: failed to discard reported free pages: {e:?}");
+                }
             }
 
             have_used = true;
@@ -141,6 +136,31 @@ impl Balloon {
         }
 
         have_used
+    }
+}
+
+#[cfg(unix)]
+fn discard_guest_pages(host_addr: *mut u8, len: u32) -> std::io::Result<()> {
+    let ret = unsafe {
+        libc::madvise(
+            host_addr as *mut libc::c_void,
+            len as usize,
+            libc::MADV_DONTNEED,
+        )
+    };
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn discard_guest_pages(host_addr: *mut u8, len: u32) -> std::io::Result<()> {
+    // The guest supplied these ranges through virtio-balloon free-page reporting, so the host can
+    // discard its resident backing pages without changing the guest-visible address space.
+    unsafe {
+        crate::windows::memory_mapping::discard_virtual_memory_range(host_addr.cast(), len as usize)
     }
 }
 

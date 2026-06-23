@@ -1,6 +1,9 @@
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 
-use polly::event_manager::{EventManager, Subscriber};
+use polly::event_manager::{EventManager, Pollable, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 
 use super::device::{
@@ -224,45 +227,39 @@ impl Balloon {
 
         // The subscriber must exist as we previously registered activate_evt via
         // `interest_list()`.
-        let self_subscriber = event_manager
-            .subscriber(self.activate_evt.as_raw_fd())
-            .unwrap();
+        let activate_evt = eventfd_pollable(&self.activate_evt);
+        let self_subscriber = event_manager.subscriber(activate_evt).unwrap();
+
+        let ifq = eventfd_pollable(self.queue_event(IFQ_INDEX));
+        let dfq = eventfd_pollable(self.queue_event(DFQ_INDEX));
+        let stq = eventfd_pollable(self.queue_event(STQ_INDEX));
+        let phq = eventfd_pollable(self.queue_event(PHQ_INDEX));
+        let frq = eventfd_pollable(self.queue_event(FRQ_INDEX));
+        let stats_timer = timerfd_pollable(&self.stats_timer);
 
         event_manager
-            .register(
-                self.queue_event(IFQ_INDEX).as_raw_fd(),
-                EpollEvent::new(EventSet::IN, self.queue_event(IFQ_INDEX).as_raw_fd() as u64),
-                self_subscriber.clone(),
-            )
+            .register(ifq, pollable_event(ifq), self_subscriber.clone())
             .unwrap_or_else(|e| {
                 error!("Failed to register balloon ifq with event manager: {e:?}");
             });
 
         event_manager
-            .register(
-                self.queue_event(DFQ_INDEX).as_raw_fd(),
-                EpollEvent::new(EventSet::IN, self.queue_event(DFQ_INDEX).as_raw_fd() as u64),
-                self_subscriber.clone(),
-            )
+            .register(dfq, pollable_event(dfq), self_subscriber.clone())
             .unwrap_or_else(|e| {
                 error!("Failed to register balloon dfq with event manager: {e:?}");
             });
 
         if self.stats_enabled() {
             event_manager
-                .register(
-                    self.queue_event(STQ_INDEX).as_raw_fd(),
-                    EpollEvent::new(EventSet::IN, self.queue_event(STQ_INDEX).as_raw_fd() as u64),
-                    self_subscriber.clone(),
-                )
+                .register(stq, pollable_event(stq), self_subscriber.clone())
                 .unwrap_or_else(|e| {
                     error!("Failed to register balloon stq with event manager: {e:?}");
                 });
 
             event_manager
                 .register(
-                    self.stats_timer.as_raw_fd(),
-                    EpollEvent::new(EventSet::IN, self.stats_timer.as_raw_fd() as u64),
+                    stats_timer,
+                    pollable_event(stats_timer),
                     self_subscriber.clone(),
                 )
                 .unwrap_or_else(|e| {
@@ -271,43 +268,33 @@ impl Balloon {
         }
 
         event_manager
-            .register(
-                self.queue_event(PHQ_INDEX).as_raw_fd(),
-                EpollEvent::new(EventSet::IN, self.queue_event(PHQ_INDEX).as_raw_fd() as u64),
-                self_subscriber.clone(),
-            )
+            .register(phq, pollable_event(phq), self_subscriber.clone())
             .unwrap_or_else(|e| {
                 error!("Failed to register balloon dfq with event manager: {e:?}");
             });
 
         event_manager
-            .register(
-                self.queue_event(FRQ_INDEX).as_raw_fd(),
-                EpollEvent::new(EventSet::IN, self.queue_event(FRQ_INDEX).as_raw_fd() as u64),
-                self_subscriber.clone(),
-            )
+            .register(frq, pollable_event(frq), self_subscriber.clone())
             .unwrap_or_else(|e| {
                 error!("Failed to register balloon frq with event manager: {e:?}");
             });
 
-        event_manager
-            .unregister(self.activate_evt.as_raw_fd())
-            .unwrap_or_else(|e| {
-                error!("Failed to unregister balloon activate evt: {e:?}");
-            })
+        event_manager.unregister(activate_evt).unwrap_or_else(|e| {
+            error!("Failed to unregister balloon activate evt: {e:?}");
+        })
     }
 }
 
 impl Subscriber for Balloon {
     fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
         let source = event.fd();
-        let ifq = self.queue_event(IFQ_INDEX).as_raw_fd();
-        let dfq = self.queue_event(DFQ_INDEX).as_raw_fd();
-        let stq = self.queue_event(STQ_INDEX).as_raw_fd();
-        let phq = self.queue_event(PHQ_INDEX).as_raw_fd();
-        let frq = self.queue_event(FRQ_INDEX).as_raw_fd();
-        let activate_evt = self.activate_evt.as_raw_fd();
-        let stats_timer = self.stats_timer.as_raw_fd();
+        let ifq = eventfd_pollable(self.queue_event(IFQ_INDEX));
+        let dfq = eventfd_pollable(self.queue_event(DFQ_INDEX));
+        let stq = eventfd_pollable(self.queue_event(STQ_INDEX));
+        let phq = eventfd_pollable(self.queue_event(PHQ_INDEX));
+        let frq = eventfd_pollable(self.queue_event(FRQ_INDEX));
+        let activate_evt = eventfd_pollable(&self.activate_evt);
+        let stats_timer = timerfd_pollable(&self.stats_timer);
 
         if self.is_activated() {
             match source {
@@ -330,11 +317,42 @@ impl Subscriber for Balloon {
     }
 
     fn interest_list(&self) -> Vec<EpollEvent> {
-        vec![EpollEvent::new(
-            EventSet::IN,
-            self.activate_evt.as_raw_fd() as u64,
-        )]
+        vec![pollable_event(eventfd_pollable(&self.activate_evt))]
     }
+}
+
+#[cfg(unix)]
+fn eventfd_pollable(event: &utils::eventfd::EventFd) -> Pollable {
+    event.as_raw_fd()
+}
+
+#[cfg(windows)]
+fn eventfd_pollable(event: &utils::eventfd::EventFd) -> Pollable {
+    event.as_raw_handle()
+}
+
+#[cfg(unix)]
+fn timerfd_pollable(timer: &utils::timerfd::TimerFd) -> Pollable {
+    timer.as_raw_fd()
+}
+
+#[cfg(windows)]
+fn timerfd_pollable(timer: &utils::timerfd::TimerFd) -> Pollable {
+    timer.as_raw_handle()
+}
+
+fn pollable_event(pollable: Pollable) -> EpollEvent {
+    EpollEvent::new(EventSet::IN, pollable_token(pollable))
+}
+
+#[cfg(unix)]
+fn pollable_token(pollable: Pollable) -> u64 {
+    pollable as u64
+}
+
+#[cfg(windows)]
+fn pollable_token(pollable: Pollable) -> u64 {
+    pollable as usize as u64
 }
 
 fn stats_descriptor_len(head: &crate::virtio::DescriptorChain<'_>) -> Option<u32> {
