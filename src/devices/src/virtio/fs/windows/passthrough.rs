@@ -390,9 +390,33 @@ impl PassthroughFs {
         }
 
         std::fs::rename(&old_path, &new_path).map_err(host_error)?;
-        self.forget_path(&old_path);
-        self.forget_path(&new_path);
+        self.rename_inode_path(&old_path, &new_path);
         Ok(())
+    }
+
+    fn rename_inode_path(&self, old_path: &Path, new_path: &Path) {
+        let mut inodes = self.inodes.write().unwrap();
+        let Some(old_data) = inodes.by_path.remove(old_path) else {
+            if let Some(replaced) = inodes.by_path.remove(new_path) {
+                inodes.by_inode.remove(&replaced.inode);
+            }
+            return;
+        };
+
+        if let Some(replaced) = inodes.by_path.remove(new_path) {
+            inodes.by_inode.remove(&replaced.inode);
+        }
+
+        // Windows does not give this backend a cheap fd-like identity for every path. Preserve the
+        // guest-visible source inode across rename by moving its path entry, which matches the
+        // important POSIX behavior for atomic temp-file replacement patterns such as heartbeat files.
+        let data = Arc::new(InodeData {
+            inode: old_data.inode,
+            path: new_path.to_path_buf(),
+            refcount: AtomicU64::new(old_data.refcount.load(Ordering::Acquire)),
+        });
+        inodes.by_inode.insert(data.inode, data.clone());
+        inodes.by_path.insert(new_path.to_path_buf(), data);
     }
 
     fn do_symlink(&self, linkname: &CStr, parent: Inode, name: &CStr) -> io::Result<Entry> {
@@ -1646,6 +1670,27 @@ mod tests {
     }
 
     #[test]
+    fn opendir_accepts_guest_directory_flags() {
+        let temp = TempDir::new();
+        let fs = PassthroughFs::new(Config {
+            root_dir: temp.path.to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        let flags = (bindings::LINUX_O_DIRECTORY
+            | bindings::LINUX_O_CLOEXEC
+            | bindings::LINUX_O_LARGEFILE) as u32;
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(flags, 0xa4000);
+
+        let (handle, _) = fs.opendir(context(), fuse::ROOT_ID, flags).unwrap();
+        fs.releasedir(context(), fuse::ROOT_ID, 0, handle.unwrap())
+            .unwrap();
+    }
+
+    #[test]
     fn create_write_fsync_and_truncate_file() {
         let temp = TempDir::new();
         let passthrough = PassthroughFs::new(Config {
@@ -1820,6 +1865,51 @@ mod tests {
             .rmdir(context(), fuse::ROOT_ID, dir_name)
             .unwrap();
         assert!(!temp.path.join("nested").exists());
+    }
+
+    #[test]
+    fn rename_replace_moves_source_inode_to_target_path() {
+        let temp = TempDir::new();
+        fs::write(temp.path.join("heartbeat.json"), b"old").unwrap();
+        fs::write(temp.path.join("heartbeat.tmp"), b"new").unwrap();
+
+        let passthrough = PassthroughFs::new(Config {
+            root_dir: temp.path.to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        passthrough.init(FsOptions::empty()).unwrap();
+
+        let target_name = CStr::from_bytes_with_nul(b"heartbeat.json\0").unwrap();
+        let temp_name = CStr::from_bytes_with_nul(b"heartbeat.tmp\0").unwrap();
+        let source = passthrough
+            .lookup(context(), fuse::ROOT_ID, temp_name)
+            .unwrap();
+
+        passthrough
+            .rename(
+                context(),
+                fuse::ROOT_ID,
+                temp_name,
+                fuse::ROOT_ID,
+                target_name,
+                0,
+            )
+            .unwrap();
+
+        let (attr, _) = passthrough.getattr(context(), source.inode, None).unwrap();
+        assert_eq!(attr.st_size, 3);
+
+        let (handle, _) = passthrough.open(context(), source.inode, false, 0).unwrap();
+        let handle = handle.unwrap();
+        let mut writer = CaptureWriter { bytes: Vec::new() };
+        passthrough
+            .read(context(), source.inode, handle, &mut writer, 3, 0, None, 0)
+            .unwrap();
+        assert_eq!(writer.bytes, b"new");
+        passthrough
+            .release(context(), source.inode, 0, handle, false, false, None)
+            .unwrap();
     }
 
     #[test]

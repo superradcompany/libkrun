@@ -8,10 +8,29 @@ pub const LINUX_ENOTEMPTY: libc::c_int = 39;
 
 pub const LINUX_O_APPEND: libc::c_int = 1024;
 pub const LINUX_O_CLOEXEC: libc::c_int = 0x80000;
+
+// Linux open flag bits are part of the guest ABI, and arm64/riscv64 use the
+// asm-generic layout rather than the x86 layout used by older constants.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub const LINUX_O_DIRECT: libc::c_int = 0x10000;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
 pub const LINUX_O_DIRECT: libc::c_int = 0x4000;
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub const LINUX_O_DIRECTORY: libc::c_int = 0x4000;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
 pub const LINUX_O_DIRECTORY: libc::c_int = 0x10000;
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub const LINUX_O_LARGEFILE: libc::c_int = 0x20000;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
 pub const LINUX_O_LARGEFILE: libc::c_int = 0;
+
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub const LINUX_O_NOFOLLOW: libc::c_int = 0x8000;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
 pub const LINUX_O_NOFOLLOW: libc::c_int = 0x20000;
+
 pub const LINUX_O_CREAT: libc::c_int = 64;
 pub const LINUX_O_EXCL: libc::c_int = 128;
 pub const LINUX_O_NOCTTY: libc::c_int = 256;
