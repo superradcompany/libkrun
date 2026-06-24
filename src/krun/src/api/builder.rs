@@ -362,6 +362,7 @@ impl VmBuilder {
         vmr.enable_balloon = self.machine.balloon;
         vmr.balloon_stats_interval = self.machine.balloon_stats_interval;
         vmr.enable_rng = self.machine.rng;
+        vmr.enable_msb_metrics = self.machine.msb_metrics;
 
         // Apply filesystem configuration
         #[cfg(not(feature = "tee"))]

@@ -1380,7 +1380,7 @@ pub fn build_microvm(
         trace.mark("rng.skipped");
     }
     #[cfg(not(feature = "tee"))]
-    {
+    if vm_resources.enable_msb_metrics {
         attach_msb_metrics_device(
             &mut vmm,
             event_manager,
@@ -1388,6 +1388,8 @@ pub fn build_microvm(
             vm_resources.metrics.clone(),
         )?;
         trace.mark("msb_metrics.attached");
+    } else {
+        trace.mark("msb_metrics.skipped");
     }
 
     #[cfg(not(target_os = "windows"))]
