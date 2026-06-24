@@ -473,10 +473,20 @@ impl Block {
 
         let disk_image = Arc::new(Mutex::new(disk_image));
 
-        let mut disk_properties =
-            DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
-        #[cfg(windows)]
-        disk_properties.set_windows_raw_file(windows_raw_file.clone());
+        let disk_properties = {
+            let disk_properties =
+                DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
+            #[cfg(windows)]
+            {
+                let mut disk_properties = disk_properties;
+                disk_properties.set_windows_raw_file(windows_raw_file.clone());
+                disk_properties
+            }
+            #[cfg(not(windows))]
+            {
+                disk_properties
+            }
+        };
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)
@@ -606,15 +616,22 @@ impl VirtioDevice for Block {
         let disk = match self.disk.take() {
             Some(d) => d,
             None => {
-                let mut disk = DiskProperties::new(
+                let disk = DiskProperties::new(
                     Arc::clone(&self.disk_image),
                     self.disk_image_id.clone(),
                     self.cache_type,
                 )
                 .map_err(|_| ActivateError::BadActivate)?;
                 #[cfg(windows)]
-                disk.set_windows_raw_file(self.windows_raw_file.clone());
-                disk
+                {
+                    let mut disk = disk;
+                    disk.set_windows_raw_file(self.windows_raw_file.clone());
+                    disk
+                }
+                #[cfg(not(windows))]
+                {
+                    disk
+                }
             }
         };
 

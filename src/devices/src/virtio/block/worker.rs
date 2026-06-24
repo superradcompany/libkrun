@@ -12,7 +12,9 @@ use crate::virtio::queue::DescriptorChain;
 use crate::virtio::InterruptTransport;
 #[cfg(windows)]
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+#[cfg(windows)]
+use std::io::Read;
+use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(windows)]

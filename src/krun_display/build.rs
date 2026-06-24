@@ -1,4 +1,5 @@
 use std::env;
+#[cfg(target_os = "windows")]
 use std::fs;
 use std::path::PathBuf;
 
