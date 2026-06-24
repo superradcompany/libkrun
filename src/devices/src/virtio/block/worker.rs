@@ -491,7 +491,7 @@ impl BlockWorker {
                 let offset = sector_offset(request_header.sector)?;
                 let segments = collect_windows_raw_buffers(mem, head.clone(), true, 0, data_len)
                     .map_err(RequestError::WritingToDescriptor)?;
-                let (operation, bounce_read) =
+                let (operation, _) =
                     self.submit_windows_raw_read_operation(offset, data_len, &segments)?;
                 self.queue_windows_raw_request(
                     pending_raw,
@@ -500,7 +500,6 @@ impl BlockWorker {
                     PendingWindowsBlockDirection::Read,
                     data_len,
                     operation,
-                    bounce_read,
                 );
                 Ok(WindowsRawSubmission::Submitted)
             }
@@ -531,7 +530,6 @@ impl BlockWorker {
                     PendingWindowsBlockDirection::Write,
                     data_len,
                     operation,
-                    false,
                 );
                 Ok(WindowsRawSubmission::Submitted)
             }
@@ -610,7 +608,6 @@ impl BlockWorker {
         direction: PendingWindowsBlockDirection,
         data_len: usize,
         operation: PendingWindowsRawFileOperation,
-        _bounce_read: bool,
     ) {
         let key = operation.completion_key();
         pending_raw.insert(

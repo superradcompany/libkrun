@@ -7,6 +7,7 @@
 //! On macOS, the binary must be codesigned with the hypervisor entitlement:
 //!   cd examples && make rust_vm
 
+#[cfg(not(feature = "tee"))]
 use std::path::PathBuf;
 
 use msb_krun::{Result, VmBuilder};
@@ -15,7 +16,9 @@ use msb_krun::{Result, VmBuilder};
 // Constants
 //--------------------------------------------------------------------------------------------------
 
+#[cfg(not(feature = "tee"))]
 const ROOTFS_PATH_ENV: &str = "KRUN_ROOTFS_PATH";
+#[cfg(not(feature = "tee"))]
 const DEFAULT_ROOTFS_DIR: &str = "rootfs-minimal";
 
 //--------------------------------------------------------------------------------------------------
