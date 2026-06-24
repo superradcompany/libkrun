@@ -1429,24 +1429,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust_vm_net"
-version = "0.1.0"
-dependencies = [
- "env_logger",
- "msb_krun",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "rust_vm_smoke"
-version = "0.1.0"
-dependencies = [
- "env_logger",
- "msb_krun",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "rustc-demangle"
 version = "0.1.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"

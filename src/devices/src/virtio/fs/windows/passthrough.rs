@@ -7,7 +7,7 @@ use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -18,8 +18,8 @@ use windows_sys::Win32::Foundation::{
     ERROR_SHARING_VIOLATION,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateSymbolicLinkW, FILE_ATTRIBUTE_READONLY, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
-    SYMBOLIC_LINK_FLAG_DIRECTORY,
+    CreateSymbolicLinkW, GetDiskFreeSpaceExW, FILE_ATTRIBUTE_READONLY,
+    SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE, SYMBOLIC_LINK_FLAG_DIRECTORY,
 };
 
 use crate::windows::memory_mapping::{
@@ -74,6 +74,8 @@ const S_IFLNK: u32 = 0o120000;
 
 const WINDOWS_TICKS_PER_SECOND: u64 = 10_000_000;
 const WINDOWS_TO_UNIX_EPOCH_SECONDS: u64 = 11_644_473_600;
+const STATFS_FRAGMENT_SIZE: u64 = 4096;
+const STATFS_NAME_MAX: u64 = 255;
 
 type Inode = u64;
 type Handle = u64;
@@ -530,6 +532,7 @@ impl PassthroughFs {
         Duration::from_secs(5)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn do_setupmapping(
         &self,
         inode: Inode,
@@ -669,9 +672,15 @@ impl FileSystem for PassthroughFs {
     type Inode = Inode;
     type Handle = Handle;
 
-    fn init(&self, _capable: FsOptions) -> io::Result<FsOptions> {
+    fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         self.insert_root()?;
-        Ok(FsOptions::empty())
+
+        let mut opts = FsOptions::empty();
+        if capable.contains(FsOptions::HAS_IOCTL_DIR) {
+            opts |= FsOptions::HAS_IOCTL_DIR;
+        }
+
+        Ok(opts)
     }
 
     fn destroy(&self) {
@@ -679,6 +688,14 @@ impl FileSystem for PassthroughFs {
         self.handles.write().unwrap().clear();
         self.inodes.write().unwrap().by_inode.clear();
         self.inodes.write().unwrap().by_path.clear();
+    }
+
+    fn statfs(&self, _ctx: Context, inode: Inode) -> io::Result<bindings::statvfs64> {
+        if inode != self.init_inode {
+            let _ = self.inode(inode)?;
+        }
+
+        statfs_for_path(&self.root)
     }
 
     fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
@@ -1018,6 +1035,37 @@ impl FileSystem for PassthroughFs {
         self.do_removemapping(requests, guest_shm_base, shm_size, map_sender)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn ioctl(
+        &self,
+        _ctx: Context,
+        _inode: Inode,
+        _handle: Handle,
+        _flags: u32,
+        cmd: u32,
+        arg: u64,
+        _in_size: u32,
+        _out_size: u32,
+        exit_code: &Arc<AtomicI32>,
+    ) -> io::Result<Vec<u8>> {
+        // These request values are part of the Linux guest /init.krun contract, so keep them
+        // literal on Windows instead of deriving them from the host platform.
+        const VIRTIO_IOC_EXIT_CODE_REQ: u32 = 0x7602;
+        const VIRTIO_IOC_REMOVE_ROOT_DIR_REQ: u32 = 0x7603;
+
+        match cmd {
+            VIRTIO_IOC_EXIT_CODE_REQ => {
+                exit_code.store(arg as i32, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+            VIRTIO_IOC_REMOVE_ROOT_DIR_REQ if self._cfg.allow_root_dir_delete => {
+                std::fs::remove_dir_all(&self.root).map_err(host_error)?;
+                Ok(Vec::new())
+            }
+            _ => Err(linux_error(LINUX_EOPNOTSUPP)),
+        }
+    }
+
     fn release(
         &self,
         _ctx: Context,
@@ -1318,6 +1366,38 @@ fn request_unmapping(sender: &Sender<WorkerMessage>, guest_addr: u64, len: u64) 
     }
 }
 
+fn statfs_for_path(path: &Path) -> io::Result<bindings::statvfs64> {
+    let path = path_to_wide(path);
+    let mut available = 0u64;
+    let mut total = 0u64;
+    let mut free = 0u64;
+
+    // SAFETY: The path pointer references a nul-terminated UTF-16 buffer and the out-pointers are
+    // valid for the duration of the call.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            path.as_ptr(),
+            &mut available as *mut u64,
+            &mut total as *mut u64,
+            &mut free as *mut u64,
+        )
+    };
+    if ok == 0 {
+        return Err(host_error(io::Error::last_os_error()));
+    }
+
+    Ok(bindings::statvfs64 {
+        f_blocks: total / STATFS_FRAGMENT_SIZE,
+        f_bfree: free / STATFS_FRAGMENT_SIZE,
+        f_bavail: available / STATFS_FRAGMENT_SIZE,
+        f_files: 0,
+        f_ffree: 0,
+        f_bsize: STATFS_FRAGMENT_SIZE,
+        f_namemax: STATFS_NAME_MAX,
+        f_frsize: STATFS_FRAGMENT_SIZE,
+    })
+}
+
 fn reject_symlink(path: &Path) -> io::Result<()> {
     let metadata = std::fs::symlink_metadata(path).map_err(host_error)?;
     if metadata.file_type().is_symlink() {
@@ -1610,6 +1690,20 @@ mod tests {
             Ok(_) => panic!("expected linux errno {errno}"),
             Err(error) => assert_eq!(error.raw_os_error(), Some(errno)),
         }
+    }
+
+    #[test]
+    fn init_requests_directory_ioctls_when_available() {
+        let temp = TempDir::new();
+        let fs = PassthroughFs::new(Config {
+            root_dir: temp.path.to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let options = fs.init(FsOptions::HAS_IOCTL_DIR).unwrap();
+
+        assert!(options.contains(FsOptions::HAS_IOCTL_DIR));
     }
 
     #[test]
@@ -2374,6 +2468,73 @@ mod tests {
             passthrough.removexattr(context(), entry.inode, name),
             LINUX_EOPNOTSUPP,
         );
+    }
+
+    #[test]
+    fn statfs_reports_host_capacity() {
+        let temp = TempDir::new();
+        let passthrough = PassthroughFs::new(Config {
+            root_dir: temp.path.to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        passthrough.init(FsOptions::empty()).unwrap();
+
+        let stat = passthrough.statfs(context(), fuse::ROOT_ID).unwrap();
+
+        assert!(stat.f_blocks > 0);
+        assert!(stat.f_bfree <= stat.f_blocks);
+        assert_eq!(stat.f_bsize, STATFS_FRAGMENT_SIZE);
+        assert_eq!(stat.f_frsize, STATFS_FRAGMENT_SIZE);
+        assert_eq!(stat.f_namemax, STATFS_NAME_MAX);
+    }
+
+    #[test]
+    fn ioctl_records_init_exit_code() {
+        let temp = TempDir::new();
+        let passthrough = PassthroughFs::new(Config {
+            root_dir: temp.path.to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        passthrough.init(FsOptions::empty()).unwrap();
+
+        let exit_code = Arc::new(AtomicI32::new(i32::MAX));
+        passthrough
+            .ioctl(
+                context(),
+                passthrough.init_inode,
+                passthrough.init_handle,
+                0,
+                0x7602,
+                42,
+                0,
+                0,
+                &exit_code,
+            )
+            .unwrap();
+
+        assert_eq!(exit_code.load(Ordering::SeqCst), 42);
+    }
+
+    #[test]
+    fn ioctl_removes_root_only_when_configured() {
+        let temp = TempDir::new();
+        fs::write(temp.path.join("owned.txt"), b"owned").unwrap();
+        let passthrough = PassthroughFs::new(Config {
+            root_dir: temp.path.to_string_lossy().into_owned(),
+            allow_root_dir_delete: true,
+            ..Default::default()
+        })
+        .unwrap();
+        passthrough.init(FsOptions::empty()).unwrap();
+
+        let exit_code = Arc::new(AtomicI32::new(i32::MAX));
+        passthrough
+            .ioctl(context(), fuse::ROOT_ID, 0, 0, 0x7603, 0, 0, 0, &exit_code)
+            .unwrap();
+
+        assert!(!temp.path.exists());
     }
 
     #[test]

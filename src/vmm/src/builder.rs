@@ -800,10 +800,9 @@ impl IrqChipT for WhpIrqChip {
                 )
             };
             if hresult < 0 {
-                return Err(devices::Error::IoError(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("WHvRequestInterrupt failed with HRESULT {hresult:#x}"),
-                )));
+                return Err(devices::Error::IoError(io::Error::other(format!(
+                    "WHvRequestInterrupt failed with HRESULT {hresult:#x}"
+                ))));
             }
         }
 
@@ -1463,8 +1462,6 @@ pub fn build_microvm(
     }
 
     #[cfg(target_os = "windows")]
-    let mut console_id = 0;
-    #[cfg(target_os = "windows")]
     trace.mark("implicit_console.skipped");
 
     #[cfg(not(target_os = "windows"))]
@@ -1480,15 +1477,17 @@ pub fn build_microvm(
         console_id += 1;
     }
     #[cfg(target_os = "windows")]
-    for console_cfg in std::mem::take(&mut vm_resources.virtio_consoles) {
+    for (console_id, console_cfg) in std::mem::take(&mut vm_resources.virtio_consoles)
+        .into_iter()
+        .enumerate()
+    {
         attach_console_devices(
             &mut vmm,
             event_manager,
             intc.clone(),
             console_cfg,
-            console_id,
+            console_id as u32,
         )?;
-        console_id += 1;
     }
     trace.mark("virtio_consoles.ready");
 

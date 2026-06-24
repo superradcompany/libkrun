@@ -11,7 +11,7 @@ CFLAGS = -O2 -g -I../include
 ROOTFS_DISTRO := fedora
 ROOTFS_DIR = rootfs_$(ROOTFS_DISTRO)
 
-.PHONY: clean rootfs rust_vm rust_vm_smoke
+.PHONY: clean rootfs rust_vm
 
 EXAMPLES := boot_efi chroot_vm external_kernel consoles
 ifeq ($(SEV),1)
@@ -56,12 +56,6 @@ rust_vm:
 	cargo build --bin rust_vm --manifest-path ../Cargo.toml
 ifeq ($(OS),Darwin)
 	codesign --entitlements chroot_vm.entitlements --force -s - ../target/debug/rust_vm
-endif
-
-rust_vm_smoke:
-	cargo build --bin rust_vm_smoke --manifest-path ../Cargo.toml
-ifeq ($(OS),Darwin)
-	codesign --entitlements chroot_vm.entitlements --force -s - ../target/debug/rust_vm_smoke
 endif
 
 nitro: nitro.c

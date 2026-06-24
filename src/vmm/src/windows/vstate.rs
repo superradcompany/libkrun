@@ -455,6 +455,7 @@ pub struct VcpuHandle {
     _vcpu_thread: thread::JoinHandle<()>,
 }
 
+#[derive(Default)]
 struct Partition {
     handle: WHV_PARTITION_HANDLE,
 }
@@ -479,24 +480,13 @@ struct EmulatorContext {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[derive(Default)]
 #[repr(C)]
 struct WhvArm64RunVpExitContext {
     exit_reason: WHV_RUN_VP_EXIT_REASON,
     reserved: u32,
     reserved1: u64,
     message: WhvArm64RunVpExitMessage,
-}
-
-#[cfg(target_arch = "aarch64")]
-impl Default for WhvArm64RunVpExitContext {
-    fn default() -> Self {
-        Self {
-            exit_reason: 0,
-            reserved: 0,
-            reserved1: 0,
-            message: WhvArm64RunVpExitMessage::default(),
-        }
-    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1395,6 +1385,7 @@ fn x86_table(base: u64, limit: u16) -> WHV_X64_TABLE_REGISTER {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_vcpu(
     id: u8,
     partition_handle: WHV_PARTITION_HANDLE,
@@ -1522,7 +1513,9 @@ fn run_vcpu(
                 WHV_ARM64_RESET_TYPE_REBOOT => 1,
                 _ => 1,
             };
-            if exit_code == 0 {
+            if reset.reset_type == WHV_ARM64_RESET_TYPE_POWER_OFF
+                || reset.reset_type == WHV_ARM64_RESET_TYPE_REBOOT
+            {
                 info!(
                     "WHP ARM64 reset exit on vCPU {id}: reset_type={}, exit_code={exit_code}",
                     reset.reset_type
@@ -2040,10 +2033,4 @@ unsafe extern "system" fn emulator_translate_gva_callback(
     }
 
     hresult
-}
-
-impl Default for Partition {
-    fn default() -> Self {
-        Self { handle: 0 }
-    }
 }

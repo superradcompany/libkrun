@@ -124,6 +124,11 @@ impl AsRawHandle for EventFd {
     }
 }
 
+// The handle is owned by EventHandle and Windows waitable-event operations are safe to call from
+// multiple threads. The counter is protected by a mutex, so clones share one coherent value.
+unsafe impl Send for EventHandle {}
+unsafe impl Sync for EventHandle {}
+
 impl Drop for EventHandle {
     fn drop(&mut self) {
         unsafe {

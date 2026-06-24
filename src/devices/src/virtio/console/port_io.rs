@@ -626,8 +626,10 @@ impl OverlappedOperation {
         }
 
         let event = unsafe { OwnedHandle::from_raw_handle(event as _) };
-        let mut overlapped = OVERLAPPED::default();
-        overlapped.hEvent = event.as_raw_handle() as HANDLE;
+        let overlapped = OVERLAPPED {
+            hEvent: event.as_raw_handle() as HANDLE,
+            ..Default::default()
+        };
 
         Ok(Self {
             overlapped,

@@ -2,13 +2,21 @@
 //!
 //! Prerequisites:
 //! - libkrunfw shared library (set KRUNFW_PATH or install system-wide)
-//! - The rootfs-alpine git submodule initialized on Unix hosts
-//! - On Windows, set KRUN_INITRAMFS_PATH to a Linux initramfs image
+//! - A Linux rootfs directory for the guest (set KRUN_ROOTFS_PATH to override rootfs-minimal)
 //!
 //! On macOS, the binary must be codesigned with the hypervisor entitlement:
 //!   cd examples && make rust_vm
 
+use std::path::PathBuf;
+
 use msb_krun::{Result, VmBuilder};
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+const ROOTFS_PATH_ENV: &str = "KRUN_ROOTFS_PATH";
+const DEFAULT_ROOTFS_DIR: &str = "rootfs-minimal";
 
 //--------------------------------------------------------------------------------------------------
 // Functions
@@ -17,54 +25,20 @@ use msb_krun::{Result, VmBuilder};
 fn main() -> Result<()> {
     env_logger::init();
 
-    let krunfw_path = std::env::var("KRUNFW_PATH").unwrap_or_else(|_| {
-        #[cfg(target_os = "macos")]
-        {
-            "libkrunfw.5.dylib".to_string()
-        }
-        #[cfg(target_os = "linux")]
-        {
-            "libkrunfw.so.5".to_string()
-        }
-        #[cfg(target_os = "windows")]
-        {
-            "libkrunfw.dll".to_string()
-        }
-    });
+    let krunfw_path = default_krunfw_path();
+    #[cfg(not(feature = "tee"))]
+    let rootfs_path = rootfs_path();
 
-    #[cfg(not(target_os = "windows"))]
-    let rootfs_path = format!(
-        "{}/rootfs-alpine/{}",
-        env!("CARGO_MANIFEST_DIR"),
-        std::env::consts::ARCH,
-    );
-
-    #[cfg(not(target_os = "windows"))]
-    eprintln!("Entering VM (rootfs={rootfs_path})");
-    #[cfg(target_os = "windows")]
+    #[cfg(not(feature = "tee"))]
+    eprintln!("Entering VM (rootfs={})", rootfs_path.display());
+    #[cfg(feature = "tee")]
     eprintln!("Entering VM");
-
-    #[cfg(target_os = "windows")]
-    let initramfs_path = std::env::var("KRUN_INITRAMFS_PATH").ok();
 
     let builder = VmBuilder::new()
         .machine(|m| m.vcpus(2).memory_mib(1024))
-        .kernel(|k| {
-            let k = k.krunfw_path(&krunfw_path);
-            #[cfg(target_os = "windows")]
-            {
-                if let Some(initramfs_path) = &initramfs_path {
-                    return k
-                        .initramfs_path(initramfs_path)
-                        .init_path("/init")
-                        .cmdline("root=/dev/ram0 rw");
-                }
-            }
+        .kernel(|k| k.krunfw_path(&krunfw_path));
 
-            k
-        });
-
-    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+    #[cfg(not(feature = "tee"))]
     let builder = builder.fs(|fs| fs.root(&rootfs_path));
 
     builder
@@ -80,4 +54,35 @@ fn main() -> Result<()> {
         .enter()?;
 
     unreachable!()
+}
+
+fn default_krunfw_path() -> String {
+    std::env::var("KRUNFW_PATH").unwrap_or_else(|_| {
+        #[cfg(target_os = "macos")]
+        {
+            "libkrunfw.5.dylib".to_string()
+        }
+        #[cfg(target_os = "linux")]
+        {
+            "libkrunfw.so.5".to_string()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            "libkrunfw.dll".to_string()
+        }
+    })
+}
+
+#[cfg(not(feature = "tee"))]
+fn rootfs_path() -> PathBuf {
+    std::env::var(ROOTFS_PATH_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| default_rootfs_path())
+}
+
+#[cfg(not(feature = "tee"))]
+fn default_rootfs_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(DEFAULT_ROOTFS_DIR)
+        .join(std::env::consts::ARCH)
 }
