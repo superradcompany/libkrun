@@ -16,9 +16,11 @@ use std::collections::VecDeque;
 #[cfg(windows)]
 use std::ffi::OsStr;
 use std::fs::File;
+use std::io;
 #[cfg(unix)]
 use std::io::ErrorKind;
-use std::io::{self, Write};
+#[cfg(windows)]
+use std::io::Write;
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 #[cfg(windows)]
