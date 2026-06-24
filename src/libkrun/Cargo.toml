@@ -7,17 +7,17 @@ publish = false
 build = "build.rs"
 
 [features]
-tee = []
-amd-sev = [ "blk", "tee" ]
-tdx = [ "blk", "tee" ]
+tee = ["devices/tee", "vmm/tee"]
+amd-sev = ["blk", "tee", "devices/amd-sev", "vmm/amd-sev"]
+tdx = ["blk", "tee", "devices/tdx", "vmm/tdx"]
 net = ["devices/net", "vmm/net"]
-blk = []
-efi = [ "blk", "net" ]
-gpu = ["krun_display"]
-snd = []
+blk = ["devices/blk", "vmm/blk"]
+efi = ["blk", "net", "devices/efi", "vmm/efi"]
+gpu = ["krun_display", "devices/gpu", "vmm/gpu"]
+snd = ["devices/snd", "vmm/snd"]
 input = ["krun_input", "vmm/input", "devices/input"]
 virgl_resource_map2 = []
-aws-nitro = [ "dep:aws-nitro", "dep:nitro-enclaves" ]
+aws-nitro = ["dep:aws-nitro", "dep:nitro-enclaves", "devices/aws-nitro", "vmm/aws-nitro"]
 
 [dependencies]
 crossbeam-channel = ">=0.5.15"
