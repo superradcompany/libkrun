@@ -663,7 +663,11 @@ pub enum Payload {
         not(target_os = "windows")
     ))]
     KernelMmap,
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    #[cfg(any(
+        all(target_arch = "x86_64", target_os = "windows", not(feature = "tee")),
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
     KernelCopy,
     ExternalKernel(ExternalKernel),
     #[cfg(test)]
@@ -856,7 +860,7 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
         return Ok(Payload::KernelMmap);
 
         #[cfg(all(target_os = "windows", target_arch = "x86_64", not(feature = "tee")))]
-        return Err(StartMicrovmError::KernelFormatUnsupported);
+        return Ok(Payload::KernelCopy);
 
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         return Ok(Payload::KernelCopy);
@@ -1964,7 +1968,11 @@ fn load_payload(
     StartMicrovmError,
 > {
     match payload {
-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        #[cfg(any(
+            all(target_arch = "x86_64", target_os = "windows", not(feature = "tee")),
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        ))]
         Payload::KernelCopy => {
             let (kernel_entry_addr, kernel_host_addr, kernel_guest_addr, kernel_size) =
                 if let Some(kernel_bundle) = &_vm_resources.kernel_bundle {
@@ -2163,6 +2171,17 @@ pub fn create_guest_memory(
             external_kernel.initramfs_size,
             firmware_size,
         ),
+        // WHP maps ordinary guest RAM up front, so copy the bundled kernel into
+        // that RAM instead of inserting a raw libkrunfw-backed region like KVM.
+        #[cfg(all(target_arch = "x86_64", target_os = "windows", not(feature = "tee")))]
+        Payload::KernelCopy => {
+            let initrd_size = vm_resources
+                .initrd_bundle
+                .as_ref()
+                .map(|initrd| initrd.size as u64)
+                .unwrap_or(0);
+            arch::arch_memory_regions(mem_size, None, 0, initrd_size, firmware_size)
+        }
         #[cfg(feature = "tee")]
         Payload::Tee => {
             let (kernel_guest_addr, kernel_size) =
