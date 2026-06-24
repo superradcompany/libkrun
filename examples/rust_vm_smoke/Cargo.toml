@@ -1,10 +1,11 @@
 [package]
-name = "rust_vm"
+name = "rust_vm_smoke"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
 [features]
+blk = ["msb_krun/blk"]
 tee = ["msb_krun/tee"]
 amd-sev = ["tee", "msb_krun/amd-sev"]
 tdx = ["tee", "msb_krun/tdx"]
@@ -12,3 +13,6 @@ tdx = ["tee", "msb_krun/tdx"]
 [dependencies]
 env_logger = "0.11"
 msb_krun = { path = "../../src/krun" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Pipes"] }

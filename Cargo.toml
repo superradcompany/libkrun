@@ -1,5 +1,12 @@
 [workspace]
-members = ["src/libkrun", "src/krun_input", "src/krun", "examples/rust_vm", "examples/rust_vm_net"]
+members = [
+    "src/libkrun",
+    "src/krun_input",
+    "src/krun",
+    "examples/rust_vm",
+    "examples/rust_vm_net",
+    "examples/rust_vm_smoke",
+]
 default-members = ["src/libkrun", "src/krun_input", "src/krun", "examples/rust_vm"]
 exclude = ["examples/gtk_display"]
 resolver = "2"
