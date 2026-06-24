@@ -170,13 +170,15 @@ impl VirtioDevice for MsbMetrics {
             return Err(ActivateError::BadActivate);
         }
 
-        if self.activate_evt.write(1).is_err() {
-            error!("Cannot write to activate_evt");
-            return Err(ActivateError::BadActivate);
-        }
-
         self.queues = Some(queues);
         self.device_state = DeviceState::Activated(mem, interrupt);
+
+        if self.activate_evt.write(1).is_err() {
+            error!("Cannot write to activate_evt");
+            self.queues = None;
+            self.device_state = DeviceState::Inactive;
+            return Err(ActivateError::BadActivate);
+        }
 
         Ok(())
     }
