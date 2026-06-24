@@ -122,8 +122,6 @@ use krun_display::IntoDisplayBackend;
 use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
 #[cfg(not(target_os = "windows"))]
 use libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
-#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
-use linux_loader::loader::{self, KernelLoader};
 #[cfg(not(target_os = "windows"))]
 use nix::unistd::isatty;
 use polly::event_manager::{Error as EventManagerError, EventManager};
@@ -173,7 +171,7 @@ pub enum StartMicrovmError {
     ElfOpenKernel(io::Error),
     /// Cannot load the kernel into the VM.
     #[cfg(not(target_os = "windows"))]
-    ElfLoadKernel(linux_loader::loader::Error),
+    ElfLoadKernel(ElfLoadError),
     /// The firmware can't be loaded into the provided memory address.
     FirmwareInvalidAddress(vm_memory::GuestMemoryError),
     /// Cannot read firmware contents from file.
@@ -182,13 +180,17 @@ pub enum StartMicrovmError {
     GuestMemoryMmapFromRanges(vm_memory::mmap::FromRangesError),
     /// Guest memory collection operation failed.
     GuestMemoryMmap(vm_memory::GuestMemoryError),
+    /// Guest memory region construction failed.
+    GuestMemoryRegion,
+    /// Guest memory region collection operation failed.
+    GuestMemoryRegionCollection(vm_memory::GuestRegionCollectionError),
     /// The BZIP2 decoder couldn't decompress the kernel.
     ImageBz2Decoder(io::Error),
     /// Cannot find compressed kernel in file.
     ImageBz2Invalid,
     /// Cannot load the kernel from the uncompressed ELF data.
     #[cfg(not(target_os = "windows"))]
-    ImageBz2LoadKernel(linux_loader::loader::Error),
+    ImageBz2LoadKernel(ElfLoadError),
     /// Cannot open the file containing the kernel code.
     ImageBz2OpenKernel(io::Error),
     /// The GZIP decoder couldn't decompress the kernel.
@@ -197,7 +199,7 @@ pub enum StartMicrovmError {
     ImageGzInvalid,
     /// Cannot load the kernel from the uncompressed ELF data.
     #[cfg(not(target_os = "windows"))]
-    ImageGzLoadKernel(linux_loader::loader::Error),
+    ImageGzLoadKernel(ElfLoadError),
     /// Cannot open the file containing the kernel code.
     ImageGzOpenKernel(io::Error),
     /// The ZSTD decoder couldn't decompress the kernel.
@@ -206,7 +208,7 @@ pub enum StartMicrovmError {
     ImageZstdInvalid,
     /// Cannot load the kernel from the uncompressed ELF data.
     #[cfg(not(target_os = "windows"))]
-    ImageZstdLoadKernel(linux_loader::loader::Error),
+    ImageZstdLoadKernel(ElfLoadError),
     /// Cannot open the file containing the kernel code.
     ImageZstdOpenKernel(io::Error),
     /// Cannot load initrd due to an invalid memory configuration.
@@ -288,6 +290,46 @@ pub enum StartMicrovmError {
     InvalidTee,
 }
 
+#[cfg(not(target_os = "windows"))]
+#[derive(Debug)]
+pub enum ElfLoadError {
+    TruncatedHeader,
+    InvalidMagic,
+    UnsupportedClass(u8),
+    UnsupportedEndian(u8),
+    InvalidProgramHeaderSize(u16),
+    InvalidProgramHeaderOffset,
+    ProgramHeaderOutOfBounds,
+    SegmentOutOfBounds,
+    SegmentAddressOverflow,
+    GuestWrite(vm_memory::GuestMemoryError),
+}
+
+#[cfg(not(target_os = "windows"))]
+impl Display for ElfLoadError {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        use self::ElfLoadError::*;
+
+        match *self {
+            TruncatedHeader => write!(f, "ELF header is truncated"),
+            InvalidMagic => write!(f, "kernel image is not an ELF image"),
+            UnsupportedClass(class) => write!(f, "unsupported ELF class: {class}"),
+            UnsupportedEndian(endian) => write!(f, "unsupported ELF endianness: {endian}"),
+            InvalidProgramHeaderSize(size) => {
+                write!(f, "invalid ELF program-header size: {size}")
+            }
+            InvalidProgramHeaderOffset => write!(f, "invalid ELF program-header offset"),
+            ProgramHeaderOutOfBounds => write!(f, "ELF program-header table is out of bounds"),
+            SegmentOutOfBounds => write!(f, "ELF load segment is out of bounds"),
+            SegmentAddressOverflow => write!(f, "ELF load segment guest address overflows"),
+            GuestWrite(ref err) => write!(f, "failed to write ELF segment to guest memory: {err}"),
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl std::error::Error for ElfLoadError {}
+
 /// It's convenient to automatically convert `kernel::cmdline::Error`s
 /// to `StartMicrovmError`s.
 impl std::convert::From<kernel::cmdline::Error> for StartMicrovmError {
@@ -331,6 +373,17 @@ impl Display for StartMicrovmError {
             }
             GuestMemoryMmap(ref err) => {
                 // Remove imbricated quotes from error message.
+                let mut err_msg = format!("{err:?}");
+                err_msg = err_msg.replace('\"', "");
+                write!(f, "Invalid Memory Configuration: {err_msg}")
+            }
+            GuestMemoryRegion => {
+                write!(
+                    f,
+                    "Invalid Memory Configuration: invalid guest memory region"
+                )
+            }
+            GuestMemoryRegionCollection(ref err) => {
                 let mut err_msg = format!("{err:?}");
                 err_msg = err_msg.replace('\"', "");
                 write!(f, "Invalid Memory Configuration: {err_msg}")
@@ -1633,6 +1686,138 @@ impl BootTrace {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+fn load_elf64_kernel(
+    guest_mem: &GuestMemoryMmap,
+    kernel_data: &[u8],
+) -> std::result::Result<GuestAddress, ElfLoadError> {
+    const ELF_HEADER_SIZE: usize = 64;
+    const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+    const ELFCLASS64: u8 = 2;
+    const ELFDATA2LSB: u8 = 1;
+    const PT_LOAD: u32 = 1;
+    const ELF64_PHDR_SIZE: u16 = 56;
+
+    if kernel_data.len() < ELF_HEADER_SIZE {
+        return Err(ElfLoadError::TruncatedHeader);
+    }
+    if kernel_data.get(0..4) != Some(ELF_MAGIC.as_slice()) {
+        return Err(ElfLoadError::InvalidMagic);
+    }
+    if kernel_data[4] != ELFCLASS64 {
+        return Err(ElfLoadError::UnsupportedClass(kernel_data[4]));
+    }
+    if kernel_data[5] != ELFDATA2LSB {
+        return Err(ElfLoadError::UnsupportedEndian(kernel_data[5]));
+    }
+
+    let entry = read_elf_u64(kernel_data, 24)?;
+    let phoff = read_elf_u64(kernel_data, 32)? as usize;
+    let phentsize = read_elf_u16(kernel_data, 54)?;
+    let phnum = read_elf_u16(kernel_data, 56)? as usize;
+
+    if phentsize != ELF64_PHDR_SIZE {
+        return Err(ElfLoadError::InvalidProgramHeaderSize(phentsize));
+    }
+    if phoff < ELF_HEADER_SIZE {
+        return Err(ElfLoadError::InvalidProgramHeaderOffset);
+    }
+
+    for index in 0..phnum {
+        let phdr_delta = index
+            .checked_mul(phentsize as usize)
+            .ok_or(ElfLoadError::ProgramHeaderOutOfBounds)?;
+        let phdr_offset = phoff
+            .checked_add(phdr_delta)
+            .ok_or(ElfLoadError::ProgramHeaderOutOfBounds)?;
+        let phdr_end = phdr_offset
+            .checked_add(ELF64_PHDR_SIZE as usize)
+            .ok_or(ElfLoadError::ProgramHeaderOutOfBounds)?;
+        if phdr_end > kernel_data.len() {
+            return Err(ElfLoadError::ProgramHeaderOutOfBounds);
+        }
+
+        let p_type = read_elf_u32(kernel_data, phdr_offset)?;
+        if p_type != PT_LOAD {
+            continue;
+        }
+
+        let p_offset = read_elf_u64(kernel_data, phdr_offset + 8)? as usize;
+        let p_paddr = read_elf_u64(kernel_data, phdr_offset + 24)?;
+        let p_filesz = read_elf_u64(kernel_data, phdr_offset + 32)? as usize;
+        let p_memsz = read_elf_u64(kernel_data, phdr_offset + 40)? as usize;
+        if p_filesz > p_memsz {
+            return Err(ElfLoadError::SegmentOutOfBounds);
+        }
+
+        // ELF kernels describe where loadable bytes live in both the file and guest physical
+        // memory. Keep both sides checked before handing slices to vm-memory.
+        let file_end = p_offset
+            .checked_add(p_filesz)
+            .ok_or(ElfLoadError::SegmentOutOfBounds)?;
+        if file_end > kernel_data.len() {
+            return Err(ElfLoadError::SegmentOutOfBounds);
+        }
+
+        p_paddr
+            .checked_add(p_memsz as u64)
+            .ok_or(ElfLoadError::SegmentAddressOverflow)?;
+
+        let guest_addr = GuestAddress(p_paddr);
+        if p_filesz > 0 {
+            guest_mem
+                .write_slice(&kernel_data[p_offset..file_end], guest_addr)
+                .map_err(ElfLoadError::GuestWrite)?;
+        }
+
+        let zero_len = p_memsz - p_filesz;
+        if zero_len > 0 {
+            // Guest memory starts zeroed, but explicitly clearing the BSS tail keeps the loader
+            // correct if this path is ever reused with pre-populated memory regions.
+            let mut remaining = zero_len;
+            let mut offset = p_filesz as u64;
+            let zero_page = [0u8; 4096];
+            while remaining > 0 {
+                let chunk_len = remaining.min(zero_page.len());
+                let addr = p_paddr
+                    .checked_add(offset)
+                    .ok_or(ElfLoadError::SegmentAddressOverflow)?;
+                guest_mem
+                    .write_slice(&zero_page[..chunk_len], GuestAddress(addr))
+                    .map_err(ElfLoadError::GuestWrite)?;
+                remaining -= chunk_len;
+                offset += chunk_len as u64;
+            }
+        }
+    }
+
+    Ok(GuestAddress(entry))
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+fn read_elf_u16(data: &[u8], offset: usize) -> std::result::Result<u16, ElfLoadError> {
+    let bytes = data
+        .get(offset..offset + 2)
+        .ok_or(ElfLoadError::TruncatedHeader)?;
+    Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+fn read_elf_u32(data: &[u8], offset: usize) -> std::result::Result<u32, ElfLoadError> {
+    let bytes = data
+        .get(offset..offset + 4)
+        .ok_or(ElfLoadError::ProgramHeaderOutOfBounds)?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+fn read_elf_u64(data: &[u8], offset: usize) -> std::result::Result<u64, ElfLoadError> {
+    let bytes = data
+        .get(offset..offset + 8)
+        .ok_or(ElfLoadError::ProgramHeaderOutOfBounds)?;
+    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 fn load_external_kernel(
     _guest_mem: &GuestMemoryMmap,
@@ -1661,14 +1846,9 @@ fn load_external_kernel(
         }
         #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
         KernelFormat::Elf => {
-            let mut file = File::options()
-                .read(true)
-                .write(false)
-                .open(external_kernel.path.clone())
+            let data = std::fs::read(external_kernel.path.clone())
                 .map_err(StartMicrovmError::ElfOpenKernel)?;
-            let load_result = loader::Elf::load(guest_mem, None, &mut file, None)
-                .map_err(StartMicrovmError::ElfLoadKernel)?;
-            load_result.kernel_load
+            load_elf64_kernel(guest_mem, &data).map_err(StartMicrovmError::ElfLoadKernel)?
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         KernelFormat::PeGz => {
@@ -1706,14 +1886,8 @@ fn load_external_kernel(
                 let mut bz2 = bzip2::read::BzDecoder::new(compressed);
                 bz2.read_to_end(&mut kernel_data)
                     .map_err(StartMicrovmError::ImageBz2Decoder)?;
-                let load_result = loader::Elf::load(
-                    guest_mem,
-                    None,
-                    &mut std::io::Cursor::new(kernel_data),
-                    None,
-                )
-                .map_err(StartMicrovmError::ImageBz2LoadKernel)?;
-                load_result.kernel_load
+                load_elf64_kernel(guest_mem, &kernel_data)
+                    .map_err(StartMicrovmError::ImageBz2LoadKernel)?
             } else {
                 return Err(StartMicrovmError::ImageBz2Invalid);
             }
@@ -1732,14 +1906,8 @@ fn load_external_kernel(
                 let mut kernel_data: Vec<u8> = Vec::new();
                 gz.read_to_end(&mut kernel_data)
                     .map_err(StartMicrovmError::ImageGzDecoder)?;
-                let load_result = loader::Elf::load(
-                    guest_mem,
-                    None,
-                    &mut std::io::Cursor::new(kernel_data),
-                    None,
-                )
-                .map_err(StartMicrovmError::ImageGzLoadKernel)?;
-                load_result.kernel_load
+                load_elf64_kernel(guest_mem, &kernel_data)
+                    .map_err(StartMicrovmError::ImageGzLoadKernel)?
             } else {
                 return Err(StartMicrovmError::ImageGzInvalid);
             }
@@ -1756,14 +1924,8 @@ fn load_external_kernel(
                 let (_, zstd_data) = data.split_at(magic);
                 let mut kernel_data: Vec<u8> = Vec::new();
                 let _ = zstd::stream::copy_decode(zstd_data, &mut kernel_data);
-                let load_result = loader::Elf::load(
-                    guest_mem,
-                    None,
-                    &mut std::io::Cursor::new(kernel_data),
-                    None,
-                )
-                .map_err(StartMicrovmError::ImageZstdLoadKernel)?;
-                load_result.kernel_load
+                load_elf64_kernel(guest_mem, &kernel_data)
+                    .map_err(StartMicrovmError::ImageZstdLoadKernel)?
             } else {
                 return Err(StartMicrovmError::ImageZstdInvalid);
             }
@@ -1884,9 +2046,9 @@ fn load_payload(
                 guest_mem
                     .insert_region(Arc::new(
                         GuestRegionMmap::new(kernel_region, GuestAddress(kernel_guest_addr))
-                            .map_err(StartMicrovmError::GuestMemoryMmap)?,
+                            .ok_or(StartMicrovmError::GuestMemoryRegion)?,
                     ))
-                    .map_err(StartMicrovmError::GuestMemoryMmap)?,
+                    .map_err(StartMicrovmError::GuestMemoryRegionCollection)?,
                 GuestAddress(kernel_entry_addr),
                 None,
                 None,

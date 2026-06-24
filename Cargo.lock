@@ -780,7 +780,7 @@ dependencies = [
  "nitro-enclaves 0.5.0",
  "once_cell",
  "rand",
- "vm-memory 0.18.0",
+ "vm-memory",
 ]
 
 [[package]]
@@ -830,15 +830,6 @@ dependencies = [
  "bindgen 0.69.5",
  "cc",
  "system-deps",
-]
-
-[[package]]
-name = "linux-loader"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "870c3814345f050991f99869417779f6062542bcf4ed81db7a1b926ad1306638"
-dependencies = [
- "vm-memory 0.16.2",
 ]
 
 [[package]]
@@ -918,7 +909,7 @@ dependencies = [
  "rustc_version",
  "tokio",
  "tracing",
- "vm-memory 0.18.0",
+ "vm-memory",
  "windows-sys 0.61.2",
 ]
 
@@ -941,7 +932,7 @@ dependencies = [
  "msb_krun_utils",
  "msb_krun_vmm",
  "nitro-enclaves 0.6.1",
- "vm-memory 0.18.0",
+ "vm-memory",
 ]
 
 [[package]]
@@ -955,7 +946,7 @@ dependencies = [
  "msb_krun_smbios",
  "msb_krun_utils",
  "tdx",
- "vm-memory 0.18.0",
+ "vm-memory",
 ]
 
 [[package]]
@@ -1014,7 +1005,7 @@ dependencies = [
  "tokio",
  "virtio-bindings",
  "vm-fdt",
- "vm-memory 0.18.0",
+ "vm-memory",
  "windows-sys 0.61.2",
  "zerocopy",
 ]
@@ -1057,7 +1048,7 @@ name = "msb_krun_kernel"
 version = "0.1.17"
 dependencies = [
  "msb_krun_utils",
- "vm-memory 0.18.0",
+ "vm-memory",
 ]
 
 [[package]]
@@ -1089,7 +1080,7 @@ dependencies = [
 name = "msb_krun_smbios"
 version = "0.1.17"
 dependencies = [
- "vm-memory 0.18.0",
+ "vm-memory",
 ]
 
 [[package]]
@@ -1121,7 +1112,6 @@ dependencies = [
  "kvm-ioctls",
  "libc",
  "libloading",
- "linux-loader",
  "log",
  "msb_krun_arch",
  "msb_krun_arch_gen",
@@ -1137,7 +1127,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tdx",
- "vm-memory 0.18.0",
+ "vm-memory",
  "windows-sys 0.61.2",
  "zstd",
 ]
@@ -1887,17 +1877,6 @@ name = "vm-fdt"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e21282841a059bb62627ce8441c491f09603622cd5a21c43bfedc85a2952f23"
-
-[[package]]
-name = "vm-memory"
-version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd5e56d48353c5f54ef50bd158a0452fc82f5383da840f7b8efc31695dd3b9d"
-dependencies = [
- "libc",
- "thiserror 1.0.69",
- "winapi",
-]
 
 [[package]]
 name = "vm-memory"
