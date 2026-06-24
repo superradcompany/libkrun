@@ -36,10 +36,11 @@ use windows_sys::Win32::System::Hypervisor::{
 };
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::Hypervisor::{
-    WHvRunVpExitReasonCanceled, WHvRunVpExitReasonMemoryAccess,
-    WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonUnsupportedFeature,
-    WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess, WHvTranslateGva,
-    WHvTranslateGvaResultSuccess, WHvX64RegisterCr0, WHvX64RegisterCr3, WHvX64RegisterCr4,
+    WHvPartitionPropertyCodeLocalApicEmulationMode, WHvRunVpExitReasonCanceled,
+    WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonUnrecoverableException,
+    WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64Halt,
+    WHvRunVpExitReasonX64IoPortAccess, WHvTranslateGva, WHvTranslateGvaResultSuccess,
+    WHvX64LocalApicEmulationModeXApic, WHvX64RegisterCr0, WHvX64RegisterCr3, WHvX64RegisterCr4,
     WHvX64RegisterCs, WHvX64RegisterDs, WHvX64RegisterEfer, WHvX64RegisterEs, WHvX64RegisterFs,
     WHvX64RegisterGdtr, WHvX64RegisterGs, WHvX64RegisterIdtr, WHvX64RegisterRbp,
     WHvX64RegisterRflags, WHvX64RegisterRip, WHvX64RegisterRsi, WHvX64RegisterRsp,
@@ -1075,6 +1076,14 @@ impl Emulator {
         };
         let status = unsafe { status.AsUINT32 };
         if hresult < 0 || status & WHV_EMULATOR_STATUS_SUCCESS == 0 {
+            error!(
+                "WHP MMIO emulation failed: vcpu={} gpa=0x{:x} gva=0x{:x} access_info=0x{:x} hresult=0x{:08x} status=0x{status:08x}",
+                context.id,
+                memory_access.Gpa,
+                memory_access.Gva,
+                unsafe { memory_access.AccessInfo.AsUINT32 },
+                hresult as u32,
+            );
             return Err(Error::EmulatorMmio { hresult, status });
         }
 
@@ -1099,6 +1108,14 @@ impl Emulator {
         };
         let status = unsafe { status.AsUINT32 };
         if hresult < 0 || status & WHV_EMULATOR_STATUS_SUCCESS == 0 {
+            error!(
+                "WHP I/O emulation failed: vcpu={} port=0x{:x} access_info=0x{:x} rax=0x{:x} hresult=0x{:08x} status=0x{status:08x}",
+                context.id,
+                io_access.PortNumber,
+                unsafe { io_access.AccessInfo.AsUINT32 },
+                io_access.Rax,
+                hresult as u32,
+            );
             return Err(Error::EmulatorIo { hresult, status });
         }
 
@@ -1128,6 +1145,8 @@ impl Partition {
 
         let partition = Self { handle };
         partition.set_processor_count(vcpu_count)?;
+        #[cfg(target_arch = "x86_64")]
+        partition.set_x64_local_apic_emulation()?;
         #[cfg(target_arch = "aarch64")]
         partition.set_arm64_ic_parameters()?;
         partition.setup()?;
@@ -1144,6 +1163,28 @@ impl Partition {
                 property_code,
                 &property as *const u32 as *const _,
                 size_of::<u32>() as u32,
+            )
+        };
+        if hresult < 0 {
+            return Err(Error::SetPartitionProperty {
+                property: property_code,
+                hresult,
+            });
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_x64_local_apic_emulation(&self) -> Result<()> {
+        let property = WHvX64LocalApicEmulationModeXApic;
+        let property_code = WHvPartitionPropertyCodeLocalApicEmulationMode;
+        let hresult = unsafe {
+            WHvSetPartitionProperty(
+                self.handle,
+                property_code,
+                &property as *const _ as *const _,
+                size_of::<i32>() as u32,
             )
         };
         if hresult < 0 {
@@ -1872,21 +1913,33 @@ unsafe extern "system" fn emulator_io_port_callback(
 
     let len = io_access.AccessSize as usize;
     if !matches!(len, 1 | 2 | 4) {
+        error!(
+            "unsupported WHP I/O access size: vcpu={} port=0x{:x} access_size={} direction={}",
+            context.id, io_access.Port, io_access.AccessSize, io_access.Direction
+        );
         return E_INVALIDARG;
     }
 
     let Some(pio_bus) = &context.pio_bus else {
+        error!(
+            "WHP I/O access has no port bus: vcpu={} port=0x{:x} access_size={} direction={}",
+            context.id, io_access.Port, io_access.AccessSize, io_access.Direction
+        );
         return E_FAIL;
     };
 
     let port = u64::from(io_access.Port);
     match io_access.Direction {
         WHV_EMULATOR_DIRECTION_READ => {
-            let mut data = io_access.Data.to_le_bytes();
+            let mut data = [0; 4];
             if pio_bus.read(context.id.into(), port, &mut data[..len]) {
                 io_access.Data = u32::from_le_bytes(data);
                 S_OK
             } else {
+                error!(
+                    "unhandled WHP I/O port read: vcpu={} port=0x{port:x} access_size={len}",
+                    context.id
+                );
                 E_FAIL
             }
         }
@@ -1895,6 +1948,10 @@ unsafe extern "system" fn emulator_io_port_callback(
             if pio_bus.write(context.id.into(), port, &data[..len]) {
                 S_OK
             } else {
+                error!(
+                    "unhandled WHP I/O port write: vcpu={} port=0x{port:x} access_size={len} data=0x{:x}",
+                    context.id, io_access.Data
+                );
                 E_FAIL
             }
         }
@@ -1916,6 +1973,10 @@ unsafe extern "system" fn emulator_memory_callback(
 
     let len = memory_access.AccessSize as usize;
     if len > memory_access.Data.len() {
+        error!(
+            "unsupported WHP MMIO access size: vcpu={} gpa=0x{:x} access_size={} direction={}",
+            context.id, memory_access.GpaAddress, memory_access.AccessSize, memory_access.Direction
+        );
         return E_INVALIDARG;
     }
 
@@ -1938,7 +1999,13 @@ unsafe extern "system" fn emulator_memory_callback(
                 GuestAddress(memory_access.GpaAddress),
             ) {
                 Ok(_) => S_OK,
-                Err(_) => E_FAIL,
+                Err(error) => {
+                    error!(
+                        "unhandled WHP MMIO read: vcpu={} gpa=0x{:x} access_size={len} guest_mem_error={error:?}",
+                        context.id, memory_access.GpaAddress
+                    );
+                    E_FAIL
+                }
             }
         }
         WHV_EMULATOR_DIRECTION_WRITE => {
@@ -1954,10 +2021,22 @@ unsafe extern "system" fn emulator_memory_callback(
                 .write(data, GuestAddress(memory_access.GpaAddress))
             {
                 Ok(_) => S_OK,
-                Err(_) => E_FAIL,
+                Err(error) => {
+                    error!(
+                        "unhandled WHP MMIO write: vcpu={} gpa=0x{:x} access_size={len} data={:x?} guest_mem_error={error:?}",
+                        context.id, memory_access.GpaAddress, data
+                    );
+                    E_FAIL
+                }
             }
         }
-        _ => E_INVALIDARG,
+        _ => {
+            error!(
+                "unsupported WHP MMIO direction: vcpu={} gpa=0x{:x} access_size={len} direction={}",
+                context.id, memory_access.GpaAddress, memory_access.Direction
+            );
+            E_INVALIDARG
+        }
     }
 }
 

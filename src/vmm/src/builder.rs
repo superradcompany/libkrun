@@ -30,6 +30,8 @@ use std::os::fd::{BorrowedFd, FromRawFd};
 #[cfg(not(target_os = "windows"))]
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -49,7 +51,7 @@ use crate::vmm_config::external_kernel::ExternalKernel;
 use crate::vmm_config::external_kernel::KernelFormat;
 #[cfg(feature = "net")]
 use crate::vmm_config::net::NetBuilder;
-#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+#[cfg(target_arch = "x86_64")]
 use devices::legacy::Cmos;
 #[cfg(target_os = "windows")]
 use devices::legacy::IrqChipT;
@@ -680,8 +682,18 @@ pub enum Payload {
 #[cfg(target_os = "windows")]
 struct WhpIrqChip {
     partition_handle: WHV_PARTITION_HANDLE,
+    #[cfg(target_arch = "x86_64")]
+    ioapic: Mutex<WhpIoApicState>,
     #[cfg(target_arch = "aarch64")]
     vcpu_count: u64,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+struct WhpIoApicState {
+    id: u8,
+    ioregsel: u8,
+    ioredtbl: [u64; X86_IOAPIC_NUM_PINS],
+    version: u8,
 }
 
 #[cfg(target_os = "windows")]
@@ -692,8 +704,125 @@ impl WhpIrqChip {
     ) -> Self {
         Self {
             partition_handle,
+            #[cfg(target_arch = "x86_64")]
+            ioapic: Mutex::new(WhpIoApicState::new()),
             #[cfg(target_arch = "aarch64")]
             vcpu_count,
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+impl WhpIoApicState {
+    fn new() -> Self {
+        Self {
+            id: 0,
+            ioregsel: 0,
+            ioredtbl: [X86_IOAPIC_REDTBL_MASKED; X86_IOAPIC_NUM_PINS],
+            version: X86_IOAPIC_VERSION,
+        }
+    }
+
+    fn read(&mut self, offset: u64, data: &mut [u8]) {
+        let value = match offset {
+            X86_IOAPIC_REG_SEL => self.ioregsel as u32,
+            X86_IOAPIC_WIN => self.read_selected_register(),
+            _ => {
+                debug!("WHP IOAPIC read from unsupported offset {offset:#x}");
+                0
+            }
+        };
+
+        let value = value.to_le_bytes();
+        let len = data.len().min(value.len());
+        data[..len].copy_from_slice(&value[..len]);
+        if data.len() > len {
+            data[len..].fill(0);
+        }
+    }
+
+    fn write(&mut self, offset: u64, data: &[u8]) {
+        if data.len() != 4 {
+            debug!(
+                "WHP IOAPIC ignoring write with unsupported size {}",
+                data.len()
+            );
+            return;
+        }
+
+        let value = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        match offset {
+            X86_IOAPIC_REG_SEL => self.ioregsel = value as u8,
+            X86_IOAPIC_WIN => self.write_selected_register(value),
+            _ => debug!("WHP IOAPIC write to unsupported offset {offset:#x}"),
+        }
+    }
+
+    fn read_selected_register(&self) -> u32 {
+        match self.ioregsel {
+            X86_IOAPIC_ID => (u32::from(self.id)) << X86_IOAPIC_ID_SHIFT,
+            X86_IOAPIC_VER => {
+                u32::from(self.version)
+                    | (((X86_IOAPIC_NUM_PINS as u32) - 1) << X86_IOAPIC_VER_ENTRIES_SHIFT)
+            }
+            X86_IOAPIC_ARB => (u32::from(self.id)) << X86_IOAPIC_ID_SHIFT,
+            _ => {
+                let Some((index, high)) = self.selected_redirection_entry() else {
+                    debug!("WHP IOAPIC read from invalid selector {:#x}", self.ioregsel);
+                    return 0;
+                };
+
+                if high {
+                    (self.ioredtbl[index] >> 32) as u32
+                } else {
+                    (self.ioredtbl[index] & 0xffff_ffff) as u32
+                }
+            }
+        }
+    }
+
+    fn write_selected_register(&mut self, value: u32) {
+        match self.ioregsel {
+            X86_IOAPIC_ID => self.id = ((value >> X86_IOAPIC_ID_SHIFT) & X86_IOAPIC_ID_MASK) as u8,
+            X86_IOAPIC_VER | X86_IOAPIC_ARB => {}
+            _ => {
+                let Some((index, high)) = self.selected_redirection_entry() else {
+                    debug!("WHP IOAPIC write to invalid selector {:#x}", self.ioregsel);
+                    return;
+                };
+
+                let ro_bits = self.ioredtbl[index] & X86_IOAPIC_REDTBL_RO_BITS;
+                if high {
+                    self.ioredtbl[index] &= 0xffff_ffff;
+                    self.ioredtbl[index] |= (u64::from(value)) << 32;
+                } else {
+                    self.ioredtbl[index] &= !0xffff_ffff;
+                    self.ioredtbl[index] |= u64::from(value);
+                }
+                self.ioredtbl[index] &= X86_IOAPIC_REDTBL_RW_BITS;
+                self.ioredtbl[index] |= ro_bits;
+            }
+        }
+    }
+
+    fn selected_redirection_entry(&self) -> Option<(usize, bool)> {
+        let selector = u64::from(self.ioregsel);
+        let reg_index = selector.checked_sub(X86_IOAPIC_REDTBL_BASE)?;
+        let index = (reg_index >> 1) as usize;
+        if index >= X86_IOAPIC_NUM_PINS {
+            return None;
+        }
+
+        Some((index, reg_index & 1 != 0))
+    }
+
+    fn vector_for_irq(&self, irq_line: u32) -> Option<u32> {
+        let entry = *self.ioredtbl.get(irq_line as usize)?;
+        let vector = (entry & X86_IOAPIC_VECTOR_MASK) as u32;
+        if vector == 0 {
+            None
+        } else {
+            Some(vector)
         }
     }
 }
@@ -731,9 +860,59 @@ const WHV_X64_INTERRUPT_DESTINATION_PHYSICAL: u8 = 0;
 const WHV_X64_INTERRUPT_TRIGGER_EDGE: u8 = 0;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 const X86_LEGACY_IRQ_VECTOR_BASE: u32 = 0x20;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const X86_IOAPIC_BASE: u64 = 0xfec0_0000;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const X86_IOAPIC_SIZE: u64 = 0x1000;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const X86_IOAPIC_NUM_PINS: usize = 24;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const X86_IOAPIC_REG_SEL: u64 = 0x00;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const X86_IOAPIC_WIN: u64 = 0x10;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const X86_IOAPIC_ID: u8 = 0x00;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const X86_IOAPIC_VER: u8 = 0x01;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const X86_IOAPIC_ARB: u8 = 0x02;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const X86_IOAPIC_REDTBL_BASE: u64 = 0x10;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const X86_IOAPIC_VERSION: u8 = 0x20;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const X86_IOAPIC_ID_SHIFT: u32 = 24;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const X86_IOAPIC_ID_MASK: u32 = 0x0f;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const X86_IOAPIC_VER_ENTRIES_SHIFT: u32 = 16;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const X86_IOAPIC_REDTBL_MASKED: u64 = 1 << 16;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const X86_IOAPIC_REDTBL_RO_BITS: u64 = (1 << 12) | (1 << 14);
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const X86_IOAPIC_REDTBL_RW_BITS: u64 = !X86_IOAPIC_REDTBL_RO_BITS;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const X86_IOAPIC_VECTOR_MASK: u64 = 0xff;
 
 #[cfg(target_os = "windows")]
-impl devices::BusDevice for WhpIrqChip {}
+impl devices::BusDevice for WhpIrqChip {
+    fn read(&mut self, _vcpuid: u64, offset: u64, data: &mut [u8]) {
+        #[cfg(target_arch = "x86_64")]
+        self.ioapic.lock().unwrap().read(offset, data);
+
+        #[cfg(target_arch = "aarch64")]
+        let _ = (offset, data);
+    }
+
+    fn write(&mut self, _vcpuid: u64, offset: u64, data: &[u8]) {
+        #[cfg(target_arch = "x86_64")]
+        self.ioapic.lock().unwrap().write(offset, data);
+
+        #[cfg(target_arch = "aarch64")]
+        let _ = (offset, data);
+    }
+}
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
 impl devices::legacy::gic::GICDevice for WhpIrqChip {
@@ -766,10 +945,22 @@ impl devices::legacy::gic::GICDevice for WhpIrqChip {
 #[cfg(target_os = "windows")]
 impl IrqChipT for WhpIrqChip {
     fn get_mmio_addr(&self) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            X86_IOAPIC_BASE
+        }
+
+        #[cfg(target_arch = "aarch64")]
         0
     }
 
     fn get_mmio_size(&self) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            X86_IOAPIC_SIZE
+        }
+
+        #[cfg(target_arch = "aarch64")]
         0
     }
 
@@ -819,13 +1010,19 @@ impl IrqChipT for WhpIrqChip {
                 )));
             };
 
+            let vector = self
+                .ioapic
+                .lock()
+                .unwrap()
+                .vector_for_irq(irq_line)
+                .unwrap_or(X86_LEGACY_IRQ_VECTOR_BASE + irq_line);
             let interrupt = WhvX64InterruptControl {
                 interrupt_type: WHV_X64_INTERRUPT_TYPE_FIXED,
                 modes: WHV_X64_INTERRUPT_DESTINATION_PHYSICAL
                     | (WHV_X64_INTERRUPT_TRIGGER_EDGE << 4),
                 reserved: [0; 6],
                 destination: 0,
-                vector: X86_LEGACY_IRQ_VECTOR_BASE + irq_line,
+                vector,
             };
             let hresult = unsafe {
                 WHvRequestInterrupt(
@@ -1140,15 +1337,15 @@ pub fn build_microvm(
                 #[cfg(target_arch = "x86_64")]
                 let cmdline = kernel_cmdline
                     .as_str()
-                    .replace("console=hvc0", "console=ttyS0")
-                    .replace("console=ttyAMA0", "console=ttyS0");
+                    .replace("console=hvc0", "console=ttyS0,115200n8")
+                    .replace("console=ttyAMA0", "console=ttyS0,115200n8");
                 kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
                 kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
             } else {
                 #[cfg(target_arch = "aarch64")]
                 kernel_cmdline.insert("console", "ttyAMA0").unwrap();
                 #[cfg(target_arch = "x86_64")]
-                kernel_cmdline.insert("console", "ttyS0").unwrap();
+                kernel_cmdline.insert("console", "ttyS0,115200n8").unwrap();
             }
         }
     }
@@ -1256,7 +1453,17 @@ pub fn build_microvm(
             u64::from(vcpu_config.vcpu_count),
         )))));
         #[cfg(target_arch = "x86_64")]
-        let pio_bus = create_windows_x86_64_pio_bus(intc.clone(), &serial_devices)?;
+        let pio_bus = create_windows_x86_64_pio_bus(
+            intc.clone(),
+            &serial_devices,
+            &exit_evt,
+            &arch_memory_info,
+        )?;
+        #[cfg(target_arch = "x86_64")]
+        mmio_device_manager
+            .register_mmio_ioapic(intc.clone())
+            .map_err(Error::RegisterMMIODevice)
+            .map_err(StartMicrovmError::Internal)?;
         vcpus = create_vcpus_windows(
             &vm,
             &vcpu_config,
@@ -1587,11 +1794,7 @@ pub fn build_microvm(
 
     // Write the kernel command line to guest memory. This is x86_64 specific, since on
     // aarch64 the command line will be specified through the FDT.
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(feature = "tee"),
-        not(target_os = "windows")
-    ))]
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
     load_cmdline(&vmm)?;
 
     vmm.configure_system(
@@ -2272,11 +2475,7 @@ pub fn create_guest_memory(
     Ok((guest_mem, arch_mem_info, shm_manager, payload_config))
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    not(feature = "tee"),
-    not(target_os = "windows")
-))]
+#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
 fn load_cmdline(vmm: &Vmm) -> std::result::Result<(), StartMicrovmError> {
     kernel::loader::load_cmdline(
         vmm.guest_memory(),
@@ -2386,27 +2585,220 @@ pub fn setup_serial_device(
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+struct WindowsX64PitStub {
+    channels: [u8; 3],
+    command: u8,
+    armed: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+#[derive(Default)]
+struct WindowsX64PicStub {
+    command: u8,
+    data: u8,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+#[derive(Default)]
+struct WindowsX64PostCodeStub {
+    value: u8,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+impl WindowsX64PitStub {
+    fn new(intc: IrqChip) -> Self {
+        let armed = Arc::new(AtomicBool::new(false));
+        let running = Arc::new(AtomicBool::new(true));
+        let thread_armed = armed.clone();
+        let thread_running = running.clone();
+
+        std::thread::spawn(move || {
+            while thread_running.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                if thread_armed.load(Ordering::Relaxed) {
+                    let intc = intc.lock().unwrap();
+                    if let Err(e) = intc.set_irq(Some(0), None) {
+                        trace!("PIT tick interrupt injection failed: {e:?}");
+                    }
+                }
+            }
+        });
+
+        Self {
+            channels: [0; 3],
+            command: 0,
+            armed,
+            running,
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+impl Drop for WindowsX64PitStub {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+impl devices::BusDevice for WindowsX64PitStub {
+    fn read(&mut self, _vcpuid: u64, offset: u64, data: &mut [u8]) {
+        if data.len() != 1 {
+            return;
+        }
+
+        data[0] = match offset {
+            0..=2 => self.channels[offset as usize],
+            3 => self.command,
+            _ => 0,
+        };
+    }
+
+    fn write(&mut self, _vcpuid: u64, offset: u64, data: &[u8]) {
+        if data.len() != 1 {
+            return;
+        }
+
+        match offset {
+            0..=2 => self.channels[offset as usize] = data[0],
+            3 => self.command = data[0],
+            _ => {}
+        }
+        self.armed.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+impl devices::BusDevice for WindowsX64PicStub {
+    fn read(&mut self, _vcpuid: u64, offset: u64, data: &mut [u8]) {
+        if data.len() != 1 {
+            return;
+        }
+
+        data[0] = match offset {
+            0 => self.command,
+            1 => self.data,
+            _ => 0,
+        };
+    }
+
+    fn write(&mut self, _vcpuid: u64, offset: u64, data: &[u8]) {
+        if data.len() != 1 {
+            return;
+        }
+
+        match offset {
+            0 => self.command = data[0],
+            1 => self.data = data[0],
+            _ => {}
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+impl devices::BusDevice for WindowsX64PostCodeStub {
+    fn read(&mut self, _vcpuid: u64, _offset: u64, data: &mut [u8]) {
+        if data.len() == 1 {
+            data[0] = self.value;
+        }
+    }
+
+    fn write(&mut self, _vcpuid: u64, _offset: u64, data: &[u8]) {
+        if data.len() == 1 {
+            self.value = data[0];
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 fn create_windows_x86_64_pio_bus(
     intc: IrqChip,
     serial: &[Arc<Mutex<Serial>>],
+    exit_evt: &EventFd,
+    arch_memory_info: &ArchMemoryInfo,
 ) -> std::result::Result<Option<devices::Bus>, StartMicrovmError> {
-    let Some(serial) = serial.first() else {
-        return Ok(None);
-    };
+    let mut pio_bus = devices::Bus::new();
 
-    {
-        let mut serial = serial.lock().unwrap();
-        serial.set_intc(intc);
-        serial.set_irq_line(4);
+    if let Some(serial) = serial.first() {
+        {
+            let mut serial = serial.lock().unwrap();
+            serial.set_intc(intc.clone());
+            serial.set_irq_line(4);
+        }
+
+        pio_bus
+            .insert(serial.clone(), 0x3f8, 0x8)
+            .map_err(Error::LegacyPioBus)
+            .map_err(StartMicrovmError::Internal)?;
     }
 
-    let mut pio_bus = devices::Bus::new();
-    pio_bus.insert(serial.clone(), 0x3f8, 0x8).map_err(|err| {
-        StartMicrovmError::Internal(Error::Serial(io::Error::new(
-            io::ErrorKind::Other,
-            format!("failed to register COM1 serial port: {err}"),
-        )))
-    })?;
+    pio_bus
+        .insert(
+            Arc::new(Mutex::new(WindowsX64PitStub::new(intc.clone()))),
+            0x40,
+            0x4,
+        )
+        .map_err(Error::LegacyPioBus)
+        .map_err(StartMicrovmError::Internal)?;
+
+    // The x64 kernel still probes and masks the legacy 8259 PIC even when WHP handles
+    // interrupt delivery through the local APIC and IOAPIC emulation paths.
+    pio_bus
+        .insert(
+            Arc::new(Mutex::new(WindowsX64PicStub::default())),
+            0x20,
+            0x2,
+        )
+        .map_err(Error::LegacyPioBus)
+        .map_err(StartMicrovmError::Internal)?;
+    pio_bus
+        .insert(
+            Arc::new(Mutex::new(WindowsX64PicStub::default())),
+            0xa0,
+            0x2,
+        )
+        .map_err(Error::LegacyPioBus)
+        .map_err(StartMicrovmError::Internal)?;
+
+    let cmos = Arc::new(Mutex::new(Cmos::new(
+        arch_memory_info.ram_below_gap,
+        arch_memory_info.ram_above_gap,
+    )));
+    {
+        let mut cmos = cmos.lock().unwrap();
+        cmos.set_intc(intc.clone());
+        cmos.set_irq_line(8);
+    }
+    pio_bus
+        .insert(cmos, 0x70, 0x8)
+        .map_err(Error::LegacyPioBus)
+        .map_err(StartMicrovmError::Internal)?;
+
+    // Linux uses port 0x80 as a legacy POST/checkpoint delay sink during early x86 boot.
+    pio_bus
+        .insert(
+            Arc::new(Mutex::new(WindowsX64PostCodeStub::default())),
+            0x80,
+            0x1,
+        )
+        .map_err(Error::LegacyPioBus)
+        .map_err(StartMicrovmError::Internal)?;
+
+    let reset_evt = exit_evt
+        .try_clone()
+        .map_err(Error::EventFd)
+        .map_err(StartMicrovmError::Internal)?;
+    let kbd_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK)
+        .map_err(Error::EventFd)
+        .map_err(StartMicrovmError::Internal)?;
+    let i8042 = Arc::new(Mutex::new(devices::legacy::I8042Device::new(
+        reset_evt, kbd_evt,
+    )));
+    pio_bus
+        .insert(i8042, 0x60, 0x5)
+        .map_err(Error::LegacyPioBus)
+        .map_err(StartMicrovmError::Internal)?;
 
     Ok(Some(pio_bus))
 }
@@ -2725,7 +3117,7 @@ fn attach_mmio_device(
         vmm.mmio_device_manager
             .register_mmio_device(mmio_device, type_id, id)?;
 
-    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+    #[cfg(target_arch = "x86_64")]
     vmm.mmio_device_manager
         .add_device_to_cmdline(_cmdline, _mmio_base, _irq)?;
 

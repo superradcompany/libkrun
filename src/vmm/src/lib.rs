@@ -122,6 +122,9 @@ pub enum Error {
     #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
     /// Cannot add devices to the Legacy I/O Bus.
     LegacyIOBus(device_manager::legacy::Error),
+    /// Cannot add devices to the legacy port I/O bus.
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    LegacyPioBus(devices::BusError),
     /// Cannot load command line.
     LoadCommandline(kernel::cmdline::Error),
     /// Cannot add a device to the MMIO Bus.
@@ -169,6 +172,8 @@ impl Display for Error {
             KvmContext(e) => write!(f, "Failed to validate KVM support: {e:?}"),
             #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
             LegacyIOBus(e) => write!(f, "Cannot add devices to the legacy I/O Bus. {e}"),
+            #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+            LegacyPioBus(e) => write!(f, "Cannot add devices to the legacy port I/O bus. {e}"),
             LoadCommandline(e) => write!(f, "Cannot load command line: {e}"),
             RegisterMMIODevice(e) => write!(f, "Cannot add a device to the MMIO Bus. {e}"),
             Serial(e) => write!(f, "Error writing to the serial console: {e:?}"),

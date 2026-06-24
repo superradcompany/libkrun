@@ -29,7 +29,7 @@ mod rtc_pl031;
 mod vcpu;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
-#[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 use x86_64::cmos;
 #[cfg(target_arch = "x86_64")]
 use x86_64::serial;
@@ -44,7 +44,7 @@ mod riscv64;
 #[cfg(target_arch = "riscv64")]
 use riscv64::serial;
 
-#[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 pub use self::cmos::Cmos;
 #[cfg(target_os = "macos")]
 pub use self::gicv3::GicV3;

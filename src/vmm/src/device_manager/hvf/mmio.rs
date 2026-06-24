@@ -13,7 +13,10 @@ use std::{fmt, io};
 
 #[cfg(target_arch = "aarch64")]
 use devices::fdt::DeviceInfoForFDT;
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "windows")
+))]
 use devices::legacy::IrqChip;
 use devices::{BusDevice, DeviceType};
 use kernel::cmdline as kernel_cmdline;
@@ -139,6 +142,24 @@ impl MMIODeviceManager {
         Ok(ret)
     }
 
+    #[cfg(target_arch = "x86_64")]
+    /// Append a registered MMIO device to the kernel cmdline.
+    pub fn add_device_to_cmdline(
+        &mut self,
+        cmdline: &mut kernel_cmdline::Cmdline,
+        mmio_base: u64,
+        irq: u32,
+    ) -> Result<()> {
+        // Linux only auto-discovers virtio-mmio on device-tree platforms. x86 guests need each
+        // MMIO transport described explicitly on the kernel command line.
+        cmdline
+            .insert(
+                "virtio_mmio.device",
+                &format!("{}K@0x{:08x}:{}", MMIO_LEN / 1024, mmio_base, irq),
+            )
+            .map_err(Error::Cmdline)
+    }
+
     #[cfg(target_arch = "aarch64")]
     /// Register an early console at some MMIO address.
     pub fn register_mmio_serial(
@@ -181,6 +202,23 @@ impl MMIODeviceManager {
 
         self.mmio_base += MMIO_LEN;
         self.irq += 1;
+
+        Ok(())
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    /// Register a MMIO IOAPIC device.
+    pub fn register_mmio_ioapic(&mut self, intc: IrqChip) -> Result<()> {
+        let (mmio_addr, mmio_size) = {
+            let intc = intc.lock().unwrap();
+            (intc.get_mmio_addr(), intc.get_mmio_size())
+        };
+
+        if mmio_size != 0 {
+            self.bus
+                .insert(intc, mmio_addr, mmio_size)
+                .map_err(Error::BusError)?;
+        }
 
         Ok(())
     }

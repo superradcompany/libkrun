@@ -121,6 +121,10 @@ impl Port {
         }
     }
 
+    pub fn is_active(&self) -> bool {
+        matches!(self.state, PortState::Active { .. })
+    }
+
     pub fn start(
         &mut self,
         mem: GuestMemoryMmap,
