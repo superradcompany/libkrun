@@ -48,6 +48,7 @@ pub struct MachineBuilder {
     pub(crate) balloon: bool,
     pub(crate) balloon_stats_interval: Option<Duration>,
     pub(crate) rng: bool,
+    pub(crate) msb_metrics: bool,
     pub(crate) enable_inet_hijack: bool,
 }
 
@@ -342,6 +343,7 @@ impl MachineBuilder {
             balloon: true,
             balloon_stats_interval: Some(Duration::from_secs(1)),
             rng: true,
+            msb_metrics: true,
             enable_inet_hijack: false,
         }
     }
@@ -420,6 +422,15 @@ impl MachineBuilder {
     /// path can disable it to remove one virtio-mmio device from cold start.
     pub fn rng(mut self, enabled: bool) -> Self {
         self.rng = enabled;
+        self
+    }
+
+    /// Enable or disable the private microsandbox metrics virtio device.
+    ///
+    /// The device is enabled by default so protected guest filesystem metrics
+    /// are available for bundled microsandbox kernels.
+    pub fn msb_metrics(mut self, enabled: bool) -> Self {
+        self.msb_metrics = enabled;
         self
     }
 
@@ -946,5 +957,21 @@ impl From<SyncMode> for devices::virtio::block::SyncMode {
             SyncMode::Relaxed => devices::virtio::block::SyncMode::Relaxed,
             SyncMode::Full => devices::virtio::block::SyncMode::Full,
         }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn machine_builder_msb_metrics_defaults_on_and_can_be_disabled() {
+        assert!(MachineBuilder::new().msb_metrics);
+        assert!(!MachineBuilder::new().msb_metrics(false).msb_metrics);
+        assert!(MachineBuilder::new().msb_metrics(true).msb_metrics);
     }
 }

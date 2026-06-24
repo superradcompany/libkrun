@@ -203,6 +203,8 @@ pub struct VmResources {
     pub balloon_stats_interval: Option<Duration>,
     /// Whether to attach the virtio-rng device.
     pub enable_rng: bool,
+    /// Whether to attach the private microsandbox metrics device.
+    pub enable_msb_metrics: bool,
     /// Do not create an implicit console device in the guest
     pub disable_implicit_console: bool,
     /// The console id to use for console= in the kernel cmdline
@@ -255,6 +257,7 @@ impl Default for VmResources {
             enable_balloon: true,
             balloon_stats_interval: Some(Duration::from_secs(1)),
             enable_rng: true,
+            enable_msb_metrics: true,
             disable_implicit_console: false,
             kernel_console: None,
             serial_consoles: Vec::new(),
@@ -514,6 +517,7 @@ mod tests {
             enable_balloon: true,
             balloon_stats_interval: Some(std::time::Duration::from_secs(1)),
             enable_rng: true,
+            enable_msb_metrics: true,
             disable_implicit_console: false,
             serial_consoles: Vec::new(),
             virtio_consoles: Vec::new(),
