@@ -16,7 +16,7 @@ use libc::{fallocate, madvise, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, MADV_D
 use std::ffi::c_void;
 #[cfg(feature = "tee")]
 use vm_memory::{
-    guest_memory::GuestMemory, Address, GuestAddress, GuestMemoryRegion, MemoryRegionAddress,
+    Address, GuestAddress, GuestMemoryBackend, GuestMemoryRegion, MemoryRegionAddress,
 };
 
 pub fn start_worker_thread(

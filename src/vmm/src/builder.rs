@@ -137,7 +137,6 @@ use vm_memory::mmap::MmapRegion;
 #[cfg(not(feature = "tee"))]
 use vm_memory::Address;
 use vm_memory::Bytes;
-#[cfg(not(feature = "tee"))]
 use vm_memory::GuestMemoryBackend;
 #[cfg(all(
     target_arch = "x86_64",
