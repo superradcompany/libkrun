@@ -5,18 +5,27 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+#![cfg_attr(target_os = "windows", allow(dead_code))]
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
+#[cfg(target_arch = "aarch64")]
 use devices::fdt::DeviceInfoForFDT;
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_os = "windows")
+))]
 use devices::legacy::IrqChip;
 use devices::{BusDevice, DeviceType};
 use kernel::cmdline as kernel_cmdline;
+#[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
 use polly::event_manager::EventManager;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
 use utils::eventfd::EventFd;
 
+#[cfg(target_arch = "aarch64")]
 use crate::vstate::Vm;
 
 /// Errors for MMIO device manager.
@@ -133,6 +142,24 @@ impl MMIODeviceManager {
         Ok(ret)
     }
 
+    #[cfg(target_arch = "x86_64")]
+    /// Append a registered MMIO device to the kernel cmdline.
+    pub fn add_device_to_cmdline(
+        &mut self,
+        cmdline: &mut kernel_cmdline::Cmdline,
+        mmio_base: u64,
+        irq: u32,
+    ) -> Result<()> {
+        // Linux only auto-discovers virtio-mmio on device-tree platforms. x86 guests need each
+        // MMIO transport described explicitly on the kernel command line.
+        cmdline
+            .insert(
+                "virtio_mmio.device",
+                &format!("{}K@0x{:08x}:{}", MMIO_LEN / 1024, mmio_base, irq),
+            )
+            .map_err(Error::Cmdline)
+    }
+
     #[cfg(target_arch = "aarch64")]
     /// Register an early console at some MMIO address.
     pub fn register_mmio_serial(
@@ -179,7 +206,24 @@ impl MMIODeviceManager {
         Ok(())
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    /// Register a MMIO IOAPIC device.
+    pub fn register_mmio_ioapic(&mut self, intc: IrqChip) -> Result<()> {
+        let (mmio_addr, mmio_size) = {
+            let intc = intc.lock().unwrap();
+            (intc.get_mmio_addr(), intc.get_mmio_size())
+        };
+
+        if mmio_size != 0 {
+            self.bus
+                .insert(intc, mmio_addr, mmio_size)
+                .map_err(Error::BusError)?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
     /// Register a MMIO RTC device.
     pub fn register_mmio_rtc(&mut self, _vm: &Vm, _intc: IrqChip) -> Result<()> {
         if self.irq > self.last_irq {
@@ -210,7 +254,7 @@ impl MMIODeviceManager {
         Ok(())
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
     /// Register a GPIO
     pub fn register_mmio_gpio(
         &mut self,
@@ -258,7 +302,7 @@ impl MMIODeviceManager {
         Ok(())
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
     /// Register a MMIO GIC device.
     pub fn register_mmio_gic(&mut self, _vm: &Vm, intc: IrqChip) -> Result<()> {
         let (mmio_addr, mmio_size) = {
@@ -322,7 +366,7 @@ impl DeviceInfoForFDT for MMIODeviceInfo {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "windows")))]
 mod tests {
     use super::super::super::builder;
     use super::*;

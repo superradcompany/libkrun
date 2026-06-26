@@ -28,8 +28,14 @@ use utils::metrics::BlockMetricsWriter;
 use virtio_bindings::{
     virtio_blk::*, virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX,
 };
+#[cfg(windows)]
+use vm_memory::VolatileSlice;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
+#[cfg(windows)]
+use super::windows::{
+    PendingWindowsRawFileOperation, WindowsRawFile, WindowsRawFileBuffer, WindowsRawFileCompletion,
+};
 use super::worker::BlockWorker;
 use super::{
     super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice, TYPE_BLOCK},
@@ -70,6 +76,10 @@ impl CacheType {
 pub(crate) struct DiskProperties {
     cache_type: CacheType,
     pub(crate) file: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    #[cfg(windows)]
+    windows_raw_file: Option<Arc<WindowsRawFile>>,
+    #[cfg(windows)]
+    pub(crate) windows_formatted_io_runtime: tokio::runtime::Runtime,
     nsectors: u64,
     image_id: Vec<u8>,
 }
@@ -96,6 +106,10 @@ impl DiskProperties {
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id: disk_image_id,
             file: disk_image,
+            #[cfg(windows)]
+            windows_raw_file: None,
+            #[cfg(windows)]
+            windows_formatted_io_runtime: tokio::runtime::Builder::new_current_thread().build()?,
         })
     }
 
@@ -107,6 +121,7 @@ impl DiskProperties {
         &self.image_id
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn build_device_id(disk_file: &File) -> result::Result<String, Error> {
         let blk_metadata = disk_file.metadata().map_err(Error::GetFileMetadata)?;
         // This is how kvmtool does it.
@@ -117,6 +132,14 @@ impl DiskProperties {
             blk_metadata.st_ino()
         );
         Ok(device_id)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn build_device_id(_disk_file: &File) -> result::Result<String, Error> {
+        Err(Error::GetFileMetadata(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "platform does not expose Unix device metadata",
+        )))
     }
 
     fn build_disk_image_id(disk_file: &File) -> Vec<u8> {
@@ -139,19 +162,151 @@ impl DiskProperties {
     pub fn cache_type(&self) -> CacheType {
         self.cache_type
     }
+
+    pub(crate) fn flush_to_disk(&self) -> io::Result<()> {
+        #[cfg(windows)]
+        if let Some(raw_file) = &self.windows_raw_file {
+            raw_file.flush()?;
+        }
+
+        let diskfile = self.file.lock().unwrap();
+        diskfile.flush()?;
+        diskfile.sync()
+    }
+
+    pub(crate) fn discard_to_any(&self, offset: u64, length: u64) -> io::Result<()> {
+        #[cfg(windows)]
+        if let Some(raw_file) = &self.windows_raw_file {
+            return raw_file.discard_to_any(offset, length);
+        }
+
+        let mut diskfile = self.file.lock().unwrap();
+        diskfile.discard_to_any(offset, length)
+    }
+
+    pub(crate) fn discard_to_zero(&self, offset: u64, length: u64) -> io::Result<()> {
+        #[cfg(windows)]
+        if let Some(raw_file) = &self.windows_raw_file {
+            return raw_file.discard_to_zero(offset, length);
+        }
+
+        let mut diskfile = self.file.lock().unwrap();
+        diskfile.discard_to_zero(offset, length)
+    }
+
+    pub(crate) fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        #[cfg(windows)]
+        if let Some(raw_file) = &self.windows_raw_file {
+            return raw_file.write_zeroes(offset, length);
+        }
+
+        let diskfile = self.file.lock().unwrap();
+        diskfile.write_zeroes(offset, length)
+    }
+
+    #[cfg(windows)]
+    fn set_windows_raw_file(&mut self, file: Option<Arc<WindowsRawFile>>) {
+        self.windows_raw_file = file;
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn has_windows_raw_file(&self) -> bool {
+        self.windows_raw_file.is_some()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn windows_raw_can_submit_direct_buffer(
+        &self,
+        buffer: WindowsRawFileBuffer,
+        offset: u64,
+    ) -> bool {
+        self.windows_raw_file
+            .as_ref()
+            .is_some_and(|file| file.can_submit_direct_buffer(buffer, offset))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn submit_windows_raw_read_buffer(
+        &self,
+        buffer: WindowsRawFileBuffer,
+        offset: u64,
+    ) -> Option<io::Result<PendingWindowsRawFileOperation>> {
+        self.windows_raw_file
+            .as_ref()
+            .map(|file| file.submit_read_buffer(buffer, offset))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn submit_windows_raw_write_buffer(
+        &self,
+        buffer: WindowsRawFileBuffer,
+        offset: u64,
+    ) -> Option<io::Result<PendingWindowsRawFileOperation>> {
+        self.windows_raw_file
+            .as_ref()
+            .map(|file| file.submit_write_buffer(buffer, offset))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn submit_windows_raw_read_bounce(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> Option<io::Result<PendingWindowsRawFileOperation>> {
+        self.windows_raw_file
+            .as_ref()
+            .map(|file| file.submit_read_bounce(offset, len))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn submit_windows_raw_write_bounce(
+        &self,
+        offset: u64,
+        buffer: Vec<u8>,
+    ) -> Option<io::Result<PendingWindowsRawFileOperation>> {
+        self.windows_raw_file
+            .as_ref()
+            .map(|file| file.submit_write_bounce(offset, buffer))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn wait_windows_raw_completion(
+        &self,
+    ) -> Option<io::Result<WindowsRawFileCompletion>> {
+        self.windows_raw_file
+            .as_ref()
+            .map(|file| file.wait_for_completion())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn windows_raw_read_vectored_at_volatile(
+        &self,
+        bufs: &[VolatileSlice],
+        offset: u64,
+    ) -> Option<io::Result<usize>> {
+        self.windows_raw_file
+            .as_ref()
+            .map(|file| file.read_vectored_at_volatile(bufs, offset))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn windows_raw_write_vectored_at_volatile(
+        &self,
+        bufs: &[VolatileSlice],
+        offset: u64,
+    ) -> Option<io::Result<usize>> {
+        self.windows_raw_file
+            .as_ref()
+            .map(|file| file.write_vectored_at_volatile(bufs, offset))
+    }
 }
 
 impl Drop for DiskProperties {
     fn drop(&mut self) {
         match self.cache_type {
             CacheType::Writeback => {
-                // flush() first to force any cached data out.
-                if self.file.lock().unwrap().flush().is_err() {
+                if self.flush_to_disk().is_err() {
                     error!("Failed to flush block data on drop.");
-                }
-                // Sync data out to physical media on host.
-                if self.file.lock().unwrap().sync().is_err() {
-                    error!("Failed to sync block data on drop.")
                 }
             }
             CacheType::Unsafe => {
@@ -208,6 +363,8 @@ pub struct Block {
     cache_type: CacheType,
     disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
+    #[cfg(windows)]
+    windows_raw_file: Option<Arc<WindowsRawFile>>,
     metrics: BlockMetricsWriter,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
@@ -241,10 +398,28 @@ impl Block {
         sync_mode: SyncMode,
         metrics: BlockMetricsWriter,
     ) -> io::Result<Block> {
+        if matches!(disk_image_format, ImageType::Vmdk) && !is_disk_read_only {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "VMDK write support is not available; configure the disk as read-only",
+            ));
+        }
+
         let disk_image = OpenOptions::new()
             .read(true)
             .write(!is_disk_read_only)
             .open(PathBuf::from(&disk_image_path))?;
+
+        #[cfg(windows)]
+        let windows_raw_file = if matches!(&disk_image_format, ImageType::Raw) {
+            Some(Arc::new(WindowsRawFile::open(
+                &disk_image_path,
+                is_disk_read_only,
+                direct_io,
+            )?))
+        } else {
+            None
+        };
 
         // Use the caller-supplied `id` as the virtio-blk disk image id so
         // it surfaces in the guest at `/sys/block/<dev>/serial` and (when
@@ -298,8 +473,20 @@ impl Block {
 
         let disk_image = Arc::new(Mutex::new(disk_image));
 
-        let disk_properties =
-            DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
+        let disk_properties = {
+            let disk_properties =
+                DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
+            #[cfg(windows)]
+            {
+                let mut disk_properties = disk_properties;
+                disk_properties.set_windows_raw_file(windows_raw_file.clone());
+                disk_properties
+            }
+            #[cfg(not(windows))]
+            {
+                disk_properties
+            }
+        };
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)
@@ -337,6 +524,8 @@ impl Block {
             cache_type,
             disk_image,
             disk_image_id,
+            #[cfg(windows)]
+            windows_raw_file,
             metrics,
             avail_features,
             acked_features: 0u64,
@@ -426,12 +615,24 @@ impl VirtioDevice for Block {
 
         let disk = match self.disk.take() {
             Some(d) => d,
-            None => DiskProperties::new(
-                Arc::clone(&self.disk_image),
-                self.disk_image_id.clone(),
-                self.cache_type,
-            )
-            .map_err(|_| ActivateError::BadActivate)?,
+            None => {
+                let disk = DiskProperties::new(
+                    Arc::clone(&self.disk_image),
+                    self.disk_image_id.clone(),
+                    self.cache_type,
+                )
+                .map_err(|_| ActivateError::BadActivate)?;
+                #[cfg(windows)]
+                {
+                    let mut disk = disk;
+                    disk.set_windows_raw_file(self.windows_raw_file.clone());
+                    disk
+                }
+                #[cfg(not(windows))]
+                {
+                    disk
+                }
+            }
         };
 
         let worker = BlockWorker::new(
@@ -457,5 +658,39 @@ impl VirtioDevice for Block {
         }
         self.device_state = DeviceState::Inactive;
         true
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use utils::metrics::MetricsWriter;
+
+    use super::*;
+
+    #[test]
+    fn writable_vmdk_is_rejected() {
+        let result = Block::new(
+            "vmdk".to_string(),
+            None,
+            CacheType::Unsafe,
+            "missing.vmdk".to_string(),
+            ImageType::Vmdk,
+            false,
+            false,
+            SyncMode::None,
+            MetricsWriter::default().register_block_device("vmdk".to_string()),
+        );
+
+        let error = match result {
+            Ok(_) => panic!("writable VMDK should be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("VMDK write support"));
     }
 }

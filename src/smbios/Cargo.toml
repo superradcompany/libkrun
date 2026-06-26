@@ -7,4 +7,4 @@ description = "SMBIOS table generation for msb_krun microVMs"
 repository = "https://github.com/containers/libkrun"
 
 [dependencies]
-vm-memory = { version = "~0.16", features = ["backend-mmap"] }
+vm-memory = { version = "~0.18", default-features = false, features = ["backend-mmap"] }

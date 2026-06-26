@@ -167,12 +167,12 @@ int32_t krun_add_disk(uint32_t ctx_id, const char *block_id, const char *disk_pa
 /* Supported disk image formats */
 #define KRUN_DISK_FORMAT_RAW 0
 #define KRUN_DISK_FORMAT_QCOW2 1
-/* Note: Only supports FLAT/ZERO formats without delta links */
+/* Note: Only supports FLAT/ZERO formats without delta links. VMDK is read-only. */
 #define KRUN_DISK_FORMAT_VMDK 2
 
 /**
  * Adds a disk image to be used as a general partition for the microVM. The supported
- * image formats are: "raw" and "qcow2".
+ * image formats are: "raw", "qcow2", and "vmdk". VMDK images must be read-only.
  *
  * This API is mutually exclusive with the deprecated krun_set_root_disk and
  * krun_set_data_disk methods and must not be used together.
@@ -207,9 +207,9 @@ int32_t krun_add_disk(uint32_t ctx_id, const char *block_id, const char *disk_pa
  *  "ctx_id"      - the configuration context ID.
  *  "block_id"    - a null-terminated string representing the partition.
  *  "disk_path"   - a null-terminated string representing the path leading to the disk image.
- *  "disk_format" - the disk image format (i.e. KRUN_DISK_FORMAT_{RAW, QCOW2})
- *  "read_only"   - whether the mount should be read-only. Required if the caller does not have
- *                  write permissions (for disk images in /usr/share).
+ *  "disk_format" - the disk image format (i.e. KRUN_DISK_FORMAT_{RAW, QCOW2, VMDK})
+ *  "read_only"   - whether the mount should be read-only. Required for VMDK and if the caller
+ *                  does not have write permissions (for disk images in /usr/share).
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
@@ -255,9 +255,9 @@ int32_t krun_add_disk2(uint32_t ctx_id,
  *  "ctx_id"      - the configuration context ID.
  *  "block_id"    - a null-terminated string representing the partition.
  *  "disk_path"   - a null-terminated string representing the path leading to the disk image.
- *  "disk_format" - the disk image format (i.e. KRUN_DISK_FORMAT_{RAW, QCOW2})
- *  "read_only"   - whether the mount should be read-only. Required if the caller does not have
- *                  write permissions (for disk images in /usr/share).
+ *  "disk_format" - the disk image format (i.e. KRUN_DISK_FORMAT_{RAW, QCOW2, VMDK})
+ *  "read_only"   - whether the mount should be read-only. Required for VMDK and if the caller
+ *                  does not have write permissions (for disk images in /usr/share).
  *  "direct_io"   - whether to bypass the host caches.
  *  "sync_mode"   - whether to enable VIRTIO_BLK_F_FLUSH. On macOS, an additional relaxed sync
  *                  mode is available, which is enabled by default, and will not ask the drive
@@ -323,13 +323,13 @@ int32_t krun_add_virtiofs2(uint32_t ctx_id,
                            const char *c_path,
                            uint64_t shm_size);
 
-/* Send the VFKIT magic after establishing the connection,
-   as required by gvproxy in vfkit mode. */
-#define NET_FLAG_VFKIT 1 << 0
+#ifndef _WIN32
 
 /* TSI (Transparent Socket Impersonation) feature flags for vsock */
 #define KRUN_TSI_HIJACK_INET  (1 << 0)
 #define KRUN_TSI_HIJACK_UNIX  (1 << 1)
+
+#endif /* _WIN32 */
 
 /* Taken from uapi/linux/virtio_net.h */
 #define NET_FEATURE_CSUM 1 << 0
@@ -340,6 +340,12 @@ int32_t krun_add_virtiofs2(uint32_t ctx_id,
 #define NET_FEATURE_HOST_TSO4 1 << 11
 #define NET_FEATURE_HOST_TSO6 1 << 12
 #define NET_FEATURE_HOST_UFO 1 << 14
+
+#ifndef _WIN32
+
+/* Send the VFKIT magic after establishing the connection,
+   as required by gvproxy in vfkit mode. */
+#define NET_FLAG_VFKIT 1 << 0
 
 /* These are the features enabled by krun_set_passt_fd and krun_set_gvproxy_path. */
 #define COMPAT_NET_FEATURES NET_FEATURE_CSUM | NET_FEATURE_GUEST_CSUM | \
@@ -432,6 +438,47 @@ int32_t krun_add_net_unixgram(uint32_t ctx_id,
                               uint32_t features,
                               uint32_t flags);
 
+#endif /* _WIN32 */
+
+#ifdef _WIN32
+
+/**
+ * Adds an independent virtio-net device connected to a Windows
+ * named-pipe-based userspace network helper.
+ *
+ * The helper must create a message-mode named pipe. libkrun connects
+ * to the pipe as a client and sends one Ethernet frame per pipe message.
+ *
+ * The "krun_add_net_*" functions can be called multiple times for
+ * adding multiple virtio-net devices. In the guest the interfaces
+ * will appear in the same order as they are added (that is, the
+ * first added interface will be "eth0", the second "eth1"...)
+ *
+ * Arguments:
+ *  "ctx_id"   - the configuration context ID.
+ *  "c_name"   - a null-terminated string containing the full pipe name,
+ *               for example "\\.\pipe\libkrun-net0".
+ *  "c_mac"    - MAC address as an array of 6 uint8_t entries.
+ *  "features" - virtio-net features for the network interface.
+ *  "flags"    - generic flags for the network interface. Must be zero.
+ *
+ * Notes:
+ * This function configures a concrete virtio-net backend. Windows TSI/vsock
+ * port mapping is not exposed until the Windows vsock transport is implemented.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_add_net_named_pipe(uint32_t ctx_id,
+                                const char *c_name,
+                                uint8_t *const c_mac,
+                                uint32_t features,
+                                uint32_t flags);
+
+#endif /* _WIN32 */
+
+#ifndef _WIN32
+
 /**
  * Adds an independent virtio-net device with the tap backend.
  * Call to this function disables TSI backend.
@@ -501,6 +548,8 @@ int32_t krun_set_passt_fd(uint32_t ctx_id, int fd);
  */
 int32_t krun_set_gvproxy_path(uint32_t ctx_id, char *c_path);
 
+#endif /* _WIN32 */
+
 /**
  * Sets the MAC address for the virtio-net device when using the passt backend.
  *
@@ -512,6 +561,8 @@ int32_t krun_set_gvproxy_path(uint32_t ctx_id, char *c_path);
  *  Zero on success or a negative error number on failure.
  */
 int32_t krun_set_net_mac(uint32_t ctx_id, uint8_t *const c_mac);
+
+#ifndef _WIN32
 
 /**
  * Configures a map of host to guest TCP ports for the microVM.
@@ -539,6 +590,8 @@ int32_t krun_set_net_mac(uint32_t ctx_id, uint8_t *const c_mac);
  * as an API of libkrun (but you can still do port mapping using command line arguments of passt)
  */
 int32_t krun_set_port_map(uint32_t ctx_id, const char *const port_map[]);
+
+#endif /* _WIN32 */
 
 /* Flags for virglrenderer.  Copied from virglrenderer bindings. */
 #define VIRGLRENDERER_USE_EGL 1 << 0
@@ -839,6 +892,8 @@ int32_t krun_set_env(uint32_t ctx_id, const char *const envp[]);
  */
 int32_t krun_set_tee_config_file(uint32_t ctx_id, const char *filepath);
 
+#ifndef _WIN32
+
 /**
  * Adds a port-path pairing for guest IPC with a process in the host.
  *
@@ -886,6 +941,8 @@ int32_t krun_add_vsock_port2(uint32_t ctx_id,
  *  Zero on success or a negative error number on failure.
  */
 int32_t krun_add_vsock(uint32_t ctx_id, uint32_t tsi_features);
+
+#endif /* _WIN32 */
 
 /**
  * Returns the eventfd file descriptor to signal the guest to shut down orderly. This must be
@@ -1056,6 +1113,8 @@ int32_t krun_set_balloon_device(uint32_t ctx_id, bool enable);
  */
 int32_t krun_set_rng_device(uint32_t ctx_id, bool enable);
 
+#ifndef _WIN32
+
 /**
  * Disable the implicit vsock device.
  *
@@ -1070,6 +1129,8 @@ int32_t krun_set_rng_device(uint32_t ctx_id, bool enable);
  */
 int32_t krun_disable_implicit_vsock(uint32_t ctx_id);
 
+#endif /* _WIN32 */
+
 /*
  * Specify the value of `console=` in the kernel commandline.
  *
@@ -1081,6 +1142,8 @@ int32_t krun_disable_implicit_vsock(uint32_t ctx_id);
  *  Zero on success or a negative error number on failure.
  */
 int32_t krun_set_kernel_console(uint32_t ctx_id, const char *console_id);
+
+#ifndef _WIN32
 
 /*
  * Adds a virtio-console device to the guest.
@@ -1196,6 +1259,8 @@ int32_t krun_add_console_port_inout(uint32_t ctx_id,
                                      const char *name,
                                      int input_fd,
                                      int output_fd);
+
+#endif /* _WIN32 */
 
 /**
  * Configure block device to be used as root filesystem.

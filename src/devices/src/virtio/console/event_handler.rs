@@ -1,9 +1,8 @@
-use std::os::unix::io::AsRawFd;
-
-use polly::event_manager::{EventManager, Subscriber};
+use polly::event_manager::{EventManager, Pollable, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 
 use super::device::Console;
+use super::{eventfd_pollable, pollable_token};
 use crate::virtio::console::device::{CONTROL_RXQ_INDEX, CONTROL_TXQ_INDEX};
 use crate::virtio::console::port_queue_mapping::{queue_idx_to_port_id, QueueDirection};
 use crate::virtio::device::VirtioDevice;
@@ -42,24 +41,22 @@ impl Console {
 
     fn handle_activate_event(&self, event_manager: &mut EventManager) {
         debug!("console: activate event");
+        let activate_evt = eventfd_pollable(&self.activate_evt);
+
         if let Err(e) = self.activate_evt.read() {
             error!("Failed to consume console activate event: {e:?}");
         }
 
         // The subscriber must exist as we previously registered activate_evt via
         // `interest_list()`.
-        let self_subscriber = event_manager
-            .subscriber(self.activate_evt.as_raw_fd())
-            .unwrap();
+        let self_subscriber = event_manager.subscriber(activate_evt).unwrap();
 
         for queue_index in 0..self.queues.len() {
+            let queue_evt = eventfd_pollable(&self.queue_events[queue_index]);
             event_manager
                 .register(
-                    self.queue_events[queue_index].as_raw_fd(),
-                    EpollEvent::new(
-                        EventSet::IN,
-                        self.queue_events[queue_index].as_raw_fd() as u64,
-                    ),
+                    queue_evt,
+                    EpollEvent::new(EventSet::IN, pollable_token(queue_evt)),
                     self_subscriber.clone(),
                 )
                 .unwrap_or_else(|e| {
@@ -69,11 +66,9 @@ impl Console {
                 });
         }
 
-        event_manager
-            .unregister(self.activate_evt.as_raw_fd())
-            .unwrap_or_else(|e| {
-                error!("Failed to unregister fs activate evt: {e:?}");
-            })
+        event_manager.unregister(activate_evt).unwrap_or_else(|e| {
+            error!("Failed to unregister fs activate evt: {e:?}");
+        })
     }
 
     fn handle_sigwinch_event(&mut self, event: &EpollEvent) {
@@ -112,12 +107,12 @@ impl Subscriber for Console {
     fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
         let source = event.fd();
 
-        let control_rxq = self.queue_events[CONTROL_RXQ_INDEX].as_raw_fd();
-        let control_txq = self.queue_events[CONTROL_TXQ_INDEX].as_raw_fd();
-        let control_rxq_control = self.control.queue_evt().as_raw_fd();
+        let control_rxq = eventfd_pollable(&self.queue_events[CONTROL_RXQ_INDEX]);
+        let control_txq = eventfd_pollable(&self.queue_events[CONTROL_TXQ_INDEX]);
+        let control_rxq_control = eventfd_pollable(self.control.queue_evt());
 
-        let activate_evt = self.activate_evt.as_raw_fd();
-        let sigwinch_evt = self.sigwinch_evt.as_raw_fd();
+        let activate_evt = eventfd_pollable(&self.activate_evt);
+        let sigwinch_evt = eventfd_pollable(&self.sigwinch_evt);
 
         if self.is_activated() {
             let mut raise_irq = false;
@@ -135,7 +130,7 @@ impl Subscriber for Console {
             else if let Some(queue_index) = self
                 .queue_events
                 .iter()
-                .position(|fd| fd.as_raw_fd() == source)
+                .position(|fd| eventfd_pollable(fd) == source)
             {
                 raise_irq |= self.read_queue_event(queue_index, event);
                 self.notify_port_queue_event(queue_index);
@@ -155,10 +150,14 @@ impl Subscriber for Console {
     }
 
     fn interest_list(&self) -> Vec<EpollEvent> {
+        fn event(event: Pollable) -> EpollEvent {
+            EpollEvent::new(EventSet::IN, pollable_token(event))
+        }
+
         vec![
-            EpollEvent::new(EventSet::IN, self.activate_evt.as_raw_fd() as u64),
-            EpollEvent::new(EventSet::IN, self.sigwinch_evt.as_raw_fd() as u64),
-            EpollEvent::new(EventSet::IN, self.control.queue_evt().as_raw_fd() as u64),
+            event(eventfd_pollable(&self.activate_evt)),
+            event(eventfd_pollable(&self.sigwinch_evt)),
+            event(eventfd_pollable(self.control.queue_evt())),
         ]
     }
 }

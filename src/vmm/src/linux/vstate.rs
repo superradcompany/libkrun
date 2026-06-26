@@ -66,8 +66,8 @@ use utils::time::{get_time, ClockType};
 #[cfg(feature = "tee")]
 use utils::worker_message::{MemoryProperties, WorkerMessage};
 use vm_memory::{
-    Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
-    GuestRegionMmap,
+    Address, GuestAddress, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap,
+    GuestMemoryRegion, GuestRegionMmap,
 };
 
 #[cfg(feature = "amd-sev")]

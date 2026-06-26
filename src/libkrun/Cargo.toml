@@ -7,17 +7,17 @@ publish = false
 build = "build.rs"
 
 [features]
-tee = []
-amd-sev = [ "blk", "tee" ]
-tdx = [ "blk", "tee" ]
-net = []
-blk = []
-efi = [ "blk", "net" ]
-gpu = ["krun_display"]
-snd = []
+tee = ["devices/tee", "vmm/tee"]
+amd-sev = ["blk", "tee", "devices/amd-sev", "vmm/amd-sev"]
+tdx = ["blk", "tee", "devices/tdx", "vmm/tdx"]
+net = ["devices/net", "vmm/net"]
+blk = ["devices/blk", "vmm/blk"]
+efi = ["blk", "net", "devices/efi", "vmm/efi"]
+gpu = ["krun_display", "devices/gpu", "vmm/gpu"]
+snd = ["devices/snd", "vmm/snd"]
 input = ["krun_input", "vmm/input", "devices/input"]
 virgl_resource_map2 = []
-aws-nitro = [ "dep:aws-nitro", "dep:nitro-enclaves" ]
+aws-nitro = ["dep:aws-nitro", "dep:nitro-enclaves", "devices/aws-nitro", "vmm/aws-nitro"]
 
 [dependencies]
 crossbeam-channel = ">=0.5.15"
@@ -43,7 +43,7 @@ kvm-bindings = { version = ">=0.11", features = ["fam-wrappers"] }
 kvm-ioctls = ">=0.21"
 aws-nitro = { package = "msb_krun_aws_nitro", path = "../aws_nitro", optional = true }
 nitro-enclaves = { version = "0.5.0", optional = true }
-vm-memory = { version = "~0.16", features = ["backend-mmap"] }
+vm-memory = { version = "~0.18", default-features = false, features = ["backend-mmap"] }
 
 [lib]
 name = "krun"

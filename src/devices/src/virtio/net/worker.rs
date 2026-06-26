@@ -1,7 +1,11 @@
 use crate::virtio::net::backend::ConnectError;
+#[cfg(windows)]
+use crate::virtio::net::namedpipe::NamedPipe;
 #[cfg(target_os = "linux")]
 use crate::virtio::net::tap::Tap;
+#[cfg(unix)]
 use crate::virtio::net::unixgram::Unixgram;
+#[cfg(unix)]
 use crate::virtio::net::unixstream::Unixstream;
 use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE};
 use crate::virtio::{DeviceQueue, InterruptTransport};
@@ -10,11 +14,26 @@ use super::backend::{NetBackend, ReadError, WriteError};
 use super::device::{FrontendError, RxError, TxError, VirtioNetBackend};
 use super::vnet_hdr_len;
 
+use std::io;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::thread;
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::event::{EventSource, RawEventSource};
+use utils::eventfd::EventFd;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+#[cfg(unix)]
+type Pollable = std::os::fd::RawFd;
+#[cfg(windows)]
+type Pollable = RawHandle;
+
+const RX_QUEUE_EVENT: u64 = 0;
+const TX_QUEUE_EVENT: u64 = 1;
+const BACKEND_EVENT: u64 = 2;
 
 pub struct NetWorker {
     rx_q: DeviceQueue,
@@ -43,27 +62,35 @@ impl NetWorker {
         cfg_backend: VirtioNetBackend,
     ) -> Result<Self, ConnectError> {
         let backend = match cfg_backend {
+            #[cfg(unix)]
             VirtioNetBackend::UnixstreamFd(fd) => {
                 // SAFETY: we need to trust that the library user has configured
                 // the backend with a healthy file descriptor.
                 let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
                 Box::new(Unixstream::new(owned_fd)) as Box<dyn NetBackend + Send>
             }
+            #[cfg(unix)]
             VirtioNetBackend::UnixstreamPath(path) => {
                 Box::new(Unixstream::open(path)?) as Box<dyn NetBackend + Send>
             }
+            #[cfg(unix)]
             VirtioNetBackend::UnixgramFd(fd) => {
                 // SAFETY: we need to trust that the library user has configured
                 // the backend with a healthy file descriptor.
                 let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
                 Box::new(Unixgram::new(owned_fd)) as Box<dyn NetBackend + Send>
             }
+            #[cfg(unix)]
             VirtioNetBackend::UnixgramPath(path, vfkit_magic) => {
                 Box::new(Unixgram::open(path, vfkit_magic)?) as Box<dyn NetBackend + Send>
             }
             #[cfg(target_os = "linux")]
             VirtioNetBackend::Tap(tap_name) => {
                 Box::new(Tap::new(tap_name, _vnet_features)?) as Box<dyn NetBackend + Send>
+            }
+            #[cfg(windows)]
+            VirtioNetBackend::NamedPipe(name) => {
+                Box::new(NamedPipe::open(name)?) as Box<dyn NetBackend + Send>
             }
             VirtioNetBackend::Custom(backend) => backend,
         };
@@ -94,28 +121,35 @@ impl NetWorker {
     }
 
     fn work(mut self) {
-        let virtq_rx_ev_fd = self.rx_q.event.as_raw_fd();
-        let virtq_tx_ev_fd = self.tx_q.event.as_raw_fd();
-        let backend_socket = self.backend.raw_socket_fd();
+        let virtq_rx_ev = eventfd_pollable(&self.rx_q.event);
+        let virtq_tx_ev = eventfd_pollable(&self.tx_q.event);
+        let backend_source = self.backend.event_source(BACKEND_EVENT);
+        let backend_pollable = match event_source_pollable(backend_source) {
+            Ok(pollable) => pollable,
+            Err(err) => {
+                log::error!("virtio-net backend event source is unsupported: {err}");
+                return;
+            }
+        };
 
         let epoll = Epoll::new().unwrap();
 
         let _ = epoll.ctl(
             ControlOperation::Add,
-            virtq_rx_ev_fd,
-            &EpollEvent::new(EventSet::IN, virtq_rx_ev_fd as u64),
+            virtq_rx_ev,
+            &EpollEvent::new(EventSet::IN, RX_QUEUE_EVENT),
         );
         let _ = epoll.ctl(
             ControlOperation::Add,
-            virtq_tx_ev_fd,
-            &EpollEvent::new(EventSet::IN, virtq_tx_ev_fd as u64),
+            virtq_tx_ev,
+            &EpollEvent::new(EventSet::IN, TX_QUEUE_EVENT),
         );
         let _ = epoll.ctl(
             ControlOperation::Add,
-            backend_socket,
+            backend_pollable,
             &EpollEvent::new(
                 EventSet::IN | EventSet::OUT | EventSet::EDGE_TRIGGERED | EventSet::READ_HANG_UP,
-                backend_socket as u64,
+                BACKEND_EVENT,
             ),
         );
 
@@ -124,16 +158,16 @@ impl NetWorker {
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
                     for event in &epoll_events[0..ev_cnt] {
-                        let source = event.fd();
+                        let source = event.data();
                         let event_set = event.event_set();
-                        match event_set {
-                            EventSet::IN if source == virtq_rx_ev_fd => {
+                        match source {
+                            RX_QUEUE_EVENT if event_set.contains(EventSet::IN) => {
                                 self.process_rx_queue_event();
                             }
-                            EventSet::IN if source == virtq_tx_ev_fd => {
+                            TX_QUEUE_EVENT if event_set.contains(EventSet::IN) => {
                                 self.process_tx_queue_event();
                             }
-                            _ if source == backend_socket => {
+                            BACKEND_EVENT => {
                                 if event_set.contains(EventSet::HANG_UP)
                                     || event_set.contains(EventSet::READ_HANG_UP)
                                 {
@@ -151,7 +185,7 @@ impl NetWorker {
                             }
                             _ => {
                                 log::warn!(
-                                    "Received unknown event: {event_set:?} from fd: {source:?}"
+                                    "Received unknown virtio-net event: {event_set:?} token={source}"
                                 );
                             }
                         }
@@ -181,7 +215,10 @@ impl NetWorker {
 
     pub(crate) fn process_tx_queue_event(&mut self) {
         match self.tx_q.event.read() {
-            Ok(_) => self.process_tx_loop(),
+            Ok(_) => {
+                log::debug!("virtio-net tx queue event");
+                self.process_tx_loop()
+            }
             Err(e) => {
                 log::error!("Failed to get tx queue event from queue: {e:?}");
             }
@@ -320,6 +357,7 @@ impl NetWorker {
             }
 
             self.tx_frame_len = read_count;
+            log::debug!("virtio-net tx descriptor: head={head_index}, bytes={read_count}");
             match self
                 .backend
                 .write_frame(vnet_hdr_len(), &mut self.tx_frame_buf[..read_count])
@@ -443,5 +481,33 @@ impl NetWorker {
     fn read_into_rx_frame_buf_from_backend(&mut self) -> result::Result<(), ReadError> {
         self.rx_frame_buf_len = self.backend.read_frame(&mut self.rx_frame_buf)?;
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn eventfd_pollable(event: &EventFd) -> Pollable {
+    event.as_raw_fd()
+}
+
+#[cfg(windows)]
+fn eventfd_pollable(event: &EventFd) -> Pollable {
+    event.as_raw_handle()
+}
+
+#[cfg(unix)]
+fn event_source_pollable(source: EventSource) -> io::Result<Pollable> {
+    match source.raw() {
+        RawEventSource::Fd(fd) => Ok(fd),
+    }
+}
+
+#[cfg(windows)]
+fn event_source_pollable(source: EventSource) -> io::Result<Pollable> {
+    match source.raw() {
+        RawEventSource::WaitableHandle(handle) => Ok(handle),
+        RawEventSource::CompletionHandle(_) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "virtio-net does not support IOCP completion sources yet",
+        )),
     }
 }

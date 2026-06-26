@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{io, mem, result};
+
 use virtio_bindings::virtio_net::virtio_net_hdr_v1;
 
 use super::QueueConfig;
@@ -13,9 +14,13 @@ pub static QUEUE_CONFIG: [QueueConfig; NUM_QUEUES] = [QueueConfig::new(QUEUE_SIZ
 
 pub mod backend;
 pub mod device;
+#[cfg(windows)]
+pub mod namedpipe;
 #[cfg(target_os = "linux")]
 mod tap;
+#[cfg(unix)]
 pub mod unixgram;
+#[cfg(unix)]
 pub mod unixstream;
 mod worker;
 

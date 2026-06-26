@@ -7,6 +7,7 @@
 use std::fs::File;
 #[cfg(feature = "tee")]
 use std::io::BufReader;
+#[cfg(not(target_os = "windows"))]
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -20,9 +21,10 @@ use crate::vmm_config::external_kernel::ExternalKernel;
 use crate::vmm_config::firmware::FirmwareConfig;
 #[cfg(not(feature = "tee"))]
 use crate::vmm_config::fs::*;
-#[cfg(feature = "tee")]
-use crate::vmm_config::kernel_bundle::{InitrdBundle, QbootBundle, QbootBundleError};
+use crate::vmm_config::kernel_bundle::InitrdBundle;
 use crate::vmm_config::kernel_bundle::{KernelBundle, KernelBundleError};
+#[cfg(feature = "tee")]
+use crate::vmm_config::kernel_bundle::{QbootBundle, QbootBundleError};
 use crate::vmm_config::kernel_cmdline::{KernelCmdlineConfig, KernelCmdlineConfigError};
 use crate::vmm_config::machine_config::{VmConfig, VmConfigError};
 #[cfg(feature = "net")]
@@ -39,7 +41,9 @@ use utils::metrics::MetricsWriter;
 
 type Result<E> = std::result::Result<(), E>;
 
-// Re-export TsiFlags from devices crate
+#[cfg(target_os = "windows")]
+pub use crate::vmm_config::vsock::TsiFlags;
+#[cfg(not(target_os = "windows"))]
 pub use devices::virtio::TsiFlags;
 
 /// Errors encountered when configuring microVM resources.
@@ -86,22 +90,31 @@ impl Default for TeeConfig {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 pub struct SerialConsoleConfig {
     pub input_fd: RawFd,
     pub output_fd: RawFd,
 }
 
+#[cfg(not(target_os = "windows"))]
 pub struct DefaultVirtioConsoleConfig {
     pub input_fd: RawFd,
     pub output_fd: RawFd,
     pub err_fd: RawFd,
 }
 
+#[cfg(not(target_os = "windows"))]
 pub enum VirtioConsoleConfigMode {
     Autoconfigure(DefaultVirtioConsoleConfig),
     Explicit(Vec<PortConfig>),
 }
 
+#[cfg(target_os = "windows")]
+pub enum VirtioConsoleConfigMode {
+    Explicit(Vec<PortConfig>),
+}
+
+#[cfg(not(target_os = "windows"))]
 pub enum PortConfig {
     Tty {
         name: String,
@@ -117,6 +130,12 @@ pub enum PortConfig {
         input: Box<dyn devices::virtio::port_io::PortInput + Send>,
         output: Box<dyn devices::virtio::port_io::PortOutput + Send>,
     },
+}
+
+#[cfg(target_os = "windows")]
+pub enum PortConfig {
+    ConsoleOutputFile { path: PathBuf },
+    NamedPipe { name: String, pipe_name: String },
 }
 
 /// Configuration for the vsock device
@@ -148,7 +167,6 @@ pub struct VmResources {
     #[cfg(feature = "tee")]
     pub qboot_bundle: Option<QbootBundle>,
     /// The parameters for the initrd bundle to be loaded in this microVM.
-    #[cfg(feature = "tee")]
     pub initrd_bundle: Option<InitrdBundle>,
     /// The fs device.
     #[cfg(not(feature = "tee"))]
@@ -210,6 +228,7 @@ pub struct VmResources {
     /// The console id to use for console= in the kernel cmdline
     pub kernel_console: Option<String>,
     /// Serial consoles to attach to the guest
+    #[cfg(not(target_os = "windows"))]
     pub serial_consoles: Vec<SerialConsoleConfig>,
     /// Virtio consoles to attach to the guest
     pub virtio_consoles: Vec<VirtioConsoleConfigMode>,
@@ -225,7 +244,6 @@ impl Default for VmResources {
             external_kernel: None,
             #[cfg(feature = "tee")]
             qboot_bundle: None,
-            #[cfg(feature = "tee")]
             initrd_bundle: None,
             #[cfg(not(feature = "tee"))]
             fs: Vec::new(),
@@ -260,6 +278,7 @@ impl Default for VmResources {
             enable_msb_metrics: true,
             disable_implicit_console: false,
             kernel_console: None,
+            #[cfg(not(target_os = "windows"))]
             serial_consoles: Vec::new(),
             virtio_consoles: Vec::new(),
         }
@@ -344,7 +363,7 @@ impl VmResources {
 
     pub fn set_kernel_bundle(&mut self, kernel_bundle: KernelBundle) -> Result<KernelBundleError> {
         // Safe because this call just returns the page size and doesn't have any side effects.
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let page_size = utils::page_size();
 
         if kernel_bundle.host_addr == 0 || (kernel_bundle.host_addr as usize) & (page_size - 1) != 0
         {
@@ -386,12 +405,10 @@ impl VmResources {
         Ok(())
     }
 
-    #[cfg(feature = "tee")]
     pub fn initrd_bundle(&self) -> Option<&InitrdBundle> {
         self.initrd_bundle.as_ref()
     }
 
-    #[cfg(feature = "tee")]
     pub fn set_initrd_bundle(&mut self, initrd_bundle: InitrdBundle) -> Result<KernelBundleError> {
         self.initrd_bundle = Some(initrd_bundle);
         Ok(())
@@ -465,7 +482,7 @@ impl VmResources {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "windows")))]
 mod tests {
     #[cfg(feature = "gpu")]
     use crate::resources::DisplayBackendConfig;
@@ -519,6 +536,7 @@ mod tests {
             enable_rng: true,
             enable_msb_metrics: true,
             disable_implicit_console: false,
+            #[cfg(not(target_os = "windows"))]
             serial_consoles: Vec::new(),
             virtio_consoles: Vec::new(),
             kernel_console: None,

@@ -6,7 +6,11 @@ use std::sync::Mutex;
 
 use arch::ArchMemoryInfo;
 use utils::metrics::MetricsWriter;
-use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{Address, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::{
+    ProcessStatus::K32QueryWorkingSetEx, Threading::GetCurrentProcess,
+};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -16,6 +20,19 @@ use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 struct GuestMemoryRange {
     start: u64,
     end: u64,
+}
+
+#[cfg(not(target_os = "windows"))]
+type ResidencyBuffer = Vec<u8>;
+#[cfg(target_os = "windows")]
+type ResidencyBuffer = Vec<WorkingSetQueryEntry>;
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct WorkingSetQueryEntry {
+    virtual_address: usize,
+    flags: usize,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -30,7 +47,7 @@ pub(crate) fn install_host_resident_memory_sampler(
     let guest_memory = guest_memory.clone();
     let ranges = guest_memory_ranges(arch_memory_info);
     let page_size = page_size();
-    let residency = Mutex::new(Vec::new());
+    let residency = Mutex::new(ResidencyBuffer::new());
 
     metrics.set_memory_host_resident_sampler(move || {
         match host_resident_memory_bytes(&guest_memory, &ranges, page_size, &residency) {
@@ -47,7 +64,7 @@ fn host_resident_memory_bytes(
     guest_memory: &GuestMemoryMmap,
     ranges: &[GuestMemoryRange],
     page_size: usize,
-    residency: &Mutex<Vec<u8>>,
+    residency: &Mutex<ResidencyBuffer>,
 ) -> io::Result<u64> {
     let mut total = 0u64;
     let mut residency = residency.lock().unwrap();
@@ -131,7 +148,7 @@ fn region_resident_bytes(
     host_addr: *mut u8,
     len: usize,
     page_size: usize,
-    residency: &mut Vec<u8>,
+    residency: &mut ResidencyBuffer,
 ) -> io::Result<u64> {
     if len == 0 {
         return Ok(0);
@@ -144,30 +161,73 @@ fn region_resident_bytes(
         .checked_add(page_offset)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "mincore range overflow"))?;
     let page_count = inspected_len.div_ceil(page_size);
-    residency.resize(page_count, 0);
 
-    mincore(aligned_start as *mut u8, inspected_len, residency)?;
+    #[cfg(not(target_os = "windows"))]
+    {
+        residency.resize(page_count, 0);
+        mincore(aligned_start as *mut u8, inspected_len, residency)?;
 
-    Ok(resident_bytes_from_mincore(
-        residency,
-        page_offset,
-        len,
-        page_size,
-    ))
+        Ok(resident_bytes_from_mincore(
+            residency,
+            page_offset,
+            len,
+            page_size,
+        ))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        residency.resize_with(page_count, Default::default);
+        query_working_set(aligned_start, page_size, residency)?;
+
+        Ok(resident_bytes_from_working_set(
+            residency,
+            page_offset,
+            len,
+            page_size,
+        ))
+    }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn resident_bytes_from_mincore(
     residency: &[u8],
     page_offset: usize,
     len: usize,
     page_size: usize,
 ) -> u64 {
+    resident_bytes_from_pages(residency.len(), page_offset, len, page_size, |idx| {
+        residency[idx] & 1 != 0
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn resident_bytes_from_working_set(
+    residency: &[WorkingSetQueryEntry],
+    page_offset: usize,
+    len: usize,
+    page_size: usize,
+) -> u64 {
+    const WORKING_SET_VALID: usize = 1;
+
+    resident_bytes_from_pages(residency.len(), page_offset, len, page_size, |idx| {
+        residency[idx].flags & WORKING_SET_VALID != 0
+    })
+}
+
+fn resident_bytes_from_pages(
+    page_count: usize,
+    page_offset: usize,
+    len: usize,
+    page_size: usize,
+    is_resident: impl Fn(usize) -> bool,
+) -> u64 {
     let region_start = page_offset;
     let region_end = page_offset + len;
     let mut bytes = 0usize;
 
-    for (idx, entry) in residency.iter().enumerate() {
-        if entry & 1 == 0 {
+    for idx in 0..page_count {
+        if !is_resident(idx) {
             continue;
         }
 
@@ -213,12 +273,39 @@ fn mincore(addr: *mut u8, len: usize, residency: &mut [u8]) -> io::Result<()> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn query_working_set(
+    aligned_start: usize,
+    page_size: usize,
+    residency: &mut [WorkingSetQueryEntry],
+) -> io::Result<()> {
+    for (idx, entry) in residency.iter_mut().enumerate() {
+        entry.virtual_address = aligned_start + idx * page_size;
+        entry.flags = 0;
+    }
+
+    let byte_len = residency
+        .len()
+        .checked_mul(std::mem::size_of::<WorkingSetQueryEntry>())
+        .and_then(|len| u32::try_from(len).ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "working-set query range is too large",
+            )
+        })?;
+    let ok = unsafe {
+        K32QueryWorkingSetEx(GetCurrentProcess(), residency.as_mut_ptr().cast(), byte_len)
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
 fn page_size() -> usize {
-    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    usize::try_from(value)
-        .ok()
-        .filter(|value| *value > 0)
-        .unwrap_or(4096)
+    utils::page_size()
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -254,9 +341,12 @@ mod tests {
     #[test]
     fn resident_bytes_accounts_for_partial_pages() {
         assert_eq!(
-            resident_bytes_from_mincore(&[1, 0, 1], 1024, 6144, 4096),
+            resident_bytes_from_pages(3, 1024, 6144, 4096, |idx| [true, false, true][idx]),
             3072
         );
-        assert_eq!(resident_bytes_from_mincore(&[1, 1], 1024, 2048, 4096), 2048);
+        assert_eq!(
+            resident_bytes_from_pages(2, 1024, 2048, 4096, |_| true),
+            2048
+        );
     }
 }

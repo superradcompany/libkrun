@@ -15,8 +15,7 @@ efi = []
 
 [dependencies]
 libc = ">=0.2.39"
-vm-memory = { version = "~0.16", features = ["backend-mmap"] }
-vmm-sys-util = ">= 0.14"
+vm-memory = { version = "~0.18", default-features = false, features = ["backend-mmap"] }
 
 arch_gen = { package = "msb_krun_arch_gen", version = "0.1.17", path = "../arch_gen" }
 smbios = { package = "msb_krun_smbios", version = "0.1.17", path = "../smbios" }

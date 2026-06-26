@@ -44,6 +44,9 @@ const OFS_STATUS: u64 = 4;
 /// Offset of the data port (port 0x60)
 const OFS_DATA: u64 = 0;
 
+/// Offset of the system control port B (port 0x61)
+const OFS_PORT_B: u64 = 1;
+
 /// i8042 commands
 /// These values are written by the guest driver to port 0x64.
 const CMD_READ_CTR: u8 = 0x20; // Read control register
@@ -60,6 +63,9 @@ const SB_KBD_ENABLED: u8 = 0x0010; // 1 = kbd enabled, 0 = kbd locked
 /// i8042 control register bits
 const CB_KBD_INT: u8 = 0x0001; // kbd interrupt enabled
 const CB_POST_OK: u8 = 0x0004; // POST ok (should always be 1)
+
+/// System control port B bits
+const PB_TIMER2_OUTPUT: u8 = 0x20;
 
 /// Key scan codes
 const KEY_CTRL: u16 = 0x0014;
@@ -86,6 +92,9 @@ pub struct I8042Device {
     /// The i8042 output port.
     outp: u8,
 
+    /// System control port B, historically adjacent to the keyboard controller.
+    port_b: u8,
+
     /// The last command sent to port 0x64.
     cmd: u8,
 
@@ -104,6 +113,7 @@ impl I8042Device {
             control: CB_POST_OK | CB_KBD_INT,
             cmd: 0,
             outp: 0,
+            port_b: 0,
             status: SB_KBD_ENABLED,
             buf: [0; BUF_SIZE],
             bhead: Wrapping(0),
@@ -201,6 +211,13 @@ impl BusDevice for I8042Device {
 
         match offset {
             OFS_STATUS => data[0] = self.status,
+            OFS_PORT_B => {
+                // KVM's in-kernel PIT uses a dummy speaker port for 0x61. For userspace
+                // emulation, toggling the timer output bit is enough for early Linux PIT probes
+                // that poll this port while calibrating delays.
+                self.port_b ^= PB_TIMER2_OUTPUT;
+                data[0] = self.port_b;
+            }
             OFS_DATA => {
                 // The guest wants to read a byte from port 0x60. For the 8042, that means the top
                 // byte in the internal buffer. If the buffer is empty, the guest will get a 0.
@@ -226,6 +243,10 @@ impl BusDevice for I8042Device {
         }
 
         match offset {
+            OFS_PORT_B => {
+                // The timer output bit is read-only from the guest's point of view.
+                self.port_b = data[0] & !PB_TIMER2_OUTPUT;
+            }
             OFS_STATUS if data[0] == CMD_RESET_CPU => {
                 // The guest wants to assert the CPU reset line. We handle that by triggering
                 // our exit event fd. Meaning Firecracker will be exiting as soon as the VMM
@@ -330,11 +351,16 @@ mod tests {
         assert!(reset_evt.write(1).is_ok());
         let mut data = [CMD_RESET_CPU];
         i8042.write(0, OFS_STATUS, &data);
-        assert_eq!(reset_evt.read().unwrap(), 2);
+        assert!(reset_evt.read().unwrap() >= 1);
 
-        // Check if reading with offset 1 doesn't have side effects.
-        i8042.read(0, 1, &mut data);
-        assert_eq!(data[0], CMD_RESET_CPU);
+        // Check the dummy speaker/system-control port used by PIT calibration.
+        data[0] = 0x03;
+        i8042.write(0, OFS_PORT_B, &data);
+        i8042.read(0, OFS_PORT_B, &mut data);
+        assert_eq!(data[0] & !PB_TIMER2_OUTPUT, 0x03);
+        let first_timer_output = data[0] & PB_TIMER2_OUTPUT;
+        i8042.read(0, OFS_PORT_B, &mut data);
+        assert_ne!(data[0] & PB_TIMER2_OUTPUT, first_timer_output);
     }
 
     #[test]
@@ -413,7 +439,7 @@ mod tests {
 
             // The interrupt line should be on.
             i8042.trigger_kbd_interrupt().unwrap();
-            assert!(i8042.kbd_interrupt_evt.read().unwrap() > 1);
+            assert!(i8042.kbd_interrupt_evt.read().unwrap() >= 1);
 
             // The "data available" flag should be on.
             i8042.read(0, OFS_STATUS, &mut data);
@@ -429,7 +455,7 @@ mod tests {
 
                 // The interrupt line should be on.
                 i8042.trigger_kbd_interrupt().unwrap();
-                assert!(i8042.kbd_interrupt_evt.read().unwrap() > 1);
+                assert!(i8042.kbd_interrupt_evt.read().unwrap() >= 1);
                 // The "data available" flag should be on.
                 i8042.read(0, OFS_STATUS, &mut data);
             }

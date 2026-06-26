@@ -17,6 +17,7 @@ extern crate log;
 pub mod builder;
 pub(crate) mod device_manager;
 /// Cross-platform exit signal handlers (SIGTERM, SIGUSR1).
+#[cfg(unix)]
 pub mod exit_signal;
 /// Resource store for configured microVM resources.
 pub mod resources;
@@ -33,31 +34,42 @@ use crate::linux::vstate;
 #[cfg(target_os = "macos")]
 mod macos;
 mod metrics;
+#[cfg(unix)]
 mod terminal;
+#[cfg(target_os = "windows")]
+mod windows;
 pub mod worker;
 
 #[cfg(target_os = "macos")]
 use macos::vstate;
+#[cfg(target_os = "windows")]
+use windows::vstate;
 
 use std::fmt::{Display, Formatter};
 use std::io;
-use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::time::Duration;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::vstate::VcpuEvent;
 use crate::vstate::{Vcpu, VcpuHandle, VcpuResponse, Vm};
 
 use arch::{ArchMemoryInfo, InitrdConfig};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crossbeam_channel::Sender;
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "riscv64"),
+    any(target_arch = "aarch64", not(target_os = "windows"))
+))]
 use devices::fdt;
 use devices::legacy::IrqChip;
 use devices::virtio::VmmExitObserver;
@@ -94,7 +106,7 @@ pub enum Error {
     ConfigureSystem(arch::Error),
     /// Legacy devices work with Event file descriptors and the creation can fail because
     /// of resource exhaustion.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
     CreateLegacyDevice(device_manager::legacy::Error),
     /// Cannot read from an Event file descriptor.
     EventFd(io::Error),
@@ -107,16 +119,22 @@ pub enum Error {
     /// Cannot open /dev/kvm. Either the host does not have KVM or Firecracker does not have
     /// permission to open the file descriptor.
     KvmContext(vstate::Error),
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
     /// Cannot add devices to the Legacy I/O Bus.
     LegacyIOBus(device_manager::legacy::Error),
+    /// Cannot add devices to the legacy port I/O bus.
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    LegacyPioBus(devices::BusError),
     /// Cannot load command line.
     LoadCommandline(kernel::cmdline::Error),
     /// Cannot add a device to the MMIO Bus.
     RegisterMMIODevice(device_manager::mmio::Error),
     /// Write to the serial console failed.
     Serial(io::Error),
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "riscv64"),
+        any(target_arch = "aarch64", not(target_os = "windows"))
+    ))]
     /// Cannot generate or write FDT
     SetupFDT(devices::fdt::Error),
     /// Cannot create Timer file descriptor.
@@ -145,19 +163,24 @@ impl Display for Error {
 
         match self {
             ConfigureSystem(e) => write!(f, "System configuration error: {e:?}"),
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
             CreateLegacyDevice(e) => write!(f, "Error creating legacy device: {e:?}"),
             EventFd(e) => write!(f, "Event fd error: {e}"),
             EventManager(e) => write!(f, "Event manager error: {e:?}"),
             I8042Error(e) => write!(f, "I8042 error: {e}"),
             KernelFile(e) => write!(f, "Cannot access kernel file: {e}"),
             KvmContext(e) => write!(f, "Failed to validate KVM support: {e:?}"),
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
             LegacyIOBus(e) => write!(f, "Cannot add devices to the legacy I/O Bus. {e}"),
+            #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+            LegacyPioBus(e) => write!(f, "Cannot add devices to the legacy port I/O bus. {e}"),
             LoadCommandline(e) => write!(f, "Cannot load command line: {e}"),
             RegisterMMIODevice(e) => write!(f, "Cannot add a device to the MMIO Bus. {e}"),
             Serial(e) => write!(f, "Error writing to the serial console: {e:?}"),
-            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+            #[cfg(all(
+                any(target_arch = "aarch64", target_arch = "riscv64"),
+                any(target_arch = "aarch64", not(target_os = "windows"))
+            ))]
             SetupFDT(e) => write!(f, "Error generating or writing FDT: {e:?}"),
             TimerFd(e) => write!(f, "Error creating timer fd: {e}"),
             Vcpu(e) => write!(f, "Vcpu error: {e}"),
@@ -208,7 +231,7 @@ pub struct Vmm {
 
     // Guest VM devices.
     mmio_device_manager: MMIODeviceManager,
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
     pio_device_manager: PortIODeviceManager,
 }
 
@@ -268,6 +291,25 @@ impl Vmm {
         Ok(())
     }
 
+    #[cfg(target_os = "windows")]
+    pub fn resume_vcpus(&mut self) -> Result<()> {
+        for handle in self.vcpus_handles.iter() {
+            handle
+                .send_event(VcpuEvent::Resume)
+                .map_err(Error::VcpuEvent)?;
+        }
+        for handle in self.vcpus_handles.iter() {
+            match handle
+                .response_receiver()
+                .recv_timeout(Duration::from_millis(1000))
+            {
+                Ok(VcpuResponse::Resumed) => (),
+                _ => return Err(Error::VcpuResume),
+            }
+        }
+        Ok(())
+    }
+
     /// Configures the system for boot.
     pub fn configure_system(
         &self,
@@ -276,6 +318,9 @@ impl Vmm {
         initrd: &Option<InitrdConfig>,
         _smbios_oem_strings: &Option<Vec<String>>,
     ) -> Result<()> {
+        #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+        let _ = (vcpus, initrd);
+
         #[cfg(target_arch = "x86_64")]
         {
             let cmdline_len = if cfg!(feature = "tee") {
@@ -320,7 +365,7 @@ impl Vmm {
             .map_err(Error::ConfigureSystem)?;
         }
 
-        #[cfg(target_arch = "riscv64")]
+        #[cfg(all(target_arch = "riscv64", not(target_os = "windows")))]
         {
             fdt::create_fdt(
                 &self.guest_memory,
@@ -351,7 +396,7 @@ impl Vmm {
     }
 
     /// Injects CTRL+ALT+DEL keystroke combo in the i8042 device.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
     pub fn send_ctrl_alt_del(&mut self) -> Result<()> {
         self.pio_device_manager
             .i8042
@@ -386,9 +431,12 @@ impl Vmm {
 
         // Exit from Firecracker using the provided exit code. Safe because we're terminating
         // the process anyway.
+        #[cfg(unix)]
         unsafe {
             libc::_exit(exit_code);
         }
+        #[cfg(windows)]
+        std::process::exit(exit_code);
     }
 
     /// Returns a reference to the inner KVM Vm object.
@@ -396,7 +444,7 @@ impl Vmm {
         &self.vm
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn add_mapping(
         &self,
         reply_sender: Sender<bool>,
@@ -408,9 +456,42 @@ impl Vmm {
             .add_mapping(reply_sender, host_addr, guest_addr, len);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_os = "windows")]
+    pub fn add_mapping_with_writable(
+        &self,
+        reply_sender: Sender<bool>,
+        host_addr: u64,
+        guest_addr: u64,
+        len: u64,
+        writable: bool,
+    ) {
+        self.vm
+            .add_mapping_with_writable(reply_sender, host_addr, guest_addr, len, writable);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
         self.vm.remove_mapping(reply_sender, guest_addr, len);
+    }
+
+    #[cfg(unix)]
+    fn is_exit_event_source(&self, source: std::os::fd::RawFd) -> bool {
+        source == self.exit_evt.as_raw_fd()
+    }
+
+    #[cfg(windows)]
+    fn is_exit_event_source(&self, source: RawHandle) -> bool {
+        source == self.exit_evt.as_raw_handle()
+    }
+
+    #[cfg(unix)]
+    fn exit_event_token(&self) -> u64 {
+        self.exit_evt.as_raw_fd() as u64
+    }
+
+    #[cfg(windows)]
+    fn exit_event_token(&self) -> u64 {
+        self.exit_evt.as_raw_handle() as usize as u64
     }
 }
 
@@ -420,7 +501,7 @@ impl Subscriber for Vmm {
         let source = event.fd();
         let event_set = event.event_set();
 
-        if source == self.exit_evt.as_raw_fd() && event_set == EventSet::IN {
+        if self.is_exit_event_source(source) && event_set == EventSet::IN {
             let _ = self.exit_evt.read();
             // Query each vcpu for the exit_code.
             // If the exit_code can't be found on any vcpu, it means that the exit signal
@@ -452,9 +533,6 @@ impl Subscriber for Vmm {
     }
 
     fn interest_list(&self) -> Vec<EpollEvent> {
-        vec![EpollEvent::new(
-            EventSet::IN,
-            self.exit_evt.as_raw_fd() as u64,
-        )]
+        vec![EpollEvent::new(EventSet::IN, self.exit_event_token())]
     }
 }

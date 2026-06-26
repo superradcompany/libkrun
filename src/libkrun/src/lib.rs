@@ -17,7 +17,7 @@ use krun_display::DisplayBackend;
 use libc::{c_char, c_int, size_t};
 use once_cell::sync::Lazy;
 use polly::event_manager::EventManager;
-#[cfg(all(feature = "blk", not(feature = "tee")))]
+#[cfg(all(feature = "blk", not(feature = "tee"), not(target_os = "windows")))]
 use rand::distr::{Alphanumeric, SampleString};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -26,20 +26,28 @@ use std::env;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::ffi::{c_void, CStr};
+#[cfg(unix)]
 use std::fs::File;
+#[cfg(unix)]
 use std::io::IsTerminal;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
+#[cfg(target_os = "windows")]
+type RawFd = libc::c_int;
 use std::path::PathBuf;
 use std::slice;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use utils::eventfd::EventFd;
+use vmm::resources::VmResources;
+#[cfg(not(target_os = "windows"))]
 use vmm::resources::{
-    DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
-    VmResources, VsockConfig,
+    DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, VirtioConsoleConfigMode,
 };
+#[cfg(not(target_os = "windows"))]
+use vmm::resources::{TsiFlags, VsockConfig};
 #[cfg(feature = "blk")]
 use vmm::vmm_config::block::{BlockDeviceConfig, BlockRootConfig};
 #[cfg(not(feature = "tee"))]
@@ -55,6 +63,7 @@ use vmm::vmm_config::kernel_cmdline::{KernelCmdlineConfig, DEFAULT_KERNEL_CMDLIN
 use vmm::vmm_config::machine_config::VmConfig;
 #[cfg(feature = "net")]
 use vmm::vmm_config::net::NetworkInterfaceConfig;
+#[cfg(not(target_os = "windows"))]
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 
 #[cfg(feature = "aws-nitro")]
@@ -79,6 +88,8 @@ const KRUNFW_NAME: &str = "libkrunfw-sev.so.5";
 const KRUNFW_NAME: &str = "libkrunfw-tdx.so.5";
 #[cfg(target_os = "macos")]
 const KRUNFW_NAME: &str = "libkrunfw.5.dylib";
+#[cfg(target_os = "windows")]
+const KRUNFW_NAME: &str = "libkrunfw.dll";
 
 #[cfg(feature = "aws-nitro")]
 static KRUN_NITRO_DEBUG: Mutex<bool> = Mutex::new(false);
@@ -123,7 +134,7 @@ impl KrunfwBindings {
 }
 
 #[derive(Clone)]
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", unix))]
 enum LegacyNetworkConfig {
     VirtioNetPasst(RawFd),
     VirtioNetGvproxy(PathBuf),
@@ -138,12 +149,14 @@ struct ContextConfig {
     env: Option<String>,
     args: Option<String>,
     rlimits: Option<String>,
-    #[cfg(feature = "net")]
+    #[cfg(all(feature = "net", unix))]
     legacy_net_cfg: Option<LegacyNetworkConfig>,
     #[cfg(feature = "net")]
     legacy_mac: Option<[u8; 6]>,
     net_index: u8,
+    #[cfg(not(target_os = "windows"))]
     tsi_port_map: Option<HashMap<u16, u16>>,
+    #[cfg(not(target_os = "windows"))]
     vsock_config: VsockConfig,
     #[cfg(feature = "blk")]
     block_cfgs: Vec<BlockDeviceConfig>,
@@ -155,13 +168,16 @@ struct ContextConfig {
     block_root: Option<BlockRootConfig>,
     #[cfg(feature = "tee")]
     tee_config_file: Option<PathBuf>,
+    #[cfg(not(target_os = "windows"))]
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     shutdown_efd: Option<EventFd>,
     gpu_virgl_flags: Option<u32>,
     gpu_shm_size: Option<usize>,
     enable_snd: bool,
     console_output: Option<PathBuf>,
+    #[cfg(unix)]
     vmm_uid: Option<libc::uid_t>,
+    #[cfg(unix)]
     vmm_gid: Option<libc::gid_t>,
 }
 
@@ -188,7 +204,7 @@ impl ContextConfig {
         }
     }
 
-    #[cfg(all(feature = "blk", not(feature = "tee")))]
+    #[cfg(all(feature = "blk", not(feature = "tee"), not(target_os = "windows")))]
     fn set_block_root(&mut self, device: String, fstype: Option<String>, options: Option<String>) {
         self.block_root = Some(BlockRootConfig {
             device,
@@ -286,6 +302,7 @@ impl ContextConfig {
         self.legacy_mac = Some(mac);
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn set_port_map(&mut self, new_port_map: HashMap<u16, u16>) -> Result<(), ()> {
         if self.net_index != 0 {
             return Err(());
@@ -305,6 +322,7 @@ impl ContextConfig {
         self.tee_config_file.clone()
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn add_vsock_port(&mut self, port: u32, filepath: PathBuf, listen: bool) {
         if let Some(ref mut map) = &mut self.unix_ipc_port_map {
             map.insert(port, (filepath, listen));
@@ -323,10 +341,12 @@ impl ContextConfig {
         self.gpu_shm_size = Some(shm_size);
     }
 
+    #[cfg(unix)]
     fn set_vmm_uid(&mut self, vmm_uid: libc::uid_t) {
         self.vmm_uid = Some(vmm_uid);
     }
 
+    #[cfg(unix)]
     fn set_vmm_gid(&mut self, vmm_gid: libc::gid_t) {
         self.vmm_gid = Some(vmm_gid);
     }
@@ -469,6 +489,7 @@ mod log_defs {
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
+#[cfg(unix)]
 pub unsafe extern "C" fn krun_init_log(target: RawFd, level: u32, style: u32, options: u32) -> i32 {
     let target = match target {
         ..-1 => return -libc::EINVAL,
@@ -477,6 +498,50 @@ pub unsafe extern "C" fn krun_init_log(target: RawFd, level: u32, style: u32, op
         1 /* stdout */ => Target::Stdout,
         2 /* stderr */ => Target::Stderr,
         fd => Target::Pipe(Box::new(File::from_raw_fd(fd))),
+    };
+
+    let filter = log_level_to_filter_str(level);
+
+    let write_style = match style {
+        log_defs::KRUN_LOG_STYLE_AUTO => "auto",
+        log_defs::KRUN_LOG_STYLE_ALWAYS => "always",
+        log_defs::KRUN_LOG_STYLE_NEVER => "never",
+        _ => return -libc::EINVAL,
+    };
+
+    let use_env = match options {
+        0 => true,
+        log_defs::KRUN_LOG_OPTION_NO_ENV => false,
+        _ => return -libc::EINVAL,
+    };
+
+    let mut builder = if use_env {
+        env_logger::Builder::from_env(
+            Env::new()
+                .default_filter_or(filter)
+                .default_write_style_or(write_style),
+        )
+    } else {
+        let mut builder = env_logger::Builder::new();
+        builder.parse_filters(filter).parse_write_style(write_style);
+        builder
+    };
+    builder.format_timestamp_micros().target(target).init();
+
+    KRUN_SUCCESS
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(target_os = "windows")]
+pub unsafe extern "C" fn krun_init_log(target: RawFd, level: u32, style: u32, options: u32) -> i32 {
+    let target = match target {
+        ..-1 => return -libc::EINVAL,
+        -1 => Target::default(),
+        0 => return -libc::EINVAL,
+        1 => Target::Stdout,
+        2 => Target::Stderr,
+        _ => return -libc::ENOTSUP,
     };
 
     let filter = log_level_to_filter_str(level);
@@ -575,7 +640,7 @@ pub extern "C" fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(not(feature = "tee"))]
+#[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
 pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) -> i32 {
     let root_path = match CStr::from_ptr(c_root_path).to_str() {
         Ok(root) => root,
@@ -604,35 +669,20 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
+#[cfg(all(not(feature = "tee"), target_os = "windows"))]
+pub unsafe extern "C" fn krun_set_root(_ctx_id: u32, _c_root_path: *const c_char) -> i32 {
+    -libc::ENOTSUP
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
 #[cfg(not(feature = "tee"))]
 pub unsafe extern "C" fn krun_add_virtiofs(
     ctx_id: u32,
     c_tag: *const c_char,
     c_path: *const c_char,
 ) -> i32 {
-    let tag = match CStr::from_ptr(c_tag).to_str() {
-        Ok(tag) => tag,
-        Err(_) => return -libc::EINVAL,
-    };
-    let path = match CStr::from_ptr(c_path).to_str() {
-        Ok(path) => path,
-        Err(_) => return -libc::EINVAL,
-    };
-
-    match CTX_MAP.lock().unwrap().entry(ctx_id) {
-        Entry::Occupied(mut ctx_cfg) => {
-            let cfg = ctx_cfg.get_mut();
-            cfg.vmr.add_fs_device(FsDeviceConfig {
-                fs_id: tag.to_string(),
-                shared_dir: path.to_string(),
-                shm_size: None,
-                allow_root_dir_delete: false,
-            });
-        }
-        Entry::Vacant(_) => return -libc::ENOENT,
-    }
-
-    KRUN_SUCCESS
+    add_virtiofs_device(ctx_id, c_tag, c_path, None)
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -644,6 +694,25 @@ pub unsafe extern "C" fn krun_add_virtiofs2(
     c_path: *const c_char,
     shm_size: u64,
 ) -> i32 {
+    let shm_size = match shm_size.try_into() {
+        Ok(shm_size) => shm_size,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    add_virtiofs_device(ctx_id, c_tag, c_path, Some(shm_size))
+}
+
+#[cfg(not(feature = "tee"))]
+unsafe fn add_virtiofs_device(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_path: *const c_char,
+    shm_size: Option<usize>,
+) -> i32 {
+    if c_tag.is_null() || c_path.is_null() {
+        return -libc::EINVAL;
+    }
+
     let tag = match CStr::from_ptr(c_tag).to_str() {
         Ok(tag) => tag,
         Err(_) => return -libc::EINVAL,
@@ -659,7 +728,7 @@ pub unsafe extern "C" fn krun_add_virtiofs2(
             cfg.vmr.add_fs_device(FsDeviceConfig {
                 fs_id: tag.to_string(),
                 shared_dir: path.to_string(),
-                shm_size: Some(shm_size.try_into().unwrap()),
+                shm_size,
                 allow_root_dir_delete: false,
             });
         }
@@ -745,6 +814,9 @@ pub unsafe extern "C" fn krun_add_disk2(
         Ok(format) => format,
         Err(_) => return -libc::EINVAL,
     };
+    if format == ImageType::Vmdk && !read_only {
+        return -libc::ENOTSUP;
+    }
 
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
@@ -795,6 +867,9 @@ pub unsafe extern "C" fn krun_add_disk3(
         Ok(fmt) => fmt,
         Err(_) => return -libc::EINVAL,
     };
+    if format == ImageType::Vmdk && !read_only {
+        return -libc::ENOTSUP;
+    }
 
     let sync_mode = match SyncMode::try_from(sync_mode) {
         Ok(mode) => mode,
@@ -889,7 +964,7 @@ pub unsafe extern "C" fn krun_set_data_disk(ctx_id: u32, c_disk_path: *const c_c
  * Send the VFKIT magic after establishing the connection,
  * as required by gvproxy in vfkit mode.
  */
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", unix))]
 const NET_FLAG_VFKIT: u32 = 1 << 0;
 
 /* Taken from uapi/linux/virtio_net.h */
@@ -915,7 +990,7 @@ const NET_FEATURE_HOST_UFO: u32 = 1 << 14;
  * the legacy API ("krun_set_passt_fd" and "krun_set_gvproxy_path")
  * for compatiblity reasons.
  */
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", unix))]
 const NET_COMPAT_FEATURES: u32 = NET_FEATURE_CSUM
     | NET_FEATURE_GUEST_CSUM
     | NET_FEATURE_GUEST_TSO4
@@ -934,7 +1009,7 @@ const NET_ALL_FEATURES: u32 = NET_FEATURE_CSUM
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", unix))]
 pub unsafe extern "C" fn krun_add_net_unixstream(
     ctx_id: u32,
     c_path: *const c_char,
@@ -990,7 +1065,7 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", unix))]
 pub unsafe extern "C" fn krun_add_net_unixgram(
     ctx_id: u32,
     c_path: *const c_char,
@@ -1047,6 +1122,52 @@ pub unsafe extern "C" fn krun_add_net_unixgram(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
+#[cfg(all(feature = "net", target_os = "windows"))]
+pub unsafe extern "C" fn krun_add_net_named_pipe(
+    ctx_id: u32,
+    c_name: *const c_char,
+    c_mac: *const u8,
+    features: u32,
+    flags: u32,
+) -> i32 {
+    if c_name.is_null() || c_mac.is_null() {
+        return -libc::EINVAL;
+    }
+
+    let name = match CStr::from_ptr(c_name).to_str() {
+        Ok(name) => name.to_string(),
+        Err(e) => {
+            debug!("Error parsing named pipe name: {e:?}");
+            return -libc::EINVAL;
+        }
+    };
+
+    let mac: [u8; 6] = match slice::from_raw_parts(c_mac, 6).try_into() {
+        Ok(m) => m,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    if (features & !NET_ALL_FEATURES) != 0 {
+        return -libc::EINVAL;
+    }
+
+    if flags != 0 {
+        return -libc::EINVAL;
+    }
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            create_virtio_net(cfg, VirtioNetBackend::NamedPipe(name), mac, features);
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
 #[cfg(all(target_os = "linux", feature = "net"))]
 pub unsafe extern "C" fn krun_add_net_tap(
     ctx_id: u32,
@@ -1096,7 +1217,7 @@ pub unsafe extern "C" fn krun_add_net_tap(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(all(not(target_os = "linux"), feature = "net"))]
+#[cfg(all(not(any(target_os = "linux", target_os = "windows")), feature = "net"))]
 pub unsafe extern "C" fn krun_add_net_tap(
     _ctx_id: u32,
     _c_tap_name: *const c_char,
@@ -1109,52 +1230,70 @@ pub unsafe extern "C" fn krun_add_net_tap(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", unix))]
 pub unsafe extern "C" fn krun_set_passt_fd(ctx_id: u32, fd: c_int) -> i32 {
-    if fd < 0 {
-        return -libc::EINVAL;
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (ctx_id, fd);
+        return -libc::ENOTSUP;
     }
 
-    match CTX_MAP.lock().unwrap().entry(ctx_id) {
-        Entry::Occupied(mut ctx_cfg) => {
-            let cfg = ctx_cfg.get_mut();
-            // The legacy interface only supports a single network interface.
-            if cfg.net_index != 0 {
-                return -libc::EINVAL;
-            }
-            cfg.legacy_net_cfg = Some(LegacyNetworkConfig::VirtioNetPasst(fd));
+    #[cfg(unix)]
+    {
+        if fd < 0 {
+            return -libc::EINVAL;
         }
-        Entry::Vacant(_) => return -libc::ENOENT,
+
+        match CTX_MAP.lock().unwrap().entry(ctx_id) {
+            Entry::Occupied(mut ctx_cfg) => {
+                let cfg = ctx_cfg.get_mut();
+                // The legacy interface only supports a single network interface.
+                if cfg.net_index != 0 {
+                    return -libc::EINVAL;
+                }
+                cfg.legacy_net_cfg = Some(LegacyNetworkConfig::VirtioNetPasst(fd));
+            }
+            Entry::Vacant(_) => return -libc::ENOENT,
+        }
+        KRUN_SUCCESS
     }
-    KRUN_SUCCESS
 }
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", unix))]
 pub unsafe extern "C" fn krun_set_gvproxy_path(ctx_id: u32, c_path: *const c_char) -> i32 {
-    let path_str = match CStr::from_ptr(c_path).to_str() {
-        Ok(path) => path,
-        Err(e) => {
-            debug!("Error parsing gvproxy_path: {e:?}");
-            return -libc::EINVAL;
-        }
-    };
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (ctx_id, c_path);
+        return -libc::ENOTSUP;
+    }
 
-    let path = PathBuf::from(path_str);
-
-    match CTX_MAP.lock().unwrap().entry(ctx_id) {
-        Entry::Occupied(mut ctx_cfg) => {
-            let cfg = ctx_cfg.get_mut();
-            // The legacy interface only supports a single network interface.
-            if cfg.net_index != 0 {
+    #[cfg(unix)]
+    {
+        let path_str = match CStr::from_ptr(c_path).to_str() {
+            Ok(path) => path,
+            Err(e) => {
+                debug!("Error parsing gvproxy_path: {e:?}");
                 return -libc::EINVAL;
             }
-            cfg.legacy_net_cfg = Some(LegacyNetworkConfig::VirtioNetGvproxy(path));
+        };
+
+        let path = PathBuf::from(path_str);
+
+        match CTX_MAP.lock().unwrap().entry(ctx_id) {
+            Entry::Occupied(mut ctx_cfg) => {
+                let cfg = ctx_cfg.get_mut();
+                // The legacy interface only supports a single network interface.
+                if cfg.net_index != 0 {
+                    return -libc::EINVAL;
+                }
+                cfg.legacy_net_cfg = Some(LegacyNetworkConfig::VirtioNetGvproxy(path));
+            }
+            Entry::Vacant(_) => return -libc::ENOENT,
         }
-        Entry::Vacant(_) => return -libc::ENOENT,
+        KRUN_SUCCESS
     }
-    KRUN_SUCCESS
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -1178,6 +1317,7 @@ pub unsafe extern "C" fn krun_set_net_mac(ctx_id: u32, c_mac: *const u8) -> i32 
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
+#[cfg(not(target_os = "windows"))]
 pub unsafe extern "C" fn krun_set_port_map(ctx_id: u32, c_port_map: *const *const c_char) -> i32 {
     let mut port_map = HashMap::new();
     let port_map_array: &[*const c_char] = slice::from_raw_parts(c_port_map, MAX_ARGS);
@@ -1407,6 +1547,7 @@ pub unsafe extern "C" fn krun_set_tee_config_file(ctx_id: u32, c_filepath: *cons
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
+#[cfg(not(target_os = "windows"))]
 pub unsafe extern "C" fn krun_add_vsock_port(
     ctx_id: u32,
     port: u32,
@@ -1417,6 +1558,7 @@ pub unsafe extern "C" fn krun_add_vsock_port(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
+#[cfg(not(target_os = "windows"))]
 pub unsafe extern "C" fn krun_add_vsock_port2(
     ctx_id: u32,
     port: u32,
@@ -1779,6 +1921,7 @@ pub unsafe extern "C" fn krun_set_snd_device(ctx_id: u32, enable: bool) -> i32 {
 
 #[allow(unused_assignments)]
 #[no_mangle]
+#[cfg(not(target_os = "windows"))]
 pub extern "C" fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
@@ -1981,7 +2124,11 @@ fn create_virtio_net(
         .expect("Failed to create network interface");
 }
 
-#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(feature = "tee"),
+    not(target_os = "windows")
+))]
 fn map_kernel(ctx_id: u32, kernel_path: &PathBuf) -> i32 {
     let file = match File::options().read(true).write(false).open(kernel_path) {
         Ok(file) => file,
@@ -2057,8 +2204,14 @@ pub unsafe extern "C" fn krun_set_kernel(
     let format = match kernel_format {
         // For raw kernels in x86_64, we map the kernel into the
         // process and treat it as a bundled kernel.
-        #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+        #[cfg(all(
+            target_arch = "x86_64",
+            not(feature = "tee"),
+            not(target_os = "windows")
+        ))]
         0 => return map_kernel(ctx_id, &path),
+        #[cfg(all(target_arch = "x86_64", not(feature = "tee"), target_os = "windows"))]
+        0 => return -libc::ENOTSUP,
         #[cfg(target_arch = "aarch64")]
         0 => KernelFormat::Raw,
         1 => KernelFormat::Elf,
@@ -2189,6 +2342,7 @@ unsafe fn load_krunfw_payload(
 }
 
 #[no_mangle]
+#[cfg(unix)]
 pub extern "C" fn krun_setuid(ctx_id: u32, uid: libc::uid_t) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
@@ -2202,6 +2356,13 @@ pub extern "C" fn krun_setuid(ctx_id: u32, uid: libc::uid_t) -> i32 {
 }
 
 #[no_mangle]
+#[cfg(target_os = "windows")]
+pub extern "C" fn krun_setuid(_ctx_id: u32, _uid: u32) -> i32 {
+    -libc::ENOTSUP
+}
+
+#[no_mangle]
+#[cfg(unix)]
 pub extern "C" fn krun_setgid(ctx_id: u32, gid: libc::gid_t) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
@@ -2214,7 +2375,13 @@ pub extern "C" fn krun_setgid(ctx_id: u32, gid: libc::gid_t) -> i32 {
     KRUN_SUCCESS
 }
 
-#[cfg(all(feature = "blk", not(feature = "tee")))]
+#[no_mangle]
+#[cfg(target_os = "windows")]
+pub extern "C" fn krun_setgid(_ctx_id: u32, _gid: u32) -> i32 {
+    -libc::ENOTSUP
+}
+
+#[cfg(all(feature = "blk", not(feature = "tee"), not(target_os = "windows")))]
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 pub unsafe extern "C" fn krun_set_root_disk_remount(
@@ -2303,6 +2470,18 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
     KRUN_SUCCESS
 }
 
+#[cfg(all(feature = "blk", not(feature = "tee"), target_os = "windows"))]
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_set_root_disk_remount(
+    _ctx_id: u32,
+    _c_device: *const c_char,
+    _c_fstype: *const c_char,
+    _c_options: *const c_char,
+) -> i32 {
+    -libc::ENOTSUP
+}
+
 #[no_mangle]
 pub extern "C" fn krun_disable_implicit_console(ctx_id: u32) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
@@ -2343,6 +2522,7 @@ pub extern "C" fn krun_set_rng_device(ctx_id: u32, enable: bool) -> i32 {
 }
 
 #[no_mangle]
+#[cfg(not(target_os = "windows"))]
 pub extern "C" fn krun_disable_implicit_vsock(ctx_id: u32) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
@@ -2356,6 +2536,7 @@ pub extern "C" fn krun_disable_implicit_vsock(ctx_id: u32) -> i32 {
 }
 
 #[no_mangle]
+#[cfg(not(target_os = "windows"))]
 pub extern "C" fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32 {
     let tsi_flags = match TsiFlags::from_bits(tsi_features) {
         Some(flags) => flags,
@@ -2383,6 +2564,7 @@ pub extern "C" fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32 {
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
+#[cfg(not(target_os = "windows"))]
 pub unsafe extern "C" fn krun_add_virtio_console_default(
     ctx_id: u32,
     input_fd: libc::c_int,
@@ -2411,6 +2593,7 @@ pub unsafe extern "C" fn krun_add_virtio_console_default(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
+#[cfg(not(target_os = "windows"))]
 pub unsafe extern "C" fn krun_add_virtio_console_multiport(ctx_id: u32) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
@@ -2427,8 +2610,16 @@ pub unsafe extern "C" fn krun_add_virtio_console_multiport(ctx_id: u32) -> i32 {
     }
 }
 
+#[allow(unused_assignments)]
+#[no_mangle]
+#[cfg(target_os = "windows")]
+pub extern "C" fn krun_get_shutdown_eventfd(_ctx_id: u32) -> i32 {
+    -libc::ENOTSUP
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
+#[cfg(not(target_os = "windows"))]
 pub unsafe extern "C" fn krun_add_console_port_tty(
     ctx_id: u32,
     console_id: u32,
@@ -2473,6 +2664,7 @@ pub unsafe extern "C" fn krun_add_console_port_tty(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
+#[cfg(not(target_os = "windows"))]
 pub unsafe extern "C" fn krun_add_console_port_inout(
     ctx_id: u32,
     console_id: u32,
@@ -2511,6 +2703,7 @@ pub unsafe extern "C" fn krun_add_console_port_inout(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
+#[cfg(not(target_os = "windows"))]
 pub unsafe extern "C" fn krun_add_serial_console_default(
     ctx_id: u32,
     input_fd: c_int,
@@ -2634,7 +2827,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         return -libc::EINVAL;
     }
 
-    #[cfg(feature = "net")]
+    #[cfg(all(feature = "net", unix))]
     {
         if let Some(legacy_net_cfg) = ctx_cfg.legacy_net_cfg.clone() {
             let backend = match legacy_net_cfg {
@@ -2650,6 +2843,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
     match &ctx_cfg.vsock_config {
         VsockConfig::Disabled => (),
         VsockConfig::Explicit { tsi_flags } => {
@@ -2665,7 +2859,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         VsockConfig::Implicit => {
             // Implicit vsock configuration - use heuristics
             // Check if TSI should be enabled based on network configuration
-            #[cfg(feature = "net")]
+            #[cfg(all(feature = "net", unix))]
             let enable_tsi = ctx_cfg.vmr.net.list.is_empty() && ctx_cfg.legacy_net_cfg.is_none();
             #[cfg(not(feature = "net"))]
             let enable_tsi = true;
@@ -2705,6 +2899,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         ctx_cfg.vmr.set_console_output(console_output);
     }
 
+    #[cfg(unix)]
     if let Some(gid) = ctx_cfg.vmm_gid {
         if unsafe { libc::setgid(gid) } != 0 {
             error!("Failed to set gid {gid}");
@@ -2712,6 +2907,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     }
 
+    #[cfg(unix)]
     if let Some(uid) = ctx_cfg.vmm_uid {
         if unsafe { libc::setuid(uid) } != 0 {
             error!("Failed to set uid {uid}");
@@ -2755,6 +2951,11 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
     }
 
+    #[cfg(all(not(feature = "tee"), target_os = "windows"))]
+    if ctx_cfg.vmr.fs.iter().any(|fs| fs.shm_size.is_some()) {
+        vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
+    }
+
     #[cfg(any(feature = "amd-sev", feature = "tdx"))]
     vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
 
@@ -2788,5 +2989,79 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
 
             -libc::EINVAL
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn add_virtiofs_adds_path_backed_device() {
+        let ctx_id = krun_create_ctx() as u32;
+        let tag = std::ffi::CString::new("hostshare").unwrap();
+        let path = std::ffi::CString::new("C:\\host\\share").unwrap();
+
+        let ret = unsafe { krun_add_virtiofs(ctx_id, tag.as_ptr(), path.as_ptr()) };
+        assert_eq!(ret, KRUN_SUCCESS);
+
+        {
+            let ctx_map = CTX_MAP.lock().unwrap();
+            let ctx = ctx_map.get(&ctx_id).unwrap();
+            assert_eq!(ctx.vmr.fs.len(), 1);
+            assert_eq!(ctx.vmr.fs[0].fs_id, "hostshare");
+            assert_eq!(ctx.vmr.fs[0].shared_dir, "C:\\host\\share");
+            assert_eq!(ctx.vmr.fs[0].shm_size, None);
+            assert!(!ctx.vmr.fs[0].allow_root_dir_delete);
+        }
+
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn add_virtiofs_rejects_unknown_context() {
+        let tag = std::ffi::CString::new("hostshare").unwrap();
+        let path = std::ffi::CString::new("C:\\host\\share").unwrap();
+
+        let ret = unsafe { krun_add_virtiofs(u32::MAX, tag.as_ptr(), path.as_ptr()) };
+        assert_eq!(ret, -libc::ENOENT);
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn add_virtiofs_rejects_null_pointers() {
+        let ctx_id = krun_create_ctx() as u32;
+        let tag = std::ffi::CString::new("hostshare").unwrap();
+        let path = std::ffi::CString::new("C:\\host\\share").unwrap();
+
+        let null_tag = unsafe { krun_add_virtiofs(ctx_id, std::ptr::null(), path.as_ptr()) };
+        let null_path = unsafe { krun_add_virtiofs(ctx_id, tag.as_ptr(), std::ptr::null()) };
+
+        assert_eq!(null_tag, -libc::EINVAL);
+        assert_eq!(null_path, -libc::EINVAL);
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
+    }
+
+    #[cfg(all(not(feature = "tee"), target_os = "windows"))]
+    #[test]
+    fn add_virtiofs2_adds_shm_backed_path_device() {
+        let ctx_id = krun_create_ctx() as u32;
+        let tag = std::ffi::CString::new("hostshare").unwrap();
+        let path = std::ffi::CString::new("C:\\host\\share").unwrap();
+
+        let ret = unsafe { krun_add_virtiofs2(ctx_id, tag.as_ptr(), path.as_ptr(), 1 << 29) };
+
+        assert_eq!(ret, KRUN_SUCCESS);
+        {
+            let ctx_map = CTX_MAP.lock().unwrap();
+            let ctx = ctx_map.get(&ctx_id).unwrap();
+            assert_eq!(ctx.vmr.fs.len(), 1);
+            assert_eq!(ctx.vmr.fs[0].fs_id, "hostshare");
+            assert_eq!(ctx.vmr.fs[0].shared_dir, "C:\\host\\share");
+            assert_eq!(ctx.vmr.fs[0].shm_size, Some(1 << 29));
+        }
+        assert_eq!(krun_free_ctx(ctx_id), KRUN_SUCCESS);
     }
 }

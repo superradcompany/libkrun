@@ -9,11 +9,13 @@ use std::collections::VecDeque;
 use std::io;
 
 use polly::event_manager::{EventManager, Subscriber};
-use utils::epoll::{EpollEvent, EventSet};
+use utils::epoll::EpollEvent;
+#[cfg(unix)]
+use utils::epoll::EventSet;
 use utils::eventfd::EventFd;
 
 use crate::bus::BusDevice;
-use crate::legacy::ReadableFd;
+use crate::legacy::{IrqChip, ReadableFd};
 
 const LOOP_SIZE: usize = 0x40;
 
@@ -70,6 +72,8 @@ pub struct Serial {
     in_buffer: VecDeque<u8>,
     out: Option<Box<dyn io::Write + Send>>,
     input: Option<Box<dyn ReadableFd + Send>>,
+    intc: Option<IrqChip>,
+    irq_line: Option<u32>,
 }
 
 impl Serial {
@@ -91,6 +95,8 @@ impl Serial {
             in_buffer: VecDeque::new(),
             out,
             input,
+            intc: None,
+            irq_line: None,
         }
     }
 
@@ -116,6 +122,14 @@ impl Serial {
     /// Provides a reference to the interrupt event fd.
     pub fn interrupt_evt(&self) -> &EventFd {
         &self.interrupt_evt
+    }
+
+    pub fn set_intc(&mut self, intc: IrqChip) {
+        self.intc = Some(intc);
+    }
+
+    pub fn set_irq_line(&mut self, irq: u32) {
+        self.irq_line = Some(irq);
     }
 
     fn is_dlab_set(&self) -> bool {
@@ -164,6 +178,14 @@ impl Serial {
     }
 
     fn trigger_interrupt(&mut self) -> io::Result<()> {
+        if let Some(intc) = &self.intc {
+            intc.lock()
+                .unwrap()
+                .set_irq(self.irq_line, Some(&self.interrupt_evt))
+                .map_err(|error| io::Error::other(format!("{error:?}")))?;
+            return Ok(());
+        }
+
         self.interrupt_evt.write(1)
     }
 
@@ -230,6 +252,7 @@ impl Serial {
         }
     }
 
+    #[cfg(unix)]
     fn raw_input(&mut self, data: &[u8]) -> io::Result<()> {
         if !self.is_loop() {
             self.in_buffer.extend(data);
@@ -261,27 +284,35 @@ impl BusDevice for Serial {
 impl Subscriber for Serial {
     /// Handle a read event (EPOLLIN) on the serial input fd.
     fn process(&mut self, event: &EpollEvent, _: &mut EventManager) {
-        let source = event.fd();
-        let event_set = event.event_set();
-
-        // TODO: also check for errors. Pending high level discussions on how we want
-        // to handle errors in devices.
-        let supported_events = EventSet::IN;
-        if !supported_events.contains(event_set) {
-            warn!("Received unknown event: {event_set:?} from source: {source:?}");
-            return;
+        #[cfg(windows)]
+        {
+            let _ = event;
         }
 
-        if let Some(input) = self.input.as_mut() {
-            if input.as_raw_fd() == source {
-                let mut out = [0u8; 32];
-                match input.read(&mut out[..]) {
-                    Ok(count) => {
-                        self.raw_input(&out[..count])
-                            .unwrap_or_else(|e| warn!("Serial error on input: {e}"));
-                    }
-                    Err(e) => {
-                        warn!("error while reading stdin: {e:?}");
+        #[cfg(unix)]
+        {
+            let source = event.fd();
+            let event_set = event.event_set();
+
+            // TODO: also check for errors. Pending high level discussions on how we want
+            // to handle errors in devices.
+            let supported_events = EventSet::IN;
+            if !supported_events.contains(event_set) {
+                warn!("Received unknown event: {event_set:?} from source: {source:?}");
+                return;
+            }
+
+            if let Some(input) = self.input.as_mut() {
+                if input.as_raw_fd() == source {
+                    let mut out = [0u8; 32];
+                    match input.read(&mut out[..]) {
+                        Ok(count) => {
+                            self.raw_input(&out[..count])
+                                .unwrap_or_else(|e| warn!("Serial error on input: {e}"));
+                        }
+                        Err(e) => {
+                            warn!("error while reading stdin: {e:?}");
+                        }
                     }
                 }
             }
@@ -291,14 +322,23 @@ impl Subscriber for Serial {
     /// Initial registration of pollable objects.
     /// If serial input is present, register the serial input FD as readable.
     fn interest_list(&self) -> Vec<EpollEvent> {
-        match &self.input {
-            Some(input) => vec![EpollEvent::new(EventSet::IN, input.as_raw_fd() as u64)],
-            None => vec![],
+        #[cfg(windows)]
+        {
+            let _ = &self.input;
+            Vec::new()
+        }
+
+        #[cfg(unix)]
+        {
+            match &self.input {
+                Some(input) => vec![EpollEvent::new(EventSet::IN, input.as_raw_fd() as u64)],
+                None => vec![],
+            }
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io;

@@ -16,7 +16,7 @@ use libc::{fallocate, madvise, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, MADV_D
 use std::ffi::c_void;
 #[cfg(feature = "tee")]
 use vm_memory::{
-    guest_memory::GuestMemory, Address, GuestAddress, GuestMemoryRegion, MemoryRegionAddress,
+    Address, GuestAddress, GuestMemoryBackend, GuestMemoryRegion, MemoryRegionAddress,
 };
 
 pub fn start_worker_thread(
@@ -28,9 +28,7 @@ pub fn start_worker_thread(
         .spawn(move || loop {
             match receiver.recv() {
                 Err(e) => error!("error receiving message from vmm worker thread: {e:?}"),
-                #[cfg(target_os = "macos")]
-                Ok(message) => vmm.lock().unwrap().match_worker_message(message),
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                 Ok(message) => vmm.lock().unwrap().match_worker_message(message),
             }
         })?;
@@ -40,11 +38,15 @@ pub fn start_worker_thread(
 impl super::Vmm {
     fn match_worker_message(&self, msg: WorkerMessage) {
         match msg {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             WorkerMessage::GpuAddMapping(s, h, g, l) => self.add_mapping(s, h, g, l),
-            #[cfg(target_os = "macos")]
+            #[cfg(target_os = "windows")]
+            WorkerMessage::DaxAddMapping(s, h, g, l, w) => {
+                self.add_mapping_with_writable(s, h, g, l, w)
+            }
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             WorkerMessage::GpuRemoveMapping(s, g, l) => self.remove_mapping(s, g, l),
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             WorkerMessage::GsiRoute(sender, entries) => {
                 let mut routing = kvm_bindings::KvmIrqRouting::new(entries.len()).unwrap();
                 let routing_entries = routing.as_mut_slice();
@@ -53,7 +55,7 @@ impl super::Vmm {
                     .send(self.vm.fd().set_gsi_routing(&routing).is_ok())
                     .unwrap();
             }
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             WorkerMessage::IrqLine(sender, irq, active) => {
                 sender
                     .send(self.vm.fd().set_irq_line(irq, active).is_ok())

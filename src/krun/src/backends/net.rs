@@ -6,11 +6,16 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use std::os::fd::RawFd;
-//! use krun::backends::net::{NetBackend, ReadError, WriteError};
+//! use krun::backends::net::{
+//!     EventFd, EventSource, EventToken, NetBackend, ReadError, WriteError, EFD_NONBLOCK,
+//! };
+//! #[cfg(unix)]
+//! use std::os::fd::{AsRawFd, RawFd};
+//! #[cfg(windows)]
+//! use std::os::windows::io::AsRawHandle;
 //!
 //! struct MyNetBackend {
-//!     // ... your implementation
+//!     event: EventFd,
 //! }
 //!
 //! impl NetBackend for MyNetBackend {
@@ -32,9 +37,14 @@
 //!         Ok(())
 //!     }
 //!
+//!     #[cfg(unix)]
 //!     fn raw_socket_fd(&self) -> RawFd {
-//!         // Return the raw fd for epoll registration
-//!         todo!()
+//!         self.event.as_raw_fd()
+//!     }
+//!
+//!     #[cfg(windows)]
+//!     fn event_source(&self, token: EventToken) -> EventSource {
+//!         EventSource::waitable_handle(self.event.as_raw_handle(), token)
 //!     }
 //! }
 //! ```
@@ -47,7 +57,16 @@
 pub use devices::virtio::net::backend::{ConnectError, NetBackend, ReadError, WriteError};
 
 #[cfg(feature = "net")]
-pub use devices::virtio::net::unixgram::Unixgram;
+pub use utils::event::{EventSource, EventToken};
 
 #[cfg(feature = "net")]
+pub use utils::eventfd::{EventFd, EFD_NONBLOCK};
+
+#[cfg(all(feature = "net", unix))]
+pub use devices::virtio::net::unixgram::Unixgram;
+
+#[cfg(all(feature = "net", unix))]
 pub use devices::virtio::net::unixstream::Unixstream;
+
+#[cfg(all(feature = "net", windows))]
+pub use devices::virtio::net::namedpipe::NamedPipe;

@@ -13,11 +13,15 @@ use std::result;
 
 use crate::virtio::queue::DescriptorChain;
 use vm_memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap,
-    GuestMemoryRegion, Le16, Le32, Le64, VolatileMemory, VolatileMemoryError, VolatileSlice,
+    Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryError,
+    GuestMemoryMmap, GuestMemoryRegion, Le16, Le32, Le64, VolatileMemory, VolatileMemoryError,
+    VolatileSlice,
 };
 
-use super::file_traits::{FileReadWriteAtVolatile, FileReadWriteVolatile};
+#[cfg(any(not(target_os = "windows"), feature = "blk"))]
+use super::file_traits::FileReadWriteAtVolatile;
+#[cfg(not(target_os = "windows"))]
+use super::file_traits::FileReadWriteVolatile;
 
 #[derive(Debug)]
 pub enum Error {
@@ -242,6 +246,7 @@ impl<'a> Reader<'a> {
     /// Returns the number of bytes read from the descriptor chain buffer.
     /// The number of bytes read can be less than `count` if there isn't
     /// enough data in the descriptor chain buffer.
+    #[cfg(not(target_os = "windows"))]
     pub fn read_to<F: FileReadWriteVolatile>(
         &mut self,
         mut dst: F,
@@ -255,6 +260,7 @@ impl<'a> Reader<'a> {
     /// Returns the number of bytes read from the descriptor chain buffer.
     /// The number of bytes read can be less than `count` if there isn't
     /// enough data in the descriptor chain buffer.
+    #[cfg(any(not(target_os = "windows"), feature = "blk"))]
     pub fn read_to_at<F: FileReadWriteAtVolatile>(
         &mut self,
         dst: F,
@@ -265,6 +271,7 @@ impl<'a> Reader<'a> {
             .consume(count, |bufs| dst.write_vectored_at_volatile(bufs, off))
     }
 
+    #[cfg(not(target_os = "windows"))]
     pub fn read_exact_to<F: FileReadWriteVolatile>(
         &mut self,
         mut dst: F,
@@ -389,6 +396,7 @@ impl<'a> Writer<'a> {
     /// Returns the number of bytes written to the descriptor chain buffer.
     /// The number of bytes written can be less than `count` if
     /// there isn't enough data in the descriptor chain buffer.
+    #[cfg(not(target_os = "windows"))]
     pub fn write_from<F: FileReadWriteVolatile>(
         &mut self,
         mut src: F,
@@ -402,6 +410,7 @@ impl<'a> Writer<'a> {
     /// Returns the number of bytes written to the descriptor chain buffer.
     /// The number of bytes written can be less than `count` if
     /// there isn't enough data in the descriptor chain buffer.
+    #[cfg(any(not(target_os = "windows"), feature = "blk"))]
     pub fn write_from_at<F: FileReadWriteAtVolatile>(
         &mut self,
         src: F,
@@ -412,6 +421,7 @@ impl<'a> Writer<'a> {
             .consume(count, |bufs| src.read_vectored_at_volatile(bufs, off))
     }
 
+    #[cfg(not(target_os = "windows"))]
     pub fn write_all_from<F: FileReadWriteVolatile>(
         &mut self,
         mut src: F,

@@ -20,6 +20,7 @@ pub mod block;
 pub mod console;
 pub mod descriptor_utils;
 pub mod device;
+#[cfg(any(not(target_os = "windows"), feature = "blk"))]
 pub mod file_traits;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub mod fs;
@@ -27,16 +28,26 @@ pub mod fs;
 pub mod gpu;
 #[cfg(feature = "input")]
 pub mod input;
+#[cfg(not(target_os = "windows"))]
 pub mod linux_errno;
+#[cfg(target_os = "windows")]
+pub mod linux_errno {
+    pub const LINUX_ERANGE: i32 = 34;
+
+    pub fn linux_error(error: std::io::Error) -> std::io::Error {
+        std::io::Error::from_raw_os_error(error.raw_os_error().unwrap_or(5))
+    }
+}
 mod mmio;
 pub mod msb_metrics;
 #[cfg(feature = "net")]
 pub mod net;
 mod queue;
-#[cfg(not(feature = "tee"))]
+#[cfg(all(not(target_os = "windows"), not(feature = "tee")))]
 pub mod rng;
 #[cfg(feature = "snd")]
 pub mod snd;
+#[cfg(not(target_os = "windows"))]
 pub mod vsock;
 
 #[cfg(not(feature = "tee"))]
@@ -54,10 +65,11 @@ pub use self::msb_metrics::*;
 #[cfg(feature = "net")]
 pub use self::net::Net;
 pub use self::queue::{Descriptor, DescriptorChain, Queue};
-#[cfg(not(feature = "tee"))]
+#[cfg(all(not(target_os = "windows"), not(feature = "tee")))]
 pub use self::rng::*;
 #[cfg(feature = "snd")]
 pub use self::snd::Snd;
+#[cfg(not(target_os = "windows"))]
 pub use self::vsock::*;
 
 /// When the driver initializes the device, it lets the device know about the

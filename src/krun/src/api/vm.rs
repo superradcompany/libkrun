@@ -15,7 +15,9 @@ use crossbeam_channel::unbounded;
 use log::error;
 use polly::event_manager::EventManager;
 use utils::eventfd::EventFd;
+use vmm::resources::TsiFlags;
 use vmm::resources::VmResources;
+use vmm::vmm_config::kernel_bundle::InitrdBundle;
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 use vmm::vmm_config::kernel_cmdline::KernelCmdlineConfig;
 use vmm::vmm_config::vsock::VsockDeviceConfig;
@@ -46,6 +48,7 @@ pub struct Vm {
     workdir: Option<String>,
     rlimits: Option<String>,
     krunfw_path: Option<PathBuf>,
+    initramfs_path: Option<PathBuf>,
     init_path: Option<String>,
     exit_observers: Vec<Box<dyn Fn(i32) + Send + 'static>>,
     /// Pre-created exit event fd for triggering VM shutdown.
@@ -59,6 +62,8 @@ pub struct Vm {
     enable_inet_hijack: bool,
     /// Keeps the libkrunfw library loaded so kernel memory pointers remain valid.
     _krunfw_library: Option<libloading::Library>,
+    /// Keeps an explicit initramfs allocation alive until it is copied to guest memory.
+    _initramfs_data: Option<Vec<u8>>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -77,6 +82,7 @@ impl Vm {
         workdir: Option<String>,
         rlimits: Option<String>,
         krunfw_path: Option<PathBuf>,
+        initramfs_path: Option<PathBuf>,
         init_path: Option<String>,
         exit_observers: Vec<Box<dyn Fn(i32) + Send + 'static>>,
         exit_evt: EventFd,
@@ -92,12 +98,14 @@ impl Vm {
             workdir,
             rlimits,
             krunfw_path,
+            initramfs_path,
             init_path,
             exit_observers,
             exit_evt,
             exit_code,
             enable_inet_hijack,
             _krunfw_library: None,
+            _initramfs_data: None,
         }
     }
 
@@ -227,6 +235,12 @@ impl Vm {
                 .map_err(|e| Error::Runtime(RuntimeError::EventLoop(format!("{e:?}"))))?;
         }
 
+        #[cfg(all(not(feature = "tee"), target_os = "windows"))]
+        if self.vmr.fs.iter().any(|fs| fs.shm_size.is_some()) {
+            vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone())
+                .map_err(|e| Error::Runtime(RuntimeError::EventLoop(format!("{e:?}"))))?;
+        }
+
         #[cfg(any(feature = "amd-sev", feature = "tdx"))]
         vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone())
             .map_err(|e| Error::Runtime(RuntimeError::EventLoop(format!("{e:?}"))))?;
@@ -277,6 +291,19 @@ impl Vm {
             .set_kernel_bundle(kernel_bundle)
             .map_err(|e| Error::Build(BuildError::Krunfw(format!("{e:?}"))))?;
 
+        if let Some(initramfs_path) = &self.initramfs_path {
+            let initramfs_data = std::fs::read(initramfs_path)?;
+            let initrd_bundle = InitrdBundle {
+                host_addr: initramfs_data.as_ptr() as u64,
+                size: initramfs_data.len(),
+            };
+
+            self.vmr
+                .set_initrd_bundle(initrd_bundle)
+                .map_err(|e| Error::Build(BuildError::Krunfw(format!("{e:?}"))))?;
+            self._initramfs_data = Some(initramfs_data);
+        }
+
         // Keep the library alive so the kernel memory pointers remain valid.
         self._krunfw_library = Some(krunfw.library);
 
@@ -318,9 +345,7 @@ impl Vm {
     /// Extracted from [`configure_vsock`](Self::configure_vsock) so the
     /// flag-selection logic can be exercised by unit tests without
     /// touching `VmResources::set_vsock_device`.
-    fn compute_tsi_flags(&self) -> devices::virtio::TsiFlags {
-        use devices::virtio::TsiFlags;
-
+    fn compute_tsi_flags(&self) -> TsiFlags {
         let mut tsi_flags = TsiFlags::empty();
 
         // Enable TSI INET hijack as a fallback when no virtio-net is
@@ -337,7 +362,7 @@ impl Vm {
         }
 
         // Enable TSI for AF_UNIX if single root virtio-fs
-        #[cfg(not(feature = "tee"))]
+        #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
         {
             tsi_flags = self.maybe_enable_hijack_unix(tsi_flags);
         }
@@ -402,20 +427,17 @@ impl Vm {
         }
     }
 
-    #[cfg(not(feature = "tee"))]
-    fn maybe_enable_hijack_unix(
-        &self,
-        mut tsi_flags: devices::virtio::TsiFlags,
-    ) -> devices::virtio::TsiFlags {
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+    fn maybe_enable_hijack_unix(&self, mut tsi_flags: TsiFlags) -> TsiFlags {
         if cfg!(target_os = "macos") {
             return tsi_flags;
         }
 
-        if tsi_flags.contains(devices::virtio::TsiFlags::HIJACK_INET)
+        if tsi_flags.contains(TsiFlags::HIJACK_INET)
             && self.vmr.fs.len() == 1
             && self.vmr.fs[0].fs_id == "/dev/root"
         {
-            tsi_flags |= devices::virtio::TsiFlags::HIJACK_UNIX;
+            tsi_flags |= TsiFlags::HIJACK_UNIX;
         }
 
         tsi_flags
@@ -472,6 +494,8 @@ struct KrunfwBindings {
 const KRUNFW_NAME: &str = "libkrunfw.so.5";
 #[cfg(target_os = "macos")]
 const KRUNFW_NAME: &str = "libkrunfw.5.dylib";
+#[cfg(target_os = "windows")]
+const KRUNFW_NAME: &str = "libkrunfw.dll";
 
 /// Load the libkrunfw library.
 ///
@@ -509,9 +533,9 @@ fn load_krunfw_library(path: Option<&std::path::Path>) -> Result<KrunfwBindings>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use devices::virtio::TsiFlags;
     use utils::eventfd::EFD_NONBLOCK;
-    #[cfg(not(feature = "tee"))]
+    use vmm::resources::TsiFlags;
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     use vmm::vmm_config::fs::FsDeviceConfig;
 
     fn make_vm() -> Vm {
@@ -524,6 +548,7 @@ mod tests {
             Some("debug loglevel=7".to_string()),
             None,
             Some("\"--flag\"".to_string()),
+            None,
             None,
             None,
             None,
@@ -546,7 +571,7 @@ mod tests {
         assert!(prolog.contains("init=/init.krun"));
     }
 
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     #[test]
     fn maybe_enable_hijack_unix_respects_platform_support() {
         let mut vm = make_vm();
@@ -566,7 +591,11 @@ mod tests {
         assert!(flags.contains(TsiFlags::HIJACK_UNIX));
     }
 
-    #[cfg(all(not(feature = "tee"), not(target_os = "macos")))]
+    #[cfg(all(
+        not(feature = "tee"),
+        not(target_os = "macos"),
+        not(target_os = "windows")
+    ))]
     #[test]
     fn maybe_enable_hijack_unix_requires_root_fs_id() {
         let mut vm = make_vm();
@@ -596,7 +625,11 @@ mod tests {
         assert!(flags.contains(TsiFlags::HIJACK_INET));
     }
 
-    #[cfg(all(not(feature = "tee"), not(target_os = "macos")))]
+    #[cfg(all(
+        not(feature = "tee"),
+        not(target_os = "macos"),
+        not(target_os = "windows")
+    ))]
     #[test]
     fn compute_tsi_flags_unix_hijack_follows_inet_hijack() {
         let mut vm = make_vm();

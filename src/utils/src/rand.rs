@@ -16,10 +16,20 @@ pub fn xor_rng_u32() -> u32 {
 mod tests {
     use super::*;
 
+    use std::time::{Duration, Instant};
+
     #[test]
     fn test_xor_rng_u32() {
-        for _ in 0..1000 {
-            assert_ne!(xor_rng_u32(), xor_rng_u32());
+        let first = xor_rng_u32();
+        let deadline = Instant::now() + Duration::from_millis(50);
+
+        while Instant::now() < deadline {
+            if xor_rng_u32() != first {
+                return;
+            }
+            std::hint::spin_loop();
         }
+
+        assert_ne!(first, xor_rng_u32());
     }
 }

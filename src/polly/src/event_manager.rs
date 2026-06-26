@@ -4,13 +4,19 @@
 use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::sync::{Arc, Mutex};
 
 use utils::epoll::{self, Epoll, EpollEvent};
 
 pub type Result<T> = std::result::Result<T, Error>;
+#[cfg(unix)]
 pub type Pollable = RawFd;
+#[cfg(windows)]
+pub type Pollable = RawHandle;
 
 /// Errors associated with epoll events handling.
 pub enum Error {
@@ -33,11 +39,11 @@ impl std::fmt::Debug for Error {
             Poll(err) => write!(f, "Error during epoll call: {err}"),
             AlreadyExists(pollable) => write!(
                 f,
-                "A handler for the specified pollable {pollable} already exists."
+                "A handler for the specified pollable {pollable:?} already exists."
             ),
             NotFound(pollable) => write!(
                 f,
-                "A handler for the specified pollable {pollable} was not found."
+                "A handler for the specified pollable {pollable:?} was not found."
             ),
         }
     }
@@ -64,13 +70,21 @@ pub trait Subscriber {
 /// Manages I/O notifications using epoll mechanism.
 pub struct EventManager {
     epoll: Epoll,
-    subscribers: HashMap<RawFd, Arc<Mutex<dyn Subscriber>>>,
+    subscribers: HashMap<Pollable, Arc<Mutex<dyn Subscriber>>>,
     ready_events: Vec<EpollEvent>,
 }
 
+#[cfg(unix)]
 impl AsRawFd for EventManager {
     fn as_raw_fd(&self) -> RawFd {
         self.epoll.as_raw_fd()
+    }
+}
+
+#[cfg(windows)]
+impl AsRawHandle for EventManager {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.epoll.as_raw_handle()
     }
 }
 
@@ -110,7 +124,7 @@ impl EventManager {
         let interest_list = subscriber.lock().unwrap().interest_list();
 
         for event in interest_list {
-            self.register(event.data() as i32, event, subscriber.clone())?
+            self.register(event.fd(), event, subscriber.clone())?
         }
 
         Ok(())

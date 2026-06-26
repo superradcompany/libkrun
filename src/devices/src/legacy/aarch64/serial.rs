@@ -12,7 +12,9 @@ use std::{io, result};
 
 use polly::event_manager::{EventManager, Subscriber};
 use utils::byte_order::{read_le_u32, write_le_u32};
-use utils::epoll::{EpollEvent, EventSet};
+use utils::epoll::EpollEvent;
+#[cfg(unix)]
+use utils::epoll::EventSet;
 use utils::eventfd::EventFd;
 
 use crate::bus::BusDevice;
@@ -41,6 +43,7 @@ const PL011_INT_RX: u32 = 0x10;
 
 const PL011_FLAG_RXFF: u32 = 0x40;
 const PL011_FLAG_RXFE: u32 = 0x10;
+const PL011_FLAG_TXFE: u32 = 0x80;
 
 const PL011_ID: [u8; 8] = [0x11, 0x10, 0x14, 0x00, 0x0d, 0xf0, 0x05, 0xb1];
 // We are only interested in the margins.
@@ -125,7 +128,7 @@ impl Serial {
             0,
             0,
             0,
-            0,
+            PL011_INT_TX,
             VecDeque::new(),
             0,
             0,
@@ -240,15 +243,21 @@ impl Serial {
         self.read_trigger = 1;
     }
 
+    fn set_tx_ready(&mut self) {
+        self.flags |= PL011_FLAG_TXFE;
+        self.int_level |= PL011_INT_TX;
+    }
+
     fn handle_write(&mut self, offset: u64, val: u32) -> Result<()> {
         match offset >> 2 {
             UARTDR => {
-                self.int_level |= PL011_INT_TX;
                 if let Some(out) = self.out.as_mut() {
                     out.write_all(&[val.to_le_bytes()[0]])
                         .map_err(Error::WriteAllFailure)?;
                     out.flush().map_err(Error::FlushFailure)?;
                 }
+                self.set_tx_ready();
+                self.trigger_interrupt().map_err(Error::InterruptFailure)?;
             }
             UARTRSR_UARTECR => {
                 self.rsr = 0;
@@ -282,6 +291,7 @@ impl Serial {
             }
             UARTIMSC => {
                 self.int_enabled = val;
+                self.set_tx_ready();
                 self.trigger_interrupt().map_err(Error::InterruptFailure)?;
             }
             UARTICR => {
@@ -307,6 +317,10 @@ impl Serial {
     }
 
     fn trigger_interrupt(&mut self) -> result::Result<(), DeviceError> {
+        if self.int_level & self.int_enabled == 0 {
+            return Ok(());
+        }
+
         if let Some(intc) = &self.intc {
             intc.lock()
                 .unwrap()
@@ -391,27 +405,35 @@ impl BusDevice for Serial {
 impl Subscriber for Serial {
     /// Handle a read event (EPOLLIN) on the serial input fd.
     fn process(&mut self, event: &EpollEvent, _: &mut EventManager) {
-        let source = event.fd();
-        let event_set = event.event_set();
-
-        // TODO: also check for errors. Pending high level discussions on how we want
-        // to handle errors in devices.
-        let supported_events = EventSet::IN;
-        if !supported_events.contains(event_set) {
-            warn!("Received unknown event: {event_set:?} from source: {source:?}");
-            return;
+        #[cfg(windows)]
+        {
+            let _ = event;
         }
 
-        if let Some(input) = self.input.as_mut() {
-            if input.as_raw_fd() == source {
-                let mut out = [0u8; 32];
-                match input.read(&mut out[..]) {
-                    Ok(count) => {
-                        self.queue_input_bytes(&out[..count])
-                            .unwrap_or_else(|e| warn!("Serial error on input: {e:?}"));
-                    }
-                    Err(e) => {
-                        warn!("error while reading stdin: {e:?}");
+        #[cfg(unix)]
+        {
+            let source = event.fd();
+            let event_set = event.event_set();
+
+            // TODO: also check for errors. Pending high level discussions on how we want
+            // to handle errors in devices.
+            let supported_events = EventSet::IN;
+            if !supported_events.contains(event_set) {
+                warn!("Received unknown event: {event_set:?} from source: {source:?}");
+                return;
+            }
+
+            if let Some(input) = self.input.as_mut() {
+                if input.as_raw_fd() == source {
+                    let mut out = [0u8; 32];
+                    match input.read(&mut out[..]) {
+                        Ok(count) => {
+                            self.queue_input_bytes(&out[..count])
+                                .unwrap_or_else(|e| warn!("Serial error on input: {e:?}"));
+                        }
+                        Err(e) => {
+                            warn!("error while reading stdin: {e:?}");
+                        }
                     }
                 }
             }
@@ -421,9 +443,18 @@ impl Subscriber for Serial {
     /// Initial registration of pollable objects.
     /// If serial input is present, register the serial input FD as readable.
     fn interest_list(&self) -> Vec<EpollEvent> {
-        match &self.input {
-            Some(input) => vec![EpollEvent::new(EventSet::IN, input.as_raw_fd() as u64)],
-            None => vec![],
+        #[cfg(windows)]
+        {
+            let _ = &self.input;
+            Vec::new()
+        }
+
+        #[cfg(unix)]
+        {
+            match &self.input {
+                Some(input) => vec![EpollEvent::new(EventSet::IN, input.as_raw_fd() as u64)],
+                None => vec![],
+            }
         }
     }
 }

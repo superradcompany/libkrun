@@ -470,6 +470,7 @@ impl BusDevice for MmioTransport {
                     0x50 => {
                         // Queue notification - write to the eventfd for the specified queue.
                         if let Some(eventfd) = self.queue_evts.get(v as usize) {
+                            log::debug!("virtio-mmio queue notify: queue={v}");
                             eventfd.write(1).unwrap();
                         } else {
                             warn!("invalid queue index for notification: {v}");

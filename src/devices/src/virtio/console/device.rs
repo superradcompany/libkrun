@@ -2,7 +2,8 @@ use std::cmp;
 use std::io::Write;
 use std::iter::zip;
 use std::mem::{size_of, size_of_val};
-use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use utils::eventfd::EventFd;
@@ -112,6 +113,7 @@ impl Console {
         defs::CONSOLE_DEV_ID
     }
 
+    #[cfg(unix)]
     pub fn get_sigwinch_fd(&self) -> RawFd {
         self.sigwinch_evt.as_raw_fd()
     }
@@ -226,6 +228,15 @@ impl Console {
                     if !name.is_empty() {
                         self.control.port_name(cmd.id, name)
                     }
+
+                    #[cfg(target_os = "windows")]
+                    {
+                        // The WHP/Linux virtio-console path may report the
+                        // port ready without a later PORT_OPEN event. Start
+                        // data queues once the guest has acknowledged the
+                        // port so early PID 1 handshakes can flow.
+                        ports_to_start.push(cmd.id as usize);
+                    }
                 }
                 control_event::VIRTIO_CONSOLE_PORT_OPEN => {
                     let opened = match cmd.value {
@@ -253,6 +264,10 @@ impl Console {
         }
 
         for port_id in ports_to_start {
+            if self.ports[port_id].is_active() {
+                continue;
+            }
+
             log::trace!("Starting port io for port {port_id}");
             let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
             let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);

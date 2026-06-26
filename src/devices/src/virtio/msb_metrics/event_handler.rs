@@ -1,6 +1,9 @@
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 
-use polly::event_manager::{EventManager, Subscriber};
+use polly::event_manager::{EventManager, Pollable, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 
 use super::device::{MsbMetrics, RX_INDEX};
@@ -29,22 +32,19 @@ impl MsbMetrics {
             error!("msb_metrics: failed to consume activate event: {err:?}");
         }
 
-        let self_subscriber = event_manager
-            .subscriber(self.activate_evt.as_raw_fd())
-            .unwrap();
+        let activate_evt = eventfd_pollable(&self.activate_evt);
+        let self_subscriber = event_manager.subscriber(activate_evt).unwrap();
+
+        let rx = eventfd_pollable(self.queue_event(RX_INDEX));
 
         event_manager
-            .register(
-                self.queue_event(RX_INDEX).as_raw_fd(),
-                EpollEvent::new(EventSet::IN, self.queue_event(RX_INDEX).as_raw_fd() as u64),
-                self_subscriber.clone(),
-            )
+            .register(rx, pollable_event(rx), self_subscriber.clone())
             .unwrap_or_else(|err| {
                 error!("msb_metrics: failed to register rx queue: {err:?}");
             });
 
         event_manager
-            .unregister(self.activate_evt.as_raw_fd())
+            .unregister(activate_evt)
             .unwrap_or_else(|err| {
                 error!("msb_metrics: failed to unregister activate event: {err:?}");
             })
@@ -54,7 +54,7 @@ impl MsbMetrics {
 impl Subscriber for MsbMetrics {
     fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
         let source = event.fd();
-        let activate_evt = self.activate_evt.as_raw_fd();
+        let activate_evt = eventfd_pollable(&self.activate_evt);
 
         if source == activate_evt {
             if !self.is_activated() {
@@ -71,7 +71,7 @@ impl Subscriber for MsbMetrics {
             return;
         }
 
-        let rx = self.queue_event(RX_INDEX).as_raw_fd();
+        let rx = eventfd_pollable(self.queue_event(RX_INDEX));
         match source {
             _ if source == rx => self.handle_rx_event(event),
             _ => warn!("msb_metrics: unexpected event received: {source:?}"),
@@ -79,9 +79,30 @@ impl Subscriber for MsbMetrics {
     }
 
     fn interest_list(&self) -> Vec<EpollEvent> {
-        vec![EpollEvent::new(
-            EventSet::IN,
-            self.activate_evt.as_raw_fd() as u64,
-        )]
+        vec![pollable_event(eventfd_pollable(&self.activate_evt))]
     }
+}
+
+#[cfg(unix)]
+fn eventfd_pollable(event: &utils::eventfd::EventFd) -> Pollable {
+    event.as_raw_fd()
+}
+
+#[cfg(windows)]
+fn eventfd_pollable(event: &utils::eventfd::EventFd) -> Pollable {
+    event.as_raw_handle()
+}
+
+fn pollable_event(pollable: Pollable) -> EpollEvent {
+    EpollEvent::new(EventSet::IN, pollable_token(pollable))
+}
+
+#[cfg(unix)]
+fn pollable_token(pollable: Pollable) -> u64 {
+    pollable as u64
+}
+
+#[cfg(windows)]
+fn pollable_token(pollable: Pollable) -> u64 {
+    pollable as usize as u64
 }

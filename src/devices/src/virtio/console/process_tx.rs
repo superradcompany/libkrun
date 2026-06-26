@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{io, thread};
 
-use vm_memory::{GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion};
 
 use crate::virtio::console::port_io::PortOutput;
 use crate::virtio::{DescriptorChain, InterruptTransport, Queue};
@@ -71,6 +71,7 @@ fn pop_head_blocking<'mem>(
     }
 }
 
+#[allow(deprecated)]
 fn write_desc_to_output(
     desc: DescriptorChain,
     output: &mut (dyn PortOutput + Send),

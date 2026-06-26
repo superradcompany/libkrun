@@ -2,7 +2,10 @@ use crate::eventfd::{EventFd, EFD_NONBLOCK, EFD_SEMAPHORE};
 use std::collections::VecDeque;
 use std::io;
 use std::io::ErrorKind;
+#[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::sync::{Arc, Mutex};
 
 /// A multiple producer single consumer channel that can be listened to by a file descriptor
@@ -76,16 +79,25 @@ impl<T: Send> PollableChannelReciever<T> {
     }
 }
 
+#[cfg(unix)]
 impl<T: Send> AsRawFd for PollableChannelReciever<T> {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.eventfd.as_raw_fd()
     }
 }
 
+#[cfg(unix)]
 impl<T: Send> AsFd for PollableChannelReciever<T> {
     fn as_fd(&self) -> BorrowedFd<'_> {
         // SAFETY: The lifetime of the fd is the same as the lifetime of self.inner.eventfd which
         //         is the same as the lifetime of self.
         unsafe { BorrowedFd::borrow_raw(self.inner.eventfd.as_raw_fd()) }
+    }
+}
+
+#[cfg(windows)]
+impl<T: Send> AsRawHandle for PollableChannelReciever<T> {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.inner.eventfd.as_raw_handle()
     }
 }

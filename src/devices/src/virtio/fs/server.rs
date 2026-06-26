@@ -2,15 +2,17 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crossbeam_channel::Sender;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use utils::worker_message::WorkerMessage;
 
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Read, Write};
+#[cfg(target_os = "windows")]
+use std::io::{Seek, SeekFrom};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -36,8 +38,16 @@ const DIRENT_PADDING: [u8; 8] = [0; 8];
 struct ZCReader<'a>(Reader<'a>);
 
 impl ZeroCopyReader for ZCReader<'_> {
+    #[cfg(not(target_os = "windows"))]
     fn read_to(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
         self.0.read_to_at(f, count, off)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn read_to(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
+        let mut dst = f.try_clone()?;
+        dst.seek(SeekFrom::Start(off))?;
+        io::copy(&mut self.0.by_ref().take(count as u64), &mut dst).map(|count| count as usize)
     }
 }
 
@@ -50,8 +60,16 @@ impl io::Read for ZCReader<'_> {
 struct ZCWriter<'a>(Writer<'a>);
 
 impl ZeroCopyWriter for ZCWriter<'_> {
+    #[cfg(not(target_os = "windows"))]
     fn write_from(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
         self.0.write_from_at(f, count, off)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn write_from(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
+        let mut src = f.try_clone()?;
+        src.seek(SeekFrom::Start(off))?;
+        io::copy(&mut src.take(count as u64), &mut self.0).map(|count| count as usize)
     }
 }
 
@@ -85,7 +103,9 @@ impl<F: FileSystem + Sync> Server<F> {
         w: Writer,
         shm_region: &Option<VirtioShmRegion>,
         exit_code: &Arc<AtomicI32>,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> Result<usize> {
         let in_header: InHeader = r.read_obj().map_err(Error::DecodeMessage)?;
 
@@ -147,7 +167,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 let shm = shm_region.as_ref().unwrap();
                 #[cfg(target_os = "linux")]
                 let shm_base_addr = shm.host_addr;
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 let shm_base_addr = shm.guest_addr;
                 self.setupmapping(
                     in_header,
@@ -155,7 +175,7 @@ impl<F: FileSystem + Sync> Server<F> {
                     w,
                     shm_base_addr,
                     shm.size as u64,
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
                     map_sender,
                 )
             }
@@ -163,7 +183,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 let shm = shm_region.as_ref().unwrap();
                 #[cfg(target_os = "linux")]
                 let shm_base_addr = shm.host_addr;
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 let shm_base_addr = shm.guest_addr;
                 self.removemapping(
                     in_header,
@@ -171,7 +191,7 @@ impl<F: FileSystem + Sync> Server<F> {
                     w,
                     shm_base_addr,
                     shm.size as u64,
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
                     map_sender,
                 )
             }
@@ -898,14 +918,14 @@ impl<F: FileSystem + Sync> Server<F> {
             | FsOptions::INIT_EXT
             | FsOptions::ALLOW_IDMAP;
 
-        if cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
             supported |= FsOptions::SECURITY_CTX;
         }
 
         let flags_64 = ((flags2 as u64) << 32) | (flags as u64);
         let capable = FsOptions::from_bits_truncate(flags_64);
 
-        let page_size: u32 = unsafe { libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap() };
+        let page_size: u32 = utils::page_size().try_into().unwrap();
         let max_pages = ((MAX_BUFFER_SIZE - 1) / page_size) + 1;
 
         match self.fs.init(capable) {
@@ -1352,7 +1372,9 @@ impl<F: FileSystem + Sync> Server<F> {
         w: Writer,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> Result<usize> {
         let SetupmappingIn {
             fh,
@@ -1372,7 +1394,7 @@ impl<F: FileSystem + Sync> Server<F> {
             moffset,
             host_shm_base,
             shm_size,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender,
         ) {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
@@ -1387,7 +1409,9 @@ impl<F: FileSystem + Sync> Server<F> {
         w: Writer,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> Result<usize> {
         let RemovemappingIn { count } = r.read_obj().map_err(Error::DecodeMessage)?;
 
@@ -1420,7 +1444,7 @@ impl<F: FileSystem + Sync> Server<F> {
             requests,
             host_shm_base,
             shm_size,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender,
         ) {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),

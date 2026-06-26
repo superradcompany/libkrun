@@ -14,10 +14,15 @@ use std::fmt;
 use std::io;
 
 mod bus;
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "riscv64"),
+    any(target_arch = "aarch64", not(target_os = "windows"))
+))]
 pub mod fdt;
 pub mod legacy;
 pub mod virtio;
+#[cfg(target_os = "windows")]
+pub(crate) mod windows;
 
 pub use self::bus::{Bus, BusDevice, Error as BusError};
 
@@ -44,7 +49,10 @@ pub enum DeviceType {
     #[cfg(target_arch = "aarch64")]
     Gpio,
     /// Device Type: Serial.
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "riscv64"),
+        any(target_arch = "aarch64", not(target_os = "windows"))
+    ))]
     Serial,
     /// Device Type: RTC.
     #[cfg(target_arch = "aarch64")]

@@ -1,5 +1,8 @@
 use std::io;
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::time::Duration;
 
 //--------------------------------------------------------------------------------------------------
@@ -14,14 +17,14 @@ pub struct TimerFd {
 }
 
 /// Pollable timer used by event-loop driven devices.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug)]
 pub struct TimerFd {
     event: crate::eventfd::EventFd,
     worker: std::sync::Mutex<Option<TimerWorker>>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug)]
 struct TimerWorker {
     stop: std::sync::mpsc::Sender<()>,
@@ -91,7 +94,7 @@ impl TimerFd {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl TimerFd {
     /// Create a nonblocking pollable timer.
     pub fn new() -> io::Result<Self> {
@@ -153,6 +156,13 @@ impl AsRawFd for TimerFd {
     }
 }
 
+#[cfg(target_os = "windows")]
+impl AsRawHandle for TimerFd {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.event.as_raw_handle()
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl Drop for TimerFd {
     fn drop(&mut self) {
@@ -162,7 +172,7 @@ impl Drop for TimerFd {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl Drop for TimerFd {
     fn drop(&mut self) {
         let _ = self.disarm();

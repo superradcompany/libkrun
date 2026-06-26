@@ -1,10 +1,9 @@
 //! Sub-builders for VmBuilder nested configuration.
 
-use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(not(target_os = "windows"))]
 use devices::virtio::console::port_io::{
     ConsolePortBackend, ConsolePortBackendInputAdapter, ConsolePortBackendOutputAdapter,
 };
@@ -13,8 +12,12 @@ use vmm::resources::PortConfig;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use crate::backends::fs::DynFileSystem;
 
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", unix))]
 use std::os::fd::OwnedFd;
+#[cfg(not(target_os = "windows"))]
+use std::os::fd::RawFd;
+#[cfg(not(target_os = "windows"))]
+use std::sync::Arc;
 
 #[cfg(feature = "net")]
 use crate::backends::net::NetBackend;
@@ -72,6 +75,7 @@ pub struct MachineBuilder {
 pub struct KernelBuilder {
     pub(crate) cmdline: Option<String>,
     pub(crate) krunfw_path: Option<PathBuf>,
+    pub(crate) initramfs_path: Option<PathBuf>,
     pub(crate) init_path: Option<String>,
 }
 
@@ -151,20 +155,27 @@ pub struct NetBuilder {
 #[cfg(feature = "net")]
 pub enum NetConfig {
     /// Unixgram backend from a pre-opened fd.
+    #[cfg(unix)]
     UnixgramFd { mac: Option<[u8; 6]>, fd: OwnedFd },
     /// Unixgram backend connecting to a socket path.
+    #[cfg(unix)]
     UnixgramPath {
         mac: Option<[u8; 6]>,
         path: PathBuf,
         send_vfkit_magic: bool,
     },
     /// Unixstream backend from a pre-opened fd.
+    #[cfg(unix)]
     UnixstreamFd { mac: Option<[u8; 6]>, fd: OwnedFd },
     /// Unixstream backend connecting to a socket path.
+    #[cfg(unix)]
     UnixstreamPath { mac: Option<[u8; 6]>, path: PathBuf },
     /// TAP backend (Linux only).
     #[cfg(target_os = "linux")]
     Tap { mac: Option<[u8; 6]>, name: String },
+    /// Windows named-pipe backend connecting to a helper-created message-mode pipe.
+    #[cfg(windows)]
+    NamedPipe { mac: Option<[u8; 6]>, name: String },
     /// Custom network backend.
     Custom {
         mac: Option<[u8; 6]>,
@@ -257,11 +268,18 @@ pub struct ExecBuilder {
 //--------------------------------------------------------------------------------------------------
 
 /// Supported disk image formats.
+///
+/// VMDK images are currently read-only.
 #[cfg(feature = "blk")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiskImageFormat {
+    /// A raw block image.
     Raw,
+
+    /// A qcow2 image.
     Qcow2,
+
+    /// A VMDK image. VMDK is currently read-only.
     Vmdk,
 }
 
@@ -490,6 +508,15 @@ impl KernelBuilder {
         self
     }
 
+    /// Set an explicit path to an initramfs image.
+    ///
+    /// The image is copied into guest memory and advertised through the device
+    /// tree on architectures that support direct kernel boot.
+    pub fn initramfs_path(mut self, path: impl AsRef<Path>) -> Self {
+        self.initramfs_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
     /// Set the path to the init binary inside the guest.
     ///
     /// This controls the kernel `init=` parameter. When not set, defaults
@@ -596,6 +623,7 @@ impl NetBuilder {
     }
 
     /// Attach a unixgram network backend from a pre-opened fd.
+    #[cfg(unix)]
     pub fn unixgram(mut self, fd: OwnedFd) -> Self {
         let mac = self.current_mac.take();
         self.configs.push(NetConfig::UnixgramFd { mac, fd });
@@ -603,6 +631,7 @@ impl NetBuilder {
     }
 
     /// Attach a unixgram network backend connecting to a socket path.
+    #[cfg(unix)]
     pub fn unixgram_path(mut self, path: impl AsRef<Path>, send_vfkit_magic: bool) -> Self {
         let mac = self.current_mac.take();
         self.configs.push(NetConfig::UnixgramPath {
@@ -614,6 +643,7 @@ impl NetBuilder {
     }
 
     /// Attach a unixstream network backend from a pre-opened fd.
+    #[cfg(unix)]
     pub fn unixstream(mut self, fd: OwnedFd) -> Self {
         let mac = self.current_mac.take();
         self.configs.push(NetConfig::UnixstreamFd { mac, fd });
@@ -621,6 +651,7 @@ impl NetBuilder {
     }
 
     /// Attach a unixstream network backend connecting to a socket path.
+    #[cfg(unix)]
     pub fn unixstream_path(mut self, path: impl AsRef<Path>) -> Self {
         let mac = self.current_mac.take();
         self.configs.push(NetConfig::UnixstreamPath {
@@ -635,6 +666,17 @@ impl NetBuilder {
     pub fn tap(mut self, name: impl Into<String>) -> Self {
         let mac = self.current_mac.take();
         self.configs.push(NetConfig::Tap {
+            mac,
+            name: name.into(),
+        });
+        self
+    }
+
+    /// Attach a Windows named-pipe network backend.
+    #[cfg(windows)]
+    pub fn named_pipe(mut self, name: impl Into<String>) -> Self {
+        let mac = self.current_mac.take();
+        self.configs.push(NetConfig::NamedPipe {
             mac,
             name: name.into(),
         });
@@ -672,6 +714,29 @@ impl ConsoleBuilder {
         self
     }
 
+    /// Add an output-only virtio-console device backed by a host file.
+    ///
+    /// On Windows this creates a real guest console port, so guests can use it as `hvc0` when the implicit serial console is disabled or `krun_set_kernel_console` selects it.
+    #[cfg(target_os = "windows")]
+    pub fn virtio_output(mut self, path: impl AsRef<Path>) -> Self {
+        self.ports.push(PortConfig::ConsoleOutputFile {
+            path: path.as_ref().to_path_buf(),
+        });
+        self
+    }
+
+    /// Add a bidirectional virtio-console port backed by a Windows named pipe.
+    ///
+    /// The guest sees the port as `/dev/virtio-ports/<name>`. The host connects to `pipe_name` as a client, so the helper should create the pipe server first.
+    #[cfg(target_os = "windows")]
+    pub fn named_pipe(mut self, name: &str, pipe_name: impl Into<String>) -> Self {
+        self.ports.push(PortConfig::NamedPipe {
+            name: name.to_string(),
+            pipe_name: pipe_name.into(),
+        });
+        self
+    }
+
     /// Enable the virtio-snd device.
     #[cfg(feature = "snd")]
     pub fn sound(mut self, enabled: bool) -> Self {
@@ -698,6 +763,7 @@ impl ConsoleBuilder {
     /// Creates a named port accessible in the guest via `/sys/class/virtio-ports/<name>`.
     /// The host reads from `input_fd` and writes to `output_fd`. Pass the same FD for both
     /// when using a bidirectional socket.
+    #[cfg(not(target_os = "windows"))]
     pub fn port(mut self, name: &str, input_fd: RawFd, output_fd: RawFd) -> Self {
         self.ports.push(PortConfig::InOut {
             name: name.to_string(),
@@ -712,6 +778,7 @@ impl ConsoleBuilder {
     /// Creates a named port accessible in the guest via `/sys/class/virtio-ports/<name>`.
     /// The `tty_fd` must be a valid terminal file descriptor. Terminal raw mode is configured
     /// automatically.
+    #[cfg(not(target_os = "windows"))]
     pub fn port_tty(mut self, name: &str, tty_fd: RawFd) -> Self {
         self.ports.push(PortConfig::Tty {
             name: name.to_string(),
@@ -742,6 +809,7 @@ impl ConsoleBuilder {
     /// VmBuilder::new()
     ///     .console(|c| c.custom("agent", Box::new(my_backend)))
     /// ```
+    #[cfg(not(target_os = "windows"))]
     pub fn custom(mut self, name: &str, backend: Box<dyn ConsolePortBackend>) -> Self {
         let backend: Arc<dyn ConsolePortBackend> = Arc::from(backend);
         let input = Box::new(ConsolePortBackendInputAdapter::new(Arc::clone(&backend)));
@@ -973,5 +1041,33 @@ mod tests {
         assert!(MachineBuilder::new().msb_metrics);
         assert!(!MachineBuilder::new().msb_metrics(false).msb_metrics);
         assert!(MachineBuilder::new().msb_metrics(true).msb_metrics);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_virtio_output_records_file_backed_console_port() {
+        let path = PathBuf::from(r"C:\logs\guest-console.log");
+        let mut builder = ConsoleBuilder::new().virtio_output(&path);
+
+        assert_eq!(builder.ports.len(), 1);
+        match builder.ports.pop().unwrap() {
+            PortConfig::ConsoleOutputFile { path: actual } => assert_eq!(actual, path),
+            _ => panic!("unexpected console port config"),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_named_pipe_records_pipe_backed_console_port() {
+        let mut builder = ConsoleBuilder::new().named_pipe("agent", r"\\.\pipe\msb-agent-console");
+
+        assert_eq!(builder.ports.len(), 1);
+        match builder.ports.pop().unwrap() {
+            PortConfig::NamedPipe { name, pipe_name } => {
+                assert_eq!(name, "agent");
+                assert_eq!(pipe_name, r"\\.\pipe\msb-agent-console");
+            }
+            _ => panic!("unexpected console port config"),
+        }
     }
 }

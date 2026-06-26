@@ -1,6 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
+#[cfg(not(target_os = "windows"))]
 fn main() {
     let bindings = bindgen::Builder::default()
         .header("libkrun_input.h")
@@ -12,4 +13,13 @@ fn main() {
     bindings
         .write_to_file(out_path.join("input_header.rs"))
         .expect("Couldn't write bindings!");
+}
+
+#[cfg(target_os = "windows")]
+fn main() {
+    println!("cargo:rerun-if-changed=bindings/windows.rs");
+
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    std::fs::copy("bindings/windows.rs", out_path.join("input_header.rs"))
+        .expect("Couldn't copy Windows input bindings!");
 }

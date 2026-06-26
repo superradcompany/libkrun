@@ -1,4 +1,4 @@
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crossbeam_channel::Sender;
 use std::cmp;
 use std::io::Write;
@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use utils::worker_message::WorkerMessage;
 use virtio_bindings::{virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX};
 use vm_memory::{ByteValued, GuestMemoryMmap};
@@ -55,7 +55,7 @@ pub struct Fs {
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
     exit_code: Arc<AtomicI32>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     map_sender: Option<Sender<WorkerMessage>>,
 }
 
@@ -89,7 +89,7 @@ impl Fs {
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
             exit_code,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender: None,
         })
     }
@@ -116,7 +116,7 @@ impl Fs {
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
             exit_code,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender: None,
         })
     }
@@ -141,7 +141,7 @@ impl Fs {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn set_map_sender(&mut self, map_sender: Sender<WorkerMessage>) {
         self.map_sender = Some(map_sender);
     }
@@ -223,7 +223,7 @@ impl VirtioDevice for Fs {
                     self.shm_region.clone(),
                     self.worker_stopfd.try_clone().unwrap(),
                     self.exit_code.clone(),
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
                     self.map_sender.clone(),
                 );
                 worker.run()
@@ -238,7 +238,7 @@ impl VirtioDevice for Fs {
                     self.shm_region.clone(),
                     self.worker_stopfd.try_clone().unwrap(),
                     self.exit_code.clone(),
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
                     self.map_sender.clone(),
                 );
                 worker.run()

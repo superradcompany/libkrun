@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crossbeam_channel::Sender;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use utils::worker_message::WorkerMessage;
 
 use std::collections::BTreeMap;
@@ -304,17 +304,30 @@ impl<W: ZeroCopyWriter> ZeroCopyWriter for &mut W {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
+type FsUid = libc::uid_t;
+#[cfg(target_os = "windows")]
+type FsUid = u32;
+#[cfg(not(target_os = "windows"))]
+type FsGid = libc::gid_t;
+#[cfg(target_os = "windows")]
+type FsGid = u32;
+#[cfg(not(target_os = "windows"))]
+type FsPid = libc::pid_t;
+#[cfg(target_os = "windows")]
+type FsPid = u32;
+
 /// Additional context associated with requests.
 #[derive(Clone, Copy, Debug)]
 pub struct Context {
     /// The user ID of the calling process.
-    pub uid: libc::uid_t,
+    pub uid: FsUid,
 
     /// The group ID of the calling process.
-    pub gid: libc::gid_t,
+    pub gid: FsGid,
 
     /// The thread group ID of the calling process.
-    pub pid: libc::pid_t,
+    pub pid: FsPid,
 }
 
 impl From<fuse::InHeader> for Context {
@@ -322,7 +335,7 @@ impl From<fuse::InHeader> for Context {
         Context {
             uid: source.uid,
             gid: source.gid,
-            pid: source.pid as i32,
+            pid: source.pid as FsPid,
         }
     }
 }
@@ -1142,7 +1155,9 @@ pub trait FileSystem {
         moffset: u64,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
@@ -1153,7 +1168,9 @@ pub trait FileSystem {
         requests: Vec<RemovemappingOne>,
         host_shm_base: u64,
         shm_size: u64,
-        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
+        #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: &Option<
+            Sender<WorkerMessage>,
+        >,
     ) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }

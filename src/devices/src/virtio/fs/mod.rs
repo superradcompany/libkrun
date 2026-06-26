@@ -5,6 +5,7 @@ pub mod filesystem;
 pub mod fuse;
 #[allow(dead_code)]
 mod multikey;
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 mod server;
 mod worker;
 
@@ -20,6 +21,12 @@ pub mod macos;
 pub use macos::fs_utils;
 #[cfg(target_os = "macos")]
 pub use macos::passthrough;
+#[cfg(target_os = "windows")]
+pub mod windows;
+#[cfg(target_os = "windows")]
+pub use windows::fs_utils;
+#[cfg(target_os = "windows")]
+pub use windows::passthrough;
 
 use super::bindings;
 use super::descriptor_utils;
@@ -29,6 +36,7 @@ pub use self::device::Fs;
 pub use self::dyn_filesystem::{DynFileSystem, DynFileSystemAdapter};
 pub use self::filesystem::ExportTable;
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 mod defs {
     use super::super::QueueConfig;
 

@@ -1,13 +1,11 @@
 //! VM Builder for creating and configuring microVMs using nested builders.
 
 use std::sync::atomic::AtomicI32;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-use std::sync::Arc;
-#[cfg(any(feature = "tee", feature = "aws-nitro"))]
 use std::sync::Arc;
 
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
-use vmm::resources::{VirtioConsoleConfigMode, VmResources};
+use vmm::resources::VirtioConsoleConfigMode;
+use vmm::resources::VmResources;
 use vmm::vmm_config::machine_config::VmConfig;
 use vmm::vmm_config::machine_config::VmConfigError;
 
@@ -18,9 +16,11 @@ use vmm::vmm_config::fs::FsDeviceConfig;
 
 #[cfg(feature = "blk")]
 use super::builders::DiskBuilder;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(not(feature = "tee"))]
+use super::builders::FsBuilder;
+#[cfg(not(feature = "tee"))]
 use super::builders::FsConfig;
-use super::builders::{ConsoleBuilder, ExecBuilder, FsBuilder, KernelBuilder, MachineBuilder};
+use super::builders::{ConsoleBuilder, ExecBuilder, KernelBuilder, MachineBuilder};
 #[cfg(feature = "net")]
 use super::builders::{NetBuilder, NetConfig};
 
@@ -36,7 +36,7 @@ use vmm::vmm_config::block::BlockDeviceConfig;
 
 #[cfg(feature = "net")]
 use devices::virtio::net::device::VirtioNetBackend;
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", unix))]
 use std::os::fd::IntoRawFd;
 #[cfg(feature = "net")]
 use vmm::vmm_config::net::NetworkInterfaceConfig;
@@ -65,6 +65,7 @@ pub struct VmBuilder {
     machine: MachineBuilder,
     kernel: KernelBuilder,
     #[cfg_attr(feature = "tee", allow(dead_code))]
+    #[cfg(not(feature = "tee"))]
     fs: FsBuilder,
     console: ConsoleBuilder,
     exec: ExecBuilder,
@@ -91,6 +92,7 @@ impl VmBuilder {
         Self {
             machine: MachineBuilder::new(),
             kernel: KernelBuilder::new(),
+            #[cfg(not(feature = "tee"))]
             fs: FsBuilder::new(),
             console: ConsoleBuilder::new(),
             exec: ExecBuilder::new(),
@@ -195,6 +197,13 @@ impl VmBuilder {
     ///     .net(|n| n.unixgram_path("/tmp/net.sock", true));
     /// ```
     ///
+    /// Windows named pipe:
+    ///
+    /// ```rust,ignore
+    /// VmBuilder::new()
+    ///     .net(|n| n.named_pipe(r"\\.\pipe\libkrun-net0"));
+    /// ```
+    ///
     /// Custom backend:
     ///
     /// ```rust,ignore
@@ -214,6 +223,7 @@ impl VmBuilder {
     /// deterministic guest names by attach order (`/dev/vda`, `/dev/vdb`,
     /// ...). For stable addressing across reorderings, set a custom `id()` —
     /// the guest can then reach the disk via `/dev/disk/by-id/virtio-<id>`.
+    /// VMDK images must be configured as read-only.
     ///
     /// # Examples
     ///
@@ -419,22 +429,28 @@ impl VmBuilder {
         #[cfg(feature = "net")]
         for (i, config) in self.net.configs.into_iter().enumerate() {
             let (mac, backend) = match config {
+                #[cfg(unix)]
                 NetConfig::UnixgramFd { mac, fd } => {
                     (mac, VirtioNetBackend::UnixgramFd(fd.into_raw_fd()))
                 }
+                #[cfg(unix)]
                 NetConfig::UnixgramPath {
                     mac,
                     path,
                     send_vfkit_magic,
                 } => (mac, VirtioNetBackend::UnixgramPath(path, send_vfkit_magic)),
+                #[cfg(unix)]
                 NetConfig::UnixstreamFd { mac, fd } => {
                     (mac, VirtioNetBackend::UnixstreamFd(fd.into_raw_fd()))
                 }
+                #[cfg(unix)]
                 NetConfig::UnixstreamPath { mac, path } => {
                     (mac, VirtioNetBackend::UnixstreamPath(path))
                 }
                 #[cfg(target_os = "linux")]
                 NetConfig::Tap { mac, name } => (mac, VirtioNetBackend::Tap(name)),
+                #[cfg(windows)]
+                NetConfig::NamedPipe { mac, name } => (mac, VirtioNetBackend::NamedPipe(name)),
                 NetConfig::Custom { mac, backend } => (mac, VirtioNetBackend::Custom(backend)),
             };
 
@@ -532,6 +548,7 @@ impl VmBuilder {
             self.exec.workdir,
             rlimits,
             self.kernel.krunfw_path,
+            self.kernel.initramfs_path,
             self.kernel.init_path,
             self.exit_observers,
             exit_evt,

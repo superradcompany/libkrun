@@ -5,9 +5,9 @@ pub use rust_to_c::*;
 use std::cmp::max;
 
 mod c_to_rust;
-pub use c_to_rust::{
-    InputConfigBackend, InputConfigInstance, InputEventProviderBackend, InputEventProviderInstance,
-};
+pub use c_to_rust::{InputConfigBackend, InputConfigInstance};
+#[cfg(unix)]
+pub use c_to_rust::{InputEventProviderBackend, InputEventProviderInstance};
 
 use thiserror::Error;
 

@@ -23,6 +23,7 @@
 // Modules
 //--------------------------------------------------------------------------------------------------
 
+#[cfg(not(target_os = "windows"))]
 pub mod console;
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -35,6 +36,7 @@ pub mod net;
 // Re-Exports
 //--------------------------------------------------------------------------------------------------
 
+#[cfg(not(target_os = "windows"))]
 pub use console::ConsolePortBackend;
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]

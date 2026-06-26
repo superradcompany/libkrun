@@ -12,7 +12,7 @@ log = "0.4.27"
 bitflags = "2.9.1"
 static_assertions = "1.1.0"
 
-[build-dependencies]
+[target.'cfg(not(target_os = "windows"))'.build-dependencies]
 bindgen = { version = "0.72", default-features = false }
 
 [features]
