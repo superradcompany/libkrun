@@ -480,6 +480,12 @@ struct EmulatorContext {
     pio_bus: Option<devices::Bus>,
 }
 
+// WHP register values are 128-bit ABI slots; `windows-sys` models the union with only 8-byte
+// alignment, but WinHvPlatform reads the register-value array as 16-byte-aligned storage.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct AlignedRegisterValue(WHV_REGISTER_VALUE);
+
 #[cfg(target_arch = "aarch64")]
 #[derive(Default)]
 #[repr(C)]
@@ -1311,6 +1317,12 @@ fn set_vcpu_registers(
     values: &[WHV_REGISTER_VALUE],
 ) -> Result<()> {
     debug_assert_eq!(names.len(), values.len());
+    let aligned_values: Vec<AlignedRegisterValue> =
+        values.iter().copied().map(AlignedRegisterValue).collect();
+    debug_assert_eq!(
+        size_of::<AlignedRegisterValue>(),
+        size_of::<WHV_REGISTER_VALUE>()
+    );
 
     let hresult = unsafe {
         WHvSetVirtualProcessorRegisters(
@@ -1318,7 +1330,7 @@ fn set_vcpu_registers(
             id as u32,
             names.as_ptr(),
             names.len() as u32,
-            values.as_ptr(),
+            aligned_values.as_ptr().cast(),
         )
     };
     if hresult < 0 {
@@ -1346,17 +1358,23 @@ fn get_vcpu_register_u64(
 }
 
 fn register_value_u64(value: u64) -> WHV_REGISTER_VALUE {
-    WHV_REGISTER_VALUE { Reg64: value }
+    let mut register = WHV_REGISTER_VALUE::default();
+    register.Reg64 = value;
+    register
 }
 
 #[cfg(target_arch = "x86_64")]
 fn register_value_segment(value: WHV_X64_SEGMENT_REGISTER) -> WHV_REGISTER_VALUE {
-    WHV_REGISTER_VALUE { Segment: value }
+    let mut register = WHV_REGISTER_VALUE::default();
+    register.Segment = value;
+    register
 }
 
 #[cfg(target_arch = "x86_64")]
 fn register_value_table(value: WHV_X64_TABLE_REGISTER) -> WHV_REGISTER_VALUE {
-    WHV_REGISTER_VALUE { Table: value }
+    let mut register = WHV_REGISTER_VALUE::default();
+    register.Table = value;
+    register
 }
 
 #[cfg(target_arch = "x86_64")]
