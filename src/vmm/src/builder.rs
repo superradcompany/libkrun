@@ -2588,9 +2588,16 @@ pub fn setup_serial_device(
 struct WindowsX64PitStub {
     channels: [u8; 3],
     command: u8,
+    channel2_latch: u32,
+    channel2_started_at: Option<Instant>,
+    channel2_write_lsb: Option<u8>,
+    channel2_read_msb_next: bool,
     armed: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
 }
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const PIT_TICK_RATE_HZ: u128 = 1_193_182;
 
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 #[derive(Default)]
@@ -2628,8 +2635,62 @@ impl WindowsX64PitStub {
         Self {
             channels: [0; 3],
             command: 0,
+            channel2_latch: 0,
+            channel2_started_at: None,
+            channel2_write_lsb: None,
+            channel2_read_msb_next: false,
             armed,
             running,
+        }
+    }
+
+    fn read_channel2(&mut self) -> u8 {
+        let counter = self.channel2_counter();
+        let value = if self.channel2_read_msb_next {
+            (counter >> 8) as u8
+        } else {
+            (counter & 0xff) as u8
+        };
+        self.channel2_read_msb_next = !self.channel2_read_msb_next;
+        value
+    }
+
+    fn write_channel2(&mut self, value: u8) {
+        self.channels[2] = value;
+
+        if self.command & 0xc0 == 0x80 && self.command & 0x30 == 0x30 {
+            if let Some(lsb) = self.channel2_write_lsb.take() {
+                let raw_latch = u16::from_le_bytes([lsb, value]);
+                self.channel2_latch = if raw_latch == 0 {
+                    0x1_0000
+                } else {
+                    u32::from(raw_latch)
+                };
+                self.channel2_started_at = Some(Instant::now());
+                self.channel2_read_msb_next = false;
+            } else {
+                self.channel2_write_lsb = Some(value);
+            }
+        }
+    }
+
+    fn channel2_counter(&self) -> u16 {
+        let Some(started_at) = self.channel2_started_at else {
+            return self.channel2_latch.min(u32::from(u16::MAX)) as u16;
+        };
+
+        // Linux early TSC calibration polls PIT channel 2 until the MSB changes.
+        // Returning a frozen byte makes that path burn the full 50k retry budget on WHP.
+        let elapsed_ticks = started_at
+            .elapsed()
+            .as_nanos()
+            .saturating_mul(PIT_TICK_RATE_HZ)
+            / 1_000_000_000;
+
+        if elapsed_ticks >= u128::from(self.channel2_latch) {
+            0
+        } else {
+            (u128::from(self.channel2_latch) - elapsed_ticks).min(u128::from(u16::MAX)) as u16
         }
     }
 }
@@ -2649,7 +2710,8 @@ impl devices::BusDevice for WindowsX64PitStub {
         }
 
         data[0] = match offset {
-            0..=2 => self.channels[offset as usize],
+            0..=1 => self.channels[offset as usize],
+            2 => self.read_channel2(),
             3 => self.command,
             _ => 0,
         };
@@ -2661,8 +2723,15 @@ impl devices::BusDevice for WindowsX64PitStub {
         }
 
         match offset {
-            0..=2 => self.channels[offset as usize] = data[0],
-            3 => self.command = data[0],
+            0..=1 => self.channels[offset as usize] = data[0],
+            2 => self.write_channel2(data[0]),
+            3 => {
+                self.command = data[0];
+                if self.command & 0xc0 == 0x80 {
+                    self.channel2_write_lsb = None;
+                    self.channel2_read_msb_next = false;
+                }
+            }
             _ => {}
         }
         self.armed.store(true, Ordering::Relaxed);
