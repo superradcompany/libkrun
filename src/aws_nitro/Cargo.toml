@@ -1,6 +1,6 @@
 [package]
 name = "msb_krun_aws_nitro"
-version = "0.1.19"
+version = "0.1.20"
 edition = "2021"
 license = "Apache-2.0"
 description = "AWS Nitro Enclaves support for msb_krun microVMs"
@@ -15,7 +15,7 @@ nix = { version = "0.30", features = ["poll"] }
 tar = "0.4"
 vsock = "0.5"
 
-devices = { package = "msb_krun_devices", version = "0.1.19", path = "../devices" }
+devices = { package = "msb_krun_devices", version = "0.1.20", path = "../devices" }
 log = "0.4"
 signal-hook = "0.3"
 

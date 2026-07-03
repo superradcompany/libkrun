@@ -1,6 +1,6 @@
 [package]
 name = "msb_krun_hvf"
-version = "0.1.19"
+version = "0.1.20"
 authors = ["Sergio Lopez <slp@sinrega.org>"]
 edition = "2021"
 build = "build.rs"
@@ -13,4 +13,4 @@ crossbeam-channel = ">=0.5.15"
 libloading = "0.8"
 log = "0.4.0"
 
-arch = { package = "msb_krun_arch", version = "0.1.19", path = "../arch" }
+arch = { package = "msb_krun_arch", version = "0.1.20", path = "../arch" }
