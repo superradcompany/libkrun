@@ -535,64 +535,13 @@ mod tests {
     #[cfg(feature = "gpu")]
     use crate::resources::DisplayBackendConfig;
     use crate::resources::VmResources;
-    use crate::vmm_config::kernel_cmdline::KernelCmdlineConfig;
     use crate::vmm_config::machine_config::{CpuFeaturesTemplate, VmConfig, VmConfigError};
     use crate::vmm_config::vsock::tests::{default_config, TempSockFile};
     use crate::vstate::VcpuConfig;
-    use utils::metrics::MetricsWriter;
     use utils::tempfile::TempFile;
 
-    fn default_kernel_cmdline() -> KernelCmdlineConfig {
-        KernelCmdlineConfig {
-            prolog: None,
-            krun_env: None,
-            epilog: None,
-        }
-    }
-
     fn default_vm_resources() -> VmResources {
-        VmResources {
-            vm_config: VmConfig::default(),
-            firmware_config: None,
-            kernel_cmdline: default_kernel_cmdline(),
-            kernel_bundle: Default::default(),
-            external_kernel: None,
-            fs: Default::default(),
-            #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-            custom_fs: Default::default(),
-            vsock: Default::default(),
-            #[cfg(feature = "net")]
-            net_builder: Default::default(),
-            gpu_virgl_flags: None,
-            gpu_shm_size: None,
-            #[cfg(feature = "gpu")]
-            display_backend: None,
-            #[cfg(feature = "gpu")]
-            displays: Vec::new(),
-            #[cfg(feature = "input")]
-            input_backends: Vec::new(),
-            #[cfg(feature = "snd")]
-            snd_device: false,
-            console_output: None,
-            smbios_oem_strings: None,
-            nested_enabled: false,
-            split_irqchip: false,
-            metrics: MetricsWriter::default(),
-            request_vsock: false,
-            enable_balloon: true,
-            #[cfg(not(feature = "tee"))]
-            mem_device: None,
-            #[cfg(not(feature = "tee"))]
-            cpu_device: None,
-            balloon_stats_interval: Some(std::time::Duration::from_secs(1)),
-            enable_rng: true,
-            enable_msb_metrics: true,
-            disable_implicit_console: false,
-            #[cfg(not(target_os = "windows"))]
-            serial_consoles: Vec::new(),
-            virtio_consoles: Vec::new(),
-            kernel_console: None,
-        }
+        VmResources::default()
     }
 
     #[test]

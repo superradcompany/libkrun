@@ -146,6 +146,23 @@ impl Epoll {
         }
     }
 
+    fn delete_filter(&self, fd: RawFd, filter: i16, udata: u64) {
+        let kev = Kevent::new(fd as usize, filter, libc::EV_DELETE, udata);
+
+        // Deleting a missing kqueue filter is fine for our epoll-style API. Callers often ask to
+        // delete the whole mask without knowing which individual filters were registered.
+        let _ = unsafe {
+            libc::kevent(
+                self.queue,
+                &kev as *const Kevent as *const libc::kevent,
+                1,
+                ptr::null_mut(),
+                0,
+                ptr::null(),
+            )
+        };
+    }
+
     pub fn ctl(
         &self,
         operation: ControlOperation,
@@ -155,7 +172,14 @@ impl Epoll {
         let eset = EventSet::from_bits(event.events).unwrap();
 
         match operation {
-            ControlOperation::Add | ControlOperation::Modify => {
+            ControlOperation::Modify => {
+                // kqueue tracks read and write filters separately, while epoll MOD replaces the
+                // whole event mask. Drop any old filters first so stale readiness does not leak
+                // through after a caller narrows its interest set.
+                self.ctl(ControlOperation::Delete, fd, &EpollEvent::default())?;
+                self.ctl(ControlOperation::Add, fd, event)?;
+            }
+            ControlOperation::Add => {
                 let mut kevs: Vec<Kevent> = Vec::new();
                 let clear = if eset.contains(EventSet::EDGE_TRIGGERED) {
                     libc::EV_CLEAR
@@ -193,51 +217,20 @@ impl Epoll {
                 assert_eq!(ret, 0);
             }
             ControlOperation::Delete => {
-                let mut kevs: Vec<Kevent> = Vec::new();
                 if eset.bits() == 0 {
                     debug!("remove fd in and out: {fd}");
-                    kevs.push(Kevent::new(
-                        fd as usize,
-                        libc::EVFILT_READ,
-                        libc::EV_DELETE,
-                        event.u64,
-                    ));
-                    kevs.push(Kevent::new(
-                        fd as usize,
-                        libc::EVFILT_WRITE,
-                        libc::EV_DELETE,
-                        event.u64,
-                    ));
+                    self.delete_filter(fd, libc::EVFILT_READ, event.u64);
+                    self.delete_filter(fd, libc::EVFILT_WRITE, event.u64);
                 } else {
                     if eset.contains(EventSet::IN) {
                         debug!("remove fd in: {fd}");
-                        kevs.push(Kevent::new(
-                            fd as usize,
-                            libc::EVFILT_READ,
-                            libc::EV_DELETE,
-                            event.u64,
-                        ));
+                        self.delete_filter(fd, libc::EVFILT_READ, event.u64);
                     }
                     if eset.contains(EventSet::OUT) {
                         debug!("remove fd out: {fd}");
-                        kevs.push(Kevent::new(
-                            fd as usize,
-                            libc::EVFILT_WRITE,
-                            libc::EV_DELETE,
-                            event.u64,
-                        ));
+                        self.delete_filter(fd, libc::EVFILT_WRITE, event.u64);
                     }
                 }
-                let _ = unsafe {
-                    libc::kevent(
-                        self.queue,
-                        kevs.as_ptr() as *const libc::kevent,
-                        kevs.len() as i32,
-                        ptr::null_mut(),
-                        0,
-                        ptr::null(),
-                    )
-                };
             }
         }
         Ok(())
@@ -249,16 +242,18 @@ impl Epoll {
         timeout: i32,
         events: &mut [EpollEvent],
     ) -> io::Result<usize> {
-        let _tout = if timeout >= 0 {
+        let timeout_duration = if timeout >= 0 {
             Some(Duration::from_millis(timeout as u64))
         } else {
             None
         };
-
-        let ts = libc::timespec {
-            tv_sec: 3,
-            tv_nsec: 0,
-        };
+        let timeout_spec = timeout_duration.map(|timeout| libc::timespec {
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_nsec: timeout.subsec_nanos() as libc::c_long,
+        });
+        let timeout_ptr = timeout_spec
+            .as_ref()
+            .map_or(ptr::null(), |ts| ts as *const libc::timespec);
 
         let mut kevs = vec![Kevent::default(); events.len()];
         debug!("kevs len: {}", kevs.len());
@@ -269,7 +264,7 @@ impl Epoll {
                 0,
                 kevs.as_mut_ptr() as *mut libc::kevent,
                 max_events as i32,
-                &ts as *const libc::timespec,
+                timeout_ptr,
             )
         };
 

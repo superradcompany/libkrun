@@ -11,7 +11,6 @@ use std::fmt::{Display, Formatter};
 use std::io;
 use std::result;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(not(test))]
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -732,7 +731,7 @@ enum VcpuEmulation {
     WaitForEventTimeout(Duration),
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     #[cfg(target_arch = "x86_64")]
     use crossbeam_channel::{unbounded, RecvTimeoutError};
@@ -1118,5 +1117,56 @@ mod tests {
         };
         // Setting default state should always fail.
         assert!(vcpu.restore_state(state).is_err());
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+
+    fn test_vcpu(id: u8) -> Vcpu {
+        Vcpu::new_aarch64(
+            id,
+            GuestAddress(0x1000),
+            None,
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            Arc::new(VcpuList::new(1)),
+            false,
+            MetricsWriter::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_set_mmio_bus() {
+        let mut vcpu = test_vcpu(0);
+
+        assert!(vcpu.mmio_bus.is_none());
+        vcpu.set_mmio_bus(devices::Bus::new());
+        assert!(vcpu.mmio_bus.is_some());
+    }
+
+    #[test]
+    fn test_configure_aarch64_records_fdt_addr() {
+        let mut vcpu = test_vcpu(0);
+        let mem_info = ArchMemoryInfo {
+            fdt_addr: 0x2000,
+            ..Default::default()
+        };
+
+        vcpu.configure_aarch64(&mem_info).unwrap();
+
+        assert_eq!(vcpu.fdt_addr, 0x2000);
+    }
+
+    #[test]
+    fn test_vcpu_tls_lifecycle() {
+        let mut vcpu = test_vcpu(0);
+
+        assert!(vcpu.reset_thread_local_data().is_err());
+        assert!(vcpu.init_thread_local_data().is_ok());
+        assert!(vcpu.init_thread_local_data().is_err());
+        assert!(vcpu.reset_thread_local_data().is_ok());
+        assert!(vcpu.reset_thread_local_data().is_err());
     }
 }

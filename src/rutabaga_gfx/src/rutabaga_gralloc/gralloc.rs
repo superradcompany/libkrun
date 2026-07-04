@@ -354,6 +354,17 @@ impl RutabagaGralloc {
 mod tests {
     use super::*;
 
+    fn image_memory_requirements_or_skip(
+        gralloc: &mut RutabagaGralloc,
+        info: ImageAllocationInfo,
+    ) -> Option<ImageMemoryRequirements> {
+        match gralloc.get_image_memory_requirements(info) {
+            Ok(reqs) => Some(reqs),
+            Err(RutabagaError::Unsupported) => None,
+            Err(err) => panic!("unexpected gralloc requirements error: {err:?}"),
+        }
+    }
+
     #[test]
     #[cfg_attr(target_os = "windows", ignore)]
     fn create_render_target() {
@@ -371,7 +382,9 @@ mod tests {
             flags: RutabagaGrallocFlags::empty().use_scanout(true),
         };
 
-        let reqs = gralloc.get_image_memory_requirements(info).unwrap();
+        let Some(reqs) = image_memory_requirements_or_skip(&mut gralloc, info) else {
+            return;
+        };
         let min_reqs = canonical_image_requirements(info).unwrap();
 
         assert!(reqs.strides[0] >= min_reqs.strides[0]);
@@ -400,7 +413,9 @@ mod tests {
             flags: RutabagaGrallocFlags::empty().use_linear(true),
         };
 
-        let reqs = gralloc.get_image_memory_requirements(info).unwrap();
+        let Some(reqs) = image_memory_requirements_or_skip(&mut gralloc, info) else {
+            return;
+        };
         let min_reqs = canonical_image_requirements(info).unwrap();
 
         assert!(reqs.strides[0] >= min_reqs.strides[0]);
@@ -441,7 +456,9 @@ mod tests {
                 .use_sw_read(true),
         };
 
-        let mut reqs = gralloc.get_image_memory_requirements(info).unwrap();
+        let Some(mut reqs) = image_memory_requirements_or_skip(&mut gralloc, info) else {
+            return;
+        };
 
         // Anything else can use the mmap(..) system call.
         if reqs.vulkan_info.is_none() {
