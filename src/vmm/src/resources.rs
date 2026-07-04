@@ -217,6 +217,12 @@ pub struct VmResources {
     pub request_vsock: bool,
     /// Whether to attach the virtio-balloon device.
     pub enable_balloon: bool,
+    /// The virtio-mem device backing live memory resize, created by the API
+    /// layer when max memory exceeds boot memory. The builder places the
+    /// hotplug region and attaches the device; the API layer keeps a clone as
+    /// the runtime control handle.
+    #[cfg(not(feature = "tee"))]
+    pub mem_device: Option<std::sync::Arc<std::sync::Mutex<devices::virtio::Mem>>>,
     /// Guest memory stats polling interval for the virtio-balloon device.
     pub balloon_stats_interval: Option<Duration>,
     /// Whether to attach the virtio-rng device.
@@ -273,6 +279,8 @@ impl Default for VmResources {
             metrics: MetricsWriter::default(),
             request_vsock: false,
             enable_balloon: true,
+            #[cfg(not(feature = "tee"))]
+            mem_device: None,
             balloon_stats_interval: Some(Duration::from_secs(1)),
             enable_rng: true,
             enable_msb_metrics: true,
@@ -565,6 +573,8 @@ mod tests {
             metrics: MetricsWriter::default(),
             request_vsock: false,
             enable_balloon: true,
+            #[cfg(not(feature = "tee"))]
+            mem_device: None,
             balloon_stats_interval: Some(std::time::Duration::from_secs(1)),
             enable_rng: true,
             enable_msb_metrics: true,

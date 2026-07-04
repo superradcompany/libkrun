@@ -33,6 +33,11 @@ impl ShmManager {
         }
     }
 
+    /// First guest address above every window this manager has handed out.
+    pub fn next_guest_addr(&self) -> u64 {
+        self.next_guest_addr
+    }
+
     pub fn regions(&self) -> Vec<(GuestAddress, usize)> {
         let mut regions: Vec<(GuestAddress, usize)> = Vec::new();
 

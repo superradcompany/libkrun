@@ -358,6 +358,21 @@ impl VmBuilder {
         };
         vmr.set_vm_config(&vm_config)
             .map_err(|err| map_vm_config_error(&self.machine, err))?;
+
+        // Reserved memory capacity is realized through a virtio-mem device; the
+        // VMM places its hotplug region during boot and `Vm::control_handle`
+        // exposes the live resize knob.
+        #[cfg(not(feature = "tee"))]
+        if self
+            .machine
+            .max_memory_mib
+            .is_some_and(|max| max > self.machine.memory_mib)
+        {
+            let mem = devices::virtio::Mem::new().map_err(|e| {
+                Error::Build(BuildError::DeviceRegistration(format!("virtio-mem: {e:?}")))
+            })?;
+            vmr.mem_device = Some(std::sync::Arc::new(std::sync::Mutex::new(mem)));
+        }
         vmr.nested_enabled = self.machine.nested_virt;
         vmr.split_irqchip = self.machine.split_irqchip;
         vmr.request_vsock = self.machine.vsock;

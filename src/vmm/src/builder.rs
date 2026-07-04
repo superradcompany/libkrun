@@ -1646,6 +1646,11 @@ pub fn build_microvm(
     } else {
         trace.mark("balloon.skipped");
     }
+    #[cfg(not(feature = "tee"))]
+    if let Some(mem_device) = vm_resources.mem_device.clone() {
+        attach_mem_device(&mut vmm, event_manager, intc.clone(), mem_device)?;
+        trace.mark("mem.attached");
+    }
     #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     if vm_resources.enable_rng {
         attach_rng_device(&mut vmm, event_manager, intc.clone())?;
@@ -2455,6 +2460,32 @@ pub fn create_guest_memory(
     }
 
     arch_mem_regions.extend(shm_manager.regions());
+
+    // Reserve the virtio-mem hotplug region above every other window. The
+    // backing is anonymous and lazily faulted, so unplugged capacity costs no
+    // host memory; the region is deliberately absent from the FDT/MPTABLE
+    // memory nodes — the guest discovers it through the virtio-mem device.
+    #[cfg(not(feature = "tee"))]
+    if let Some(mem_device) = &vm_resources.mem_device {
+        let boot_mib = vm_resources.vm_config().mem_size_mib.unwrap_or(128) as u64;
+        let max_mib = vm_resources
+            .vm_config()
+            .max_mem_size_mib
+            .map(|mib| mib as u64)
+            .unwrap_or(boot_mib);
+        let block = devices::virtio::VIRTIO_MEM_BLOCK_SIZE;
+        let hotplug_bytes = (max_mib.saturating_sub(boot_mib) << 20) / block * block;
+        if hotplug_bytes > 0 {
+            const GIB: u64 = 1 << 30;
+            let base = shm_manager.next_guest_addr().div_ceil(GIB) * GIB;
+            mem_device
+                .lock()
+                .unwrap()
+                .set_region(base, hotplug_bytes)
+                .expect("hotplug region is block-aligned by construction");
+            arch_mem_regions.push((GuestAddress(base), hotplug_bytes as usize));
+        }
+    }
 
     let guest_mem = GuestMemoryMmap::from_ranges(&arch_mem_regions)
         .map_err(StartMicrovmError::GuestMemoryMmapFromRanges)?;
@@ -3706,6 +3737,27 @@ fn attach_balloon_device(
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc.clone(), balloon).map_err(RegisterBalloonDevice)?;
+
+    Ok(())
+}
+
+#[cfg(not(feature = "tee"))]
+fn attach_mem_device(
+    vmm: &mut Vmm,
+    event_manager: &mut EventManager,
+    intc: IrqChip,
+    mem_device: Arc<Mutex<devices::virtio::Mem>>,
+) -> std::result::Result<(), StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    event_manager
+        .add_subscriber(mem_device.clone())
+        .map_err(RegisterEvent)?;
+
+    let id = String::from(mem_device.lock().unwrap().id());
+
+    // The device mutex mustn't be locked here otherwise it will deadlock.
+    attach_mmio_device(vmm, id, intc.clone(), mem_device).map_err(RegisterBalloonDevice)?;
 
     Ok(())
 }

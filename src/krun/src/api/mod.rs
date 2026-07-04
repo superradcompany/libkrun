@@ -55,3 +55,5 @@ pub use metrics::{
     VmMetrics,
 };
 pub use vm::Vm;
+#[cfg(not(feature = "tee"))]
+pub use vm::{VmControl, VmMemoryState};

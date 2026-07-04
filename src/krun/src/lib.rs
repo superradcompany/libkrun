@@ -57,6 +57,8 @@ pub use api::metrics::{
     VmMetrics,
 };
 pub use api::vm::Vm;
+#[cfg(not(feature = "tee"))]
+pub use api::vm::{VmControl, VmMemoryState};
 
 #[cfg(not(target_os = "windows"))]
 pub use backends::console::ConsolePortBackend;
