@@ -247,12 +247,17 @@ impl EventManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
     use utils::epoll::EventSet;
     use utils::eventfd::EventFd;
 
     struct DummySubscriber {
-        event_fd_1: EventFd,
-        event_fd_2: EventFd,
+        stream_1: UnixStream,
+        stream_1_peer: UnixStream,
+        stream_2: UnixStream,
+        _stream_2_peer: UnixStream,
 
         // Flags used for checking that the event manager called the `process`
         // function for ev1/ev2.
@@ -269,9 +274,14 @@ mod tests {
 
     impl DummySubscriber {
         fn new() -> Self {
+            let (stream_1, stream_1_peer) = UnixStream::pair().unwrap();
+            let (stream_2, stream_2_peer) = UnixStream::pair().unwrap();
+
             DummySubscriber {
-                event_fd_1: EventFd::new(0).unwrap(),
-                event_fd_2: EventFd::new(0).unwrap(),
+                stream_1,
+                stream_1_peer,
+                stream_2,
+                _stream_2_peer: stream_2_peer,
                 processed_ev1_out: false,
                 processed_ev2_out: false,
                 processed_ev1_in: false,
@@ -283,6 +293,14 @@ mod tests {
     }
 
     impl DummySubscriber {
+        fn stream_1_fd(&self) -> RawFd {
+            self.stream_1.as_raw_fd()
+        }
+
+        fn stream_2_fd(&self) -> RawFd {
+            self.stream_2.as_raw_fd()
+        }
+
         fn register_ev2(&mut self) {
             self.register_ev2 = true;
         }
@@ -307,6 +325,10 @@ mod tests {
             self.processed_ev1_in
         }
 
+        fn make_ev1_readable(&mut self) {
+            self.stream_1_peer.write_all(&[1]).unwrap();
+        }
+
         fn reset_state(&mut self) {
             self.processed_ev1_out = false;
             self.processed_ev2_out = false;
@@ -317,28 +339,24 @@ mod tests {
             if self.register_ev2 {
                 event_manager
                     .register(
-                        self.event_fd_2.as_raw_fd(),
-                        EpollEvent::new(EventSet::OUT, self.event_fd_2.as_raw_fd() as u64),
-                        event_manager
-                            .subscriber(self.event_fd_1.as_raw_fd())
-                            .unwrap(),
+                        self.stream_2_fd(),
+                        EpollEvent::new(EventSet::OUT, self.stream_2_fd() as u64),
+                        event_manager.subscriber(self.stream_1_fd()).unwrap(),
                     )
                     .unwrap();
                 self.register_ev2 = false;
             }
 
             if self.unregister_ev1 {
-                event_manager
-                    .unregister(self.event_fd_1.as_raw_fd())
-                    .unwrap();
+                event_manager.unregister(self.stream_1_fd()).unwrap();
                 self.unregister_ev1 = false;
             }
 
             if self.modify_ev1 {
                 event_manager
                     .modify(
-                        self.event_fd_1.as_raw_fd(),
-                        EpollEvent::new(EventSet::IN, self.event_fd_1.as_raw_fd() as u64),
+                        self.stream_1_fd(),
+                        EpollEvent::new(EventSet::IN, self.stream_1_fd() as u64),
                     )
                     .unwrap();
                 self.modify_ev1 = false;
@@ -346,17 +364,17 @@ mod tests {
         }
 
         fn handle_in(&mut self, source: RawFd) {
-            if self.event_fd_1.as_raw_fd() == source {
+            if self.stream_1_fd() == source {
                 self.processed_ev1_in = true;
             }
         }
 
         fn handle_out(&mut self, source: RawFd) {
             match source {
-                _ if self.event_fd_1.as_raw_fd() == source => {
+                _ if self.stream_1_fd() == source => {
                     self.processed_ev1_out = true;
                 }
-                _ if self.event_fd_2.as_raw_fd() == source => {
+                _ if self.stream_2_fd() == source => {
                     self.processed_ev2_out = true;
                 }
                 _ => {}
@@ -386,10 +404,7 @@ mod tests {
         }
 
         fn interest_list(&self) -> Vec<EpollEvent> {
-            vec![EpollEvent::new(
-                EventSet::OUT,
-                self.event_fd_1.as_raw_fd() as u64,
-            )]
+            vec![EpollEvent::new(EventSet::OUT, self.stream_1_fd() as u64)]
         }
     }
 
@@ -459,12 +474,7 @@ mod tests {
         dummy_subscriber.lock().unwrap().reset_state();
 
         // Make sure ev1 is ready for IN so that we don't loop forever.
-        dummy_subscriber
-            .lock()
-            .unwrap()
-            .event_fd_1
-            .write(1)
-            .unwrap();
+        dummy_subscriber.lock().unwrap().make_ev1_readable();
 
         event_manager.run().unwrap();
         assert!(!dummy_subscriber.lock().unwrap().processed_ev1_out());
@@ -505,15 +515,15 @@ mod tests {
 
         // At this point ev2 is not registered. Check that unregistering it throws an error.
         assert!(event_manager
-            .unregister(dummy_subscriber.lock().unwrap().event_fd_2.as_raw_fd())
+            .unregister(dummy_subscriber.lock().unwrap().stream_2_fd())
             .is_err());
 
         // Try to unregister ev1 twice. Only the first call should be successful.
         assert!(event_manager
-            .unregister(dummy_subscriber.lock().unwrap().event_fd_1.as_raw_fd())
+            .unregister(dummy_subscriber.lock().unwrap().stream_1_fd())
             .is_ok());
         assert!(event_manager
-            .unregister(dummy_subscriber.lock().unwrap().event_fd_1.as_raw_fd())
+            .unregister(dummy_subscriber.lock().unwrap().stream_1_fd())
             .is_err());
     }
 
@@ -526,7 +536,7 @@ mod tests {
             .add_subscriber(dummy_subscriber.clone())
             .unwrap();
 
-        let dummy_fd = dummy_subscriber.lock().unwrap().event_fd_1.as_raw_fd();
+        let dummy_fd = dummy_subscriber.lock().unwrap().stream_1_fd();
         assert!(event_manager.subscriber(dummy_fd).is_ok());
         assert!(event_manager.subscriber(-1).is_err());
     }
