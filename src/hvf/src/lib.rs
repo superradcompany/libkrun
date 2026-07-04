@@ -65,6 +65,10 @@ const PSR_D_BIT: u64 = 0x0000_0200;
 const PSTATE_EL1_FAULT_BITS_64: u64 = PSR_MODE_EL1H | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
 const PSTATE_EL2_FAULT_BITS_64: u64 = PSR_MODE_EL2H | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
 
+// Architectural reset value of SCTLR_EL1: only the RES1 bits (11, 20, 22, 23, 28, 29)
+// set, so MMU, caches, and alignment checking are all disabled.
+const SCTLR_EL1_RES1: u64 = (1 << 11) | (1 << 20) | (1 << 22) | (1 << 23) | (1 << 28) | (1 << 29);
+
 const HCR_TLOR: u64 = 1 << 35;
 const HCR_RW: u64 = 1 << 31;
 const HCR_TSW: u64 = 1 << 22;
@@ -321,8 +325,10 @@ impl HvfVm {
 
 #[derive(Debug)]
 pub enum VcpuExit<'a> {
+    AffinityInfo(u64),
     Breakpoint,
     Canceled,
+    CpuOff,
     CpuOn(u64, u64, u64),
     HypervisorCall,
     MmioRead(u64, &'a mut [u8]),
@@ -482,6 +488,21 @@ impl HvfVcpu<'_> {
             if ret != HV_SUCCESS {
                 return Err(Error::VcpuInitialRegisters);
             }
+
+            // Restore SCTLR_EL1 to its architectural reset value (RES1 bits only, so
+            // MMU/caches off). A vCPU restarted by PSCI CPU_ON after a CPU_OFF still
+            // carries the MMU state of its previous life, but the guest enters at a
+            // physical entry address and expects translation disabled.
+            let ret = unsafe {
+                hv_vcpu_set_sys_reg(
+                    self.vcpuid,
+                    hv_sys_reg_t_HV_SYS_REG_SCTLR_EL1,
+                    SCTLR_EL1_RES1,
+                )
+            };
+            if ret != HV_SUCCESS {
+                return Err(Error::VcpuInitialRegisters);
+            }
         }
 
         let ret = unsafe { hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_PC, entry_addr) };
@@ -557,20 +578,39 @@ impl HvfVcpu<'_> {
         }
     }
 
+    /// Write a PSCI return value into the guest's X0. Used by exits like
+    /// `AffinityInfo` whose result the VMM computes outside this crate.
+    pub fn write_psci_result(&self, val: u64) -> Result<(), Error> {
+        self.write_reg(hv_reg_t_HV_REG_X0, val)
+    }
+
     fn handle_psci_request(&self) -> Result<VcpuExit<'_>, Error> {
         match self.read_reg(hv_reg_t_HV_REG_X0)? {
             0x8400_0000 /* QEMU_PSCI_0_2_FN_PSCI_VERSION */ => {
                 self.write_reg(hv_reg_t_HV_REG_X0, 2)?;
                 Ok(VcpuExit::PsciHandled)
             },
+            0x8400_0002 /* QEMU_PSCI_0_2_FN_CPU_OFF */ => {
+                // Success does not return to the caller: the vCPU parks until a
+                // later CPU_ON targets it again.
+                Ok(VcpuExit::CpuOff)
+            },
+            0x8400_0004 /* QEMU_PSCI_0_2_FN_AFFINITY_INFO */ |
+            0xc400_0004 /* QEMU_PSCI_0_2_FN64_AFFINITY_INFO */ => {
+                let mpidr = self.read_reg(hv_reg_t_HV_REG_X1)?;
+                // The VMM answers ON/OFF through `write_psci_result`.
+                Ok(VcpuExit::AffinityInfo(mpidr))
+            },
             0x8400_0006 /* QEMU_PSCI_0_2_FN_MIGRATE_INFO_TYPE */ => {
                 self.write_reg(hv_reg_t_HV_REG_X0, 2)?;
                 Ok(VcpuExit::PsciHandled)
             },
             0x8400_0008 /* QEMU_PSCI_0_2_FN_SYSTEM_OFF */ => {
+                debug!("PSCI SYSTEM_OFF on vcpu {}", self.vcpuid);
                 Ok(VcpuExit::Shutdown)
             },
             0x8400_0009 /* QEMU_PSCI_0_2_FN_SYSTEM_RESET */ => {
+                debug!("PSCI SYSTEM_RESET on vcpu {}", self.vcpuid);
                 Ok(VcpuExit::Shutdown)
             },
             0xc400_0003 /* QEMU_PSCI_0_2_FN64_CPU_ON */ => {

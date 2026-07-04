@@ -622,9 +622,7 @@ fn map_vm_config_error(machine: &MachineBuilder, err: VmConfigError) -> Error {
         VmConfigError::InvalidMaxMemorySize => Error::Config(ConfigError::InvalidMaxMemorySize(
             machine.max_memory_mib.unwrap_or(machine.memory_mib),
         )),
-        VmConfigError::MaxCapacityUnsupported => {
-            Error::Config(ConfigError::MaxCapacityUnsupported)
-        }
+        VmConfigError::MaxCapacityUnsupported => Error::Config(ConfigError::MaxCapacityUnsupported),
     }
 }
 

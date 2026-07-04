@@ -3118,22 +3118,20 @@ fn create_vcpus_aarch64(
     metrics: utils::metrics::MetricsWriter,
 ) -> super::Result<Vec<Vcpu>> {
     // Create the full possible topology; CPUs beyond `vcpu_count` park on their boot
-    // channel until vCPU 0 relays a PSCI CPU_ON when the guest onlines them.
+    // channel until a PSCI CPU_ON supplies an entry point when the guest onlines them.
     let mut vcpus = Vec::with_capacity(vcpu_config.max_vcpu_count as usize);
     let mut boot_senders: HashMap<u64, Sender<u64>> = HashMap::new();
+    let mut parked_cpus: HashMap<u64, std::sync::atomic::AtomicBool> = HashMap::new();
 
     for cpu_index in 0..vcpu_config.max_vcpu_count {
-        let (boot_sender, boot_receiver) = if cpu_index != 0 {
-            let (boot_sender, boot_receiver) = unbounded();
-            (Some(boot_sender), Some(boot_receiver))
-        } else {
-            (None, None)
-        };
+        // Every CPU gets a boot channel so it can re-park and restart across
+        // guest offline/online cycles; only vCPU 0 skips waiting at first boot.
+        let (boot_sender, boot_receiver) = unbounded();
 
         let mut vcpu = Vcpu::new_aarch64(
             cpu_index,
             entry_addr,
-            boot_receiver,
+            Some(boot_receiver),
             exit_evt.try_clone().map_err(Error::EventFd)?,
             vcpu_list.clone(),
             nested_enabled,
@@ -3143,14 +3141,23 @@ fn create_vcpus_aarch64(
 
         vcpu.configure_aarch64(mem_info).map_err(Error::Vcpu)?;
 
-        if let Some(boot_sender) = boot_sender {
-            boot_senders.insert(vcpu.get_mpidr(), boot_sender);
-        }
+        boot_senders.insert(vcpu.get_mpidr(), boot_sender);
+        parked_cpus.insert(
+            vcpu.get_mpidr(),
+            std::sync::atomic::AtomicBool::new(cpu_index != 0),
+        );
 
         vcpus.push(vcpu);
     }
 
-    vcpus[0].set_boot_senders(boot_senders);
+    // CPU_ON can be issued from any online vCPU and AFFINITY_INFO answered from
+    // any thread, so every vCPU shares the relay and parked-state maps.
+    let boot_senders = Arc::new(boot_senders);
+    let parked_cpus = Arc::new(parked_cpus);
+    for vcpu in &mut vcpus {
+        vcpu.set_boot_senders(boot_senders.clone());
+        vcpu.set_parked_cpus(parked_cpus.clone());
+    }
 
     Ok(vcpus)
 }

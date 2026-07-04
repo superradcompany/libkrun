@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::io;
 use std::result;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(test))]
 use std::sync::Arc;
 use std::thread;
@@ -39,6 +40,8 @@ pub enum Error {
     REGSConfiguration(arch::aarch64::regs::Error),
     /// Cannot set the memory regions.
     SetUserMemoryRegion(hvf::Error),
+    /// Failed writing a PSCI result into the vCPU.
+    VcpuHvf(hvf::Error),
     /// Failed to signal Vcpu.
     SignalVcpu(utils::errno::Error),
     /// Error doing Vcpu Init on Arm.
@@ -75,6 +78,7 @@ impl Display for Error {
                 "The number of configured slots is bigger than the maximum reported by KVM"
             ),
             SetUserMemoryRegion(e) => write!(f, "Cannot set the memory regions: {e:?}"),
+            VcpuHvf(e) => write!(f, "Failed writing a PSCI result into the vCPU: {e:?}"),
             SignalVcpu(e) => write!(f, "Failed to signal Vcpu: {e}"),
             REGSConfiguration(e) => write!(
                 f,
@@ -184,7 +188,12 @@ pub struct Vcpu {
     id: u8,
     boot_entry_addr: u64,
     boot_receiver: Option<Receiver<u64>>,
-    boot_senders: Option<HashMap<u64, Sender<u64>>>,
+    // Shared by every vCPU: a runtime CPU online (PSCI CPU_ON) can be issued from
+    // whichever vCPU the guest scheduled the hotplug path on, not just the boot CPU.
+    boot_senders: Option<Arc<HashMap<u64, Sender<u64>>>>,
+    // Shared parked/offline flags (keyed by MPIDR) so AFFINITY_INFO can be answered
+    // from any vCPU thread.
+    parked_cpus: Option<Arc<HashMap<u64, AtomicBool>>>,
     fdt_addr: u64,
     mmio_bus: Option<devices::Bus>,
     #[cfg_attr(all(test, target_arch = "aarch64"), allow(unused))]
@@ -289,6 +298,7 @@ impl Vcpu {
             boot_entry_addr: boot_entry_addr.raw_value(),
             boot_receiver,
             boot_senders: None,
+            parked_cpus: None,
             fdt_addr: 0,
             mmio_bus: None,
             exit_evt,
@@ -318,8 +328,23 @@ impl Vcpu {
         self.mmio_bus = Some(mmio_bus);
     }
 
-    pub fn set_boot_senders(&mut self, boot_senders: HashMap<u64, Sender<u64>>) {
+    pub fn set_boot_senders(&mut self, boot_senders: Arc<HashMap<u64, Sender<u64>>>) {
         self.boot_senders = Some(boot_senders);
+    }
+
+    pub fn set_parked_cpus(&mut self, parked_cpus: Arc<HashMap<u64, AtomicBool>>) {
+        self.parked_cpus = Some(parked_cpus);
+    }
+
+    /// Record this vCPU's parked/offline state for AFFINITY_INFO queries.
+    fn set_parked(&self, parked: bool) {
+        if let Some(flag) = self
+            .parked_cpus
+            .as_ref()
+            .and_then(|parked_cpus| parked_cpus.get(&self.mpidr))
+        {
+            flag.store(parked, Ordering::Release);
+        }
     }
 
     /// Configures an aarch64 specific vcpu.
@@ -375,14 +400,33 @@ impl Vcpu {
                     debug!("vCPU {vcpuid} canceled");
                     Ok(VcpuEmulation::Handled)
                 }
+                VcpuExit::AffinityInfo(mpidr) => {
+                    debug!("AffinityInfo: mpidr=0x{mpidr:x}");
+                    let off = self
+                        .parked_cpus
+                        .as_ref()
+                        .and_then(|parked| parked.get(&mpidr))
+                        .is_some_and(|flag| flag.load(Ordering::Acquire));
+                    // PSCI AFFINITY_INFO: 0 = ON, 1 = OFF.
+                    hvf_vcpu
+                        .write_psci_result(if off { 1 } else { 0 })
+                        .map_err(Error::VcpuHvf)?;
+                    Ok(VcpuEmulation::Handled)
+                }
+                VcpuExit::CpuOff => {
+                    debug!("CpuOff: vCPU {vcpuid}");
+                    Ok(VcpuEmulation::CpuOff)
+                }
                 VcpuExit::CpuOn(mpidr, entry, context_id) => {
                     debug!("CpuOn: mpidr=0x{mpidr:x} entry=0x{entry:x} context_id={context_id}");
-                    if let Some(boot_senders) = &self.boot_senders {
-                        if let Some(sender) = boot_senders.get(&mpidr) {
-                            sender.send(entry).unwrap()
-                        }
+                    if let Some(sender) = self
+                        .boot_senders
+                        .as_ref()
+                        .and_then(|senders| senders.get(&mpidr))
+                    {
+                        sender.send(entry).unwrap()
                     } else {
-                        error!("CpuOn request coming from an unexpected vCPU={}", self.id);
+                        error!("CPU_ON for unknown target mpidr=0x{mpidr:x}");
                     }
                     Ok(VcpuEmulation::Handled)
                 }
@@ -454,8 +498,15 @@ impl Vcpu {
         let (wfe_sender, wfe_receiver) = unbounded();
         self.vcpu_list.register(hvf_vcpuid, wfe_sender);
 
-        let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
-            boot_receiver.recv().unwrap()
+        // The boot CPU starts immediately at the kernel entry point; every other CPU
+        // parks on its boot channel until PSCI CPU_ON supplies an entry point.
+        let entry_addr = if self.id == 0 {
+            self.boot_entry_addr
+        } else if let Some(boot_receiver) = &self.boot_receiver {
+            self.set_parked(true);
+            let entry = boot_receiver.recv().unwrap();
+            self.set_parked(false);
+            entry
         } else {
             self.boot_entry_addr
         };
@@ -476,6 +527,26 @@ impl Vcpu {
             match emulation {
                 // Emulation ran successfully, continue.
                 Ok(VcpuEmulation::Handled) => (),
+                // The guest offlined this CPU (PSCI CPU_OFF). Park until a later
+                // CPU_ON supplies a fresh entry point, then restart from it.
+                Ok(VcpuEmulation::CpuOff) => {
+                    if let Some(boot_receiver) = &self.boot_receiver {
+                        self.set_parked(true);
+                        let entry = boot_receiver.recv().unwrap();
+                        self.set_parked(false);
+                        hvf_vcpu
+                            .set_initial_state(entry, self.fdt_addr)
+                            .unwrap_or_else(|_| {
+                                panic!("Can't reset HVF vCPU {hvf_vcpuid} state after CPU_OFF")
+                            });
+                    } else {
+                        error!(
+                            "vCPU {} received CPU_OFF without a boot channel; stopping it",
+                            self.id
+                        );
+                        break;
+                    }
+                }
                 // Emulation was interrupted by a breakpoint.
                 Ok(VcpuEmulation::Interrupted) => self.wait_for_resume(),
                 // Wait for an external event.
@@ -604,6 +675,7 @@ impl VcpuHandle {
 }
 
 enum VcpuEmulation {
+    CpuOff,
     Handled,
     Interrupted,
     Stopped,
