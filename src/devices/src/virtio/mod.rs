@@ -38,7 +38,9 @@ pub mod linux_errno {
         std::io::Error::from_raw_os_error(error.raw_os_error().unwrap_or(5))
     }
 }
-#[cfg(not(feature = "tee"))]
+// The CPU capacity module is compiled under every feature: TEE builds never
+// instantiate the device (extra capacity is rejected at config time), but the
+// vCPU run loops still reference its enforcement types unconditionally.
 pub mod cpu;
 #[cfg(not(feature = "tee"))]
 pub mod mem;
@@ -59,7 +61,6 @@ pub use self::balloon::*;
 #[cfg(feature = "blk")]
 pub use self::block::{Block, CacheType};
 pub use self::console::*;
-#[cfg(not(feature = "tee"))]
 pub use self::cpu::*;
 pub use self::device::*;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
