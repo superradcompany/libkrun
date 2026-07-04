@@ -1109,6 +1109,7 @@ pub fn build_microvm(
             vcpu_config.vcpu_count
         );
         vcpu_config.vcpu_count = 1;
+        vcpu_config.max_vcpu_count = 1;
     }
 
     // Clone the command-line so that a failed boot doesn't pollute the original.
@@ -1124,6 +1125,27 @@ pub fn build_microvm(
 
     if let Some(cmdline) = &vm_resources.kernel_cmdline.krun_env {
         kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
+    }
+
+    // When extra CPU capacity is reserved, every possible vCPU is described to the guest
+    // (MPTABLE/FDT), so cap the number brought online at boot to the requested count. The
+    // remaining CPUs stay offline until the guest's msb-cpu driver onlines them.
+    if vcpu_config.max_vcpu_count > vcpu_config.vcpu_count {
+        kernel_cmdline
+            .insert_str(format!(" maxcpus={}", vcpu_config.vcpu_count))
+            .unwrap();
+    }
+
+    // Hotplugged virtio-mem blocks must come online automatically: without this,
+    // guests whose kernel lacks MEMORY_HOTPLUG_DEFAULT_ONLINE (and which run no
+    // udev onlining rule) accept the blocks but leave them offline, so a live
+    // grow silently adds no usable memory. The movable zone keeps later unplug
+    // reliable.
+    #[cfg(not(feature = "tee"))]
+    if vm_resources.mem_device.is_some() {
+        kernel_cmdline
+            .insert_str(" memhp_default_state=online_movable")
+            .unwrap();
     }
     trace.mark("kernel_cmdline.ready");
 
@@ -1399,11 +1421,12 @@ pub fn build_microvm(
 
     #[cfg(target_os = "macos")]
     let vcpu_list = {
-        let cpu_count = vm_resources.vm_config().vcpu_count.unwrap();
-        Arc::new(VcpuList::new(cpu_count as u64))
+        // Size for the full possible topology so parked vCPUs can register too.
+        Arc::new(VcpuList::new(vcpu_config.max_vcpu_count as u64))
     };
 
-    let vcpus;
+    #[allow(unused_mut)]
+    let mut vcpus;
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
@@ -1518,7 +1541,8 @@ pub fn build_microvm(
             // architected vGIC, which is required for requesting KVM the instantiation of a
             // GICv3. To relieve the users from having to configure the gic version manually,
             // try first to instantiate a GICv3, and fall back to a GICv2 if it fails.
-            let vcpu_count = vm_resources.vm_config().vcpu_count.unwrap() as u64;
+            // Redistributors must cover the full possible topology, not just online CPUs.
+            let vcpu_count = vcpu_config.max_vcpu_count as u64;
             let gic = match KvmGicV3::new(vm.fd(), vcpu_count) {
                 Ok(gicv3) => IrqChipDevice::new(Box::new(gicv3)),
                 Err(_) => {
@@ -1542,8 +1566,9 @@ pub fn build_microvm(
     {
         intc = {
             // If the system supports the in-kernel GIC, use it. Otherwise, fall back to the
-            // userspace implementation.
-            let gic = match HvfGicV3::new(vm_resources.vm_config().vcpu_count.unwrap() as u64) {
+            // userspace implementation. Redistributors must cover the full possible
+            // topology, not just online CPUs.
+            let gic = match HvfGicV3::new(vcpu_config.max_vcpu_count as u64) {
                 Ok(hvfgic) => IrqChipDevice::new(Box::new(hvfgic)),
                 Err(_) => IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone()))),
             };
@@ -1571,6 +1596,14 @@ pub fn build_microvm(
             event_manager,
             _shutdown_efd,
         )?;
+    }
+
+    #[cfg(all(not(feature = "tee"), any(target_os = "linux", target_os = "macos")))]
+    if let Some(cpu_device) = &vm_resources.cpu_device {
+        let enforcement = cpu_device.lock().unwrap().enforcement();
+        for vcpu in &mut vcpus {
+            vcpu.set_enforcement(enforcement.clone());
+        }
     }
 
     #[cfg(all(target_arch = "riscv64", target_os = "linux"))]
@@ -1633,6 +1666,16 @@ pub fn build_microvm(
         trace.mark("balloon.attached");
     } else {
         trace.mark("balloon.skipped");
+    }
+    #[cfg(not(feature = "tee"))]
+    if let Some(mem_device) = vm_resources.mem_device.clone() {
+        attach_mem_device(&mut vmm, event_manager, intc.clone(), mem_device)?;
+        trace.mark("mem.attached");
+    }
+    #[cfg(not(feature = "tee"))]
+    if let Some(cpu_device) = vm_resources.cpu_device.clone() {
+        attach_cpu_device(&mut vmm, event_manager, intc.clone(), cpu_device)?;
+        trace.mark("cpu.attached");
     }
     #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     if vm_resources.enable_rng {
@@ -2444,6 +2487,32 @@ pub fn create_guest_memory(
 
     arch_mem_regions.extend(shm_manager.regions());
 
+    // Reserve the virtio-mem hotplug region above every other window. The
+    // backing is anonymous and lazily faulted, so unplugged capacity costs no
+    // host memory; the region is deliberately absent from the FDT/MPTABLE
+    // memory nodes — the guest discovers it through the virtio-mem device.
+    #[cfg(not(feature = "tee"))]
+    if let Some(mem_device) = &vm_resources.mem_device {
+        let boot_mib = vm_resources.vm_config().mem_size_mib.unwrap_or(128) as u64;
+        let max_mib = vm_resources
+            .vm_config()
+            .max_mem_size_mib
+            .map(|mib| mib as u64)
+            .unwrap_or(boot_mib);
+        let block = devices::virtio::VIRTIO_MEM_BLOCK_SIZE;
+        let hotplug_bytes = (max_mib.saturating_sub(boot_mib) << 20) / block * block;
+        if hotplug_bytes > 0 {
+            const GIB: u64 = 1 << 30;
+            let base = shm_manager.next_guest_addr().div_ceil(GIB) * GIB;
+            mem_device
+                .lock()
+                .unwrap()
+                .set_region(base, hotplug_bytes)
+                .expect("hotplug region is block-aligned by construction");
+            arch_mem_regions.push((GuestAddress(base), hotplug_bytes as usize));
+        }
+    }
+
     let guest_mem = GuestMemoryMmap::from_ranges(&arch_mem_regions)
         .map_err(StartMicrovmError::GuestMemoryMmapFromRanges)?;
 
@@ -3008,8 +3077,10 @@ fn create_vcpus_x86_64(
     metrics: utils::metrics::MetricsWriter,
     #[cfg(feature = "tee")] pm_sender: Sender<WorkerMessage>,
 ) -> super::Result<Vec<Vcpu>> {
-    let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
-    for cpu_index in 0..vcpu_config.vcpu_count {
+    // Create the full possible topology; CPUs beyond `vcpu_count` boot offline (maxcpus=)
+    // and wait inside KVM for INIT/SIPI until the guest onlines them.
+    let mut vcpus = Vec::with_capacity(vcpu_config.max_vcpu_count as usize);
+    for cpu_index in 0..vcpu_config.max_vcpu_count {
         let mut vcpu = Vcpu::new_x86_64(
             cpu_index,
             vm.fd(),
@@ -3071,8 +3142,10 @@ fn create_vcpus_aarch64(
     exit_evt: &EventFd,
     metrics: utils::metrics::MetricsWriter,
 ) -> super::Result<Vec<Vcpu>> {
-    let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
-    for cpu_index in 0..vcpu_config.vcpu_count {
+    // Create the full possible topology; CPUs beyond `vcpu_count` boot powered off
+    // (KVM_ARM_VCPU_POWER_OFF) and wait for PSCI CPU_ON when the guest onlines them.
+    let mut vcpus = Vec::with_capacity(vcpu_config.max_vcpu_count as usize);
+    for cpu_index in 0..vcpu_config.max_vcpu_count {
         let mut vcpu = Vcpu::new_aarch64(
             cpu_index,
             vm.fd(),
@@ -3101,21 +3174,21 @@ fn create_vcpus_aarch64(
     nested_enabled: bool,
     metrics: utils::metrics::MetricsWriter,
 ) -> super::Result<Vec<Vcpu>> {
-    let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
+    // Create the full possible topology; CPUs beyond `vcpu_count` park on their boot
+    // channel until a PSCI CPU_ON supplies an entry point when the guest onlines them.
+    let mut vcpus = Vec::with_capacity(vcpu_config.max_vcpu_count as usize);
     let mut boot_senders: HashMap<u64, Sender<u64>> = HashMap::new();
+    let mut parked_cpus: HashMap<u64, std::sync::atomic::AtomicBool> = HashMap::new();
 
-    for cpu_index in 0..vcpu_config.vcpu_count {
-        let (boot_sender, boot_receiver) = if cpu_index != 0 {
-            let (boot_sender, boot_receiver) = unbounded();
-            (Some(boot_sender), Some(boot_receiver))
-        } else {
-            (None, None)
-        };
+    for cpu_index in 0..vcpu_config.max_vcpu_count {
+        // Every CPU gets a boot channel so it can re-park and restart across
+        // guest offline/online cycles; only vCPU 0 skips waiting at first boot.
+        let (boot_sender, boot_receiver) = unbounded();
 
         let mut vcpu = Vcpu::new_aarch64(
             cpu_index,
             entry_addr,
-            boot_receiver,
+            Some(boot_receiver),
             exit_evt.try_clone().map_err(Error::EventFd)?,
             vcpu_list.clone(),
             nested_enabled,
@@ -3125,14 +3198,23 @@ fn create_vcpus_aarch64(
 
         vcpu.configure_aarch64(mem_info).map_err(Error::Vcpu)?;
 
-        if let Some(boot_sender) = boot_sender {
-            boot_senders.insert(vcpu.get_mpidr(), boot_sender);
-        }
+        boot_senders.insert(vcpu.get_mpidr(), boot_sender);
+        parked_cpus.insert(
+            vcpu.get_mpidr(),
+            std::sync::atomic::AtomicBool::new(cpu_index != 0),
+        );
 
         vcpus.push(vcpu);
     }
 
-    vcpus[0].set_boot_senders(boot_senders);
+    // CPU_ON can be issued from any online vCPU and AFFINITY_INFO answered from
+    // any thread, so every vCPU shares the relay and parked-state maps.
+    let boot_senders = Arc::new(boot_senders);
+    let parked_cpus = Arc::new(parked_cpus);
+    for vcpu in &mut vcpus {
+        vcpu.set_boot_senders(boot_senders.clone());
+        vcpu.set_parked_cpus(parked_cpus.clone());
+    }
 
     Ok(vcpus)
 }
@@ -3685,6 +3767,48 @@ fn attach_balloon_device(
     Ok(())
 }
 
+#[cfg(not(feature = "tee"))]
+fn attach_cpu_device(
+    vmm: &mut Vmm,
+    event_manager: &mut EventManager,
+    intc: IrqChip,
+    cpu_device: Arc<Mutex<devices::virtio::Cpu>>,
+) -> std::result::Result<(), StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    event_manager
+        .add_subscriber(cpu_device.clone())
+        .map_err(RegisterEvent)?;
+
+    let id = String::from(cpu_device.lock().unwrap().id());
+
+    // The device mutex mustn't be locked here otherwise it will deadlock.
+    attach_mmio_device(vmm, id, intc.clone(), cpu_device).map_err(RegisterBalloonDevice)?;
+
+    Ok(())
+}
+
+#[cfg(not(feature = "tee"))]
+fn attach_mem_device(
+    vmm: &mut Vmm,
+    event_manager: &mut EventManager,
+    intc: IrqChip,
+    mem_device: Arc<Mutex<devices::virtio::Mem>>,
+) -> std::result::Result<(), StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    event_manager
+        .add_subscriber(mem_device.clone())
+        .map_err(RegisterEvent)?;
+
+    let id = String::from(mem_device.lock().unwrap().id());
+
+    // The device mutex mustn't be locked here otherwise it will deadlock.
+    attach_mmio_device(vmm, id, intc.clone(), mem_device).map_err(RegisterBalloonDevice)?;
+
+    Ok(())
+}
+
 #[cfg(feature = "blk")]
 fn attach_block_devices(
     vmm: &mut Vmm,
@@ -3862,6 +3986,7 @@ pub mod tests {
 
         let vcpu_config = VcpuConfig {
             vcpu_count,
+            max_vcpu_count: vcpu_count,
             ht_enabled: false,
             cpu_template: None,
         };
@@ -3898,6 +4023,7 @@ pub mod tests {
 
         let vcpu_config = VcpuConfig {
             vcpu_count,
+            max_vcpu_count: vcpu_count,
             ht_enabled: false,
             cpu_template: None,
         };

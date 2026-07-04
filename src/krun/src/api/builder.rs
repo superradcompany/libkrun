@@ -351,11 +351,49 @@ impl VmBuilder {
         let vm_config = VmConfig {
             vcpu_count: Some(self.machine.vcpus),
             mem_size_mib: Some(self.machine.memory_mib),
+            max_vcpu_count: self.machine.max_vcpus,
+            max_mem_size_mib: self.machine.max_memory_mib,
             ht_enabled: Some(self.machine.hyperthreading),
             ..Default::default()
         };
         vmr.set_vm_config(&vm_config)
             .map_err(|err| map_vm_config_error(&self.machine, err))?;
+
+        // Reserved CPU capacity is realized through the private msb-cpu device:
+        // the guest driver converges on the requested online count and the
+        // device's enforcement state parks vCPUs above it host-side.
+        #[cfg(not(feature = "tee"))]
+        if self
+            .machine
+            .max_vcpus
+            .is_some_and(|max| max > self.machine.vcpus)
+        {
+            let cpu = devices::virtio::Cpu::new(
+                self.machine.max_vcpus.unwrap_or(self.machine.vcpus) as u32,
+                self.machine.vcpus as u32,
+            )
+            .map_err(|e| {
+                Error::Build(BuildError::DeviceRegistration(format!(
+                    "virtio-msb-cpu: {e:?}"
+                )))
+            })?;
+            vmr.cpu_device = Some(std::sync::Arc::new(std::sync::Mutex::new(cpu)));
+        }
+
+        // Reserved memory capacity is realized through a virtio-mem device; the
+        // VMM places its hotplug region during boot and `Vm::control_handle`
+        // exposes the live resize knob.
+        #[cfg(not(feature = "tee"))]
+        if self
+            .machine
+            .max_memory_mib
+            .is_some_and(|max| max > self.machine.memory_mib)
+        {
+            let mem = devices::virtio::Mem::new().map_err(|e| {
+                Error::Build(BuildError::DeviceRegistration(format!("virtio-mem: {e:?}")))
+            })?;
+            vmr.mem_device = Some(std::sync::Arc::new(std::sync::Mutex::new(mem)));
+        }
         vmr.nested_enabled = self.machine.nested_virt;
         vmr.split_irqchip = self.machine.split_irqchip;
         vmr.request_vsock = self.machine.vsock;
@@ -614,6 +652,13 @@ fn map_vm_config_error(machine: &MachineBuilder, err: VmConfigError) -> Error {
         VmConfigError::InvalidMemorySize => {
             Error::Config(ConfigError::InvalidMemorySize(machine.memory_mib))
         }
+        VmConfigError::InvalidMaxVcpuCount => Error::Config(ConfigError::InvalidMaxVcpuCount(
+            machine.max_vcpus.unwrap_or(machine.vcpus),
+        )),
+        VmConfigError::InvalidMaxMemorySize => Error::Config(ConfigError::InvalidMaxMemorySize(
+            machine.max_memory_mib.unwrap_or(machine.memory_mib),
+        )),
+        VmConfigError::MaxCapacityUnsupported => Error::Config(ConfigError::MaxCapacityUnsupported),
     }
 }
 
@@ -637,6 +682,38 @@ mod tests {
 
         match err {
             Error::Config(ConfigError::InvalidVcpuCount(3)) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_rejects_max_vcpus_below_effective_count() {
+        let err = match VmBuilder::new()
+            .machine(|machine| machine.vcpus(4).max_vcpus(2))
+            .build()
+        {
+            Ok(_) => panic!("max vCPUs below the effective count should fail"),
+            Err(err) => err,
+        };
+
+        match err {
+            Error::Config(ConfigError::InvalidMaxVcpuCount(2)) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_rejects_max_memory_below_effective_size() {
+        let err = match VmBuilder::new()
+            .machine(|machine| machine.memory_mib(2048).max_memory_mib(1024))
+            .build()
+        {
+            Ok(_) => panic!("max memory below the effective size should fail"),
+            Err(err) => err,
+        };
+
+        match err {
+            Error::Config(ConfigError::InvalidMaxMemorySize(1024)) => {}
             other => panic!("unexpected error: {other:?}"),
         }
     }

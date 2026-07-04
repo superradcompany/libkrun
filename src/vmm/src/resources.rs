@@ -217,6 +217,17 @@ pub struct VmResources {
     pub request_vsock: bool,
     /// Whether to attach the virtio-balloon device.
     pub enable_balloon: bool,
+    /// The virtio-mem device backing live memory resize, created by the API
+    /// layer when max memory exceeds boot memory. The builder places the
+    /// hotplug region and attaches the device; the API layer keeps a clone as
+    /// the runtime control handle.
+    #[cfg(not(feature = "tee"))]
+    pub mem_device: Option<std::sync::Arc<std::sync::Mutex<devices::virtio::Mem>>>,
+    /// The CPU capacity device backing live CPU resize, created by the API
+    /// layer when max vCPUs exceed the boot count. Also the source of the
+    /// enforcement state every vCPU run loop consults.
+    #[cfg(not(feature = "tee"))]
+    pub cpu_device: Option<std::sync::Arc<std::sync::Mutex<devices::virtio::Cpu>>>,
     /// Guest memory stats polling interval for the virtio-balloon device.
     pub balloon_stats_interval: Option<Duration>,
     /// Whether to attach the virtio-rng device.
@@ -273,6 +284,10 @@ impl Default for VmResources {
             metrics: MetricsWriter::default(),
             request_vsock: false,
             enable_balloon: true,
+            #[cfg(not(feature = "tee"))]
+            mem_device: None,
+            #[cfg(not(feature = "tee"))]
+            cpu_device: None,
             balloon_stats_interval: Some(Duration::from_secs(1)),
             enable_rng: true,
             enable_msb_metrics: true,
@@ -290,8 +305,10 @@ impl VmResources {
     pub fn vcpu_config(&self) -> VcpuConfig {
         // The unwraps are ok to use because the values are initialized using defaults if not
         // supplied by the user.
+        let vcpu_count = self.vm_config().vcpu_count.unwrap();
         VcpuConfig {
-            vcpu_count: self.vm_config().vcpu_count.unwrap(),
+            vcpu_count,
+            max_vcpu_count: self.vm_config().max_vcpu_count.unwrap_or(vcpu_count),
             ht_enabled: self.vm_config().ht_enabled.unwrap(),
             cpu_template: self.vm_config().cpu_template,
         }
@@ -326,9 +343,38 @@ impl VmResources {
             return Err(VmConfigError::InvalidVcpuCount);
         }
 
+        if let Some(max_vcpu_count) = machine_config.max_vcpu_count {
+            if max_vcpu_count < vcpu_count_value
+                || max_vcpu_count > crate::vmm_config::machine_config::MAX_SUPPORTED_VCPUS
+            {
+                return Err(VmConfigError::InvalidMaxVcpuCount);
+            }
+            if ht_enabled && max_vcpu_count > 1 && max_vcpu_count % 2 == 1 {
+                return Err(VmConfigError::InvalidMaxVcpuCount);
+            }
+            // Booting a wider possible topology than the online count relies on parked
+            // vCPUs waiting for PSCI/INIT-SIPI wake-ups, which the WHP backend does not
+            // implement, and on non-TEE boot topology tables. Reject rather than lie.
+            #[cfg(any(target_os = "windows", target_arch = "riscv64", feature = "tee"))]
+            if max_vcpu_count > vcpu_count_value {
+                return Err(VmConfigError::MaxCapacityUnsupported);
+            }
+        }
+
+        if let Some(max_mem_size_mib) = machine_config.max_mem_size_mib {
+            let mem_size_mib = machine_config
+                .mem_size_mib
+                .unwrap_or_else(|| self.vm_config.mem_size_mib.unwrap());
+            if max_mem_size_mib < mem_size_mib {
+                return Err(VmConfigError::InvalidMaxMemorySize);
+            }
+        }
+
         // Update all the fields that have a new value.
         self.vm_config.vcpu_count = Some(vcpu_count_value);
         self.vm_config.ht_enabled = Some(ht_enabled);
+        self.vm_config.max_vcpu_count = machine_config.max_vcpu_count;
+        self.vm_config.max_mem_size_mib = machine_config.max_mem_size_mib;
 
         if machine_config.mem_size_mib.is_some() {
             self.vm_config.mem_size_mib = machine_config.mem_size_mib;
@@ -471,6 +517,8 @@ impl VmResources {
         self.set_vm_config(&VmConfig {
             vcpu_count: Some(tee_config.cpus),
             mem_size_mib: Some(tee_config.ram_mib),
+            max_vcpu_count: None,
+            max_mem_size_mib: None,
             ht_enabled: Some(false),
             cpu_template: None,
         })
@@ -532,6 +580,10 @@ mod tests {
             metrics: MetricsWriter::default(),
             request_vsock: false,
             enable_balloon: true,
+            #[cfg(not(feature = "tee"))]
+            mem_device: None,
+            #[cfg(not(feature = "tee"))]
+            cpu_device: None,
             balloon_stats_interval: Some(std::time::Duration::from_secs(1)),
             enable_rng: true,
             enable_msb_metrics: true,
@@ -548,6 +600,7 @@ mod tests {
         let vm_resources = default_vm_resources();
         let expected_vcpu_config = VcpuConfig {
             vcpu_count: vm_resources.vm_config().vcpu_count.unwrap(),
+            max_vcpu_count: vm_resources.vm_config().vcpu_count.unwrap(),
             ht_enabled: vm_resources.vm_config().ht_enabled.unwrap(),
             cpu_template: vm_resources.vm_config().cpu_template,
         };
@@ -570,6 +623,8 @@ mod tests {
         let mut aux_vm_config = VmConfig {
             vcpu_count: Some(32),
             mem_size_mib: Some(512),
+            max_vcpu_count: None,
+            max_mem_size_mib: None,
             ht_enabled: Some(true),
             cpu_template: Some(CpuFeaturesTemplate::T2),
         };
@@ -596,6 +651,61 @@ mod tests {
         assert_eq!(
             vm_resources.set_vm_config(&aux_vm_config),
             Err(VmConfigError::InvalidMemorySize)
+        );
+    }
+
+    #[test]
+    fn test_set_vm_config_max_capacity() {
+        let mut vm_resources = default_vm_resources();
+        let mut vm_config = VmConfig {
+            vcpu_count: Some(2),
+            mem_size_mib: Some(1024),
+            max_vcpu_count: Some(8),
+            max_mem_size_mib: Some(8192),
+            ht_enabled: Some(false),
+            cpu_template: None,
+        };
+
+        vm_resources.set_vm_config(&vm_config).unwrap();
+        let vcpu_config = vm_resources.vcpu_config();
+        assert_eq!(vcpu_config.vcpu_count, 2);
+        assert_eq!(vcpu_config.max_vcpu_count, 8);
+
+        // Without explicit capacity, max tracks the effective count.
+        vm_config.max_vcpu_count = None;
+        vm_config.max_mem_size_mib = None;
+        vm_resources.set_vm_config(&vm_config).unwrap();
+        assert_eq!(vm_resources.vcpu_config().max_vcpu_count, 2);
+
+        // Max vcpus below the effective count.
+        vm_config.max_vcpu_count = Some(1);
+        assert_eq!(
+            vm_resources.set_vm_config(&vm_config),
+            Err(VmConfigError::InvalidMaxVcpuCount)
+        );
+
+        // Max vcpus above the supported limit.
+        vm_config.max_vcpu_count = Some(65);
+        assert_eq!(
+            vm_resources.set_vm_config(&vm_config),
+            Err(VmConfigError::InvalidMaxVcpuCount)
+        );
+
+        // Odd max vcpus with hyperthreading enabled.
+        vm_config.max_vcpu_count = Some(3);
+        vm_config.ht_enabled = Some(true);
+        assert_eq!(
+            vm_resources.set_vm_config(&vm_config),
+            Err(VmConfigError::InvalidMaxVcpuCount)
+        );
+        vm_config.ht_enabled = Some(false);
+
+        // Max memory below the boot memory size.
+        vm_config.max_vcpu_count = Some(8);
+        vm_config.max_mem_size_mib = Some(512);
+        assert_eq!(
+            vm_resources.set_vm_config(&vm_config),
+            Err(VmConfigError::InvalidMaxMemorySize)
         );
     }
 

@@ -66,6 +66,57 @@ pub struct Vm {
     _initramfs_data: Option<Vec<u8>>,
 }
 
+/// Cloneable handle for live VM resource control.
+///
+/// Obtained through [`Vm::control_handle`] before `enter()`; background
+/// threads use it to drive live resizes while the VM runs. Memory resize is
+/// backed by virtio-mem and only available when the machine reserved capacity
+/// with [`max_memory_mib`](super::builders::MachineBuilder::max_memory_mib).
+#[cfg(not(feature = "tee"))]
+#[derive(Clone)]
+pub struct VmControl {
+    boot_mib: u64,
+    mem: Option<Arc<std::sync::Mutex<devices::virtio::Mem>>>,
+    cpu: Option<Arc<std::sync::Mutex<devices::virtio::Cpu>>>,
+}
+
+/// Point-in-time CPU sizing of a running VM as seen through [`VmControl`].
+/// `actual` is what the guest driver last reported; `enforced` is what the
+/// VMM allows to execute regardless of guest cooperation.
+#[cfg(not(feature = "tee"))]
+#[derive(Debug, Clone, Copy)]
+pub struct VmCpuState {
+    /// CPUs possible in this boot.
+    pub possible: u32,
+
+    /// Online count the host asked the guest to converge on.
+    pub requested_online: u32,
+
+    /// Online count the guest driver last reported.
+    pub actual_online: u32,
+
+    /// Online count the VMM currently enforces.
+    pub enforced: u32,
+}
+
+/// Point-in-time memory sizing of a running VM, in MiB, as seen through
+/// [`VmControl`]. `current` trails `target` while the guest converges.
+#[cfg(not(feature = "tee"))]
+#[derive(Debug, Clone, Copy)]
+pub struct VmMemoryState {
+    /// Memory the VM booted with.
+    pub boot_mib: u64,
+
+    /// Total memory the host asked the guest to converge on.
+    pub target_mib: u64,
+
+    /// Total memory currently usable by the guest (boot + plugged).
+    pub current_mib: u64,
+
+    /// Boot-time ceiling for live growth (boot + hotplug capacity).
+    pub max_mib: u64,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
@@ -136,6 +187,22 @@ impl Vm {
     /// on a successful boot.
     pub fn metrics_handle(&self) -> MetricsHandle {
         self.vmr.metrics.handle()
+    }
+
+    /// Get a cloneable handle for live VM resource control.
+    ///
+    /// Must be called **before** [`enter()`](Self::enter), because `enter()`
+    /// never returns on a successful boot. Live memory resize is only
+    /// available when the machine reserved capacity with
+    /// [`max_memory_mib`](super::builders::MachineBuilder::max_memory_mib)
+    /// above the boot memory size.
+    #[cfg(not(feature = "tee"))]
+    pub fn control_handle(&self) -> VmControl {
+        VmControl {
+            boot_mib: self.vmr.vm_config().mem_size_mib.unwrap_or(128) as u64,
+            mem: self.vmr.mem_device.clone(),
+            cpu: self.vmr.cpu_device.clone(),
+        }
     }
 
     /// Start the VM. This call never returns on success — the VMM calls
@@ -646,5 +713,66 @@ mod tests {
         // already being set, so the default (no opt-in) drops both.
         assert!(!flags.contains(TsiFlags::HIJACK_INET));
         assert!(!flags.contains(TsiFlags::HIJACK_UNIX));
+    }
+}
+
+#[cfg(not(feature = "tee"))]
+impl VmControl {
+    /// Whether the running VM can resize memory live.
+    pub fn memory_resize_supported(&self) -> bool {
+        self.mem.is_some()
+    }
+
+    /// Whether the running VM can resize its online CPU count live.
+    pub fn cpu_resize_supported(&self) -> bool {
+        self.cpu.is_some()
+    }
+
+    /// Ask the guest to converge on `online` CPUs and enforce that ceiling
+    /// host-side. Returns the accepted target (clamped to 1..=possible), or
+    /// `None` when the VM booted without CPU capacity. The guest driver
+    /// onlines/offlines asynchronously; poll [`cpu_state`](Self::cpu_state)
+    /// for convergence — enforcement applies immediately either way.
+    pub fn set_cpu_target(&self, online: u32) -> Option<u32> {
+        let cpu = self.cpu.as_ref()?;
+        Some(cpu.lock().unwrap().set_requested_online(online))
+    }
+
+    /// Current CPU sizing, or `None` when the VM booted without capacity.
+    pub fn cpu_state(&self) -> Option<VmCpuState> {
+        let cpu = self.cpu.as_ref()?;
+        let snap = cpu.lock().unwrap().state_snapshot();
+        Some(VmCpuState {
+            possible: snap.possible,
+            requested_online: snap.requested_online,
+            actual_online: snap.actual_online,
+            enforced: snap.enforced,
+        })
+    }
+
+    /// Ask the guest to converge on `total_mib` of usable memory.
+    ///
+    /// Returns the accepted target in MiB (clamped to the boot..max range and
+    /// rounded down to hotplug block granularity), or `None` when the VM
+    /// booted without hotplug capacity. The guest plugs/unplugs blocks
+    /// asynchronously; poll [`memory_state`](Self::memory_state) for
+    /// convergence.
+    pub fn set_memory_target_mib(&self, total_mib: u64) -> Option<u64> {
+        let mem = self.mem.as_ref()?;
+        let hotplug_target = total_mib.saturating_sub(self.boot_mib) << 20;
+        let accepted = mem.lock().unwrap().set_requested_size(hotplug_target);
+        Some(self.boot_mib + (accepted >> 20))
+    }
+
+    /// Current memory sizing, or `None` when the VM booted without capacity.
+    pub fn memory_state(&self) -> Option<VmMemoryState> {
+        let mem = self.mem.as_ref()?;
+        let snap = mem.lock().unwrap().state_snapshot();
+        Some(VmMemoryState {
+            boot_mib: self.boot_mib,
+            target_mib: self.boot_mib + (snap.requested_size >> 20),
+            current_mib: self.boot_mib + (snap.plugged_size >> 20),
+            max_mib: self.boot_mib + (snap.region_size >> 20),
+        })
     }
 }
