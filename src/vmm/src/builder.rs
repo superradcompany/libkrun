@@ -1109,6 +1109,7 @@ pub fn build_microvm(
             vcpu_config.vcpu_count
         );
         vcpu_config.vcpu_count = 1;
+        vcpu_config.max_vcpu_count = 1;
     }
 
     // Clone the command-line so that a failed boot doesn't pollute the original.
@@ -1124,6 +1125,15 @@ pub fn build_microvm(
 
     if let Some(cmdline) = &vm_resources.kernel_cmdline.krun_env {
         kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
+    }
+
+    // When extra CPU capacity is reserved, every possible vCPU is described to the guest
+    // (MPTABLE/FDT), so cap the number brought online at boot to the requested count. The
+    // remaining CPUs stay offline until onlined through /sys/devices/system/cpu.
+    if vcpu_config.max_vcpu_count > vcpu_config.vcpu_count {
+        kernel_cmdline
+            .insert_str(format!(" maxcpus={}", vcpu_config.vcpu_count))
+            .unwrap();
     }
     trace.mark("kernel_cmdline.ready");
 
@@ -1399,8 +1409,8 @@ pub fn build_microvm(
 
     #[cfg(target_os = "macos")]
     let vcpu_list = {
-        let cpu_count = vm_resources.vm_config().vcpu_count.unwrap();
-        Arc::new(VcpuList::new(cpu_count as u64))
+        // Size for the full possible topology so parked vCPUs can register too.
+        Arc::new(VcpuList::new(vcpu_config.max_vcpu_count as u64))
     };
 
     let vcpus;
@@ -1518,7 +1528,8 @@ pub fn build_microvm(
             // architected vGIC, which is required for requesting KVM the instantiation of a
             // GICv3. To relieve the users from having to configure the gic version manually,
             // try first to instantiate a GICv3, and fall back to a GICv2 if it fails.
-            let vcpu_count = vm_resources.vm_config().vcpu_count.unwrap() as u64;
+            // Redistributors must cover the full possible topology, not just online CPUs.
+            let vcpu_count = vcpu_config.max_vcpu_count as u64;
             let gic = match KvmGicV3::new(vm.fd(), vcpu_count) {
                 Ok(gicv3) => IrqChipDevice::new(Box::new(gicv3)),
                 Err(_) => {
@@ -1542,8 +1553,9 @@ pub fn build_microvm(
     {
         intc = {
             // If the system supports the in-kernel GIC, use it. Otherwise, fall back to the
-            // userspace implementation.
-            let gic = match HvfGicV3::new(vm_resources.vm_config().vcpu_count.unwrap() as u64) {
+            // userspace implementation. Redistributors must cover the full possible
+            // topology, not just online CPUs.
+            let gic = match HvfGicV3::new(vcpu_config.max_vcpu_count as u64) {
                 Ok(hvfgic) => IrqChipDevice::new(Box::new(hvfgic)),
                 Err(_) => IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone()))),
             };
@@ -3008,8 +3020,10 @@ fn create_vcpus_x86_64(
     metrics: utils::metrics::MetricsWriter,
     #[cfg(feature = "tee")] pm_sender: Sender<WorkerMessage>,
 ) -> super::Result<Vec<Vcpu>> {
-    let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
-    for cpu_index in 0..vcpu_config.vcpu_count {
+    // Create the full possible topology; CPUs beyond `vcpu_count` boot offline (maxcpus=)
+    // and wait inside KVM for INIT/SIPI until the guest onlines them.
+    let mut vcpus = Vec::with_capacity(vcpu_config.max_vcpu_count as usize);
+    for cpu_index in 0..vcpu_config.max_vcpu_count {
         let mut vcpu = Vcpu::new_x86_64(
             cpu_index,
             vm.fd(),
@@ -3071,8 +3085,10 @@ fn create_vcpus_aarch64(
     exit_evt: &EventFd,
     metrics: utils::metrics::MetricsWriter,
 ) -> super::Result<Vec<Vcpu>> {
-    let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
-    for cpu_index in 0..vcpu_config.vcpu_count {
+    // Create the full possible topology; CPUs beyond `vcpu_count` boot powered off
+    // (KVM_ARM_VCPU_POWER_OFF) and wait for PSCI CPU_ON when the guest onlines them.
+    let mut vcpus = Vec::with_capacity(vcpu_config.max_vcpu_count as usize);
+    for cpu_index in 0..vcpu_config.max_vcpu_count {
         let mut vcpu = Vcpu::new_aarch64(
             cpu_index,
             vm.fd(),
@@ -3101,10 +3117,12 @@ fn create_vcpus_aarch64(
     nested_enabled: bool,
     metrics: utils::metrics::MetricsWriter,
 ) -> super::Result<Vec<Vcpu>> {
-    let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
+    // Create the full possible topology; CPUs beyond `vcpu_count` park on their boot
+    // channel until vCPU 0 relays a PSCI CPU_ON when the guest onlines them.
+    let mut vcpus = Vec::with_capacity(vcpu_config.max_vcpu_count as usize);
     let mut boot_senders: HashMap<u64, Sender<u64>> = HashMap::new();
 
-    for cpu_index in 0..vcpu_config.vcpu_count {
+    for cpu_index in 0..vcpu_config.max_vcpu_count {
         let (boot_sender, boot_receiver) = if cpu_index != 0 {
             let (boot_sender, boot_receiver) = unbounded();
             (Some(boot_sender), Some(boot_receiver))
@@ -3862,6 +3880,7 @@ pub mod tests {
 
         let vcpu_config = VcpuConfig {
             vcpu_count,
+            max_vcpu_count: vcpu_count,
             ht_enabled: false,
             cpu_template: None,
         };
@@ -3898,6 +3917,7 @@ pub mod tests {
 
         let vcpu_config = VcpuConfig {
             vcpu_count,
+            max_vcpu_count: vcpu_count,
             ht_enabled: false,
             cpu_template: None,
         };

@@ -415,6 +415,9 @@ pub struct Vm {
 #[derive(Debug, Eq, PartialEq)]
 pub struct VcpuConfig {
     pub vcpu_count: u8,
+    /// Maximum possible guest VCPUs. Always equal to `vcpu_count` on WHP, which
+    /// has no parked-vcpu bring-up; wider capacity is rejected at config time.
+    pub max_vcpu_count: u8,
     pub ht_enabled: bool,
     pub cpu_template: Option<CpuFeaturesTemplate>,
 }

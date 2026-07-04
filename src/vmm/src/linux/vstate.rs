@@ -910,6 +910,8 @@ pub struct VmState {
 pub struct VcpuConfig {
     /// Number of guest VCPUs.
     pub vcpu_count: u8,
+    /// Maximum possible guest VCPUs; vcpus above `vcpu_count` boot parked awaiting hotplug.
+    pub max_vcpu_count: u8,
     /// Enable hyperthreading in the CPUID configuration.
     pub ht_enabled: bool,
     /// CPUID template to use.
@@ -1918,6 +1920,7 @@ mod tests {
 
         let mut vcpu_config = VcpuConfig {
             vcpu_count: 1,
+            max_vcpu_count: 1,
             ht_enabled: false,
             cpu_template: None,
         };

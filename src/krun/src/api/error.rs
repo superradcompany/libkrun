@@ -33,6 +33,15 @@ pub enum ConfigError {
     /// Invalid memory size.
     InvalidMemorySize(usize),
 
+    /// Invalid maximum vCPU count: below the effective count or above the supported limit.
+    InvalidMaxVcpuCount(u8),
+
+    /// Invalid maximum memory size: below the boot memory size.
+    InvalidMaxMemorySize(usize),
+
+    /// Reserving capacity above the initial resources is not supported on this platform.
+    MaxCapacityUnsupported,
+
     /// Missing kernel configuration.
     MissingKernel,
 
@@ -107,6 +116,14 @@ impl fmt::Display for ConfigError {
         match self {
             ConfigError::InvalidVcpuCount(n) => write!(f, "invalid vCPU count: {}", n),
             ConfigError::InvalidMemorySize(n) => write!(f, "invalid memory size: {} MiB", n),
+            ConfigError::InvalidMaxVcpuCount(n) => write!(f, "invalid max vCPU count: {}", n),
+            ConfigError::InvalidMaxMemorySize(n) => {
+                write!(f, "invalid max memory size: {} MiB", n)
+            }
+            ConfigError::MaxCapacityUnsupported => write!(
+                f,
+                "reserving CPU or memory capacity above the initial resources is not supported on this platform"
+            ),
             ConfigError::MissingKernel => write!(f, "missing kernel configuration"),
             ConfigError::InvalidKernelBundle(s) => write!(f, "invalid kernel bundle: {}", s),
             ConfigError::Network(s) => write!(f, "network: {}", s),

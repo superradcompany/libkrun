@@ -44,6 +44,8 @@ use crate::backends::net::NetBackend;
 pub struct MachineBuilder {
     pub(crate) vcpus: u8,
     pub(crate) memory_mib: usize,
+    pub(crate) max_vcpus: Option<u8>,
+    pub(crate) max_memory_mib: Option<usize>,
     pub(crate) hyperthreading: bool,
     pub(crate) nested_virt: bool,
     pub(crate) split_irqchip: bool,
@@ -354,6 +356,8 @@ impl MachineBuilder {
         Self {
             vcpus: 1,
             memory_mib: 512,
+            max_vcpus: None,
+            max_memory_mib: None,
             hyperthreading: false,
             nested_virt: false,
             split_irqchip: false,
@@ -375,6 +379,28 @@ impl MachineBuilder {
     /// Set the memory size in MiB.
     pub fn memory_mib(mut self, mib: usize) -> Self {
         self.memory_mib = mib;
+        self
+    }
+
+    /// Set the maximum possible virtual CPUs.
+    ///
+    /// The VM boots with this full topology described to the guest but only
+    /// [`vcpus`](Self::vcpus) online (`maxcpus=` boot parameter); the guest can
+    /// online the remaining CPUs later through CPU hotplug. Defaults to the
+    /// effective vCPU count, which reserves no extra capacity.
+    pub fn max_vcpus(mut self, count: u8) -> Self {
+        self.max_vcpus = Some(count);
+        self
+    }
+
+    /// Set the maximum guest memory in MiB reserved for future memory hotplug.
+    ///
+    /// Currently configuration plumbing only: capacity above
+    /// [`memory_mib`](Self::memory_mib) is validated and recorded but not yet
+    /// consumed until the virtio-mem device lands. Defaults to the effective
+    /// memory size, which reserves no extra capacity.
+    pub fn max_memory_mib(mut self, mib: usize) -> Self {
+        self.max_memory_mib = Some(mib);
         self
     }
 

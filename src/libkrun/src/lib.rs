@@ -619,9 +619,13 @@ pub extern "C" fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -
         }
     };
 
+    // The C API keeps the legacy contract: no capacity is reserved beyond the
+    // requested resources. Extra capacity is a Rust-API (msb_krun) feature.
     let vm_config = VmConfig {
         vcpu_count: Some(num_vcpus),
         mem_size_mib: Some(mem_size_mib),
+        max_vcpu_count: None,
+        max_mem_size_mib: None,
         ht_enabled: Some(false),
         cpu_template: None,
     };

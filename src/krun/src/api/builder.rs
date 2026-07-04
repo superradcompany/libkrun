@@ -351,6 +351,8 @@ impl VmBuilder {
         let vm_config = VmConfig {
             vcpu_count: Some(self.machine.vcpus),
             mem_size_mib: Some(self.machine.memory_mib),
+            max_vcpu_count: self.machine.max_vcpus,
+            max_mem_size_mib: self.machine.max_memory_mib,
             ht_enabled: Some(self.machine.hyperthreading),
             ..Default::default()
         };
@@ -614,6 +616,15 @@ fn map_vm_config_error(machine: &MachineBuilder, err: VmConfigError) -> Error {
         VmConfigError::InvalidMemorySize => {
             Error::Config(ConfigError::InvalidMemorySize(machine.memory_mib))
         }
+        VmConfigError::InvalidMaxVcpuCount => Error::Config(ConfigError::InvalidMaxVcpuCount(
+            machine.max_vcpus.unwrap_or(machine.vcpus),
+        )),
+        VmConfigError::InvalidMaxMemorySize => Error::Config(ConfigError::InvalidMaxMemorySize(
+            machine.max_memory_mib.unwrap_or(machine.memory_mib),
+        )),
+        VmConfigError::MaxCapacityUnsupported => {
+            Error::Config(ConfigError::MaxCapacityUnsupported)
+        }
     }
 }
 
@@ -637,6 +648,38 @@ mod tests {
 
         match err {
             Error::Config(ConfigError::InvalidVcpuCount(3)) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_rejects_max_vcpus_below_effective_count() {
+        let err = match VmBuilder::new()
+            .machine(|machine| machine.vcpus(4).max_vcpus(2))
+            .build()
+        {
+            Ok(_) => panic!("max vCPUs below the effective count should fail"),
+            Err(err) => err,
+        };
+
+        match err {
+            Error::Config(ConfigError::InvalidMaxVcpuCount(2)) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_rejects_max_memory_below_effective_size() {
+        let err = match VmBuilder::new()
+            .machine(|machine| machine.memory_mib(2048).max_memory_mib(1024))
+            .build()
+        {
+            Ok(_) => panic!("max memory below the effective size should fail"),
+            Err(err) => err,
+        };
+
+        match err {
+            Error::Config(ConfigError::InvalidMaxMemorySize(1024)) => {}
             other => panic!("unexpected error: {other:?}"),
         }
     }
