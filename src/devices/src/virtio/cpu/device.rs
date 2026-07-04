@@ -1,7 +1,9 @@
 use std::cmp;
 use std::io::Write;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use utils::eventfd::EventFd;
 use vm_memory::{ByteValued, GuestMemoryMmap};
@@ -25,6 +27,18 @@ pub const ENFORCEMENT_GRACE: std::time::Duration = std::time::Duration::from_sec
 /// guest — cross-CPU synchronization (IPIs, TLB shootdowns, RCU) waits forever for the parked CPU, wedging the initiating CPUs too. Waking for one emulation step per park
 /// interval keeps that machinery draining at a duty cycle too small to matter for compute.
 pub const THROTTLE_PARK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long an enforced vCPU may stay inside a single emulation step before the kicker forces it back to the host.
+///
+/// A hard-spinning guest takes no VM exits at all (on HVF even the vtimer is hardware-virtualized), so without a forced exit an enforced vCPU's run loop would never observe
+/// enforcement. Together with [`THROTTLE_PARK`] this bounds an uncooperative vCPU's duty cycle to roughly `slice / (slice + park)`.
+const ENFORCED_RUN_SLICE: Duration = Duration::from_millis(5);
+
+/// How often the kicker thread scans for enforced vCPUs overstaying their run slice. It only runs while some vCPU is enforced off.
+const KICK_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Sentinel for [`CpuKickSlot::entered_ns`]: the vCPU is not inside an emulation step.
+const NOT_IN_GUEST: u64 = u64::MAX;
 
 // Config space offsets (three little-endian u32 fields).
 const CONFIG_ACTUAL_ONLINE_OFFSET: u64 = 8;
@@ -50,24 +64,127 @@ unsafe impl ByteValued for VirtioCpuConfig {}
 /// the dying CPU to execute its own PSCI CPU_OFF path. The boot CPU is always
 /// runnable: `enforced` is clamped to at least 1.
 pub struct CpuEnforcement {
+    possible: u32,
     enforced: AtomicU32,
     gate: Mutex<()>,
     raised: Condvar,
+    kick_slots: Mutex<Vec<Arc<CpuKickSlot>>>,
+    kicker_running: AtomicBool,
+}
+
+/// A vCPU's registration with the enforcement kicker.
+///
+/// The vCPU run loop brackets every emulation step with [`enter_guest`](Self::enter_guest)/[`leave_guest`](Self::leave_guest); the kicker forces an exit only on vCPUs that
+/// have been inside one step longer than [`ENFORCED_RUN_SLICE`], so parked or event-waiting vCPUs never accumulate spurious cancellations that would swallow their next
+/// (progress-making) emulation step.
+pub struct CpuKickSlot {
+    cpu_index: u32,
+    /// Monotonic timestamp (ns) when the current emulation step started, or [`NOT_IN_GUEST`].
+    entered_ns: AtomicU64,
+    kick: Box<dyn Fn() + Send + Sync>,
+}
+
+impl CpuKickSlot {
+    /// Mark this vCPU as entering an emulation step.
+    pub fn enter_guest(&self) {
+        self.entered_ns.store(monotonic_ns(), Ordering::Release);
+    }
+
+    /// Mark this vCPU as back on the host.
+    pub fn leave_guest(&self) {
+        self.entered_ns.store(NOT_IN_GUEST, Ordering::Release);
+    }
 }
 
 impl CpuEnforcement {
-    fn new(enforced: u32) -> Arc<Self> {
+    fn new(possible: u32, enforced: u32) -> Arc<Self> {
         Arc::new(Self {
+            possible,
             enforced: AtomicU32::new(enforced.max(1)),
             gate: Mutex::new(()),
             raised: Condvar::new(),
+            kick_slots: Mutex::new(Vec::new()),
+            kicker_running: AtomicBool::new(false),
         })
     }
 
-    fn set(&self, enforced: u32) {
-        self.enforced.store(enforced.max(1), Ordering::Release);
-        let _guard = self.gate.lock().unwrap();
-        self.raised.notify_all();
+    fn set(this: &Arc<Self>, enforced: u32) {
+        let enforced = enforced.max(1);
+        this.enforced.store(enforced, Ordering::Release);
+        {
+            let _guard = this.gate.lock().unwrap();
+            this.raised.notify_all();
+        }
+        if enforced < this.possible {
+            Self::spawn_kicker(this);
+        }
+    }
+
+    /// Register the calling vCPU thread for forced exits. `kick` must make the vCPU's in-flight emulation step return to the host (`hv_vcpus_exit` on macOS, the vCPU kick
+    /// signal on Linux) and be callable from any thread.
+    pub fn register_kicker(
+        self: &Arc<Self>,
+        cpu_index: u32,
+        kick: Box<dyn Fn() + Send + Sync>,
+    ) -> Arc<CpuKickSlot> {
+        let slot = Arc::new(CpuKickSlot {
+            cpu_index,
+            entered_ns: AtomicU64::new(NOT_IN_GUEST),
+            kick,
+        });
+        self.kick_slots.lock().unwrap().push(slot.clone());
+        // The VM may boot (or a guest may CPU_ON a vCPU) with enforcement already below the possible count; make sure the kicker covers that from the start.
+        if self.enforced() < self.possible {
+            Self::spawn_kicker(self);
+        }
+        slot
+    }
+
+    /// Start the kicker thread if some vCPU is enforced off and no kicker is running.
+    ///
+    /// The kicker periodically forces enforced vCPUs that overstay [`ENFORCED_RUN_SLICE`] out of guest mode so their run loops observe enforcement even when the guest takes
+    /// no VM exits on its own. It exits once enforcement covers every possible vCPU again (holding only a `Weak`, so it also dies with the device).
+    fn spawn_kicker(this: &Arc<Self>) {
+        if this
+            .kicker_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let weak = Arc::downgrade(this);
+        thread::Builder::new()
+            .name("msb-cpu kicker".into())
+            .spawn(move || loop {
+                thread::sleep(KICK_INTERVAL);
+                let Some(this) = weak.upgrade() else { return };
+                let enforced = this.enforced();
+                if enforced >= this.possible {
+                    this.kicker_running.store(false, Ordering::Release);
+                    // set() may have lowered enforcement between the check above and the store; reclaim the flag rather than leave that lowering unkicked.
+                    if this.enforced() < this.possible
+                        && this
+                            .kicker_running
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                    {
+                        continue;
+                    }
+                    return;
+                }
+                let now = monotonic_ns();
+                let slice_ns = ENFORCED_RUN_SLICE.as_nanos() as u64;
+                for slot in this.kick_slots.lock().unwrap().iter() {
+                    if slot.cpu_index < enforced {
+                        continue;
+                    }
+                    let entered = slot.entered_ns.load(Ordering::Acquire);
+                    if entered != NOT_IN_GUEST && now.saturating_sub(entered) >= slice_ns {
+                        (slot.kick)();
+                    }
+                }
+            })
+            .expect("failed to spawn msb-cpu kicker thread");
     }
 
     /// Current enforced online count.
@@ -95,6 +212,12 @@ impl CpuEnforcement {
             guard = next;
         }
     }
+}
+
+/// Monotonic nanoseconds since the first call; only ever compared against itself.
+fn monotonic_ns() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
 
 /// Point-in-time view of the device for host-side control and reporting.
@@ -139,7 +262,7 @@ impl Cpu {
                 requested_online: initial_online,
                 actual_online: initial_online,
             },
-            enforcement: CpuEnforcement::new(initial_online),
+            enforcement: CpuEnforcement::new(possible, initial_online),
         })
     }
 
@@ -159,7 +282,7 @@ impl Cpu {
     pub fn set_requested_online(&mut self, online: u32) -> u32 {
         let online = cmp::min(online.max(1), self.config.possible);
         self.config.requested_online = online;
-        self.enforcement.set(online);
+        CpuEnforcement::set(&self.enforcement, online);
         if let DeviceState::Activated(_, ref interrupt) = self.device_state {
             interrupt.signal_config_change();
         }

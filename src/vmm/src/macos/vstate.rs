@@ -22,7 +22,7 @@ use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 use arch::ArchMemoryInfo;
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use devices::legacy::VcpuList;
-use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
+use hvf::{vcpu_request_exit, HvfVcpu, HvfVm, VcpuExit, Vcpus};
 use utils::eventfd::EventFd;
 use utils::metrics::MetricsWriter;
 use vm_memory::{
@@ -506,6 +506,17 @@ impl Vcpu {
         let (wfe_sender, wfe_receiver) = unbounded();
         self.vcpu_list.register(hvf_vcpuid, wfe_sender);
 
+        // Register with the enforcement kicker: a hard-spinning guest takes no VM exits on HVF (even the vtimer is hardware-virtualized), so when enforcement drops below
+        // this vCPU's index the kicker must be able to force it out of guest mode for the enforcement check below to run at all — and to bound its slice while throttled.
+        let kick_slot = self.enforcement.as_ref().map(|enforcement| {
+            enforcement.register_kicker(
+                self.id as u32,
+                Box::new(move || {
+                    let _ = vcpu_request_exit(hvf_vcpuid);
+                }),
+            )
+        });
+
         // The boot CPU starts immediately at the kernel entry point; every other CPU
         // parks on its boot channel until PSCI CPU_ON supplies an entry point.
         let entry_addr = if self.id == 0 {
@@ -548,7 +559,13 @@ impl Vcpu {
                     }
                 }
             }
+            if let Some(slot) = &kick_slot {
+                slot.enter_guest();
+            }
             let emulation = self.run_emulation(&mut hvf_vcpu);
+            if let Some(slot) = &kick_slot {
+                slot.leave_guest();
+            }
             if let Some(exec_time_ns) = hvf_vcpu.exec_time_ns() {
                 self.metrics
                     .add_vcpu_time_ns(exec_time_ns.saturating_sub(last_exec_time_ns));

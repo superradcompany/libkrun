@@ -928,6 +928,8 @@ pub struct Vcpu {
     // Host-authoritative online ceiling; vCPUs at or above it park between
     // emulation steps regardless of guest cooperation.
     enforcement: Option<std::sync::Arc<devices::virtio::CpuEnforcement>>,
+    // This vCPU's registration with the enforcement kicker, filled in on the vcpu thread.
+    kick_slot: Option<std::sync::Arc<devices::virtio::CpuKickSlot>>,
     mmio_bus: Option<devices::Bus>,
     #[allow(dead_code)]
     #[cfg_attr(all(test, target_arch = "aarch64"), allow(unused))]
@@ -1081,6 +1083,7 @@ impl Vcpu {
             fd: kvm_vcpu,
             id,
             enforcement: None,
+            kick_slot: None,
             mmio_bus: None,
             exit_evt,
             io_bus,
@@ -1120,6 +1123,7 @@ impl Vcpu {
             fd: kvm_vcpu,
             id,
             enforcement: None,
+            kick_slot: None,
             mmio_bus: None,
             exit_evt,
             mpidr: 0,
@@ -1154,6 +1158,7 @@ impl Vcpu {
             fd: kvm_vcpu,
             id,
             enforcement: None,
+            kick_slot: None,
             mmio_bus: None,
             exit_evt,
             event_receiver,
@@ -1596,6 +1601,18 @@ impl Vcpu {
     /// Note that the state of the VCPU and associated VM must be setup first for this to do
     /// anything useful.
     pub fn run(&mut self) {
+        // Register with the enforcement kicker: a guest thread spinning without VM exits would never let the enforcement check in `running` observe a lowered ceiling, so
+        // the kicker signals this thread (same mechanism as `VcpuHandle::send_event`) to force KVM_RUN back to the host.
+        if let Some(enforcement) = &self.enforcement {
+            let thread = unsafe { libc::pthread_self() };
+            self.kick_slot = Some(enforcement.register_kicker(
+                self.id as u32,
+                Box::new(move || unsafe {
+                    libc::pthread_kill(thread, sigrtmin() + VCPU_RTSIG_OFFSET);
+                }),
+            ));
+        }
+
         // Start running the machine state in the `Paused` state.
         StateMachine::run(self, Self::paused);
     }
@@ -1620,10 +1637,9 @@ impl Vcpu {
                     // path); throttle it only if the guest refuses. Throttling
                     // (one emulation step per park interval) rather than fully
                     // parking keeps an uncooperative guest live: IPIs and TLB
-                    // shootdowns aimed at this CPU still complete. The duty
-                    // cycle is only as tight as KVM_RUN exit frequency; a
-                    // spinning guest thread runs until its next exit (typically
-                    // the guest timer tick) before the next park.
+                    // shootdowns aimed at this CPU still complete. The kicker
+                    // bounds each emulation step, so even a guest thread that
+                    // spins without taking exits is forced back here.
                     let deadline = *enforcement_deadline.get_or_insert_with(|| {
                         std::time::Instant::now() + devices::virtio::ENFORCEMENT_GRACE
                     });
@@ -1632,7 +1648,13 @@ impl Vcpu {
                     }
                 }
             }
+            if let Some(slot) = &self.kick_slot {
+                slot.enter_guest();
+            }
             let emulation = self.run_emulation();
+            if let Some(slot) = &self.kick_slot {
+                slot.leave_guest();
+            }
             let thread_cpu_ns = get_time(ClockType::ThreadCpu);
             self.metrics
                 .add_vcpu_time_ns(thread_cpu_ns.saturating_sub(last_thread_cpu_ns));
