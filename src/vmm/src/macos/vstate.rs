@@ -194,6 +194,9 @@ pub struct Vcpu {
     // Shared parked/offline flags (keyed by MPIDR) so AFFINITY_INFO can be answered
     // from any vCPU thread.
     parked_cpus: Option<Arc<HashMap<u64, AtomicBool>>>,
+    // Host-authoritative online ceiling; vCPUs at or above it park between
+    // emulation steps regardless of guest cooperation.
+    enforcement: Option<Arc<devices::virtio::CpuEnforcement>>,
     fdt_addr: u64,
     mmio_bus: Option<devices::Bus>,
     #[cfg_attr(all(test, target_arch = "aarch64"), allow(unused))]
@@ -299,6 +302,7 @@ impl Vcpu {
             boot_receiver,
             boot_senders: None,
             parked_cpus: None,
+            enforcement: None,
             fdt_addr: 0,
             mmio_bus: None,
             exit_evt,
@@ -334,6 +338,10 @@ impl Vcpu {
 
     pub fn set_parked_cpus(&mut self, parked_cpus: Arc<HashMap<u64, AtomicBool>>) {
         self.parked_cpus = Some(parked_cpus);
+    }
+
+    pub fn set_enforcement(&mut self, enforcement: Arc<devices::virtio::CpuEnforcement>) {
+        self.enforcement = Some(enforcement);
     }
 
     /// Record this vCPU's parked/offline state for AFFINITY_INFO queries.
@@ -516,7 +524,28 @@ impl Vcpu {
             .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
 
         let mut last_exec_time_ns = hvf_vcpu.exec_time_ns().unwrap_or(0);
+        let mut enforcement_deadline: Option<std::time::Instant> = None;
         loop {
+            // Host-side enforcement: stop scheduling this vCPU while its index
+            // is at or above the enforced online count. A cooperative guest
+            // offlines it via PSCI first; an uncooperative one just stops
+            // receiving execution time here.
+            if let Some(enforcement) = &self.enforcement {
+                if enforcement.runnable(self.id as u32) {
+                    enforcement_deadline = None;
+                } else {
+                    // Give the guest a grace window to offline this CPU
+                    // gracefully (the dying CPU must run its own PSCI CPU_OFF
+                    // path); hard-park it only if the guest refuses.
+                    let deadline = *enforcement_deadline.get_or_insert_with(|| {
+                        std::time::Instant::now() + devices::virtio::ENFORCEMENT_GRACE
+                    });
+                    if std::time::Instant::now() >= deadline {
+                        enforcement.wait_until_runnable(self.id as u32);
+                        enforcement_deadline = None;
+                    }
+                }
+            }
             let emulation = self.run_emulation(&mut hvf_vcpu);
             if let Some(exec_time_ns) = hvf_vcpu.exec_time_ns() {
                 self.metrics

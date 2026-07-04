@@ -223,6 +223,11 @@ pub struct VmResources {
     /// the runtime control handle.
     #[cfg(not(feature = "tee"))]
     pub mem_device: Option<std::sync::Arc<std::sync::Mutex<devices::virtio::Mem>>>,
+    /// The CPU capacity device backing live CPU resize, created by the API
+    /// layer when max vCPUs exceed the boot count. Also the source of the
+    /// enforcement state every vCPU run loop consults.
+    #[cfg(not(feature = "tee"))]
+    pub cpu_device: Option<std::sync::Arc<std::sync::Mutex<devices::virtio::Cpu>>>,
     /// Guest memory stats polling interval for the virtio-balloon device.
     pub balloon_stats_interval: Option<Duration>,
     /// Whether to attach the virtio-rng device.
@@ -281,6 +286,8 @@ impl Default for VmResources {
             enable_balloon: true,
             #[cfg(not(feature = "tee"))]
             mem_device: None,
+            #[cfg(not(feature = "tee"))]
+            cpu_device: None,
             balloon_stats_interval: Some(Duration::from_secs(1)),
             enable_rng: true,
             enable_msb_metrics: true,
@@ -575,6 +582,8 @@ mod tests {
             enable_balloon: true,
             #[cfg(not(feature = "tee"))]
             mem_device: None,
+            #[cfg(not(feature = "tee"))]
+            cpu_device: None,
             balloon_stats_interval: Some(std::time::Duration::from_secs(1)),
             enable_rng: true,
             enable_msb_metrics: true,

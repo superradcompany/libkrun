@@ -925,6 +925,9 @@ type VcpuCell = Cell<Option<*mut Vcpu>>;
 pub struct Vcpu {
     fd: VcpuFd,
     id: u8,
+    // Host-authoritative online ceiling; vCPUs at or above it park between
+    // emulation steps regardless of guest cooperation.
+    enforcement: Option<std::sync::Arc<devices::virtio::CpuEnforcement>>,
     mmio_bus: Option<devices::Bus>,
     #[allow(dead_code)]
     #[cfg_attr(all(test, target_arch = "aarch64"), allow(unused))]
@@ -1077,6 +1080,7 @@ impl Vcpu {
         Ok(Vcpu {
             fd: kvm_vcpu,
             id,
+            enforcement: None,
             mmio_bus: None,
             exit_evt,
             io_bus,
@@ -1115,6 +1119,7 @@ impl Vcpu {
         Ok(Vcpu {
             fd: kvm_vcpu,
             id,
+            enforcement: None,
             mmio_bus: None,
             exit_evt,
             mpidr: 0,
@@ -1148,6 +1153,7 @@ impl Vcpu {
         Ok(Vcpu {
             fd: kvm_vcpu,
             id,
+            enforcement: None,
             mmio_bus: None,
             exit_evt,
             event_receiver,
@@ -1161,6 +1167,13 @@ impl Vcpu {
     /// Returns the cpu index as seen by the guest OS.
     pub fn cpu_index(&self) -> u8 {
         self.id
+    }
+
+    pub fn set_enforcement(
+        &mut self,
+        enforcement: std::sync::Arc<devices::virtio::CpuEnforcement>,
+    ) {
+        self.enforcement = Some(enforcement);
     }
 
     /// Gets the MPIDR register value.
@@ -1592,7 +1605,28 @@ impl Vcpu {
         // This loop is here just for optimizing the emulation path.
         // No point in ticking the state machine if there are no external events.
         let mut last_thread_cpu_ns = get_time(ClockType::ThreadCpu);
+        let mut enforcement_deadline: Option<std::time::Instant> = None;
         loop {
+            // Host-side enforcement: stop scheduling this vCPU while its index
+            // is at or above the enforced online count. A cooperative guest
+            // offlines it via PSCI/hotplug first; an uncooperative one just
+            // stops receiving execution time here.
+            if let Some(enforcement) = &self.enforcement {
+                if enforcement.runnable(self.id as u32) {
+                    enforcement_deadline = None;
+                } else {
+                    // Give the guest a grace window to offline this CPU
+                    // gracefully (the dying CPU must run its own PSCI CPU_OFF
+                    // path); hard-park it only if the guest refuses.
+                    let deadline = *enforcement_deadline.get_or_insert_with(|| {
+                        std::time::Instant::now() + devices::virtio::ENFORCEMENT_GRACE
+                    });
+                    if std::time::Instant::now() >= deadline {
+                        enforcement.wait_until_runnable(self.id as u32);
+                        enforcement_deadline = None;
+                    }
+                }
+            }
             let emulation = self.run_emulation();
             let thread_cpu_ns = get_time(ClockType::ThreadCpu);
             self.metrics

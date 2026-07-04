@@ -39,6 +39,8 @@ pub mod linux_errno {
     }
 }
 #[cfg(not(feature = "tee"))]
+pub mod cpu;
+#[cfg(not(feature = "tee"))]
 pub mod mem;
 mod mmio;
 pub mod msb_metrics;
@@ -57,6 +59,8 @@ pub use self::balloon::*;
 #[cfg(feature = "blk")]
 pub use self::block::{Block, CacheType};
 pub use self::console::*;
+#[cfg(not(feature = "tee"))]
+pub use self::cpu::*;
 pub use self::device::*;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use self::fs::*;

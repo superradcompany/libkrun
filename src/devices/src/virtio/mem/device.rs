@@ -123,7 +123,9 @@ impl Mem {
     /// Set the guest-physical placement of the hotplug region. Must be called
     /// before the VM boots; both values must be block-aligned.
     pub fn set_region(&mut self, addr: u64, size: u64) -> super::Result<()> {
-        if addr % VIRTIO_MEM_BLOCK_SIZE != 0 || size % VIRTIO_MEM_BLOCK_SIZE != 0 {
+        if !addr.is_multiple_of(VIRTIO_MEM_BLOCK_SIZE)
+            || !size.is_multiple_of(VIRTIO_MEM_BLOCK_SIZE)
+        {
             return Err(MemError::UnalignedRegion);
         }
         self.config.addr = addr;
@@ -160,7 +162,7 @@ impl Mem {
     /// Map a guest request range onto block indices, if fully inside the region.
     fn block_range(&self, addr: u64, nb_blocks: u16) -> Option<std::ops::Range<usize>> {
         let offset = addr.checked_sub(self.config.addr)?;
-        if offset % VIRTIO_MEM_BLOCK_SIZE != 0 {
+        if !offset.is_multiple_of(VIRTIO_MEM_BLOCK_SIZE) {
             return None;
         }
         let first = (offset / VIRTIO_MEM_BLOCK_SIZE) as usize;

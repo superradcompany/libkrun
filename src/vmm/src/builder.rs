@@ -1129,10 +1129,22 @@ pub fn build_microvm(
 
     // When extra CPU capacity is reserved, every possible vCPU is described to the guest
     // (MPTABLE/FDT), so cap the number brought online at boot to the requested count. The
-    // remaining CPUs stay offline until onlined through /sys/devices/system/cpu.
+    // remaining CPUs stay offline until the guest's msb-cpu driver onlines them.
     if vcpu_config.max_vcpu_count > vcpu_config.vcpu_count {
         kernel_cmdline
             .insert_str(format!(" maxcpus={}", vcpu_config.vcpu_count))
+            .unwrap();
+    }
+
+    // Hotplugged virtio-mem blocks must come online automatically: without this,
+    // guests whose kernel lacks MEMORY_HOTPLUG_DEFAULT_ONLINE (and which run no
+    // udev onlining rule) accept the blocks but leave them offline, so a live
+    // grow silently adds no usable memory. The movable zone keeps later unplug
+    // reliable.
+    #[cfg(not(feature = "tee"))]
+    if vm_resources.mem_device.is_some() {
+        kernel_cmdline
+            .insert_str(" memhp_default_state=online_movable")
             .unwrap();
     }
     trace.mark("kernel_cmdline.ready");
@@ -1413,7 +1425,8 @@ pub fn build_microvm(
         Arc::new(VcpuList::new(vcpu_config.max_vcpu_count as u64))
     };
 
-    let vcpus;
+    #[allow(unused_mut)]
+    let mut vcpus;
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
@@ -1585,6 +1598,14 @@ pub fn build_microvm(
         )?;
     }
 
+    #[cfg(all(not(feature = "tee"), any(target_os = "linux", target_os = "macos")))]
+    if let Some(cpu_device) = &vm_resources.cpu_device {
+        let enforcement = cpu_device.lock().unwrap().enforcement();
+        for vcpu in &mut vcpus {
+            vcpu.set_enforcement(enforcement.clone());
+        }
+    }
+
     #[cfg(all(target_arch = "riscv64", target_os = "linux"))]
     {
         vcpus = create_vcpus_riscv64(
@@ -1650,6 +1671,11 @@ pub fn build_microvm(
     if let Some(mem_device) = vm_resources.mem_device.clone() {
         attach_mem_device(&mut vmm, event_manager, intc.clone(), mem_device)?;
         trace.mark("mem.attached");
+    }
+    #[cfg(not(feature = "tee"))]
+    if let Some(cpu_device) = vm_resources.cpu_device.clone() {
+        attach_cpu_device(&mut vmm, event_manager, intc.clone(), cpu_device)?;
+        trace.mark("cpu.attached");
     }
     #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     if vm_resources.enable_rng {
@@ -3737,6 +3763,27 @@ fn attach_balloon_device(
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc.clone(), balloon).map_err(RegisterBalloonDevice)?;
+
+    Ok(())
+}
+
+#[cfg(not(feature = "tee"))]
+fn attach_cpu_device(
+    vmm: &mut Vmm,
+    event_manager: &mut EventManager,
+    intc: IrqChip,
+    cpu_device: Arc<Mutex<devices::virtio::Cpu>>,
+) -> std::result::Result<(), StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    event_manager
+        .add_subscriber(cpu_device.clone())
+        .map_err(RegisterEvent)?;
+
+    let id = String::from(cpu_device.lock().unwrap().id());
+
+    // The device mutex mustn't be locked here otherwise it will deadlock.
+    attach_mmio_device(vmm, id, intc.clone(), cpu_device).map_err(RegisterBalloonDevice)?;
 
     Ok(())
 }

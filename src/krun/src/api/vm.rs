@@ -77,6 +77,26 @@ pub struct Vm {
 pub struct VmControl {
     boot_mib: u64,
     mem: Option<Arc<std::sync::Mutex<devices::virtio::Mem>>>,
+    cpu: Option<Arc<std::sync::Mutex<devices::virtio::Cpu>>>,
+}
+
+/// Point-in-time CPU sizing of a running VM as seen through [`VmControl`].
+/// `actual` is what the guest driver last reported; `enforced` is what the
+/// VMM allows to execute regardless of guest cooperation.
+#[cfg(not(feature = "tee"))]
+#[derive(Debug, Clone, Copy)]
+pub struct VmCpuState {
+    /// CPUs possible in this boot.
+    pub possible: u32,
+
+    /// Online count the host asked the guest to converge on.
+    pub requested_online: u32,
+
+    /// Online count the guest driver last reported.
+    pub actual_online: u32,
+
+    /// Online count the VMM currently enforces.
+    pub enforced: u32,
 }
 
 /// Point-in-time memory sizing of a running VM, in MiB, as seen through
@@ -181,6 +201,7 @@ impl Vm {
         VmControl {
             boot_mib: self.vmr.vm_config().mem_size_mib.unwrap_or(128) as u64,
             mem: self.vmr.mem_device.clone(),
+            cpu: self.vmr.cpu_device.clone(),
         }
     }
 
@@ -700,6 +721,33 @@ impl VmControl {
     /// Whether the running VM can resize memory live.
     pub fn memory_resize_supported(&self) -> bool {
         self.mem.is_some()
+    }
+
+    /// Whether the running VM can resize its online CPU count live.
+    pub fn cpu_resize_supported(&self) -> bool {
+        self.cpu.is_some()
+    }
+
+    /// Ask the guest to converge on `online` CPUs and enforce that ceiling
+    /// host-side. Returns the accepted target (clamped to 1..=possible), or
+    /// `None` when the VM booted without CPU capacity. The guest driver
+    /// onlines/offlines asynchronously; poll [`cpu_state`](Self::cpu_state)
+    /// for convergence — enforcement applies immediately either way.
+    pub fn set_cpu_target(&self, online: u32) -> Option<u32> {
+        let cpu = self.cpu.as_ref()?;
+        Some(cpu.lock().unwrap().set_requested_online(online))
+    }
+
+    /// Current CPU sizing, or `None` when the VM booted without capacity.
+    pub fn cpu_state(&self) -> Option<VmCpuState> {
+        let cpu = self.cpu.as_ref()?;
+        let snap = cpu.lock().unwrap().state_snapshot();
+        Some(VmCpuState {
+            possible: snap.possible,
+            requested_online: snap.requested_online,
+            actual_online: snap.actual_online,
+            enforced: snap.enforced,
+        })
     }
 
     /// Ask the guest to converge on `total_mib` of usable memory.

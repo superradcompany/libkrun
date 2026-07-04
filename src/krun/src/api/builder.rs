@@ -359,6 +359,27 @@ impl VmBuilder {
         vmr.set_vm_config(&vm_config)
             .map_err(|err| map_vm_config_error(&self.machine, err))?;
 
+        // Reserved CPU capacity is realized through the private msb-cpu device:
+        // the guest driver converges on the requested online count and the
+        // device's enforcement state parks vCPUs above it host-side.
+        #[cfg(not(feature = "tee"))]
+        if self
+            .machine
+            .max_vcpus
+            .is_some_and(|max| max > self.machine.vcpus)
+        {
+            let cpu = devices::virtio::Cpu::new(
+                self.machine.max_vcpus.unwrap_or(self.machine.vcpus) as u32,
+                self.machine.vcpus as u32,
+            )
+            .map_err(|e| {
+                Error::Build(BuildError::DeviceRegistration(format!(
+                    "virtio-msb-cpu: {e:?}"
+                )))
+            })?;
+            vmr.cpu_device = Some(std::sync::Arc::new(std::sync::Mutex::new(cpu)));
+        }
+
         // Reserved memory capacity is realized through a virtio-mem device; the
         // VMM places its hotplug region during boot and `Vm::control_handle`
         // exposes the live resize knob.
