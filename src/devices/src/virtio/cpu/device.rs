@@ -16,8 +16,15 @@ use crate::virtio::InterruptTransport;
 pub(crate) const BASE_AVAIL_FEATURES: u64 = 1 << uapi::VIRTIO_F_VERSION_1 as u64;
 
 /// How long a vCPU above the enforced count keeps running before it is
-/// hard-parked, giving a cooperative guest time to offline it cleanly.
+/// throttled, giving a cooperative guest time to offline it cleanly.
 pub const ENFORCEMENT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long an enforced-off vCPU parks between emulation steps once the grace window expires.
+///
+/// Enforcement throttles instead of freezing the vCPU outright: a guest without the msb-cpu driver keeps the CPU online, and fully parking an online CPU deadlocks the whole
+/// guest — cross-CPU synchronization (IPIs, TLB shootdowns, RCU) waits forever for the parked CPU, wedging the initiating CPUs too. Waking for one emulation step per park
+/// interval keeps that machinery draining at a duty cycle too small to matter for compute.
+pub const THROTTLE_PARK: std::time::Duration = std::time::Duration::from_millis(100);
 
 // Config space offsets (three little-endian u32 fields).
 const CONFIG_ACTUAL_ONLINE_OFFSET: u64 = 8;
@@ -35,12 +42,13 @@ unsafe impl ByteValued for VirtioCpuConfig {}
 
 /// Host-authoritative CPU count shared with every vCPU run loop.
 ///
-/// vCPUs whose index is at or above `enforced` park between emulation steps
-/// until the count is raised again, so a guest that refuses to offline a CPU
-/// stops receiving execution time on it anyway. Run loops grant a short grace
-/// window ([`ENFORCEMENT_GRACE`]) before hard-parking, because a graceful
-/// offline needs the dying CPU to execute its own PSCI CPU_OFF path. The boot
-/// CPU is always runnable: `enforced` is clamped to at least 1.
+/// vCPUs whose index is at or above `enforced` are throttled between emulation
+/// steps until the count is raised again, so a guest that refuses to offline a
+/// CPU loses almost all execution time on it while the guest as a whole stays
+/// live (see [`THROTTLE_PARK`]). Run loops grant a short grace window
+/// ([`ENFORCEMENT_GRACE`]) before throttling, because a graceful offline needs
+/// the dying CPU to execute its own PSCI CPU_OFF path. The boot CPU is always
+/// runnable: `enforced` is clamped to at least 1.
 pub struct CpuEnforcement {
     enforced: AtomicU32,
     gate: Mutex<()>,
@@ -73,11 +81,18 @@ impl CpuEnforcement {
         cpu_index < self.enforced()
     }
 
-    /// Park the calling vCPU thread until its index becomes runnable again.
-    pub fn wait_until_runnable(&self, cpu_index: u32) {
+    /// Park the calling vCPU thread for one throttle interval ([`THROTTLE_PARK`]), returning early if its index becomes runnable. The caller runs one emulation step
+    /// between parks so guest-wide synchronization that involves this CPU still completes.
+    pub fn throttle(&self, cpu_index: u32) {
+        let deadline = std::time::Instant::now() + THROTTLE_PARK;
         let mut guard = self.gate.lock().unwrap();
         while cpu_index >= self.enforced.load(Ordering::Acquire) {
-            guard = self.raised.wait(guard).unwrap();
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return;
+            }
+            let (next, _timeout) = self.raised.wait_timeout(guard, deadline - now).unwrap();
+            guard = next;
         }
     }
 }

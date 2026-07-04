@@ -536,13 +536,15 @@ impl Vcpu {
                 } else {
                     // Give the guest a grace window to offline this CPU
                     // gracefully (the dying CPU must run its own PSCI CPU_OFF
-                    // path); hard-park it only if the guest refuses.
+                    // path); throttle it only if the guest refuses. Throttling
+                    // (one emulation step per park interval) rather than fully
+                    // parking keeps an uncooperative guest live: IPIs and TLB
+                    // shootdowns aimed at this CPU still complete.
                     let deadline = *enforcement_deadline.get_or_insert_with(|| {
                         std::time::Instant::now() + devices::virtio::ENFORCEMENT_GRACE
                     });
                     if std::time::Instant::now() >= deadline {
-                        enforcement.wait_until_runnable(self.id as u32);
-                        enforcement_deadline = None;
+                        enforcement.throttle(self.id as u32);
                     }
                 }
             }

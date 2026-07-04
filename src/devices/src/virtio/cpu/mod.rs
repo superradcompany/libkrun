@@ -2,7 +2,7 @@ mod device;
 mod event_handler;
 
 pub use self::defs::uapi::VIRTIO_ID_MSB_CPU as TYPE_MSB_CPU;
-pub use self::device::{Cpu, CpuEnforcement, CpuStateSnapshot, ENFORCEMENT_GRACE};
+pub use self::device::{Cpu, CpuEnforcement, CpuStateSnapshot, ENFORCEMENT_GRACE, THROTTLE_PARK};
 
 mod defs {
     use super::super::QueueConfig;
