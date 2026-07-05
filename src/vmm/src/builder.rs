@@ -3204,14 +3204,23 @@ fn create_vcpus_windows(
     metrics: utils::metrics::MetricsWriter,
     #[cfg(target_arch = "x86_64")] pio_bus: Option<&devices::Bus>,
 ) -> super::Result<Vec<Vcpu>> {
-    let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
+    // Create the full possible topology; every AP parks in the startup
+    // router until the guest sends it INIT/SIPI, so CPUs beyond the boot
+    // online count (reserved capacity) simply wait until the guest onlines
+    // them through the msb-cpu driver. On aarch64 only the boot count is
+    // created because reserved capacity is rejected at config time.
+    #[cfg(target_arch = "x86_64")]
+    let create_count = vcpu_config.max_vcpu_count.max(vcpu_config.vcpu_count);
+    #[cfg(target_arch = "aarch64")]
+    let create_count = vcpu_config.vcpu_count;
+
+    let mut vcpus = Vec::with_capacity(create_count as usize);
     // One router shared by all vCPU threads: INIT/SIPI writes trap on the
     // sending vCPU and are applied to the parked target APs through it.
     #[cfg(target_arch = "x86_64")]
-    let sipi_router = std::sync::Arc::new(crate::windows::vstate::ApStartupRouter::new(
-        vcpu_config.vcpu_count,
-    ));
-    for cpu_index in 0..vcpu_config.vcpu_count {
+    let sipi_router =
+        std::sync::Arc::new(crate::windows::vstate::ApStartupRouter::new(create_count));
+    for cpu_index in 0..create_count {
         let mut vcpu = vm
             .create_vcpu(
                 cpu_index,
