@@ -1906,12 +1906,13 @@ fn log_x86_fatal_exit_state(
         Err(_) => "<unavailable>".to_string(),
     };
     error!(
-        "WHP vCPU {id} fatal exit state: rip={:#x} cs={:#x} rflags={:#x} exec_state={:#x} cr0={} cr3={} cr4={} efer={} rsp={}",
+        "WHP vCPU {id} fatal exit state: rip={:#x} cs={:#x} rflags={:#x} exec_state={:#x} cr0={} cr2={} cr3={} cr4={} efer={} rsp={}",
         vp.Rip,
         vp.Cs.Selector,
         vp.Rflags,
         unsafe { vp.ExecutionState.AsUINT16 },
         reg(WHvX64RegisterCr0),
+        reg(WHvX64RegisterCr2),
         reg(WHvX64RegisterCr3),
         reg(WHvX64RegisterCr4),
         reg(WHvX64RegisterEfer),
