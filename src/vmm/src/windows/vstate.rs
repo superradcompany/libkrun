@@ -1343,7 +1343,6 @@ fn set_vcpu_registers(
     Ok(())
 }
 
-#[cfg(target_arch = "aarch64")]
 fn get_vcpu_register_u64(
     partition_handle: WHV_PARTITION_HANDLE,
     id: u8,
@@ -1617,18 +1616,41 @@ fn run_vcpu(
             continue;
         }
 
-        if reason == whp_unrecoverable_exception_exit_reason()
-            || reason == whp_unsupported_feature_exit_reason()
-        {
-            error!("{}", Error::UnhandledExit { id, reason });
-            signal_vcpu_exit(&response_sender, &exit_evt, 1);
-            return;
-        }
-
+        // Unrecoverable exceptions, unsupported features, and unknown exit
+        // reasons all end the VM; dump the guest state first so triple
+        // faults are diagnosable from a single log capture.
         error!("{}", Error::UnhandledExit { id, reason });
+        #[cfg(target_arch = "x86_64")]
+        log_x86_fatal_exit_state(partition_handle, id, &exit_context);
         signal_vcpu_exit(&response_sender, &exit_evt, 1);
         return;
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn log_x86_fatal_exit_state(
+    partition_handle: WHV_PARTITION_HANDLE,
+    id: u8,
+    exit_context: &WHV_RUN_VP_EXIT_CONTEXT,
+) {
+    let vp = &exit_context.VpContext;
+    // The exit context only carries RIP/CS/RFLAGS; fetch control registers separately so early-boot faults (paging off, CR3 unset) are distinguishable from post-boot ones.
+    let reg = |name: WHV_REGISTER_NAME| match get_vcpu_register_u64(partition_handle, id, name) {
+        Ok(value) => format!("{value:#x}"),
+        Err(_) => "<unavailable>".to_string(),
+    };
+    error!(
+        "WHP vCPU {id} fatal exit state: rip={:#x} cs={:#x} rflags={:#x} exec_state={:#x} cr0={} cr3={} cr4={} efer={} rsp={}",
+        vp.Rip,
+        vp.Cs.Selector,
+        vp.Rflags,
+        unsafe { vp.ExecutionState.AsUINT16 },
+        reg(WHvX64RegisterCr0),
+        reg(WHvX64RegisterCr3),
+        reg(WHvX64RegisterCr4),
+        reg(WHvX64RegisterEfer),
+        reg(WHvX64RegisterRsp),
+    );
 }
 
 fn current_thread_cpu_time_ns() -> Option<u64> {

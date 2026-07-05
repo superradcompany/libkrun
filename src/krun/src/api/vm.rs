@@ -476,10 +476,14 @@ impl Vm {
             .as_deref()
             .map(|cmdline| format!(" {cmdline}"))
             .unwrap_or_default();
+        // Escape hatch for boot debugging: appended last so it can override earlier parameters (e.g. `ignore_loglevel`, `maxcpus=1`) without any API plumbing.
+        let debug_cmdline = env::var("MSB_KRUN_KERNEL_CMDLINE")
+            .map(|extra| format!(" {extra}"))
+            .unwrap_or_default();
 
         KernelCmdlineConfig {
             prolog: Some(format!(
-                "{}{} root=/dev/root init={init}",
+                "{}{}{debug_cmdline} root=/dev/root init={init}",
                 vmm::vmm_config::kernel_cmdline::DEFAULT_KERNEL_CMDLINE,
                 user_cmdline,
             )),
