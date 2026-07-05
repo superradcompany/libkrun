@@ -39,20 +39,18 @@ use windows_sys::Win32::System::Hypervisor::{
 use windows_sys::Win32::System::Hypervisor::{
     WHvCapabilityCodeExtendedVmExits, WHvPartitionPropertyCodeExtendedVmExits,
     WHvPartitionPropertyCodeLocalApicEmulationMode, WHvRegisterInternalActivityState,
-    WHvRunVpExitReasonCanceled,
-    WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonX64ApicInitSipiTrap,
-    WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess, WHvTranslateGva,
-    WHvTranslateGvaResultSuccess,
-    WHvX64LocalApicEmulationModeXApic, WHvX64RegisterApicId, WHvX64RegisterCr0,
-    WHvX64RegisterCr2, WHvX64RegisterCr3, WHvX64RegisterCr4,
-    WHvX64RegisterCs, WHvX64RegisterDs, WHvX64RegisterEfer, WHvX64RegisterEs, WHvX64RegisterFs,
-    WHvX64RegisterGdtr, WHvX64RegisterGs, WHvX64RegisterIdtr, WHvX64RegisterRbp,
-    WHvX64RegisterRflags, WHvX64RegisterRip, WHvX64RegisterRsi, WHvX64RegisterRsp,
-    WHvX64RegisterSs, WHvX64RegisterTr, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_IO_ACCESS_INFO,
-    WHV_EMULATOR_MEMORY_ACCESS_INFO, WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT,
-    WHV_RUN_VP_EXIT_CONTEXT, WHV_TRANSLATE_GVA_FLAGS, WHV_TRANSLATE_GVA_RESULT,
-    WHV_TRANSLATE_GVA_RESULT_CODE, WHV_X64_IO_PORT_ACCESS_CONTEXT, WHV_X64_SEGMENT_REGISTER,
-    WHV_X64_SEGMENT_REGISTER_0, WHV_X64_TABLE_REGISTER,
+    WHvRunVpExitReasonCanceled, WHvRunVpExitReasonMemoryAccess,
+    WHvRunVpExitReasonX64ApicInitSipiTrap, WHvRunVpExitReasonX64Halt,
+    WHvRunVpExitReasonX64IoPortAccess, WHvTranslateGva, WHvTranslateGvaResultSuccess,
+    WHvX64LocalApicEmulationModeXApic, WHvX64RegisterApicId, WHvX64RegisterCr0, WHvX64RegisterCr2,
+    WHvX64RegisterCr3, WHvX64RegisterCr4, WHvX64RegisterCs, WHvX64RegisterDs, WHvX64RegisterEfer,
+    WHvX64RegisterEs, WHvX64RegisterFs, WHvX64RegisterGdtr, WHvX64RegisterGs, WHvX64RegisterIdtr,
+    WHvX64RegisterRbp, WHvX64RegisterRflags, WHvX64RegisterRip, WHvX64RegisterRsi,
+    WHvX64RegisterRsp, WHvX64RegisterSs, WHvX64RegisterTr, WHV_EMULATOR_CALLBACKS,
+    WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO, WHV_EMULATOR_STATUS,
+    WHV_MEMORY_ACCESS_CONTEXT, WHV_RUN_VP_EXIT_CONTEXT, WHV_TRANSLATE_GVA_FLAGS,
+    WHV_TRANSLATE_GVA_RESULT, WHV_TRANSLATE_GVA_RESULT_CODE, WHV_X64_IO_PORT_ACCESS_CONTEXT,
+    WHV_X64_SEGMENT_REGISTER, WHV_X64_SEGMENT_REGISTER_0, WHV_X64_TABLE_REGISTER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
 
@@ -507,7 +505,9 @@ impl ApStartupRouter {
         let targets: Vec<u8> = match shorthand {
             // All-including-self and all-excluding-self: the sender is
             // already running either way, so both reduce to "all others".
-            0b10 | 0b11 => (0..self.slots.len() as u8).filter(|&t| t != sender).collect(),
+            0b10 | 0b11 => (0..self.slots.len() as u8)
+                .filter(|&t| t != sender)
+                .collect(),
             // Physical destination: xAPIC IDs match vCPU indices here.
             0b00 if !logical_destination => vec![((icr >> 56) & 0xff) as u8],
             _ => {
