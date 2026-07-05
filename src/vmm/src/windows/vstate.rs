@@ -518,6 +518,7 @@ impl ApStartupRouter {
             };
             let mut state = slot.lock().unwrap();
             if *state != ApParkState::Running {
+                debug!("WHP vCPU {sender}: startup IPI vector {vector:#x} -> vCPU {target}");
                 *state = ApParkState::SipiPending(vector);
             }
         }
@@ -539,6 +540,7 @@ impl ApStartupRouter {
                 let mut state = slot.lock().unwrap();
                 if let ApParkState::SipiPending(vector) = *state {
                     *state = ApParkState::Running;
+                    debug!("WHP vCPU {id}: unparked by startup IPI (vector {vector:#x})");
                     return Ok(vector);
                 }
             }
@@ -1763,6 +1765,7 @@ fn run_vcpu(
         #[cfg(target_arch = "x86_64")]
         if reason == WHvRunVpExitReasonX64ApicInitSipiTrap {
             let icr = unsafe { exit_context.Anonymous.ApicInitSipi.ApicIcr };
+            debug!("WHP vCPU {id}: INIT/SIPI trap (icr={icr:#x})");
             if let Some(router) = &sipi_router {
                 router.deliver_icr(id, icr);
             } else {
