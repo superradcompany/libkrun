@@ -38,12 +38,13 @@ use windows_sys::Win32::System::Hypervisor::{
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::Hypervisor::{
     WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
-    WHvRunVpExitReasonCanceled,
+    WHvRegisterInternalActivityState, WHvRunVpExitReasonCanceled,
     WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonUnrecoverableException,
     WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64ApicInitSipiTrap,
     WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess, WHvTranslateGva,
     WHvTranslateGvaResultSuccess,
-    WHvX64LocalApicEmulationModeXApic, WHvX64RegisterCr0, WHvX64RegisterCr3, WHvX64RegisterCr4,
+    WHvX64LocalApicEmulationModeXApic, WHvX64RegisterApicId, WHvX64RegisterCr0,
+    WHvX64RegisterCr2, WHvX64RegisterCr3, WHvX64RegisterCr4,
     WHvX64RegisterCs, WHvX64RegisterDs, WHvX64RegisterEfer, WHvX64RegisterEs, WHvX64RegisterFs,
     WHvX64RegisterGdtr, WHvX64RegisterGs, WHvX64RegisterIdtr, WHvX64RegisterRbp,
     WHvX64RegisterRflags, WHvX64RegisterRip, WHvX64RegisterRsi, WHvX64RegisterRsp,
@@ -1645,6 +1646,7 @@ fn run_vcpu(
                         signal_vcpu_exit(&response_sender, &exit_evt, 1);
                         return;
                     }
+                    spawn_ap_probe(partition_handle, id);
                 }
                 Err(()) => return,
             }
@@ -1826,6 +1828,36 @@ fn run_vcpu(
         signal_vcpu_exit(&response_sender, &exit_evt, 1);
         return;
     }
+}
+
+/// Debug aid, gated on `MSB_KRUN_WHP_TRACE`: samples an AP's state a few
+/// seconds after its startup IPI so a silently stuck AP (e.g. parked in a
+/// cli;hlt loop) can be located without guest cooperation.
+#[cfg(target_arch = "x86_64")]
+fn spawn_ap_probe(partition_handle: WHV_PARTITION_HANDLE, id: u8) {
+    if std::env::var_os("MSB_KRUN_WHP_TRACE").is_none() {
+        return;
+    }
+    let handle = partition_handle;
+    thread::spawn(move || {
+        for wait_secs in [1u64, 3, 8] {
+            thread::sleep(Duration::from_secs(wait_secs));
+            let reg = |name: WHV_REGISTER_NAME| match get_vcpu_register_u64(handle, id, name) {
+                Ok(value) => format!("{value:#x}"),
+                Err(_) => "<unavailable>".to_string(),
+            };
+            warn!(
+                "WHP AP probe vCPU {id}: rip={} cs_base={} cr0={} cr3={} cr2={} apic_id={} activity={}",
+                reg(WHvX64RegisterRip),
+                reg(WHvX64RegisterCs),
+                reg(WHvX64RegisterCr0),
+                reg(WHvX64RegisterCr3),
+                reg(WHvX64RegisterCr2),
+                reg(WHvX64RegisterApicId),
+                reg(WHvRegisterInternalActivityState),
+            );
+        }
+    });
 }
 
 /// Applies the architectural SIPI effect: the AP starts in real mode at
