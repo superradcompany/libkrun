@@ -5,17 +5,18 @@ use std::fmt::{Display, Formatter};
 use std::mem::{size_of, zeroed};
 use std::result;
 #[cfg(target_arch = "aarch64")]
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+#[cfg(target_arch = "x86_64")]
+use std::sync::Mutex;
 use std::thread;
-#[cfg(target_arch = "aarch64")]
 use std::time::Duration;
 
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 
 use arch::ArchMemoryInfo;
+#[cfg(target_arch = "x86_64")]
+use crossbeam_channel::RecvTimeoutError;
 use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
 use utils::{eventfd::EventFd, metrics::MetricsWriter};
 #[cfg(target_arch = "x86_64")]
@@ -38,8 +39,9 @@ use windows_sys::Win32::System::Hypervisor::{
 use windows_sys::Win32::System::Hypervisor::{
     WHvPartitionPropertyCodeLocalApicEmulationMode, WHvRunVpExitReasonCanceled,
     WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonUnrecoverableException,
-    WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64Halt,
-    WHvRunVpExitReasonX64IoPortAccess, WHvTranslateGva, WHvTranslateGvaResultSuccess,
+    WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64ApicInitSipiTrap,
+    WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess, WHvTranslateGva,
+    WHvTranslateGvaResultSuccess,
     WHvX64LocalApicEmulationModeXApic, WHvX64RegisterCr0, WHvX64RegisterCr3, WHvX64RegisterCr4,
     WHvX64RegisterCs, WHvX64RegisterDs, WHvX64RegisterEfer, WHvX64RegisterEs, WHvX64RegisterFs,
     WHvX64RegisterGdtr, WHvX64RegisterGs, WHvX64RegisterIdtr, WHvX64RegisterRbp,
@@ -239,7 +241,6 @@ pub enum Error {
         id: u8,
         hresult: windows_sys::core::HRESULT,
     },
-    #[cfg(target_arch = "aarch64")]
     GetVirtualProcessorRegisters {
         id: u8,
         hresult: windows_sys::core::HRESULT,
@@ -361,7 +362,6 @@ impl Display for Error {
                 "WHvRunVirtualProcessor({id}) failed with HRESULT 0x{:08x}",
                 *hresult as u32
             ),
-            #[cfg(target_arch = "aarch64")]
             Error::GetVirtualProcessorRegisters { id, hresult } => write!(
                 f,
                 "WHvGetVirtualProcessorRegisters({id}) failed with HRESULT 0x{:08x}",
@@ -429,12 +429,131 @@ pub struct Vcpu {
     mmio_bus: Option<devices::Bus>,
     #[cfg(target_arch = "x86_64")]
     pio_bus: Option<devices::Bus>,
+    #[cfg(target_arch = "x86_64")]
+    sipi_router: Option<Arc<ApStartupRouter>>,
     exit_evt: EventFd,
     metrics: MetricsWriter,
     event_sender: Option<Sender<VcpuEvent>>,
     event_receiver: Option<Receiver<VcpuEvent>>,
     response_sender: Option<Sender<VcpuResponse>>,
     response_receiver: Option<Receiver<VcpuResponse>>,
+}
+
+/// Boot-time state of an x86 application processor under WHP.
+///
+/// WHP's in-hypervisor local APIC emulation does not start APs itself: an
+/// ICR write on the sending vCPU exits with `X64ApicInitSipiTrap` and the
+/// VMM must apply the INIT/SIPI to the targets. APs therefore stay parked
+/// (architectural reset state, never entered) until a startup IPI arrives.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApParkState {
+    /// Waiting for a startup IPI; the vCPU thread has not entered the guest.
+    Parked,
+    /// Startup IPI received with this vector; the AP thread will apply the
+    /// real-mode startup state and begin running.
+    SipiPending(u8),
+    /// The vCPU is executing guest code.
+    Running,
+}
+
+/// Routes INIT/SIPI IPIs trapped on the sending vCPU to parked APs.
+#[cfg(target_arch = "x86_64")]
+pub struct ApStartupRouter {
+    slots: Vec<Mutex<ApParkState>>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl ApStartupRouter {
+    const ICR_DELIVERY_INIT: u64 = 0b101;
+    const ICR_DELIVERY_STARTUP: u64 = 0b110;
+
+    pub fn new(vcpu_count: u8) -> Self {
+        let slots = (0..vcpu_count)
+            .map(|id| {
+                // The BSP boots directly at the kernel entry point.
+                Mutex::new(if id == 0 {
+                    ApParkState::Running
+                } else {
+                    ApParkState::Parked
+                })
+            })
+            .collect();
+        Self { slots }
+    }
+
+    /// Applies a trapped ICR write. INIT is a no-op for parked APs (they
+    /// already hold reset state); a startup IPI records the vector and
+    /// wakes the target. INIT/SIPI to a running vCPU is ignored, so CPU
+    /// re-onlining after offline is not supported yet on WHP.
+    fn deliver_icr(&self, sender: u8, icr: u64) {
+        let delivery_mode = (icr >> 8) & 0x7;
+        if delivery_mode == Self::ICR_DELIVERY_INIT {
+            return;
+        }
+        if delivery_mode != Self::ICR_DELIVERY_STARTUP {
+            warn!("WHP vCPU {sender}: unsupported trapped IPI ignored (icr={icr:#x})");
+            return;
+        }
+
+        let vector = (icr & 0xff) as u8;
+        let shorthand = (icr >> 18) & 0x3;
+        let logical_destination = (icr >> 11) & 0x1 == 1;
+        let targets: Vec<u8> = match shorthand {
+            // All-including-self and all-excluding-self: the sender is
+            // already running either way, so both reduce to "all others".
+            0b10 | 0b11 => (0..self.slots.len() as u8).filter(|&t| t != sender).collect(),
+            // Physical destination: xAPIC IDs match vCPU indices here.
+            0b00 if !logical_destination => vec![((icr >> 56) & 0xff) as u8],
+            _ => {
+                warn!("WHP vCPU {sender}: unsupported SIPI destination ignored (icr={icr:#x})");
+                return;
+            }
+        };
+
+        for target in targets {
+            let Some(slot) = self.slots.get(target as usize) else {
+                warn!("WHP vCPU {sender}: SIPI to unknown vCPU {target} ignored");
+                continue;
+            };
+            let mut state = slot.lock().unwrap();
+            if *state != ApParkState::Running {
+                *state = ApParkState::SipiPending(vector);
+            }
+        }
+    }
+
+    /// Parks an AP thread until its startup IPI arrives, keeping the
+    /// pause/resume protocol responsive so VM-wide pauses cannot deadlock
+    /// on a CPU the guest has not started. Returns the SIPI vector, or
+    /// `Err` when the control channel closed (VM shutdown).
+    fn wait_for_sipi(
+        &self,
+        id: u8,
+        event_receiver: &Receiver<VcpuEvent>,
+        response_sender: &Sender<VcpuResponse>,
+    ) -> result::Result<u8, ()> {
+        let slot = &self.slots[id as usize];
+        loop {
+            {
+                let mut state = slot.lock().unwrap();
+                if let ApParkState::SipiPending(vector) = *state {
+                    *state = ApParkState::Running;
+                    return Ok(vector);
+                }
+            }
+            match event_receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(VcpuEvent::Pause) => {
+                    let _ = response_sender.send(VcpuResponse::Paused);
+                }
+                Ok(VcpuEvent::Resume) => {
+                    let _ = response_sender.send(VcpuResponse::Resumed);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return Err(()),
+            }
+        }
+    }
 }
 
 #[allow(unused)]
@@ -720,6 +839,8 @@ impl Vcpu {
             mmio_bus: None,
             #[cfg(target_arch = "x86_64")]
             pio_bus: None,
+            #[cfg(target_arch = "x86_64")]
+            sipi_router: None,
             exit_evt,
             metrics,
             event_sender: Some(event_sender),
@@ -736,6 +857,11 @@ impl Vcpu {
     #[cfg(target_arch = "x86_64")]
     pub fn set_pio_bus(&mut self, pio_bus: devices::Bus) {
         self.pio_bus = Some(pio_bus);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_sipi_router(&mut self, sipi_router: Arc<ApStartupRouter>) {
+        self.sipi_router = Some(sipi_router);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -787,6 +913,8 @@ impl Vcpu {
         let mmio_bus = self.mmio_bus.take();
         #[cfg(target_arch = "x86_64")]
         let pio_bus = self.pio_bus.take();
+        #[cfg(target_arch = "x86_64")]
+        let sipi_router = self.sipi_router.take();
         let exit_evt = self.exit_evt.try_clone().map_err(Error::VcpuThreadSpawn)?;
         let metrics = self.metrics.clone();
         self.partition_handle = 0;
@@ -801,6 +929,8 @@ impl Vcpu {
                     mmio_bus,
                     #[cfg(target_arch = "x86_64")]
                     pio_bus,
+                    #[cfg(target_arch = "x86_64")]
+                    sipi_router,
                     exit_evt,
                     metrics,
                     event_receiver,
@@ -856,6 +986,13 @@ impl Vcpu {
         guest_mem: &GuestMemoryMmap,
         entry_addr: GuestAddress,
     ) -> Result<()> {
+        // Only the BSP boots at the kernel entry point. APs keep the
+        // architectural reset state and stay parked until the guest sends
+        // them INIT/SIPI (see `ApStartupRouter`).
+        if self.id != 0 {
+            return Ok(());
+        }
+
         write_x86_gdt_table(guest_mem)?;
         write_x86_idt_value(guest_mem)?;
         setup_x86_page_tables(guest_mem)?;
@@ -1453,6 +1590,7 @@ fn run_vcpu(
     guest_mem: GuestMemoryMmap,
     mmio_bus: Option<devices::Bus>,
     #[cfg(target_arch = "x86_64")] pio_bus: Option<devices::Bus>,
+    #[cfg(target_arch = "x86_64")] sipi_router: Option<Arc<ApStartupRouter>>,
     exit_evt: EventFd,
     metrics: MetricsWriter,
     event_receiver: Receiver<VcpuEvent>,
@@ -1460,6 +1598,24 @@ fn run_vcpu(
 ) {
     if wait_until_resumed(&event_receiver, &response_sender).is_err() {
         return;
+    }
+
+    // x86 APs must not execute until the guest starts them: park here until
+    // the BSP's startup IPI supplies the real-mode entry vector.
+    #[cfg(target_arch = "x86_64")]
+    if id != 0 {
+        if let Some(router) = &sipi_router {
+            match router.wait_for_sipi(id, &event_receiver, &response_sender) {
+                Ok(vector) => {
+                    if let Err(err) = apply_sipi_startup_state(partition_handle, id, vector) {
+                        error!("{err}");
+                        signal_vcpu_exit(&response_sender, &exit_evt, 1);
+                        return;
+                    }
+                }
+                Err(()) => return,
+            }
+        }
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -1605,6 +1761,17 @@ fn run_vcpu(
         }
 
         #[cfg(target_arch = "x86_64")]
+        if reason == WHvRunVpExitReasonX64ApicInitSipiTrap {
+            let icr = unsafe { exit_context.Anonymous.ApicInitSipi.ApicIcr };
+            if let Some(router) = &sipi_router {
+                router.deliver_icr(id, icr);
+            } else {
+                warn!("WHP vCPU {id}: INIT/SIPI trap without an AP router (icr={icr:#x})");
+            }
+            continue;
+        }
+
+        #[cfg(target_arch = "x86_64")]
         if reason == WHvRunVpExitReasonX64IoPortAccess {
             let io_access = unsafe { exit_context.Anonymous.IoPortAccess };
             if let Err(err) = emulator.emulate_io(&mut emulator_context, &exit_context, &io_access)
@@ -1625,6 +1792,30 @@ fn run_vcpu(
         signal_vcpu_exit(&response_sender, &exit_evt, 1);
         return;
     }
+}
+
+/// Applies the architectural SIPI effect: the AP starts in real mode at
+/// `vector << 12` with everything else still in the reset state it has held
+/// while parked.
+#[cfg(target_arch = "x86_64")]
+fn apply_sipi_startup_state(
+    partition_handle: WHV_PARTITION_HANDLE,
+    id: u8,
+    vector: u8,
+) -> Result<()> {
+    let cs = x86_segment(
+        u64::from(vector) << 12,
+        0xffff,
+        u16::from(vector) << 8,
+        0x9b,
+    );
+    let names = [WHvX64RegisterCs, WHvX64RegisterRip, WHvX64RegisterRflags];
+    let values = [
+        register_value_segment(cs),
+        register_value_u64(0),
+        register_value_u64(0x2),
+    ];
+    set_vcpu_registers(partition_handle, id, &names, &values)
 }
 
 #[cfg(target_arch = "x86_64")]
