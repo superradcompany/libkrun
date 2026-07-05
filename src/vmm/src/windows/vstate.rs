@@ -37,10 +37,10 @@ use windows_sys::Win32::System::Hypervisor::{
 };
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::Hypervisor::{
-    WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
-    WHvRegisterInternalActivityState, WHvRunVpExitReasonCanceled,
-    WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonUnrecoverableException,
-    WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64ApicInitSipiTrap,
+    WHvCapabilityCodeExtendedVmExits, WHvPartitionPropertyCodeExtendedVmExits,
+    WHvPartitionPropertyCodeLocalApicEmulationMode, WHvRegisterInternalActivityState,
+    WHvRunVpExitReasonCanceled,
+    WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonX64ApicInitSipiTrap,
     WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess, WHvTranslateGva,
     WHvTranslateGvaResultSuccess,
     WHvX64LocalApicEmulationModeXApic, WHvX64RegisterApicId, WHvX64RegisterCr0,
@@ -108,11 +108,6 @@ const WHV_ARM64_REGISTER_GICR_BASE_GPA: WHV_REGISTER_NAME = 0x0006_3000;
 const WHV_ARM64_EXIT_REASON_UNMAPPED_GPA: WHV_RUN_VP_EXIT_REASON = 0x8000_0000_u32 as i32;
 #[cfg(target_arch = "aarch64")]
 const WHV_ARM64_EXIT_REASON_GPA_INTERCEPT: WHV_RUN_VP_EXIT_REASON = 0x8000_0001_u32 as i32;
-#[cfg(target_arch = "aarch64")]
-const WHV_ARM64_EXIT_REASON_UNRECOVERABLE_EXCEPTION: WHV_RUN_VP_EXIT_REASON =
-    0x8000_0021_u32 as i32;
-#[cfg(target_arch = "aarch64")]
-const WHV_ARM64_EXIT_REASON_UNSUPPORTED_FEATURE: WHV_RUN_VP_EXIT_REASON = 0x8000_0022_u32 as i32;
 #[cfg(target_arch = "aarch64")]
 const WHV_ARM64_EXIT_REASON_CANCELED: WHV_RUN_VP_EXIT_REASON = 0xffff_ffff_u32 as i32;
 #[cfg(target_arch = "aarch64")]
@@ -247,6 +242,8 @@ pub enum Error {
         id: u8,
         hresult: windows_sys::core::HRESULT,
     },
+    #[cfg(target_arch = "x86_64")]
+    ApicInitSipiTrapUnsupported,
     SetVirtualProcessorRegisters {
         id: u8,
         hresult: windows_sys::core::HRESULT,
@@ -368,6 +365,12 @@ impl Display for Error {
                 f,
                 "WHvGetVirtualProcessorRegisters({id}) failed with HRESULT 0x{:08x}",
                 *hresult as u32
+            ),
+            #[cfg(target_arch = "x86_64")]
+            Error::ApicInitSipiTrapUnsupported => write!(
+                f,
+                "this host's Windows Hypervisor Platform cannot trap INIT/SIPI, \
+                 which multi-CPU guests require; retry with a single CPU"
             ),
             Error::SetVirtualProcessorRegisters { id, hresult } => write!(
                 f,
@@ -1298,7 +1301,7 @@ impl Partition {
         #[cfg(target_arch = "x86_64")]
         partition.set_x64_local_apic_emulation()?;
         #[cfg(target_arch = "x86_64")]
-        partition.set_x64_extended_vm_exits()?;
+        partition.set_x64_extended_vm_exits(vcpu_count)?;
         #[cfg(target_arch = "aarch64")]
         partition.set_arm64_ic_parameters()?;
         partition.setup()?;
@@ -1330,12 +1333,23 @@ impl Partition {
     /// INIT/SIPI writes to the emulated local APIC are only surfaced to the
     /// VMM (as `X64ApicInitSipiTrap` exits) when the corresponding extended
     /// VM exit is enabled; without it, application processors can never be
-    /// started.
+    /// started. Bit 6 = X64ApicInitSipiExitTrap (WinHvPlatformDefs.h);
+    /// windows-sys models WHV_EXTENDED_VM_EXITS as an opaque u64 bitfield.
     #[cfg(target_arch = "x86_64")]
-    fn set_x64_extended_vm_exits(&self) -> Result<()> {
-        // Bit 6 = X64ApicInitSipiExitTrap (WinHvPlatformDefs.h); windows-sys
-        // models WHV_EXTENDED_VM_EXITS as an opaque u64 bitfield.
-        let property: u64 = 1 << 6;
+    fn set_x64_extended_vm_exits(&self, vcpu_count: u8) -> Result<()> {
+        const X64_APIC_INIT_SIPI_EXIT_TRAP: u64 = 1 << 6;
+
+        let supported = query_extended_vm_exits()?;
+        if supported & X64_APIC_INIT_SIPI_EXIT_TRAP == 0 {
+            // Single-CPU guests never send startup IPIs, so this host can
+            // still run them; refuse multi-CPU rather than hang at boot.
+            if vcpu_count > 1 {
+                return Err(Error::ApicInitSipiTrapUnsupported);
+            }
+            return Ok(());
+        }
+
+        let property: u64 = X64_APIC_INIT_SIPI_EXIT_TRAP;
         let property_code = WHvPartitionPropertyCodeExtendedVmExits;
         let hresult = unsafe {
             WHvSetPartitionProperty(
@@ -1419,6 +1433,27 @@ impl Partition {
 
         Ok(())
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn query_extended_vm_exits() -> Result<u64> {
+    let mut capability: WHV_CAPABILITY = unsafe { zeroed() };
+    let mut written_size = 0;
+    let code = WHvCapabilityCodeExtendedVmExits;
+    let hresult = unsafe {
+        WHvGetCapability(
+            code,
+            &mut capability as *mut WHV_CAPABILITY as *mut _,
+            size_of::<WHV_CAPABILITY>() as u32,
+            &mut written_size,
+        )
+    };
+
+    if hresult < 0 {
+        return Err(Error::GetCapability { code, hresult });
+    }
+
+    Ok(unsafe { capability.ExtendedVmExits.Anonymous._bitfield })
 }
 
 fn query_hypervisor_present() -> Result<bool> {
@@ -2057,26 +2092,6 @@ fn whp_canceled_exit_reason() -> WHV_RUN_VP_EXIT_REASON {
 #[cfg(target_arch = "x86_64")]
 fn whp_canceled_exit_reason() -> WHV_RUN_VP_EXIT_REASON {
     WHvRunVpExitReasonCanceled
-}
-
-#[cfg(target_arch = "aarch64")]
-fn whp_unrecoverable_exception_exit_reason() -> WHV_RUN_VP_EXIT_REASON {
-    WHV_ARM64_EXIT_REASON_UNRECOVERABLE_EXCEPTION
-}
-
-#[cfg(target_arch = "x86_64")]
-fn whp_unrecoverable_exception_exit_reason() -> WHV_RUN_VP_EXIT_REASON {
-    WHvRunVpExitReasonUnrecoverableException
-}
-
-#[cfg(target_arch = "aarch64")]
-fn whp_unsupported_feature_exit_reason() -> WHV_RUN_VP_EXIT_REASON {
-    WHV_ARM64_EXIT_REASON_UNSUPPORTED_FEATURE
-}
-
-#[cfg(target_arch = "x86_64")]
-fn whp_unsupported_feature_exit_reason() -> WHV_RUN_VP_EXIT_REASON {
-    WHvRunVpExitReasonUnsupportedFeature
 }
 
 #[cfg(target_arch = "aarch64")]
