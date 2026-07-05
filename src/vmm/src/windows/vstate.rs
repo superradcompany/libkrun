@@ -37,7 +37,8 @@ use windows_sys::Win32::System::Hypervisor::{
 };
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::Hypervisor::{
-    WHvPartitionPropertyCodeLocalApicEmulationMode, WHvRunVpExitReasonCanceled,
+    WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
+    WHvRunVpExitReasonCanceled,
     WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonUnrecoverableException,
     WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64ApicInitSipiTrap,
     WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess, WHvTranslateGva,
@@ -1295,6 +1296,8 @@ impl Partition {
         partition.set_processor_count(vcpu_count)?;
         #[cfg(target_arch = "x86_64")]
         partition.set_x64_local_apic_emulation()?;
+        #[cfg(target_arch = "x86_64")]
+        partition.set_x64_extended_vm_exits()?;
         #[cfg(target_arch = "aarch64")]
         partition.set_arm64_ic_parameters()?;
         partition.setup()?;
@@ -1311,6 +1314,34 @@ impl Partition {
                 property_code,
                 &property as *const u32 as *const _,
                 size_of::<u32>() as u32,
+            )
+        };
+        if hresult < 0 {
+            return Err(Error::SetPartitionProperty {
+                property: property_code,
+                hresult,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// INIT/SIPI writes to the emulated local APIC are only surfaced to the
+    /// VMM (as `X64ApicInitSipiTrap` exits) when the corresponding extended
+    /// VM exit is enabled; without it, application processors can never be
+    /// started.
+    #[cfg(target_arch = "x86_64")]
+    fn set_x64_extended_vm_exits(&self) -> Result<()> {
+        // Bit 6 = X64ApicInitSipiExitTrap (WinHvPlatformDefs.h); windows-sys
+        // models WHV_EXTENDED_VM_EXITS as an opaque u64 bitfield.
+        let property: u64 = 1 << 6;
+        let property_code = WHvPartitionPropertyCodeExtendedVmExits;
+        let hresult = unsafe {
+            WHvSetPartitionProperty(
+                self.handle,
+                property_code,
+                &property as *const u64 as *const _,
+                size_of::<u64>() as u32,
             )
         };
         if hresult < 0 {
