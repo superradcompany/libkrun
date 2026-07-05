@@ -1875,11 +1875,20 @@ fn apply_sipi_startup_state(
         u16::from(vector) << 8,
         0x9b,
     );
-    let names = [WHvX64RegisterCs, WHvX64RegisterRip, WHvX64RegisterRflags];
+    // Clearing InternalActivityState releases the VP from the
+    // startup-suspend state WHP parks APs in; without this the processor
+    // holds its reset state forever and never fetches an instruction.
+    let names = [
+        WHvX64RegisterCs,
+        WHvX64RegisterRip,
+        WHvX64RegisterRflags,
+        WHvRegisterInternalActivityState,
+    ];
     let values = [
         register_value_segment(cs),
         register_value_u64(0),
         register_value_u64(0x2),
+        register_value_u64(0),
     ];
     set_vcpu_registers(partition_handle, id, &names, &values)
 }
