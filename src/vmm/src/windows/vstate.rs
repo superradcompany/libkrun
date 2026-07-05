@@ -37,9 +37,9 @@ use windows_sys::Win32::System::Hypervisor::{
 };
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::Hypervisor::{
-    WHvCapabilityCodeExtendedVmExits, WHvPartitionPropertyCodeExtendedVmExits,
-    WHvPartitionPropertyCodeLocalApicEmulationMode, WHvRegisterInternalActivityState,
-    WHvRunVpExitReasonCanceled, WHvRunVpExitReasonMemoryAccess,
+    WHvCapabilityCodeExtendedVmExits, WHvCapabilityCodeProcessorClockFrequency,
+    WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
+    WHvRegisterInternalActivityState, WHvRunVpExitReasonCanceled, WHvRunVpExitReasonMemoryAccess,
     WHvRunVpExitReasonX64ApicInitSipiTrap, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt,
     WHvRunVpExitReasonX64IoPortAccess, WHvTranslateGva, WHvTranslateGvaResultSuccess,
     WHvX64LocalApicEmulationModeXApic, WHvX64RegisterApicId, WHvX64RegisterCr0, WHvX64RegisterCr2,
@@ -1973,6 +1973,12 @@ fn normalize_cpuid(id: u8, vcpu_count: u8, access: &WHV_X64_CPUID_ACCESS_CONTEXT
     };
 
     match leaf {
+        // The guest must be able to reach the synthesized TSC leaf (0x15)
+        // even on hosts whose CPUID tops out below it (AMD stops at 0xD).
+        0x0 => {
+            let max_leaf = (result.rax as u32).max(0x15);
+            result.rax = u64::from(max_leaf);
+        }
         0x1 => {
             let mut ebx = result.rbx as u32;
             ebx = (ebx & 0x00ff_ffff) | (u32::from(id) << 24);
@@ -2005,10 +2011,48 @@ fn normalize_cpuid(id: u8, vcpu_count: u8, access: &WHV_X64_CPUID_ACCESS_CONTEXT
             result.rcx = u64::from(subleaf | (level_type << 8));
             result.rdx = u64::from(id);
         }
+        // TSC/crystal ratio: hand the guest its TSC frequency directly so
+        // it never falls back to PIT/HPET calibration (neither of which we
+        // emulate well enough) and the jiffies clocksource. The guest TSC
+        // runs at the host rate under WHP, which the platform reports via
+        // WHvCapabilityCodeProcessorClockFrequency.
+        0x15 => {
+            if let Some(tsc_hz) = host_tsc_frequency_hz() {
+                result.rax = 1; // ratio denominator
+                result.rbx = 1; // ratio numerator
+                result.rcx = tsc_hz; // "crystal" clock in Hz
+                result.rdx = 0;
+            }
+        }
         _ => {}
     }
 
     result
+}
+
+/// Host processor clock (TSC) frequency, queried once. `None` when the
+/// platform cannot report it; the guest then calibrates as before.
+#[cfg(target_arch = "x86_64")]
+fn host_tsc_frequency_hz() -> Option<u64> {
+    static TSC_HZ: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *TSC_HZ.get_or_init(|| {
+        let mut capability: WHV_CAPABILITY = unsafe { zeroed() };
+        let mut written_size = 0;
+        let hresult = unsafe {
+            WHvGetCapability(
+                WHvCapabilityCodeProcessorClockFrequency,
+                &mut capability as *mut WHV_CAPABILITY as *mut _,
+                size_of::<WHV_CAPABILITY>() as u32,
+                &mut written_size,
+            )
+        };
+        if hresult < 0 {
+            warn!("WHP: processor clock frequency unavailable (hresult {hresult:#x})");
+            return None;
+        }
+        let hz = unsafe { capability.ProcessorClockFrequency };
+        (hz != 0).then_some(hz)
+    })
 }
 
 /// Applies the architectural SIPI effect: the AP starts in real mode at
