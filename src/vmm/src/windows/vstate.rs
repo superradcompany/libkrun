@@ -2196,32 +2196,32 @@ unsafe extern "system" fn emulator_io_port_callback(
         return E_FAIL;
     };
 
+    // Unclaimed ports behave like a floating ISA bus (reads return all
+    // ones, writes are dropped) instead of tearing the VM down: guests
+    // legitimately probe ports we do not emulate (ELCR, PCI config, ...).
     let port = u64::from(io_access.Port);
     match io_access.Direction {
         WHV_EMULATOR_DIRECTION_READ => {
             let mut data = [0; 4];
-            if pio_bus.read(context.id.into(), port, &mut data[..len]) {
-                io_access.Data = u32::from_le_bytes(data);
-                S_OK
-            } else {
-                error!(
-                    "unhandled WHP I/O port read: vcpu={} port=0x{port:x} access_size={len}",
+            if !pio_bus.read(context.id.into(), port, &mut data[..len]) {
+                debug!(
+                    "unclaimed WHP I/O port read: vcpu={} port=0x{port:x} access_size={len}",
                     context.id
                 );
-                E_FAIL
+                data[..len].fill(0xff);
             }
+            io_access.Data = u32::from_le_bytes(data);
+            S_OK
         }
         WHV_EMULATOR_DIRECTION_WRITE => {
             let data = io_access.Data.to_le_bytes();
-            if pio_bus.write(context.id.into(), port, &data[..len]) {
-                S_OK
-            } else {
-                error!(
-                    "unhandled WHP I/O port write: vcpu={} port=0x{port:x} access_size={len} data=0x{:x}",
+            if !pio_bus.write(context.id.into(), port, &data[..len]) {
+                debug!(
+                    "unclaimed WHP I/O port write: vcpu={} port=0x{port:x} access_size={len} data=0x{:x}",
                     context.id, io_access.Data
                 );
-                E_FAIL
             }
+            S_OK
         }
         _ => E_INVALIDARG,
     }
