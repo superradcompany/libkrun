@@ -40,16 +40,17 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvCapabilityCodeExtendedVmExits, WHvPartitionPropertyCodeExtendedVmExits,
     WHvPartitionPropertyCodeLocalApicEmulationMode, WHvRegisterInternalActivityState,
     WHvRunVpExitReasonCanceled, WHvRunVpExitReasonMemoryAccess,
-    WHvRunVpExitReasonX64ApicInitSipiTrap, WHvRunVpExitReasonX64Halt,
+    WHvRunVpExitReasonX64ApicInitSipiTrap, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt,
     WHvRunVpExitReasonX64IoPortAccess, WHvTranslateGva, WHvTranslateGvaResultSuccess,
     WHvX64LocalApicEmulationModeXApic, WHvX64RegisterApicId, WHvX64RegisterCr0, WHvX64RegisterCr2,
     WHvX64RegisterCr3, WHvX64RegisterCr4, WHvX64RegisterCs, WHvX64RegisterDs, WHvX64RegisterEfer,
     WHvX64RegisterEs, WHvX64RegisterFs, WHvX64RegisterGdtr, WHvX64RegisterGs, WHvX64RegisterIdtr,
-    WHvX64RegisterRbp, WHvX64RegisterRflags, WHvX64RegisterRip, WHvX64RegisterRsi,
-    WHvX64RegisterRsp, WHvX64RegisterSs, WHvX64RegisterTr, WHV_EMULATOR_CALLBACKS,
-    WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO, WHV_EMULATOR_STATUS,
-    WHV_MEMORY_ACCESS_CONTEXT, WHV_RUN_VP_EXIT_CONTEXT, WHV_TRANSLATE_GVA_FLAGS,
-    WHV_TRANSLATE_GVA_RESULT, WHV_TRANSLATE_GVA_RESULT_CODE, WHV_X64_IO_PORT_ACCESS_CONTEXT,
+    WHvX64RegisterRax, WHvX64RegisterRbp, WHvX64RegisterRbx, WHvX64RegisterRcx, WHvX64RegisterRdx,
+    WHvX64RegisterRflags, WHvX64RegisterRip, WHvX64RegisterRsi, WHvX64RegisterRsp,
+    WHvX64RegisterSs, WHvX64RegisterTr, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_IO_ACCESS_INFO,
+    WHV_EMULATOR_MEMORY_ACCESS_INFO, WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT,
+    WHV_RUN_VP_EXIT_CONTEXT, WHV_TRANSLATE_GVA_FLAGS, WHV_TRANSLATE_GVA_RESULT,
+    WHV_TRANSLATE_GVA_RESULT_CODE, WHV_X64_CPUID_ACCESS_CONTEXT, WHV_X64_IO_PORT_ACCESS_CONTEXT,
     WHV_X64_SEGMENT_REGISTER, WHV_X64_SEGMENT_REGISTER_0, WHV_X64_TABLE_REGISTER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
@@ -483,6 +484,10 @@ impl ApStartupRouter {
             })
             .collect();
         Self { slots }
+    }
+
+    fn vcpu_count(&self) -> u8 {
+        self.slots.len() as u8
     }
 
     /// Applies a trapped ICR write. INIT is a no-op for parked APs (they
@@ -1333,23 +1338,37 @@ impl Partition {
     /// INIT/SIPI writes to the emulated local APIC are only surfaced to the
     /// VMM (as `X64ApicInitSipiTrap` exits) when the corresponding extended
     /// VM exit is enabled; without it, application processors can never be
-    /// started. Bit 6 = X64ApicInitSipiExitTrap (WinHvPlatformDefs.h);
-    /// windows-sys models WHV_EXTENDED_VM_EXITS as an opaque u64 bitfield.
+    /// started. CPUID exits let the VMM answer with a normalized result so
+    /// guest boot does not depend on the host CPU or the host's WHP build.
+    /// Bit 0 = X64CpuidExit, bit 6 = X64ApicInitSipiExitTrap
+    /// (WinHvPlatformDefs.h); windows-sys models WHV_EXTENDED_VM_EXITS as an
+    /// opaque u64 bitfield.
     #[cfg(target_arch = "x86_64")]
     fn set_x64_extended_vm_exits(&self, vcpu_count: u8) -> Result<()> {
+        const X64_CPUID_EXIT: u64 = 1 << 0;
         const X64_APIC_INIT_SIPI_EXIT_TRAP: u64 = 1 << 6;
 
         let supported = query_extended_vm_exits()?;
-        if supported & X64_APIC_INIT_SIPI_EXIT_TRAP == 0 {
+        let mut property: u64 = 0;
+
+        if supported & X64_CPUID_EXIT != 0 {
+            property |= X64_CPUID_EXIT;
+        } else {
+            warn!("WHP: CPUID exits unsupported; the guest sees host CPUID unnormalized");
+        }
+
+        if supported & X64_APIC_INIT_SIPI_EXIT_TRAP != 0 {
+            property |= X64_APIC_INIT_SIPI_EXIT_TRAP;
+        } else if vcpu_count > 1 {
             // Single-CPU guests never send startup IPIs, so this host can
             // still run them; refuse multi-CPU rather than hang at boot.
-            if vcpu_count > 1 {
-                return Err(Error::ApicInitSipiTrapUnsupported);
-            }
+            return Err(Error::ApicInitSipiTrapUnsupported);
+        }
+
+        if property == 0 {
             return Ok(());
         }
 
-        let property: u64 = X64_APIC_INIT_SIPI_EXIT_TRAP;
         let property_code = WHvPartitionPropertyCodeExtendedVmExits;
         let hresult = unsafe {
             WHvSetPartitionProperty(
@@ -1831,6 +1850,36 @@ fn run_vcpu(
         }
 
         #[cfg(target_arch = "x86_64")]
+        if reason == WHvRunVpExitReasonX64Cpuid {
+            let cpuid = unsafe { exit_context.Anonymous.CpuidAccess };
+            let vcpu_count = sipi_router.as_ref().map_or(1, |router| router.vcpu_count());
+            let result = normalize_cpuid(id, vcpu_count, &cpuid);
+            // The VpContext bitfield's low nibble is the instruction length.
+            let next_rip =
+                exit_context.VpContext.Rip + u64::from(exit_context.VpContext._bitfield & 0xf);
+            let names = [
+                WHvX64RegisterRax,
+                WHvX64RegisterRbx,
+                WHvX64RegisterRcx,
+                WHvX64RegisterRdx,
+                WHvX64RegisterRip,
+            ];
+            let values = [
+                register_value_u64(result.rax),
+                register_value_u64(result.rbx),
+                register_value_u64(result.rcx),
+                register_value_u64(result.rdx),
+                register_value_u64(next_rip),
+            ];
+            if let Err(err) = set_vcpu_registers(partition_handle, id, &names, &values) {
+                error!("{err}");
+                signal_vcpu_exit(&response_sender, &exit_evt, 1);
+                return;
+            }
+            continue;
+        }
+
+        #[cfg(target_arch = "x86_64")]
         if reason == WHvRunVpExitReasonX64ApicInitSipiTrap {
             let icr = unsafe { exit_context.Anonymous.ApicInitSipi.ApicIcr };
             debug!("WHP vCPU {id}: INIT/SIPI trap (icr={icr:#x})");
@@ -1893,6 +1942,73 @@ fn spawn_ap_probe(partition_handle: WHV_PARTITION_HANDLE, id: u8) {
             );
         }
     });
+}
+
+#[cfg(target_arch = "x86_64")]
+struct CpuidResult {
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+}
+
+/// Answers a trapped CPUID with the hypervisor's default result, normalized
+/// so the guest sees the virtual machine rather than the host: stable APIC
+/// IDs and topology derived from the vCPU count, the hypervisor-present
+/// bit, and no x2APIC (the local APIC emulation mode is xAPIC-only). Guest
+/// boot paths must not vary with the host CPU vendor or WHP build defaults.
+#[cfg(target_arch = "x86_64")]
+fn normalize_cpuid(id: u8, vcpu_count: u8, access: &WHV_X64_CPUID_ACCESS_CONTEXT) -> CpuidResult {
+    const CPUID_1_ECX_X2APIC: u32 = 1 << 21;
+    const CPUID_1_ECX_HYPERVISOR: u32 = 1 << 31;
+    const CPUID_1_EDX_HTT: u32 = 1 << 28;
+
+    let leaf = access.Rax as u32;
+    let subleaf = access.Rcx as u32;
+    let mut result = CpuidResult {
+        rax: access.DefaultResultRax,
+        rbx: access.DefaultResultRbx,
+        rcx: access.DefaultResultRcx,
+        rdx: access.DefaultResultRdx,
+    };
+
+    match leaf {
+        0x1 => {
+            let mut ebx = result.rbx as u32;
+            ebx = (ebx & 0x00ff_ffff) | (u32::from(id) << 24);
+            ebx = (ebx & 0xff00_ffff) | (u32::from(vcpu_count) << 16);
+            result.rbx = u64::from(ebx);
+
+            let mut ecx = result.rcx as u32;
+            ecx |= CPUID_1_ECX_HYPERVISOR;
+            ecx &= !CPUID_1_ECX_X2APIC;
+            result.rcx = u64::from(ecx);
+
+            let mut edx = result.rdx as u32;
+            if vcpu_count > 1 {
+                edx |= CPUID_1_EDX_HTT;
+            }
+            result.rdx = u64::from(edx);
+        }
+        // Extended topology: one thread per core, `vcpu_count` cores, and
+        // the vCPU index as the x2APIC ID, replacing whatever slice of the
+        // host topology the default result leaks.
+        0xB | 0x1F => {
+            let core_shift = u32::from(vcpu_count).next_power_of_two().trailing_zeros();
+            let (shift, count, level_type) = match subleaf {
+                0 => (0, 1, 1u32),                           // SMT level
+                1 => (core_shift, u32::from(vcpu_count), 2), // core level
+                _ => (0, 0, 0),                              // no further levels
+            };
+            result.rax = u64::from(shift);
+            result.rbx = u64::from(count);
+            result.rcx = u64::from(subleaf | (level_type << 8));
+            result.rdx = u64::from(id);
+        }
+        _ => {}
+    }
+
+    result
 }
 
 /// Applies the architectural SIPI effect: the AP starts in real mode at

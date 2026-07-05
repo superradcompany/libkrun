@@ -31,7 +31,7 @@ use std::os::fd::{BorrowedFd, FromRawFd};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -2693,11 +2693,15 @@ pub fn setup_serial_device(
 struct WindowsX64PitStub {
     channels: [u8; 3],
     command: u8,
+    channel0_access: u8,
+    channel0_mode: u8,
+    channel0_write_lsb: Option<u8>,
+    channel0_period_ns: Arc<AtomicU64>,
+    channel0_periodic: Arc<AtomicBool>,
     channel2_latch: u32,
     channel2_started_at: Option<Instant>,
     channel2_write_lsb: Option<u8>,
     channel2_read_msb_next: bool,
-    armed: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
 }
 
@@ -2720,19 +2724,38 @@ struct WindowsX64PostCodeStub {
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 impl WindowsX64PitStub {
     fn new(intc: IrqChip) -> Self {
-        let armed = Arc::new(AtomicBool::new(false));
+        let channel0_period_ns = Arc::new(AtomicU64::new(0));
+        let channel0_periodic = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
-        let thread_armed = armed.clone();
+        let thread_period = channel0_period_ns.clone();
+        let thread_periodic = channel0_periodic.clone();
         let thread_running = running.clone();
 
+        // Channel 0 timer: ticks at the guest-programmed rate and injects
+        // IRQ0 through the IOAPIC route, which already drops it while the
+        // guest keeps the pin masked.
         std::thread::spawn(move || {
             while thread_running.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                if thread_armed.load(Ordering::Relaxed) {
+                let period_ns = thread_period.load(Ordering::Relaxed);
+                if period_ns == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                // Clamp so a tiny divisor cannot busy-spin the host;
+                // jiffies-grade timing is all a guest needs from a PIT.
+                std::thread::sleep(std::time::Duration::from_nanos(period_ns.max(1_000_000)));
+                if thread_period.load(Ordering::Relaxed) == 0 {
+                    continue;
+                }
+                {
                     let intc = intc.lock().unwrap();
                     if let Err(e) = intc.set_irq(Some(0), None) {
                         trace!("PIT tick interrupt injection failed: {e:?}");
                     }
+                }
+                if !thread_periodic.load(Ordering::Relaxed) {
+                    // One-shot modes fire once per reload.
+                    thread_period.store(0, Ordering::Relaxed);
                 }
             }
         });
@@ -2740,13 +2763,42 @@ impl WindowsX64PitStub {
         Self {
             channels: [0; 3],
             command: 0,
+            channel0_access: 0,
+            channel0_mode: 0,
+            channel0_write_lsb: None,
+            channel0_period_ns,
+            channel0_periodic,
             channel2_latch: 0,
             channel2_started_at: None,
             channel2_write_lsb: None,
             channel2_read_msb_next: false,
-            armed,
             running,
         }
+    }
+
+    fn write_channel0(&mut self, value: u8) {
+        self.channels[0] = value;
+
+        let divisor = match self.channel0_access {
+            0b01 => u32::from(value),
+            0b10 => u32::from(value) << 8,
+            _ => {
+                if let Some(lsb) = self.channel0_write_lsb.take() {
+                    u32::from(u16::from_le_bytes([lsb, value]))
+                } else {
+                    self.channel0_write_lsb = Some(value);
+                    return;
+                }
+            }
+        };
+        let divisor = if divisor == 0 { 0x1_0000 } else { divisor };
+        let period_ns = u64::from(divisor) * 1_000_000_000 / PIT_TICK_RATE_HZ as u64;
+
+        // Modes 2 (rate generator) and 3 (square wave) reload themselves;
+        // everything else behaves as a one-shot.
+        self.channel0_periodic
+            .store(matches!(self.channel0_mode, 2 | 3), Ordering::Relaxed);
+        self.channel0_period_ns.store(period_ns, Ordering::Relaxed);
     }
 
     fn read_channel2(&mut self) -> u8 {
@@ -2828,10 +2880,23 @@ impl devices::BusDevice for WindowsX64PitStub {
         }
 
         match offset {
-            0..=1 => self.channels[offset as usize] = data[0],
+            0 => self.write_channel0(data[0]),
+            1 => self.channels[1] = data[0],
             2 => self.write_channel2(data[0]),
             3 => {
                 self.command = data[0];
+                if self.command & 0xc0 == 0 {
+                    let access = (self.command >> 4) & 0x3;
+                    // Access 0 is the counter-latch command; anything else
+                    // reprograms the channel, so stop ticking until the
+                    // guest writes the new reload value.
+                    if access != 0 {
+                        self.channel0_access = access;
+                        self.channel0_mode = (self.command >> 1) & 0x7;
+                        self.channel0_write_lsb = None;
+                        self.channel0_period_ns.store(0, Ordering::Relaxed);
+                    }
+                }
                 if self.command & 0xc0 == 0x80 {
                     self.channel2_write_lsb = None;
                     self.channel2_read_msb_next = false;
@@ -2839,7 +2904,6 @@ impl devices::BusDevice for WindowsX64PitStub {
             }
             _ => {}
         }
-        self.armed.store(true, Ordering::Relaxed);
     }
 }
 
