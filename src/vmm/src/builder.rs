@@ -816,15 +816,30 @@ impl WhpIoApicState {
         Some((index, reg_index & 1 != 0))
     }
 
-    fn vector_for_irq(&self, irq_line: u32) -> Option<u32> {
+    fn route_for_irq(&self, irq_line: u32) -> Option<IoApicRoute> {
         let entry = *self.ioredtbl.get(irq_line as usize)?;
         let vector = (entry & X86_IOAPIC_VECTOR_MASK) as u32;
         if vector == 0 {
-            None
-        } else {
-            Some(vector)
+            return None;
         }
+        Some(IoApicRoute {
+            vector,
+            destination: ((entry >> 56) & 0xff) as u32,
+            logical: (entry >> 11) & 0x1 == 1,
+            level_triggered: (entry >> 15) & 0x1 == 1,
+            masked: entry & X86_IOAPIC_REDTBL_MASKED != 0,
+        })
     }
+}
+
+/// Interrupt routing the guest programmed into an IOAPIC redirection entry.
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+struct IoApicRoute {
+    vector: u32,
+    destination: u32,
+    logical: bool,
+    level_triggered: bool,
+    masked: bool,
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
@@ -857,7 +872,11 @@ const WHV_X64_INTERRUPT_TYPE_FIXED: u8 = 0;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 const WHV_X64_INTERRUPT_DESTINATION_PHYSICAL: u8 = 0;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const WHV_X64_INTERRUPT_DESTINATION_LOGICAL: u8 = 1;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 const WHV_X64_INTERRUPT_TRIGGER_EDGE: u8 = 0;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const WHV_X64_INTERRUPT_TRIGGER_LEVEL: u8 = 1;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 const X86_LEGACY_IRQ_VECTOR_BASE: u32 = 0x20;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
@@ -1010,18 +1029,35 @@ impl IrqChipT for WhpIrqChip {
                 )));
             };
 
-            let vector = self
-                .ioapic
-                .lock()
-                .unwrap()
-                .vector_for_irq(irq_line)
-                .unwrap_or(X86_LEGACY_IRQ_VECTOR_BASE + irq_line);
+            let route = self.ioapic.lock().unwrap().route_for_irq(irq_line);
+            let (vector, destination, logical, level_triggered) = match route {
+                // The guest masked the pin: architecturally the interrupt
+                // is simply not delivered.
+                Some(route) if route.masked => return Ok(()),
+                Some(route) => (
+                    route.vector,
+                    route.destination,
+                    route.logical,
+                    route.level_triggered,
+                ),
+                // Pin not programmed yet: legacy identity route to the BSP.
+                None => (X86_LEGACY_IRQ_VECTOR_BASE + irq_line, 0, false, false),
+            };
+            let destination_mode = if logical {
+                WHV_X64_INTERRUPT_DESTINATION_LOGICAL
+            } else {
+                WHV_X64_INTERRUPT_DESTINATION_PHYSICAL
+            };
+            let trigger_mode = if level_triggered {
+                WHV_X64_INTERRUPT_TRIGGER_LEVEL
+            } else {
+                WHV_X64_INTERRUPT_TRIGGER_EDGE
+            };
             let interrupt = WhvX64InterruptControl {
                 interrupt_type: WHV_X64_INTERRUPT_TYPE_FIXED,
-                modes: WHV_X64_INTERRUPT_DESTINATION_PHYSICAL
-                    | (WHV_X64_INTERRUPT_TRIGGER_EDGE << 4),
+                modes: destination_mode | (trigger_mode << 4),
                 reserved: [0; 6],
-                destination: 0,
+                destination,
                 vector,
             };
             let hresult = unsafe {
@@ -3114,6 +3150,12 @@ fn create_vcpus_windows(
     #[cfg(target_arch = "x86_64")] pio_bus: Option<&devices::Bus>,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
+    // One router shared by all vCPU threads: INIT/SIPI writes trap on the
+    // sending vCPU and are applied to the parked target APs through it.
+    #[cfg(target_arch = "x86_64")]
+    let sipi_router = std::sync::Arc::new(crate::windows::vstate::ApStartupRouter::new(
+        vcpu_config.vcpu_count,
+    ));
     for cpu_index in 0..vcpu_config.vcpu_count {
         let mut vcpu = vm
             .create_vcpu(
@@ -3125,8 +3167,11 @@ fn create_vcpus_windows(
         vcpu.configure_windows(guest_mem, mem_info, entry_addr)
             .map_err(Error::Vcpu)?;
         #[cfg(target_arch = "x86_64")]
-        if let Some(pio_bus) = pio_bus {
-            vcpu.set_pio_bus(pio_bus.clone());
+        {
+            if let Some(pio_bus) = pio_bus {
+                vcpu.set_pio_bus(pio_bus.clone());
+            }
+            vcpu.set_sipi_router(sipi_router.clone());
         }
         vcpus.push(vcpu);
     }

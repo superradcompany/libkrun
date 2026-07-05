@@ -5,17 +5,18 @@ use std::fmt::{Display, Formatter};
 use std::mem::{size_of, zeroed};
 use std::result;
 #[cfg(target_arch = "aarch64")]
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+#[cfg(target_arch = "x86_64")]
+use std::sync::Mutex;
 use std::thread;
-#[cfg(target_arch = "aarch64")]
 use std::time::Duration;
 
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 
 use arch::ArchMemoryInfo;
+#[cfg(target_arch = "x86_64")]
+use crossbeam_channel::RecvTimeoutError;
 use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
 use utils::{eventfd::EventFd, metrics::MetricsWriter};
 #[cfg(target_arch = "x86_64")]
@@ -36,19 +37,20 @@ use windows_sys::Win32::System::Hypervisor::{
 };
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::Hypervisor::{
-    WHvPartitionPropertyCodeLocalApicEmulationMode, WHvRunVpExitReasonCanceled,
-    WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonUnrecoverableException,
-    WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64Halt,
+    WHvCapabilityCodeExtendedVmExits, WHvPartitionPropertyCodeExtendedVmExits,
+    WHvPartitionPropertyCodeLocalApicEmulationMode, WHvRegisterInternalActivityState,
+    WHvRunVpExitReasonCanceled, WHvRunVpExitReasonMemoryAccess,
+    WHvRunVpExitReasonX64ApicInitSipiTrap, WHvRunVpExitReasonX64Halt,
     WHvRunVpExitReasonX64IoPortAccess, WHvTranslateGva, WHvTranslateGvaResultSuccess,
-    WHvX64LocalApicEmulationModeXApic, WHvX64RegisterCr0, WHvX64RegisterCr3, WHvX64RegisterCr4,
-    WHvX64RegisterCs, WHvX64RegisterDs, WHvX64RegisterEfer, WHvX64RegisterEs, WHvX64RegisterFs,
-    WHvX64RegisterGdtr, WHvX64RegisterGs, WHvX64RegisterIdtr, WHvX64RegisterRbp,
-    WHvX64RegisterRflags, WHvX64RegisterRip, WHvX64RegisterRsi, WHvX64RegisterRsp,
-    WHvX64RegisterSs, WHvX64RegisterTr, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_IO_ACCESS_INFO,
-    WHV_EMULATOR_MEMORY_ACCESS_INFO, WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT,
-    WHV_RUN_VP_EXIT_CONTEXT, WHV_TRANSLATE_GVA_FLAGS, WHV_TRANSLATE_GVA_RESULT,
-    WHV_TRANSLATE_GVA_RESULT_CODE, WHV_X64_IO_PORT_ACCESS_CONTEXT, WHV_X64_SEGMENT_REGISTER,
-    WHV_X64_SEGMENT_REGISTER_0, WHV_X64_TABLE_REGISTER,
+    WHvX64LocalApicEmulationModeXApic, WHvX64RegisterApicId, WHvX64RegisterCr0, WHvX64RegisterCr2,
+    WHvX64RegisterCr3, WHvX64RegisterCr4, WHvX64RegisterCs, WHvX64RegisterDs, WHvX64RegisterEfer,
+    WHvX64RegisterEs, WHvX64RegisterFs, WHvX64RegisterGdtr, WHvX64RegisterGs, WHvX64RegisterIdtr,
+    WHvX64RegisterRbp, WHvX64RegisterRflags, WHvX64RegisterRip, WHvX64RegisterRsi,
+    WHvX64RegisterRsp, WHvX64RegisterSs, WHvX64RegisterTr, WHV_EMULATOR_CALLBACKS,
+    WHV_EMULATOR_IO_ACCESS_INFO, WHV_EMULATOR_MEMORY_ACCESS_INFO, WHV_EMULATOR_STATUS,
+    WHV_MEMORY_ACCESS_CONTEXT, WHV_RUN_VP_EXIT_CONTEXT, WHV_TRANSLATE_GVA_FLAGS,
+    WHV_TRANSLATE_GVA_RESULT, WHV_TRANSLATE_GVA_RESULT_CODE, WHV_X64_IO_PORT_ACCESS_CONTEXT,
+    WHV_X64_SEGMENT_REGISTER, WHV_X64_SEGMENT_REGISTER_0, WHV_X64_TABLE_REGISTER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
 
@@ -104,11 +106,6 @@ const WHV_ARM64_REGISTER_GICR_BASE_GPA: WHV_REGISTER_NAME = 0x0006_3000;
 const WHV_ARM64_EXIT_REASON_UNMAPPED_GPA: WHV_RUN_VP_EXIT_REASON = 0x8000_0000_u32 as i32;
 #[cfg(target_arch = "aarch64")]
 const WHV_ARM64_EXIT_REASON_GPA_INTERCEPT: WHV_RUN_VP_EXIT_REASON = 0x8000_0001_u32 as i32;
-#[cfg(target_arch = "aarch64")]
-const WHV_ARM64_EXIT_REASON_UNRECOVERABLE_EXCEPTION: WHV_RUN_VP_EXIT_REASON =
-    0x8000_0021_u32 as i32;
-#[cfg(target_arch = "aarch64")]
-const WHV_ARM64_EXIT_REASON_UNSUPPORTED_FEATURE: WHV_RUN_VP_EXIT_REASON = 0x8000_0022_u32 as i32;
 #[cfg(target_arch = "aarch64")]
 const WHV_ARM64_EXIT_REASON_CANCELED: WHV_RUN_VP_EXIT_REASON = 0xffff_ffff_u32 as i32;
 #[cfg(target_arch = "aarch64")]
@@ -239,11 +236,12 @@ pub enum Error {
         id: u8,
         hresult: windows_sys::core::HRESULT,
     },
-    #[cfg(target_arch = "aarch64")]
     GetVirtualProcessorRegisters {
         id: u8,
         hresult: windows_sys::core::HRESULT,
     },
+    #[cfg(target_arch = "x86_64")]
+    ApicInitSipiTrapUnsupported,
     SetVirtualProcessorRegisters {
         id: u8,
         hresult: windows_sys::core::HRESULT,
@@ -361,11 +359,16 @@ impl Display for Error {
                 "WHvRunVirtualProcessor({id}) failed with HRESULT 0x{:08x}",
                 *hresult as u32
             ),
-            #[cfg(target_arch = "aarch64")]
             Error::GetVirtualProcessorRegisters { id, hresult } => write!(
                 f,
                 "WHvGetVirtualProcessorRegisters({id}) failed with HRESULT 0x{:08x}",
                 *hresult as u32
+            ),
+            #[cfg(target_arch = "x86_64")]
+            Error::ApicInitSipiTrapUnsupported => write!(
+                f,
+                "this host's Windows Hypervisor Platform cannot trap INIT/SIPI, \
+                 which multi-CPU guests require; retry with a single CPU"
             ),
             Error::SetVirtualProcessorRegisters { id, hresult } => write!(
                 f,
@@ -429,12 +432,135 @@ pub struct Vcpu {
     mmio_bus: Option<devices::Bus>,
     #[cfg(target_arch = "x86_64")]
     pio_bus: Option<devices::Bus>,
+    #[cfg(target_arch = "x86_64")]
+    sipi_router: Option<Arc<ApStartupRouter>>,
     exit_evt: EventFd,
     metrics: MetricsWriter,
     event_sender: Option<Sender<VcpuEvent>>,
     event_receiver: Option<Receiver<VcpuEvent>>,
     response_sender: Option<Sender<VcpuResponse>>,
     response_receiver: Option<Receiver<VcpuResponse>>,
+}
+
+/// Boot-time state of an x86 application processor under WHP.
+///
+/// WHP's in-hypervisor local APIC emulation does not start APs itself: an
+/// ICR write on the sending vCPU exits with `X64ApicInitSipiTrap` and the
+/// VMM must apply the INIT/SIPI to the targets. APs therefore stay parked
+/// (architectural reset state, never entered) until a startup IPI arrives.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApParkState {
+    /// Waiting for a startup IPI; the vCPU thread has not entered the guest.
+    Parked,
+    /// Startup IPI received with this vector; the AP thread will apply the
+    /// real-mode startup state and begin running.
+    SipiPending(u8),
+    /// The vCPU is executing guest code.
+    Running,
+}
+
+/// Routes INIT/SIPI IPIs trapped on the sending vCPU to parked APs.
+#[cfg(target_arch = "x86_64")]
+pub struct ApStartupRouter {
+    slots: Vec<Mutex<ApParkState>>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl ApStartupRouter {
+    const ICR_DELIVERY_INIT: u64 = 0b101;
+    const ICR_DELIVERY_STARTUP: u64 = 0b110;
+
+    pub fn new(vcpu_count: u8) -> Self {
+        let slots = (0..vcpu_count)
+            .map(|id| {
+                // The BSP boots directly at the kernel entry point.
+                Mutex::new(if id == 0 {
+                    ApParkState::Running
+                } else {
+                    ApParkState::Parked
+                })
+            })
+            .collect();
+        Self { slots }
+    }
+
+    /// Applies a trapped ICR write. INIT is a no-op for parked APs (they
+    /// already hold reset state); a startup IPI records the vector and
+    /// wakes the target. INIT/SIPI to a running vCPU is ignored, so CPU
+    /// re-onlining after offline is not supported yet on WHP.
+    fn deliver_icr(&self, sender: u8, icr: u64) {
+        let delivery_mode = (icr >> 8) & 0x7;
+        if delivery_mode == Self::ICR_DELIVERY_INIT {
+            return;
+        }
+        if delivery_mode != Self::ICR_DELIVERY_STARTUP {
+            warn!("WHP vCPU {sender}: unsupported trapped IPI ignored (icr={icr:#x})");
+            return;
+        }
+
+        let vector = (icr & 0xff) as u8;
+        let shorthand = (icr >> 18) & 0x3;
+        let logical_destination = (icr >> 11) & 0x1 == 1;
+        let targets: Vec<u8> = match shorthand {
+            // All-including-self and all-excluding-self: the sender is
+            // already running either way, so both reduce to "all others".
+            0b10 | 0b11 => (0..self.slots.len() as u8)
+                .filter(|&t| t != sender)
+                .collect(),
+            // Physical destination: xAPIC IDs match vCPU indices here.
+            0b00 if !logical_destination => vec![((icr >> 56) & 0xff) as u8],
+            _ => {
+                warn!("WHP vCPU {sender}: unsupported SIPI destination ignored (icr={icr:#x})");
+                return;
+            }
+        };
+
+        for target in targets {
+            let Some(slot) = self.slots.get(target as usize) else {
+                warn!("WHP vCPU {sender}: SIPI to unknown vCPU {target} ignored");
+                continue;
+            };
+            let mut state = slot.lock().unwrap();
+            if *state != ApParkState::Running {
+                debug!("WHP vCPU {sender}: startup IPI vector {vector:#x} -> vCPU {target}");
+                *state = ApParkState::SipiPending(vector);
+            }
+        }
+    }
+
+    /// Parks an AP thread until its startup IPI arrives, keeping the
+    /// pause/resume protocol responsive so VM-wide pauses cannot deadlock
+    /// on a CPU the guest has not started. Returns the SIPI vector, or
+    /// `Err` when the control channel closed (VM shutdown).
+    fn wait_for_sipi(
+        &self,
+        id: u8,
+        event_receiver: &Receiver<VcpuEvent>,
+        response_sender: &Sender<VcpuResponse>,
+    ) -> result::Result<u8, ()> {
+        let slot = &self.slots[id as usize];
+        loop {
+            {
+                let mut state = slot.lock().unwrap();
+                if let ApParkState::SipiPending(vector) = *state {
+                    *state = ApParkState::Running;
+                    debug!("WHP vCPU {id}: unparked by startup IPI (vector {vector:#x})");
+                    return Ok(vector);
+                }
+            }
+            match event_receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(VcpuEvent::Pause) => {
+                    let _ = response_sender.send(VcpuResponse::Paused);
+                }
+                Ok(VcpuEvent::Resume) => {
+                    let _ = response_sender.send(VcpuResponse::Resumed);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return Err(()),
+            }
+        }
+    }
 }
 
 #[allow(unused)]
@@ -720,6 +846,8 @@ impl Vcpu {
             mmio_bus: None,
             #[cfg(target_arch = "x86_64")]
             pio_bus: None,
+            #[cfg(target_arch = "x86_64")]
+            sipi_router: None,
             exit_evt,
             metrics,
             event_sender: Some(event_sender),
@@ -736,6 +864,11 @@ impl Vcpu {
     #[cfg(target_arch = "x86_64")]
     pub fn set_pio_bus(&mut self, pio_bus: devices::Bus) {
         self.pio_bus = Some(pio_bus);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_sipi_router(&mut self, sipi_router: Arc<ApStartupRouter>) {
+        self.sipi_router = Some(sipi_router);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -787,6 +920,8 @@ impl Vcpu {
         let mmio_bus = self.mmio_bus.take();
         #[cfg(target_arch = "x86_64")]
         let pio_bus = self.pio_bus.take();
+        #[cfg(target_arch = "x86_64")]
+        let sipi_router = self.sipi_router.take();
         let exit_evt = self.exit_evt.try_clone().map_err(Error::VcpuThreadSpawn)?;
         let metrics = self.metrics.clone();
         self.partition_handle = 0;
@@ -801,6 +936,8 @@ impl Vcpu {
                     mmio_bus,
                     #[cfg(target_arch = "x86_64")]
                     pio_bus,
+                    #[cfg(target_arch = "x86_64")]
+                    sipi_router,
                     exit_evt,
                     metrics,
                     event_receiver,
@@ -856,6 +993,13 @@ impl Vcpu {
         guest_mem: &GuestMemoryMmap,
         entry_addr: GuestAddress,
     ) -> Result<()> {
+        // Only the BSP boots at the kernel entry point. APs keep the
+        // architectural reset state and stay parked until the guest sends
+        // them INIT/SIPI (see `ApStartupRouter`).
+        if self.id != 0 {
+            return Ok(());
+        }
+
         write_x86_gdt_table(guest_mem)?;
         write_x86_idt_value(guest_mem)?;
         setup_x86_page_tables(guest_mem)?;
@@ -1156,6 +1300,8 @@ impl Partition {
         partition.set_processor_count(vcpu_count)?;
         #[cfg(target_arch = "x86_64")]
         partition.set_x64_local_apic_emulation()?;
+        #[cfg(target_arch = "x86_64")]
+        partition.set_x64_extended_vm_exits(vcpu_count)?;
         #[cfg(target_arch = "aarch64")]
         partition.set_arm64_ic_parameters()?;
         partition.setup()?;
@@ -1172,6 +1318,45 @@ impl Partition {
                 property_code,
                 &property as *const u32 as *const _,
                 size_of::<u32>() as u32,
+            )
+        };
+        if hresult < 0 {
+            return Err(Error::SetPartitionProperty {
+                property: property_code,
+                hresult,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// INIT/SIPI writes to the emulated local APIC are only surfaced to the
+    /// VMM (as `X64ApicInitSipiTrap` exits) when the corresponding extended
+    /// VM exit is enabled; without it, application processors can never be
+    /// started. Bit 6 = X64ApicInitSipiExitTrap (WinHvPlatformDefs.h);
+    /// windows-sys models WHV_EXTENDED_VM_EXITS as an opaque u64 bitfield.
+    #[cfg(target_arch = "x86_64")]
+    fn set_x64_extended_vm_exits(&self, vcpu_count: u8) -> Result<()> {
+        const X64_APIC_INIT_SIPI_EXIT_TRAP: u64 = 1 << 6;
+
+        let supported = query_extended_vm_exits()?;
+        if supported & X64_APIC_INIT_SIPI_EXIT_TRAP == 0 {
+            // Single-CPU guests never send startup IPIs, so this host can
+            // still run them; refuse multi-CPU rather than hang at boot.
+            if vcpu_count > 1 {
+                return Err(Error::ApicInitSipiTrapUnsupported);
+            }
+            return Ok(());
+        }
+
+        let property: u64 = X64_APIC_INIT_SIPI_EXIT_TRAP;
+        let property_code = WHvPartitionPropertyCodeExtendedVmExits;
+        let hresult = unsafe {
+            WHvSetPartitionProperty(
+                self.handle,
+                property_code,
+                &property as *const u64 as *const _,
+                size_of::<u64>() as u32,
             )
         };
         if hresult < 0 {
@@ -1248,6 +1433,27 @@ impl Partition {
 
         Ok(())
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn query_extended_vm_exits() -> Result<u64> {
+    let mut capability: WHV_CAPABILITY = unsafe { zeroed() };
+    let mut written_size = 0;
+    let code = WHvCapabilityCodeExtendedVmExits;
+    let hresult = unsafe {
+        WHvGetCapability(
+            code,
+            &mut capability as *mut WHV_CAPABILITY as *mut _,
+            size_of::<WHV_CAPABILITY>() as u32,
+            &mut written_size,
+        )
+    };
+
+    if hresult < 0 {
+        return Err(Error::GetCapability { code, hresult });
+    }
+
+    Ok(unsafe { capability.ExtendedVmExits.Anonymous._bitfield })
 }
 
 fn query_hypervisor_present() -> Result<bool> {
@@ -1343,7 +1549,6 @@ fn set_vcpu_registers(
     Ok(())
 }
 
-#[cfg(target_arch = "aarch64")]
 fn get_vcpu_register_u64(
     partition_handle: WHV_PARTITION_HANDLE,
     id: u8,
@@ -1454,6 +1659,7 @@ fn run_vcpu(
     guest_mem: GuestMemoryMmap,
     mmio_bus: Option<devices::Bus>,
     #[cfg(target_arch = "x86_64")] pio_bus: Option<devices::Bus>,
+    #[cfg(target_arch = "x86_64")] sipi_router: Option<Arc<ApStartupRouter>>,
     exit_evt: EventFd,
     metrics: MetricsWriter,
     event_receiver: Receiver<VcpuEvent>,
@@ -1461,6 +1667,25 @@ fn run_vcpu(
 ) {
     if wait_until_resumed(&event_receiver, &response_sender).is_err() {
         return;
+    }
+
+    // x86 APs must not execute until the guest starts them: park here until
+    // the BSP's startup IPI supplies the real-mode entry vector.
+    #[cfg(target_arch = "x86_64")]
+    if id != 0 {
+        if let Some(router) = &sipi_router {
+            match router.wait_for_sipi(id, &event_receiver, &response_sender) {
+                Ok(vector) => {
+                    if let Err(err) = apply_sipi_startup_state(partition_handle, id, vector) {
+                        error!("{err}");
+                        signal_vcpu_exit(&response_sender, &exit_evt, 1);
+                        return;
+                    }
+                    spawn_ap_probe(partition_handle, id);
+                }
+                Err(()) => return,
+            }
+        }
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -1606,6 +1831,18 @@ fn run_vcpu(
         }
 
         #[cfg(target_arch = "x86_64")]
+        if reason == WHvRunVpExitReasonX64ApicInitSipiTrap {
+            let icr = unsafe { exit_context.Anonymous.ApicInitSipi.ApicIcr };
+            debug!("WHP vCPU {id}: INIT/SIPI trap (icr={icr:#x})");
+            if let Some(router) = &sipi_router {
+                router.deliver_icr(id, icr);
+            } else {
+                warn!("WHP vCPU {id}: INIT/SIPI trap without an AP router (icr={icr:#x})");
+            }
+            continue;
+        }
+
+        #[cfg(target_arch = "x86_64")]
         if reason == WHvRunVpExitReasonX64IoPortAccess {
             let io_access = unsafe { exit_context.Anonymous.IoPortAccess };
             if let Err(err) = emulator.emulate_io(&mut emulator_context, &exit_context, &io_access)
@@ -1617,18 +1854,105 @@ fn run_vcpu(
             continue;
         }
 
-        if reason == whp_unrecoverable_exception_exit_reason()
-            || reason == whp_unsupported_feature_exit_reason()
-        {
-            error!("{}", Error::UnhandledExit { id, reason });
-            signal_vcpu_exit(&response_sender, &exit_evt, 1);
-            return;
-        }
-
+        // Unrecoverable exceptions, unsupported features, and unknown exit
+        // reasons all end the VM; dump the guest state first so triple
+        // faults are diagnosable from a single log capture.
         error!("{}", Error::UnhandledExit { id, reason });
+        #[cfg(target_arch = "x86_64")]
+        log_x86_fatal_exit_state(partition_handle, id, &exit_context);
         signal_vcpu_exit(&response_sender, &exit_evt, 1);
         return;
     }
+}
+
+/// Debug aid, gated on `MSB_KRUN_WHP_TRACE`: samples an AP's state a few
+/// seconds after its startup IPI so a silently stuck AP (e.g. parked in a
+/// cli;hlt loop) can be located without guest cooperation.
+#[cfg(target_arch = "x86_64")]
+fn spawn_ap_probe(partition_handle: WHV_PARTITION_HANDLE, id: u8) {
+    if std::env::var_os("MSB_KRUN_WHP_TRACE").is_none() {
+        return;
+    }
+    let handle = partition_handle;
+    thread::spawn(move || {
+        for wait_secs in [1u64, 3, 8] {
+            thread::sleep(Duration::from_secs(wait_secs));
+            let reg = |name: WHV_REGISTER_NAME| match get_vcpu_register_u64(handle, id, name) {
+                Ok(value) => format!("{value:#x}"),
+                Err(_) => "<unavailable>".to_string(),
+            };
+            warn!(
+                "WHP AP probe vCPU {id}: rip={} cs_base={} cr0={} cr3={} cr2={} apic_id={} activity={}",
+                reg(WHvX64RegisterRip),
+                reg(WHvX64RegisterCs),
+                reg(WHvX64RegisterCr0),
+                reg(WHvX64RegisterCr3),
+                reg(WHvX64RegisterCr2),
+                reg(WHvX64RegisterApicId),
+                reg(WHvRegisterInternalActivityState),
+            );
+        }
+    });
+}
+
+/// Applies the architectural SIPI effect: the AP starts in real mode at
+/// `vector << 12` with everything else still in the reset state it has held
+/// while parked.
+#[cfg(target_arch = "x86_64")]
+fn apply_sipi_startup_state(
+    partition_handle: WHV_PARTITION_HANDLE,
+    id: u8,
+    vector: u8,
+) -> Result<()> {
+    let cs = x86_segment(
+        u64::from(vector) << 12,
+        0xffff,
+        u16::from(vector) << 8,
+        0x9b,
+    );
+    // Clearing InternalActivityState releases the VP from the
+    // startup-suspend state WHP parks APs in; without this the processor
+    // holds its reset state forever and never fetches an instruction.
+    let names = [
+        WHvX64RegisterCs,
+        WHvX64RegisterRip,
+        WHvX64RegisterRflags,
+        WHvRegisterInternalActivityState,
+    ];
+    let values = [
+        register_value_segment(cs),
+        register_value_u64(0),
+        register_value_u64(0x2),
+        register_value_u64(0),
+    ];
+    set_vcpu_registers(partition_handle, id, &names, &values)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn log_x86_fatal_exit_state(
+    partition_handle: WHV_PARTITION_HANDLE,
+    id: u8,
+    exit_context: &WHV_RUN_VP_EXIT_CONTEXT,
+) {
+    let vp = &exit_context.VpContext;
+    // The exit context only carries RIP/CS/RFLAGS; fetch control registers separately so early-boot faults (paging off, CR3 unset) are distinguishable from post-boot ones.
+    let reg = |name: WHV_REGISTER_NAME| match get_vcpu_register_u64(partition_handle, id, name) {
+        Ok(value) => format!("{value:#x}"),
+        Err(_) => "<unavailable>".to_string(),
+    };
+    error!(
+        "WHP vCPU {id} fatal exit state: rip={:#x} cs={:#x} rflags={:#x} exec_state={:#x} cr0={} cr2={} cr3={} cr4={} efer={} rsp={}",
+        vp.Rip,
+        vp.Cs.Selector,
+        vp.Rflags,
+        unsafe { vp.ExecutionState.AsUINT16 },
+        reg(WHvX64RegisterCr0),
+        reg(WHvX64RegisterCr2),
+        reg(WHvX64RegisterCr3),
+        reg(WHvX64RegisterCr4),
+        reg(WHvX64RegisterEfer),
+        reg(WHvX64RegisterRsp),
+    );
 }
 
 fn current_thread_cpu_time_ns() -> Option<u64> {
@@ -1768,26 +2092,6 @@ fn whp_canceled_exit_reason() -> WHV_RUN_VP_EXIT_REASON {
 #[cfg(target_arch = "x86_64")]
 fn whp_canceled_exit_reason() -> WHV_RUN_VP_EXIT_REASON {
     WHvRunVpExitReasonCanceled
-}
-
-#[cfg(target_arch = "aarch64")]
-fn whp_unrecoverable_exception_exit_reason() -> WHV_RUN_VP_EXIT_REASON {
-    WHV_ARM64_EXIT_REASON_UNRECOVERABLE_EXCEPTION
-}
-
-#[cfg(target_arch = "x86_64")]
-fn whp_unrecoverable_exception_exit_reason() -> WHV_RUN_VP_EXIT_REASON {
-    WHvRunVpExitReasonUnrecoverableException
-}
-
-#[cfg(target_arch = "aarch64")]
-fn whp_unsupported_feature_exit_reason() -> WHV_RUN_VP_EXIT_REASON {
-    WHV_ARM64_EXIT_REASON_UNSUPPORTED_FEATURE
-}
-
-#[cfg(target_arch = "x86_64")]
-fn whp_unsupported_feature_exit_reason() -> WHV_RUN_VP_EXIT_REASON {
-    WHvRunVpExitReasonUnsupportedFeature
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1949,32 +2253,32 @@ unsafe extern "system" fn emulator_io_port_callback(
         return E_FAIL;
     };
 
+    // Unclaimed ports behave like a floating ISA bus (reads return all
+    // ones, writes are dropped) instead of tearing the VM down: guests
+    // legitimately probe ports we do not emulate (ELCR, PCI config, ...).
     let port = u64::from(io_access.Port);
     match io_access.Direction {
         WHV_EMULATOR_DIRECTION_READ => {
             let mut data = [0; 4];
-            if pio_bus.read(context.id.into(), port, &mut data[..len]) {
-                io_access.Data = u32::from_le_bytes(data);
-                S_OK
-            } else {
-                error!(
-                    "unhandled WHP I/O port read: vcpu={} port=0x{port:x} access_size={len}",
+            if !pio_bus.read(context.id.into(), port, &mut data[..len]) {
+                debug!(
+                    "unclaimed WHP I/O port read: vcpu={} port=0x{port:x} access_size={len}",
                     context.id
                 );
-                E_FAIL
+                data[..len].fill(0xff);
             }
+            io_access.Data = u32::from_le_bytes(data);
+            S_OK
         }
         WHV_EMULATOR_DIRECTION_WRITE => {
             let data = io_access.Data.to_le_bytes();
-            if pio_bus.write(context.id.into(), port, &data[..len]) {
-                S_OK
-            } else {
-                error!(
-                    "unhandled WHP I/O port write: vcpu={} port=0x{port:x} access_size={len} data=0x{:x}",
+            if !pio_bus.write(context.id.into(), port, &data[..len]) {
+                debug!(
+                    "unclaimed WHP I/O port write: vcpu={} port=0x{port:x} access_size={len} data=0x{:x}",
                     context.id, io_access.Data
                 );
-                E_FAIL
             }
+            S_OK
         }
         _ => E_INVALIDARG,
     }
