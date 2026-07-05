@@ -826,6 +826,7 @@ impl WhpIoApicState {
             vector,
             destination: ((entry >> 56) & 0xff) as u32,
             logical: (entry >> 11) & 0x1 == 1,
+            level_triggered: (entry >> 15) & 0x1 == 1,
             masked: entry & X86_IOAPIC_REDTBL_MASKED != 0,
         })
     }
@@ -837,6 +838,7 @@ struct IoApicRoute {
     vector: u32,
     destination: u32,
     logical: bool,
+    level_triggered: bool,
     masked: bool,
 }
 
@@ -873,6 +875,8 @@ const WHV_X64_INTERRUPT_DESTINATION_PHYSICAL: u8 = 0;
 const WHV_X64_INTERRUPT_DESTINATION_LOGICAL: u8 = 1;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 const WHV_X64_INTERRUPT_TRIGGER_EDGE: u8 = 0;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+const WHV_X64_INTERRUPT_TRIGGER_LEVEL: u8 = 1;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 const X86_LEGACY_IRQ_VECTOR_BASE: u32 = 0x20;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
@@ -1026,22 +1030,32 @@ impl IrqChipT for WhpIrqChip {
             };
 
             let route = self.ioapic.lock().unwrap().route_for_irq(irq_line);
-            let (vector, destination, logical) = match route {
+            let (vector, destination, logical, level_triggered) = match route {
                 // The guest masked the pin: architecturally the interrupt
                 // is simply not delivered.
                 Some(route) if route.masked => return Ok(()),
-                Some(route) => (route.vector, route.destination, route.logical),
+                Some(route) => (
+                    route.vector,
+                    route.destination,
+                    route.logical,
+                    route.level_triggered,
+                ),
                 // Pin not programmed yet: legacy identity route to the BSP.
-                None => (X86_LEGACY_IRQ_VECTOR_BASE + irq_line, 0, false),
+                None => (X86_LEGACY_IRQ_VECTOR_BASE + irq_line, 0, false, false),
             };
             let destination_mode = if logical {
                 WHV_X64_INTERRUPT_DESTINATION_LOGICAL
             } else {
                 WHV_X64_INTERRUPT_DESTINATION_PHYSICAL
             };
+            let trigger_mode = if level_triggered {
+                WHV_X64_INTERRUPT_TRIGGER_LEVEL
+            } else {
+                WHV_X64_INTERRUPT_TRIGGER_EDGE
+            };
             let interrupt = WhvX64InterruptControl {
                 interrupt_type: WHV_X64_INTERRUPT_TYPE_FIXED,
-                modes: destination_mode | (WHV_X64_INTERRUPT_TRIGGER_EDGE << 4),
+                modes: destination_mode | (trigger_mode << 4),
                 reserved: [0; 6],
                 destination,
                 vector,
