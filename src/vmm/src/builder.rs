@@ -1138,15 +1138,6 @@ pub fn build_microvm(
 
     #[allow(unused_mut)]
     let mut vcpu_config = vm_resources.vcpu_config();
-    #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
-    if vcpu_config.vcpu_count > 1 {
-        debug!(
-            "WHP ARM64 PSCI bring-up is not implemented yet; booting with one vCPU instead of {}",
-            vcpu_config.vcpu_count
-        );
-        vcpu_config.vcpu_count = 1;
-        vcpu_config.max_vcpu_count = 1;
-    }
 
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[allow(unused_mut)]
