@@ -477,7 +477,7 @@ impl Vm {
             .map(|cmdline| format!(" {cmdline}"))
             .unwrap_or_default();
         // Escape hatch for boot debugging: appended last so it can override earlier parameters (e.g. `ignore_loglevel`, `maxcpus=1`) without any API plumbing.
-        let debug_cmdline = env::var("MSB_KRUN_KERNEL_CMDLINE")
+        let debug_cmdline = std::env::var("MSB_KRUN_KERNEL_CMDLINE")
             .map(|extra| format!(" {extra}"))
             .unwrap_or_default();
 
