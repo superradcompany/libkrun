@@ -1191,15 +1191,15 @@ pub fn build_microvm(
         kernel_cmdline.insert_str(cmdline).unwrap();
     }
 
-    #[cfg(not(feature = "tee"))]
-    #[allow(unused_mut)]
     // The WHP partition is sized to the full possible topology: reserved
     // CPU capacity creates every vCPU up front (parked in the startup
     // router), so the partition's processor count must cover them all.
     #[cfg(target_os = "windows")]
     let setup_vcpu_count = vcpu_config.max_vcpu_count.max(vcpu_config.vcpu_count);
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(all(not(target_os = "windows"), not(feature = "tee")))]
     let setup_vcpu_count = vcpu_config.vcpu_count;
+    #[cfg(not(feature = "tee"))]
+    #[allow(unused_mut)]
     let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled, setup_vcpu_count)?;
     trace.mark("vm.ready");
 
