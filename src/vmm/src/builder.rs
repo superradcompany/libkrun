@@ -1191,13 +1191,16 @@ pub fn build_microvm(
         kernel_cmdline.insert_str(cmdline).unwrap();
     }
 
+    // The WHP partition is sized to the full possible topology: reserved
+    // CPU capacity creates every vCPU up front (parked in the startup
+    // router), so the partition's processor count must cover them all.
+    #[cfg(target_os = "windows")]
+    let setup_vcpu_count = vcpu_config.max_vcpu_count.max(vcpu_config.vcpu_count);
+    #[cfg(all(not(target_os = "windows"), not(feature = "tee")))]
+    let setup_vcpu_count = vcpu_config.vcpu_count;
     #[cfg(not(feature = "tee"))]
     #[allow(unused_mut)]
-    let mut vm = setup_vm(
-        &guest_memory,
-        vm_resources.nested_enabled,
-        vcpu_config.vcpu_count,
-    )?;
+    let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled, setup_vcpu_count)?;
     trace.mark("vm.ready");
 
     #[cfg(feature = "tee")]
@@ -1498,9 +1501,13 @@ pub fn build_microvm(
 
     #[cfg(target_os = "windows")]
     {
+        // Size the guest-visible GIC redistributor range to the created topology:
+        // with reserved CPU capacity the FDT lists every possible CPU, and the
+        // GICv3 driver must find each one's GICR frame inside the advertised
+        // range (the HVF GIC sizes by max for the same reason).
         intc = Arc::new(Mutex::new(IrqChipDevice::new(Box::new(WhpIrqChip::new(
             vm.partition_handle(),
-            u64::from(vcpu_config.vcpu_count),
+            u64::from(setup_vcpu_count),
         )))));
         #[cfg(target_arch = "x86_64")]
         let pio_bus = create_windows_x86_64_pio_bus(
@@ -3204,14 +3211,21 @@ fn create_vcpus_windows(
     metrics: utils::metrics::MetricsWriter,
     #[cfg(target_arch = "x86_64")] pio_bus: Option<&devices::Bus>,
 ) -> super::Result<Vec<Vcpu>> {
-    let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
+    // Create the full possible topology so CPUs beyond the boot online count
+    // (reserved capacity) can come online later through the msb-cpu driver.
+    // On x86 every AP parks in the startup router until the guest sends it
+    // INIT/SIPI; on aarch64 only vCPU 0 gets an entry point and WHP's
+    // in-hypervisor PSCI keeps the rest powered off until the guest issues
+    // CPU_ON for them.
+    let create_count = vcpu_config.max_vcpu_count.max(vcpu_config.vcpu_count);
+
+    let mut vcpus = Vec::with_capacity(create_count as usize);
     // One router shared by all vCPU threads: INIT/SIPI writes trap on the
     // sending vCPU and are applied to the parked target APs through it.
     #[cfg(target_arch = "x86_64")]
-    let sipi_router = std::sync::Arc::new(crate::windows::vstate::ApStartupRouter::new(
-        vcpu_config.vcpu_count,
-    ));
-    for cpu_index in 0..vcpu_config.vcpu_count {
+    let sipi_router =
+        std::sync::Arc::new(crate::windows::vstate::ApStartupRouter::new(create_count));
+    for cpu_index in 0..create_count {
         let mut vcpu = vm
             .create_vcpu(
                 cpu_index,
