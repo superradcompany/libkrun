@@ -355,12 +355,9 @@ impl VmResources {
             // Booting a wider possible topology than the online count relies on parked
             // vCPUs waiting for wake-ups (INIT/SIPI on x86, PSCI on aarch64) and on
             // non-TEE boot topology tables. On x86 Windows the AP startup router
-            // provides exactly that, so only the still-unwired platforms reject.
-            #[cfg(any(
-                all(target_os = "windows", target_arch = "aarch64"),
-                target_arch = "riscv64",
-                feature = "tee"
-            ))]
+            // provides exactly that and on aarch64 Windows WHP's in-hypervisor PSCI
+            // does, so only the still-unwired platforms reject.
+            #[cfg(any(target_arch = "riscv64", feature = "tee"))]
             if max_vcpu_count > vcpu_count_value {
                 return Err(VmConfigError::MaxCapacityUnsupported);
             }

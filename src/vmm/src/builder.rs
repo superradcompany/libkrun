@@ -1501,9 +1501,13 @@ pub fn build_microvm(
 
     #[cfg(target_os = "windows")]
     {
+        // Size the guest-visible GIC redistributor range to the created topology:
+        // with reserved CPU capacity the FDT lists every possible CPU, and the
+        // GICv3 driver must find each one's GICR frame inside the advertised
+        // range (the HVF GIC sizes by max for the same reason).
         intc = Arc::new(Mutex::new(IrqChipDevice::new(Box::new(WhpIrqChip::new(
             vm.partition_handle(),
-            u64::from(vcpu_config.vcpu_count),
+            u64::from(setup_vcpu_count),
         )))));
         #[cfg(target_arch = "x86_64")]
         let pio_bus = create_windows_x86_64_pio_bus(
@@ -3207,15 +3211,13 @@ fn create_vcpus_windows(
     metrics: utils::metrics::MetricsWriter,
     #[cfg(target_arch = "x86_64")] pio_bus: Option<&devices::Bus>,
 ) -> super::Result<Vec<Vcpu>> {
-    // Create the full possible topology; every AP parks in the startup
-    // router until the guest sends it INIT/SIPI, so CPUs beyond the boot
-    // online count (reserved capacity) simply wait until the guest onlines
-    // them through the msb-cpu driver. On aarch64 only the boot count is
-    // created because reserved capacity is rejected at config time.
-    #[cfg(target_arch = "x86_64")]
+    // Create the full possible topology so CPUs beyond the boot online count
+    // (reserved capacity) can come online later through the msb-cpu driver.
+    // On x86 every AP parks in the startup router until the guest sends it
+    // INIT/SIPI; on aarch64 only vCPU 0 gets an entry point and WHP's
+    // in-hypervisor PSCI keeps the rest powered off until the guest issues
+    // CPU_ON for them.
     let create_count = vcpu_config.max_vcpu_count.max(vcpu_config.vcpu_count);
-    #[cfg(target_arch = "aarch64")]
-    let create_count = vcpu_config.vcpu_count;
 
     let mut vcpus = Vec::with_capacity(create_count as usize);
     // One router shared by all vCPU threads: INIT/SIPI writes trap on the
