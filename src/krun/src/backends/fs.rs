@@ -34,7 +34,7 @@
 //--------------------------------------------------------------------------------------------------
 
 pub use devices::virtio::bindings::{stat64, statvfs64};
-pub use devices::virtio::fs::dyn_filesystem::DynFileSystem;
+pub use devices::virtio::fs::dyn_filesystem::{AddDirEntry, AddDirEntryPlus, DynFileSystem};
 pub use devices::virtio::fs::filesystem::{
     Context, DirEntry, Entry, Extensions, FsOptions, GetxattrReply, ListxattrReply, OpenOptions,
     RemovemappingOne, SecContext, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
