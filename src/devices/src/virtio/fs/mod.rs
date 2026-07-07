@@ -33,7 +33,7 @@ use super::descriptor_utils;
 
 pub use self::defs::uapi::VIRTIO_ID_FS as TYPE_FS;
 pub use self::device::Fs;
-pub use self::dyn_filesystem::{DynFileSystem, DynFileSystemAdapter};
+pub use self::dyn_filesystem::{AddDirEntry, AddDirEntryPlus, DynFileSystem, DynFileSystemAdapter};
 pub use self::filesystem::ExportTable;
 
 #[cfg_attr(target_os = "windows", allow(dead_code))]

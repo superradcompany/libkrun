@@ -25,6 +25,15 @@ use crate::virtio::bindings::{stat64, statvfs64, LINUX_ENOSYS};
 // Types
 //--------------------------------------------------------------------------------------------------
 
+/// Object-safe callback used by dynamic filesystem backends to stream directory
+/// entries into the FUSE response buffer.
+pub type AddDirEntry<'a> = dyn for<'name> FnMut(DirEntry<'name>) -> io::Result<usize> + 'a;
+
+/// Object-safe callback used by dynamic filesystem backends to stream directory
+/// entries with attributes into the FUSE response buffer.
+pub type AddDirEntryPlus<'a> =
+    dyn for<'name> FnMut(DirEntry<'name>, Entry) -> io::Result<usize> + 'a;
+
 /// Object-safe filesystem trait for dynamic dispatch.
 ///
 /// This trait mirrors the `FileSystem` trait but uses `u64` directly for `Inode`
@@ -318,6 +327,32 @@ pub trait DynFileSystem: Send + Sync {
         Err(io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
 
+    /// Read a directory by streaming entries into `add_entry`.
+    ///
+    /// Backends should prefer overriding this method when entry names are owned
+    /// by per-handle snapshots or other non-static storage. The vector-returning
+    /// `readdir` method remains as a compatibility fallback for older custom
+    /// backends.
+    fn readdir_for_each(
+        &self,
+        ctx: Context,
+        inode: u64,
+        handle: u64,
+        size: u32,
+        offset: u64,
+        add_entry: &mut AddDirEntry<'_>,
+    ) -> io::Result<()> {
+        let entries = self.readdir(ctx, inode, handle, size, offset)?;
+        for entry in entries {
+            match add_entry(entry) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// Read a directory with entry attributes.
     ///
     /// Returns a vector of (DirEntry, Entry) pairs. Unlike the original FileSystem
@@ -331,6 +366,31 @@ pub trait DynFileSystem: Send + Sync {
         offset: u64,
     ) -> io::Result<Vec<(DirEntry<'static>, Entry)>> {
         Err(io::Error::from_raw_os_error(LINUX_ENOSYS))
+    }
+
+    /// Read a directory with attributes by streaming entries into `add_entry`.
+    ///
+    /// This avoids forcing custom backends to allocate or leak `'static` entry
+    /// names. Existing vector-returning implementations continue to work via the
+    /// default compatibility bridge.
+    fn readdirplus_for_each(
+        &self,
+        ctx: Context,
+        inode: u64,
+        handle: u64,
+        size: u32,
+        offset: u64,
+        add_entry: &mut AddDirEntryPlus<'_>,
+    ) -> io::Result<()> {
+        let entries = self.readdirplus(ctx, inode, handle, size, offset)?;
+        for (dir_entry, entry) in entries {
+            match add_entry(dir_entry, entry) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     /// Synchronize the contents of a directory.
@@ -746,15 +806,8 @@ impl FileSystem for DynFileSystemAdapter {
     where
         F: FnMut(DirEntry) -> io::Result<usize>,
     {
-        let entries = self.0.readdir(ctx, inode, handle, size, offset)?;
-        for entry in entries {
-            match add_entry(entry) {
-                Ok(0) => break, // buffer full
-                Ok(_) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
+        self.0
+            .readdir_for_each(ctx, inode, handle, size, offset, &mut add_entry)
     }
 
     fn readdirplus<F>(
@@ -769,15 +822,8 @@ impl FileSystem for DynFileSystemAdapter {
     where
         F: FnMut(DirEntry, Entry) -> io::Result<usize>,
     {
-        let entries = self.0.readdirplus(ctx, inode, handle, size, offset)?;
-        for (dir_entry, entry) in entries {
-            match add_entry(dir_entry, entry) {
-                Ok(0) => break, // buffer full
-                Ok(_) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
+        self.0
+            .readdirplus_for_each(ctx, inode, handle, size, offset, &mut add_entry)
     }
 
     fn fsyncdir(&self, ctx: Context, inode: u64, datasync: bool, handle: u64) -> io::Result<()> {
