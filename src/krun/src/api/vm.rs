@@ -1,5 +1,6 @@
 //! VM handle for entering microVMs.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
@@ -60,6 +61,8 @@ pub struct Vm {
     /// virtio-net device is configured. Set via
     /// [`MachineBuilder::enable_inet_hijack`](super::builders::MachineBuilder::enable_inet_hijack).
     enable_inet_hijack: bool,
+    vsock_unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+    vsock_host_port_map: Option<HashMap<u16, u16>>,
     /// Keeps the libkrunfw library loaded so kernel memory pointers remain valid.
     _krunfw_library: Option<libloading::Library>,
     /// Keeps an explicit initramfs allocation alive until it is copied to guest memory.
@@ -139,6 +142,8 @@ impl Vm {
         exit_evt: EventFd,
         exit_code: Arc<AtomicI32>,
         enable_inet_hijack: bool,
+        vsock_unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+        vsock_host_port_map: Option<HashMap<u16, u16>>,
     ) -> Self {
         Self {
             vmr,
@@ -155,6 +160,8 @@ impl Vm {
             exit_evt,
             exit_code,
             enable_inet_hijack,
+            vsock_unix_ipc_port_map,
+            vsock_host_port_map,
             _krunfw_library: None,
             _initramfs_data: None,
         }
@@ -395,8 +402,8 @@ impl Vm {
         let vsock_config = VsockDeviceConfig {
             vsock_id: "vsock0".to_string(),
             guest_cid: 3,
-            host_port_map: None,
-            unix_ipc_port_map: None,
+            host_port_map: self.vsock_host_port_map.take(),
+            unix_ipc_port_map: self.vsock_unix_ipc_port_map.take(),
             tsi_flags,
         };
 
@@ -629,6 +636,8 @@ mod tests {
             EventFd::new(EFD_NONBLOCK).unwrap(),
             Arc::new(AtomicI32::new(i32::MAX)),
             enable_inet_hijack,
+            None,
+            None,
         )
     }
 

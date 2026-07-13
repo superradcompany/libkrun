@@ -1,5 +1,6 @@
 //! Sub-builders for VmBuilder nested configuration.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -50,6 +51,8 @@ pub struct MachineBuilder {
     pub(crate) nested_virt: bool,
     pub(crate) split_irqchip: bool,
     pub(crate) vsock: bool,
+    pub(crate) vsock_unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+    pub(crate) vsock_host_port_map: Option<HashMap<u16, u16>>,
     pub(crate) balloon: bool,
     pub(crate) balloon_stats_interval: Option<Duration>,
     pub(crate) rng: bool,
@@ -362,6 +365,8 @@ impl MachineBuilder {
             nested_virt: false,
             split_irqchip: false,
             vsock: false,
+            vsock_unix_ipc_port_map: None,
+            vsock_host_port_map: None,
             balloon: true,
             balloon_stats_interval: Some(Duration::from_secs(1)),
             rng: true,
@@ -437,6 +442,41 @@ impl MachineBuilder {
     /// its own purposes even though TSI would not otherwise require one.
     pub fn vsock(mut self, enabled: bool) -> Self {
         self.vsock = enabled;
+        self
+    }
+
+    /// Set the vsock Unix IPC port map.
+    ///
+    /// Maps guest vsock ports to host Unix domain sockets. Each entry is
+    /// `(guest_port, (host_uds_path, listen_mode))`:
+    /// - `listen_mode = false`: guest `connect(AF_VSOCK, CID=2, port)` proxies
+    ///   to the host UDS (connect mode — host UDS is the server).
+    /// - `listen_mode = true`: host UDS listens and pushes accepted connections
+    ///   into the guest as incoming vsock connections.
+    ///
+    /// Setting a non-empty map enables vsock attachment, same as calling
+    /// [`vsock(true)`](Self::vsock); a later `vsock(false)` still disables it.
+    pub fn vsock_unix_ipc_port_map(mut self, map: HashMap<u32, (PathBuf, bool)>) -> Self {
+        if !map.is_empty() {
+            self.vsock = true;
+        }
+        self.vsock_unix_ipc_port_map = Some(map);
+        self
+    }
+
+    /// Set the vsock host port map.
+    ///
+    /// Remaps guest TCP listen ports when TSI proxies a guest listen socket:
+    /// an entry `(guest_port, host_port)` makes a guest socket listening on
+    /// `guest_port` bind `host_port` on the host instead.
+    ///
+    /// Setting a non-empty map enables vsock attachment, same as calling
+    /// [`vsock(true)`](Self::vsock); a later `vsock(false)` still disables it.
+    pub fn vsock_host_port_map(mut self, map: HashMap<u16, u16>) -> Self {
+        if !map.is_empty() {
+            self.vsock = true;
+        }
+        self.vsock_host_port_map = Some(map);
         self
     }
 

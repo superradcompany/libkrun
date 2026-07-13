@@ -592,6 +592,8 @@ impl VmBuilder {
             exit_evt,
             exit_code,
             self.machine.enable_inet_hijack,
+            self.machine.vsock_unix_ipc_port_map,
+            self.machine.vsock_host_port_map,
         ))
     }
 }
@@ -716,6 +718,37 @@ mod tests {
             Error::Config(ConfigError::InvalidMaxMemorySize(1024)) => {}
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn vsock_port_maps_enable_vsock() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let builder = VmBuilder::new();
+        assert!(!builder.machine.vsock);
+
+        let builder = VmBuilder::new()
+            .machine(|machine| machine.vsock_unix_ipc_port_map(HashMap::new()));
+        assert!(!builder.machine.vsock, "empty map must not enable vsock");
+
+        let mut unix_map = HashMap::new();
+        unix_map.insert(5000, (PathBuf::from("/tmp/ipc.sock"), false));
+        let builder = VmBuilder::new()
+            .machine(|machine| machine.vsock_unix_ipc_port_map(unix_map));
+        assert!(builder.machine.vsock, "non-empty Unix IPC map enables vsock");
+
+        let mut host_map = HashMap::new();
+        host_map.insert(8080, 18080);
+        let builder = VmBuilder::new()
+            .machine(|machine| machine.vsock_host_port_map(host_map));
+        assert!(builder.machine.vsock, "non-empty host port map enables vsock");
+
+        let mut unix_map = HashMap::new();
+        unix_map.insert(5000, (PathBuf::from("/tmp/ipc.sock"), false));
+        let builder = VmBuilder::new()
+            .machine(|machine| machine.vsock_unix_ipc_port_map(unix_map).vsock(false));
+        assert!(!builder.machine.vsock, "later vsock(false) overrides the map");
     }
 
     #[cfg(feature = "blk")]
