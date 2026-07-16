@@ -1143,24 +1143,25 @@ pub fn build_microvm(
     #[allow(unused_mut)]
     let mut kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
     if let Some(cmdline) = payload_config.kernel_cmdline {
-        kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
+        kernel_cmdline.insert_str(cmdline.as_str())?;
     } else if let Some(cmdline) = &vm_resources.kernel_cmdline.prolog {
-        kernel_cmdline.insert_str(cmdline).unwrap();
+        kernel_cmdline.insert_str(cmdline)?;
     } else {
-        kernel_cmdline.insert_str(DEFAULT_KERNEL_CMDLINE).unwrap();
+        kernel_cmdline.insert_str(DEFAULT_KERNEL_CMDLINE)?;
     }
 
+    // The krun_env segment carries caller-controlled guest env; a non-cmdline-safe byte in it
+    // (e.g. a tab in an OCI image env value) must surface as a StartMicrovmError, not a panic —
+    // the API layer validates per variable, this is the backstop.
     if let Some(cmdline) = &vm_resources.kernel_cmdline.krun_env {
-        kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
+        kernel_cmdline.insert_str(cmdline.as_str())?;
     }
 
     // When extra CPU capacity is reserved, every possible vCPU is described to the guest
     // (MPTABLE/FDT), so cap the number brought online at boot to the requested count. The
     // remaining CPUs stay offline until the guest's msb-cpu driver onlines them.
     if vcpu_config.max_vcpu_count > vcpu_config.vcpu_count {
-        kernel_cmdline
-            .insert_str(format!(" maxcpus={}", vcpu_config.vcpu_count))
-            .unwrap();
+        kernel_cmdline.insert_str(format!(" maxcpus={}", vcpu_config.vcpu_count))?;
     }
 
     // Hotplugged virtio-mem blocks must come online automatically: without this,
@@ -1170,9 +1171,7 @@ pub fn build_microvm(
     // reliable.
     #[cfg(not(feature = "tee"))]
     if vm_resources.mem_device.is_some() {
-        kernel_cmdline
-            .insert_str(" memhp_default_state=online_movable")
-            .unwrap();
+        kernel_cmdline.insert_str(" memhp_default_state=online_movable")?;
     }
     trace.mark("kernel_cmdline.ready");
 
@@ -1188,7 +1187,7 @@ pub fn build_microvm(
             format!("console={kernel_console}").as_str(),
         );
         kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
-        kernel_cmdline.insert_str(cmdline).unwrap();
+        kernel_cmdline.insert_str(cmdline)?;
     }
 
     // The WHP partition is sized to the full possible topology: reserved
@@ -1392,10 +1391,10 @@ pub fn build_microvm(
                     .replace("console=hvc0", "console=ttyS0,115200n8")
                     .replace("console=ttyAMA0", "console=ttyS0,115200n8");
                 kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
-                kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
+                kernel_cmdline.insert_str(cmdline.as_str())?;
             } else {
                 #[cfg(target_arch = "aarch64")]
-                kernel_cmdline.insert("console", "ttyAMA0").unwrap();
+                kernel_cmdline.insert("console", "ttyAMA0")?;
                 #[cfg(target_arch = "x86_64")]
                 kernel_cmdline.insert("console", "ttyS0,115200n8").unwrap();
             }
@@ -1866,7 +1865,7 @@ pub fn build_microvm(
     }
 
     if let Some(s) = &vm_resources.kernel_cmdline.epilog {
-        vmm.kernel_cmdline.insert_str(s).unwrap();
+        vmm.kernel_cmdline.insert_str(s)?;
     };
 
     // Write the kernel command line to guest memory. This is x86_64 specific, since on

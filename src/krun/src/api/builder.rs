@@ -548,6 +548,21 @@ impl VmBuilder {
             )
         };
 
+        // The exec env rides the kernel command line as quoted `KEY="value"` words (api/vm.rs
+        // get_env → KRUN_ENV), and the vmm cmdline layer rejects control/non-ASCII bytes — a tab
+        // in a perfectly legitimate OCI image env value (e.g. gcc's GPG_KEYS) used to reach an
+        // `.unwrap()` there and abort the whole VMM. Validate per variable here, where the name
+        // is still known, so the caller gets an actionable error instead of a crash. Carrying
+        // such values would need an encoded transport (tracked separately).
+        for (key, value) in &self.exec.env {
+            validate_cmdline_env(key, value).map_err(|reason| {
+                Error::Build(BuildError::Start(format!(
+                    "guest env var {key:?} cannot be carried on the kernel command line \
+                     ({reason}); sanitize or drop this variable"
+                )))
+            })?;
+        }
+
         let env = if self.exec.env.is_empty() {
             None
         } else {
@@ -662,6 +677,23 @@ fn map_vm_config_error(machine: &MachineBuilder, err: VmConfigError) -> Error {
     }
 }
 
+/// Check that one exec env pair can be carried as a quoted `KEY="value"` kernel-cmdline word: printable ASCII only (the vmm cmdline layer rejects everything else, and the kernel
+/// would misparse it anyway), no double quotes (they would terminate the kernel's quote parsing mid-value), and no whitespace in the key (the kernel splits words on unquoted
+/// whitespace, so a spaced key silently becomes two parameters).
+fn validate_cmdline_env(key: &str, value: &str) -> std::result::Result<(), &'static str> {
+    let printable = |s: &str| s.bytes().all(|b| (0x20..=0x7e).contains(&b));
+    if !printable(key) || !printable(value) {
+        return Err("it contains control or non-ASCII bytes");
+    }
+    if key.contains('"') || value.contains('"') {
+        return Err("it contains a double quote");
+    }
+    if key.contains(' ') {
+        return Err("the key contains whitespace");
+    }
+    Ok(())
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
@@ -716,6 +748,22 @@ mod tests {
             Error::Config(ConfigError::InvalidMaxMemorySize(1024)) => {}
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn validate_cmdline_env_rejects_uncarryable_values() {
+        // Ordinary env, including spaces in the value (quoted on the cmdline), is fine.
+        assert!(validate_cmdline_env("PATH", "/usr/local/bin:/usr/bin").is_ok());
+        assert!(validate_cmdline_env("GREETING", "hello world").is_ok());
+
+        // Regression: gcc:13-bookworm's GPG_KEYS/GCC_MIRRORS carry tab separators, which
+        // previously reached the vmm cmdline unwrap and aborted the process (InvalidAscii).
+        assert!(validate_cmdline_env("GPG_KEYS", "B215C163\t B3C42148").is_err());
+
+        assert!(validate_cmdline_env("MOTD", "héllo").is_err());
+        assert!(validate_cmdline_env("Q", "say \"hi\"").is_err());
+        assert!(validate_cmdline_env("BAD KEY", "v").is_err());
+        assert!(validate_cmdline_env("NL", "a\nb").is_err());
     }
 
     #[cfg(feature = "blk")]
