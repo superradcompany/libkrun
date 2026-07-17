@@ -565,9 +565,7 @@ impl DiskProperties {
                     storage,
                     offset: storage_offset,
                     ..
-                } => self
-                    .windows_formatted_io_runtime
-                    .block_on(storage.readv(chunk, *storage_offset))?,
+                } => storage.readv(chunk, *storage_offset)?,
                 FormatReadPlanStep::Zero { .. } | FormatReadPlanStep::Eof { .. } => {
                     chunk.fill(0);
                 }
@@ -601,7 +599,7 @@ impl DiskProperties {
         let mut image_offset = offset;
         let mut remaining_len = full_length;
         while remaining_len > 0 {
-            let (mapping, mapped_len) = file.get_mapping_sync(image_offset, remaining_len)?;
+            let (mapping, mapped_len) = file.get_mapping(image_offset, remaining_len)?;
             let step_len = std::cmp::min(mapped_len, remaining_len);
             if step_len == 0 {
                 return Ok(None);
@@ -643,8 +641,7 @@ impl DiskProperties {
         for (storage, storage_offset, len) in steps {
             let (chunk, rest) = remaining.split_at(len);
             remaining = rest;
-            self.windows_formatted_io_runtime
-                .block_on(storage.writev(chunk, storage_offset))?;
+            storage.writev(chunk, storage_offset)?;
         }
 
         Ok(Some(
@@ -699,8 +696,8 @@ mod tests {
     use imago::qcow2::Qcow2;
     use imago::vmdk::Vmdk;
     use imago::{
-        raw::Raw, DenyImplicitOpenGate, DynStorage, FormatCreateBuilder, FormatDriverBuilder,
-        PermissiveImplicitOpenGate, Storage, StorageCreateOptions, SyncFormatAccess,
+        raw::Raw, DenyImplicitOpenGate, DynStorage, FormatAccess, FormatCreateBuilder,
+        FormatDriverBuilder, PermissiveImplicitOpenGate, Storage, StorageCreateOptions,
     };
     use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
@@ -718,8 +715,8 @@ mod tests {
         file.set_len(payload.len() as u64).unwrap();
         drop(file);
 
-        let raw = Raw::<Box<dyn DynStorage>>::open_path_sync(&path, true).unwrap();
-        let disk_image = Arc::new(Mutex::new(SyncFormatAccess::new(raw).unwrap()));
+        let raw = Raw::<Box<dyn DynStorage>>::open_path(&path, true).unwrap();
+        let disk_image = Arc::new(Mutex::new(FormatAccess::new(raw)));
         let disk = DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe).unwrap();
 
         let mem: GuestMemoryMmap<()> =
@@ -747,8 +744,8 @@ mod tests {
         file.set_len(1024).unwrap();
         drop(file);
 
-        let raw = Raw::<Box<dyn DynStorage>>::open_path_sync(&path, true).unwrap();
-        let disk_image = Arc::new(Mutex::new(SyncFormatAccess::new(raw).unwrap()));
+        let raw = Raw::<Box<dyn DynStorage>>::open_path(&path, true).unwrap();
+        let disk_image = Arc::new(Mutex::new(FormatAccess::new(raw)));
         let disk = DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe).unwrap();
 
         let mem: GuestMemoryMmap<()> =
@@ -891,34 +888,28 @@ mod tests {
     }
 
     fn create_qcow2_disk(path: &std::path::Path, preallocate: PreallocateMode) -> DiskProperties {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let qcow2 = runtime
-            .block_on(async {
-                let storage = Box::<dyn DynStorage>::create_open(
-                    StorageCreateOptions::new().filename(path).overwrite(true),
-                )
-                .await?;
-                Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::create_builder(storage)
-                    .size(4096)
-                    .cluster_size(512)
-                    .preallocate(preallocate)
-                    .create_open(DenyImplicitOpenGate::default(), |image| {
-                        Ok(Qcow2::builder(image).backing(None).write(true))
-                    })
-                    .await
-            })
-            .unwrap();
-        let disk_image = Arc::new(Mutex::new(SyncFormatAccess::new(qcow2).unwrap()));
+        let storage = Box::<dyn DynStorage>::create_open(
+            StorageCreateOptions::new().filename(path).overwrite(true),
+        )
+        .unwrap();
+        let qcow2 =
+            Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::create_builder(storage)
+                .size(4096)
+                .cluster_size(512)
+                .preallocate(preallocate)
+                .create_open(DenyImplicitOpenGate::default(), |image| {
+                    Ok(Qcow2::builder(image).backing(None).write(true))
+                })
+                .unwrap();
+        let disk_image = Arc::new(Mutex::new(FormatAccess::new(qcow2)));
         DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe).unwrap()
     }
 
     fn create_vmdk_disk(path: &std::path::Path) -> DiskProperties {
         let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder_path(path)
-            .open_sync(PermissiveImplicitOpenGate::default())
+            .open(PermissiveImplicitOpenGate::default())
             .unwrap();
-        let disk_image = Arc::new(Mutex::new(SyncFormatAccess::new(vmdk).unwrap()));
+        let disk_image = Arc::new(Mutex::new(FormatAccess::new(vmdk)));
         DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe).unwrap()
     }
 
