@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use imago::{
-    file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk, DynStorage, FormatDriverBuilder,
-    PermissiveImplicitOpenGate, Storage, StorageOpenOptions, SyncFormatAccess,
+    file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk, DynStorage, FormatAccess,
+    FormatDriverBuilder, PermissiveImplicitOpenGate, Storage, StorageOpenOptions,
 };
 use log::{error, warn};
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
@@ -75,18 +75,16 @@ impl CacheType {
 /// Helper object for setting up all `Block` fields derived from its backing file.
 pub(crate) struct DiskProperties {
     cache_type: CacheType,
-    pub(crate) file: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    pub(crate) file: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
     #[cfg(windows)]
     windows_raw_file: Option<Arc<WindowsRawFile>>,
-    #[cfg(windows)]
-    pub(crate) windows_formatted_io_runtime: tokio::runtime::Runtime,
     nsectors: u64,
     image_id: Vec<u8>,
 }
 
 impl DiskProperties {
     pub fn new(
-        disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+        disk_image: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
         disk_image_id: Vec<u8>,
         cache_type: CacheType,
     ) -> io::Result<Self> {
@@ -108,8 +106,6 @@ impl DiskProperties {
             file: disk_image,
             #[cfg(windows)]
             windows_raw_file: None,
-            #[cfg(windows)]
-            windows_formatted_io_runtime: tokio::runtime::Builder::new_current_thread().build()?,
         })
     }
 
@@ -361,7 +357,7 @@ pub struct Block {
     // Host file and properties.
     disk: Option<DiskProperties>,
     cache_type: CacheType,
-    disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    disk_image: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
     #[cfg(windows)]
     windows_raw_file: Option<Arc<WindowsRawFile>>,
@@ -442,32 +438,30 @@ impl Block {
 
         #[cfg(target_os = "macos")]
         let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
-        let file = ImagoFile::open_sync(file_opts)?;
+        let file = ImagoFile::open(file_opts)?;
         let discard_alignment = file.discard_align();
 
         let disk_image = match disk_image_format {
             ImageType::Qcow2 => {
                 let mut qcow2 =
-                    Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image_sync(
+                    Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image(
                         Box::new(file),
                         !is_disk_read_only,
                     )?;
-                qcow2.open_implicit_dependencies_sync()?;
-                SyncFormatAccess::new(qcow2)?
+                qcow2.open_implicit_dependencies()?;
+                FormatAccess::new(qcow2)
             }
             ImageType::Raw => {
-                let raw = Raw::<Box<dyn DynStorage>>::open_image_sync(
-                    Box::new(file),
-                    !is_disk_read_only,
-                )?;
-                SyncFormatAccess::new(raw)?
+                let raw =
+                    Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), !is_disk_read_only)?;
+                FormatAccess::new(raw)
             }
             ImageType::Vmdk => {
                 let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(
                     Box::new(file),
                 )
-                .open_sync(PermissiveImplicitOpenGate::default())?;
-                SyncFormatAccess::new(vmdk)?
+                .open(PermissiveImplicitOpenGate::default())?;
+                FormatAccess::new(vmdk)
             }
         };
 
