@@ -8,6 +8,38 @@ use std::fmt;
 /// address would silently strand the extra CPUs.
 pub const MAX_SUPPORTED_VCPUS: u8 = 64;
 
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// Identifies one logical processor in the host's processor topology.
+///
+/// Linux currently supports processor group zero. The group is explicit so callers do not need a
+/// different public representation when grouped processor topologies are supported on Windows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostCpuId {
+    /// Host processor group.
+    pub group: u16,
+    /// Logical processor index within the group.
+    pub index: u16,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl HostCpuId {
+    /// Creates a host CPU identifier in processor group zero.
+    pub const fn new(index: u16) -> Self {
+        Self { group: 0, index }
+    }
+
+    /// Creates a host CPU identifier in the specified processor group.
+    pub const fn in_group(group: u16, index: u16) -> Self {
+        Self { group, index }
+    }
+}
+
 /// Errors associated with configuring the microVM.
 #[derive(Debug, Eq, PartialEq)]
 pub enum VmConfigError {

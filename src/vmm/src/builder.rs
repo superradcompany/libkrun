@@ -1916,6 +1916,14 @@ pub fn build_microvm(
         println!("Starting TEE/microVM.");
     }
 
+    #[cfg(target_os = "linux")]
+    if let Some(affinity) = &vm_resources.vcpu_affinity {
+        // The public builder validates an exact map for the full possible topology.
+        for (vcpu, host_cpu) in vcpus.iter_mut().zip(affinity.iter().copied()) {
+            vcpu.set_host_cpu(host_cpu);
+        }
+    }
+
     vmm.start_vcpus(vcpus)
         .map_err(StartMicrovmError::Internal)?;
     trace.mark("vcpus.started");

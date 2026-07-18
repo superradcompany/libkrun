@@ -344,6 +344,24 @@ impl VmBuilder {
             return Err(Error::Config(ConfigError::InvalidMemorySize(0)));
         }
 
+        if let Some(affinity) = &self.machine.vcpu_affinity {
+            let expected = self.machine.max_vcpus.unwrap_or(self.machine.vcpus) as usize;
+            if affinity.len() != expected {
+                return Err(Error::Config(ConfigError::InvalidVcpuAffinityLength {
+                    expected,
+                    actual: affinity.len(),
+                }));
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            return Err(Error::Config(ConfigError::VcpuAffinityUnsupported));
+
+            #[cfg(target_os = "linux")]
+            if let Some(cpu) = affinity.iter().find(|cpu| cpu.group != 0) {
+                return Err(Error::Config(ConfigError::InvalidHostCpuGroup(cpu.group)));
+            }
+        }
+
         // Build VmResources
         let mut vmr = VmResources::default();
 
@@ -358,6 +376,11 @@ impl VmBuilder {
         };
         vmr.set_vm_config(&vm_config)
             .map_err(|err| map_vm_config_error(&self.machine, err))?;
+
+        #[cfg(target_os = "linux")]
+        {
+            vmr.vcpu_affinity = self.machine.vcpu_affinity;
+        }
 
         // Reserved CPU capacity is realized through the private msb-cpu device:
         // the guest driver converges on the requested online count and the
@@ -701,6 +724,7 @@ fn validate_cmdline_env(key: &str, value: &str) -> std::result::Result<(), &'sta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::builders::HostCpuId;
 
     #[test]
     fn build_rejects_invalid_machine_config() {
@@ -764,6 +788,64 @@ mod tests {
         assert!(validate_cmdline_env("Q", "say \"hi\"").is_err());
         assert!(validate_cmdline_env("BAD KEY", "v").is_err());
         assert!(validate_cmdline_env("NL", "a\nb").is_err());
+    }
+
+    #[test]
+    fn build_rejects_affinity_that_does_not_cover_max_vcpus() {
+        let err = match VmBuilder::new()
+            .machine(|machine| {
+                machine
+                    .vcpus(2)
+                    .max_vcpus(4)
+                    .vcpu_affinity(vec![HostCpuId::new(0), HostCpuId::new(1)])
+            })
+            .build()
+        {
+            Ok(_) => panic!("partial vCPU affinity map should fail"),
+            Err(err) => err,
+        };
+
+        match err {
+            Error::Config(ConfigError::InvalidVcpuAffinityLength {
+                expected: 4,
+                actual: 2,
+            }) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn build_rejects_vcpu_affinity_on_unsupported_hosts() {
+        let err = match VmBuilder::new()
+            .machine(|machine| machine.vcpu_affinity(vec![HostCpuId::new(0)]))
+            .build()
+        {
+            Ok(_) => panic!("vCPU affinity should fail on unsupported hosts"),
+            Err(err) => err,
+        };
+
+        match err {
+            Error::Config(ConfigError::VcpuAffinityUnsupported) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_rejects_nonzero_processor_group_on_linux() {
+        let err = match VmBuilder::new()
+            .machine(|machine| machine.vcpu_affinity(vec![HostCpuId::in_group(1, 0)]))
+            .build()
+        {
+            Ok(_) => panic!("nonzero processor group should fail on Linux"),
+            Err(err) => err,
+        };
+
+        match err {
+            Error::Config(ConfigError::InvalidHostCpuGroup(1)) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[cfg(feature = "blk")]
