@@ -5,6 +5,6 @@
 //--------------------------------------------------------------------------------------------------
 
 pub use utils::metrics::{
-    BlockDeviceMetrics, BlockMetrics, CpuMetrics, FilesystemMetrics, MemoryMetrics, MetricsHandle,
-    VmMetrics,
+    BlockDeviceIoProfile, BlockDeviceMetrics, BlockIoProfile, BlockMetrics, CpuMetrics,
+    FilesystemMetrics, LatencyHistogram, MemoryMetrics, MetricsHandle, VmMetrics,
 };

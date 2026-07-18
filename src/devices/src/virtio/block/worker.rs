@@ -21,9 +21,13 @@ use std::os::fd::AsRawFd;
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::result;
 use std::thread;
+#[cfg(feature = "block-io-profile")]
+use std::time::{Duration, Instant};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 use utils::metrics::BlockMetricsWriter;
+#[cfg(feature = "block-io-profile")]
+use utils::metrics::BlockRequestKind;
 use virtio_bindings::virtio_blk::*;
 #[cfg(windows)]
 use vm_memory::{Address, GuestMemoryBackend};
@@ -110,6 +114,69 @@ enum PendingWindowsBlockDirection {
 enum WindowsRawSubmission {
     Submitted,
     Fallback,
+}
+
+#[cfg(feature = "block-io-profile")]
+struct RequestProfile {
+    metrics: BlockMetricsWriter,
+    request_started: Instant,
+    parse_started: Instant,
+    parse_recorded: bool,
+    failed: bool,
+}
+
+#[cfg(feature = "block-io-profile")]
+impl RequestProfile {
+    fn new(metrics: BlockMetricsWriter, worker_backlog: Duration) -> Self {
+        metrics.record_worker_backlog_ns(duration_ns(worker_backlog));
+        let now = Instant::now();
+        Self {
+            metrics,
+            request_started: now,
+            parse_started: now,
+            parse_recorded: false,
+            failed: false,
+        }
+    }
+
+    fn add_scratch_vectors(&self, count: u64) {
+        self.metrics.add_scratch_vectors(count);
+    }
+
+    fn record_parse(&mut self) {
+        if !self.parse_recorded {
+            self.metrics
+                .record_descriptor_parse_ns(duration_ns(self.parse_started.elapsed()));
+            self.parse_recorded = true;
+        }
+    }
+
+    fn record_kind(&self, request_type: u32) {
+        self.metrics
+            .record_request_kind(block_request_kind(request_type));
+    }
+
+    fn record_failure(&mut self) {
+        self.failed = true;
+    }
+
+    fn record_completion(&self, started: Instant, interrupted: bool) {
+        self.metrics
+            .record_completion_ns(duration_ns(started.elapsed()));
+        self.metrics.record_completion(interrupted);
+    }
+}
+
+#[cfg(feature = "block-io-profile")]
+impl Drop for RequestProfile {
+    fn drop(&mut self) {
+        self.record_parse();
+        if self.failed {
+            self.metrics.record_failed_request();
+        }
+        self.metrics
+            .record_request_ns(duration_ns(self.request_started.elapsed()));
+    }
 }
 
 impl BlockWorker {
@@ -308,39 +375,74 @@ impl BlockWorker {
 
     #[cfg(not(windows))]
     fn process_queue(&mut self, mem: &GuestMemoryMmap) {
+        #[cfg(feature = "block-io-profile")]
+        let drain_started = Instant::now();
         while let Some(head) = self.device_queue.queue.pop(mem) {
+            #[cfg(feature = "block-io-profile")]
+            let mut profile = RequestProfile::new(self.metrics.clone(), drain_started.elapsed());
             let mut reader = match Reader::new(mem, head.clone()) {
-                Ok(r) => r,
+                Ok(r) => {
+                    #[cfg(feature = "block-io-profile")]
+                    profile.add_scratch_vectors(1);
+                    r
+                }
                 Err(e) => {
+                    #[cfg(feature = "block-io-profile")]
+                    profile.record_failure();
                     error!("invalid descriptor chain: {e:?}");
                     continue;
                 }
             };
             let mut writer = match Writer::new(mem, head.clone()) {
-                Ok(r) => r,
+                Ok(r) => {
+                    #[cfg(feature = "block-io-profile")]
+                    profile.add_scratch_vectors(1);
+                    r
+                }
                 Err(e) => {
+                    #[cfg(feature = "block-io-profile")]
+                    profile.record_failure();
                     error!("invalid descriptor chain: {e:?}");
                     continue;
                 }
             };
+            #[cfg(feature = "block-io-profile")]
+            profile.add_scratch_vectors(1);
             let request_header: RequestHeader = match reader.read_obj() {
                 Ok(h) => h,
                 Err(e) => {
+                    #[cfg(feature = "block-io-profile")]
+                    profile.record_failure();
                     error!("invalid request header: {e:?}");
                     continue;
                 }
             };
+            #[cfg(feature = "block-io-profile")]
+            {
+                profile.record_parse();
+                profile.record_kind(request_header.request_type);
+                profile
+                    .add_scratch_vectors(request_data_scratch_vectors(request_header.request_type));
+            }
 
             let (status, len): (u8, usize) =
                 match self.process_request(request_header, &mut reader, &mut writer) {
                     Ok(l) => (VIRTIO_BLK_S_OK.try_into().unwrap(), l),
                     Err(e) => {
+                        #[cfg(feature = "block-io-profile")]
+                        profile.record_failure();
                         error!("error processing request: {e:?}");
                         (VIRTIO_BLK_S_IOERR.try_into().unwrap(), 0)
                     }
                 };
 
+            #[cfg(feature = "block-io-profile")]
+            let completion_started = Instant::now();
+            #[cfg(feature = "block-io-profile")]
+            profile.add_scratch_vectors(1);
             if let Err(e) = writer.write_obj(status) {
+                #[cfg(feature = "block-io-profile")]
+                profile.record_failure();
                 error!("Failed to write virtio block status: {e:?}")
             }
 
@@ -349,14 +451,27 @@ impl BlockWorker {
                 .queue
                 .add_used(mem, head.index, len as u32)
             {
+                #[cfg(feature = "block-io-profile")]
+                profile.record_failure();
                 error!("failed to add used elements to the queue: {e:?}");
             }
 
+            #[cfg(feature = "block-io-profile")]
+            let mut interrupted = false;
             if self.device_queue.queue.needs_notification(mem).unwrap() {
                 if let Err(e) = self.interrupt.try_signal_used_queue() {
+                    #[cfg(feature = "block-io-profile")]
+                    profile.record_failure();
                     error!("error signalling queue: {e:?}");
+                } else {
+                    #[cfg(feature = "block-io-profile")]
+                    {
+                        interrupted = true;
+                    }
                 }
             }
+            #[cfg(feature = "block-io-profile")]
+            profile.record_completion(completion_started, interrupted);
         }
     }
 
@@ -841,12 +956,19 @@ impl BlockWorker {
             }
             VIRTIO_BLK_T_FLUSH => match self.disk.cache_type() {
                 CacheType::Writeback => {
-                    self.disk
-                        .flush_to_disk()
-                        .map_err(RequestError::FlushingToDisk)?;
+                    #[cfg(feature = "block-io-profile")]
+                    let started = Instant::now();
+                    let result = self.disk.flush_to_disk();
+                    #[cfg(feature = "block-io-profile")]
+                    self.metrics.record_flush_ns(duration_ns(started.elapsed()));
+                    result.map_err(RequestError::FlushingToDisk)?;
                     Ok(0)
                 }
-                CacheType::Unsafe => Ok(0),
+                CacheType::Unsafe => {
+                    #[cfg(feature = "block-io-profile")]
+                    self.metrics.record_flush_ns(0);
+                    Ok(0)
+                }
             },
             VIRTIO_BLK_T_GET_ID => {
                 let data_len = writer.available_bytes();
@@ -987,6 +1109,33 @@ fn single_direct_windows_raw_buffer(
         [buffer] => Some(*buffer),
         _ => None,
     }
+}
+
+#[cfg(feature = "block-io-profile")]
+fn block_request_kind(request_type: u32) -> BlockRequestKind {
+    match request_type {
+        VIRTIO_BLK_T_IN => BlockRequestKind::Read,
+        VIRTIO_BLK_T_OUT => BlockRequestKind::Write,
+        VIRTIO_BLK_T_FLUSH => BlockRequestKind::Flush,
+        _ => BlockRequestKind::Other,
+    }
+}
+
+#[cfg(feature = "block-io-profile")]
+fn request_data_scratch_vectors(request_type: u32) -> u64 {
+    match request_type {
+        VIRTIO_BLK_T_IN
+        | VIRTIO_BLK_T_OUT
+        | VIRTIO_BLK_T_GET_ID
+        | VIRTIO_BLK_T_DISCARD
+        | VIRTIO_BLK_T_WRITE_ZEROES => 1,
+        _ => 0,
+    }
+}
+
+#[cfg(feature = "block-io-profile")]
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().try_into().unwrap_or(u64::MAX)
 }
 
 #[cfg(unix)]

@@ -8,6 +8,8 @@ use std::io::{Error, ErrorKind, Result};
 use std::io::{IoSlice, IoSliceMut};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(feature = "block-io-profile")]
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "blk")]
 use imago::io_buffers::{IoVector, IoVectorMut};
@@ -446,6 +448,8 @@ impl FileReadWriteAtVolatile for DiskProperties {
             return Ok(result);
         }
 
+        #[cfg(feature = "block-io-profile")]
+        let prepare_started = Instant::now();
         let ptr_guards = bufs
             .iter()
             .map(|slice| slice.ptr_guard_mut())
@@ -462,11 +466,23 @@ impl FileReadWriteAtVolatile for DiskProperties {
             })
             .collect::<Vec<_>>();
         let iovec = IoVectorMut::from(buffers);
+        #[cfg(feature = "block-io-profile")]
+        {
+            self.metrics.add_scratch_vectors(2);
+            self.metrics
+                .record_iovec_prepare_ns(duration_ns(prepare_started.elapsed()));
+        }
         let full_length = iovec
             .len()
             .try_into()
             .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-        self.file.lock().unwrap().readv(iovec, offset)?;
+        #[cfg(feature = "block-io-profile")]
+        let format_started = Instant::now();
+        let result = self.file.lock().unwrap().readv(iovec, offset);
+        #[cfg(feature = "block-io-profile")]
+        self.metrics
+            .record_format_read_ns(duration_ns(format_started.elapsed()));
+        result?;
         Ok(full_length)
     }
 
@@ -489,6 +505,8 @@ impl FileReadWriteAtVolatile for DiskProperties {
             return Ok(result);
         }
 
+        #[cfg(feature = "block-io-profile")]
+        let prepare_started = Instant::now();
         let ptr_guards = bufs
             .iter()
             .map(|slice| slice.ptr_guard())
@@ -505,13 +523,30 @@ impl FileReadWriteAtVolatile for DiskProperties {
             })
             .collect::<Vec<_>>();
         let iovec = IoVector::from(buffers);
+        #[cfg(feature = "block-io-profile")]
+        {
+            self.metrics.add_scratch_vectors(2);
+            self.metrics
+                .record_iovec_prepare_ns(duration_ns(prepare_started.elapsed()));
+        }
         let full_length = iovec
             .len()
             .try_into()
             .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-        self.file.lock().unwrap().writev(iovec, offset)?;
+        #[cfg(feature = "block-io-profile")]
+        let format_started = Instant::now();
+        let result = self.file.lock().unwrap().writev(iovec, offset);
+        #[cfg(feature = "block-io-profile")]
+        self.metrics
+            .record_format_write_ns(duration_ns(format_started.elapsed()));
+        result?;
         Ok(full_length)
     }
+}
+
+#[cfg(all(feature = "blk", feature = "block-io-profile"))]
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().try_into().unwrap_or(u64::MAX)
 }
 
 #[cfg(all(feature = "blk", windows))]
@@ -699,6 +734,7 @@ mod tests {
         raw::Raw, DenyImplicitOpenGate, DynStorage, FormatAccess, FormatCreateBuilder,
         FormatDriverBuilder, PermissiveImplicitOpenGate, Storage, StorageCreateOptions,
     };
+    use utils::metrics::MetricsWriter;
     use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
     use crate::virtio::block::device::CacheType;
@@ -717,7 +753,8 @@ mod tests {
 
         let raw = Raw::<Box<dyn DynStorage>>::open_path(&path, true).unwrap();
         let disk_image = Arc::new(Mutex::new(FormatAccess::new(raw)));
-        let disk = DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe).unwrap();
+        let disk =
+            DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe, test_metrics()).unwrap();
 
         let mem: GuestMemoryMmap<()> =
             GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
@@ -746,7 +783,8 @@ mod tests {
 
         let raw = Raw::<Box<dyn DynStorage>>::open_path(&path, true).unwrap();
         let disk_image = Arc::new(Mutex::new(FormatAccess::new(raw)));
-        let disk = DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe).unwrap();
+        let disk =
+            DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe, test_metrics()).unwrap();
 
         let mem: GuestMemoryMmap<()> =
             GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
@@ -902,7 +940,7 @@ mod tests {
                 })
                 .unwrap();
         let disk_image = Arc::new(Mutex::new(FormatAccess::new(qcow2)));
-        DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe).unwrap()
+        DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe, test_metrics()).unwrap()
     }
 
     fn create_vmdk_disk(path: &std::path::Path) -> DiskProperties {
@@ -910,7 +948,11 @@ mod tests {
             .open(PermissiveImplicitOpenGate::default())
             .unwrap();
         let disk_image = Arc::new(Mutex::new(FormatAccess::new(vmdk)));
-        DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe).unwrap()
+        DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe, test_metrics()).unwrap()
+    }
+
+    fn test_metrics() -> utils::metrics::BlockMetricsWriter {
+        MetricsWriter::default().register_block_device("test".to_string())
     }
 
     fn temp_image_path(test_name: &str) -> std::path::PathBuf {

@@ -11,6 +11,7 @@ license = "Apache-2.0"
 default = []
 net = ["devices/net", "vmm/net"]
 blk = ["devices/blk", "vmm/blk"]
+block-io-profile = ["blk", "devices/block-io-profile"]
 gpu = ["krun_display", "devices/gpu", "vmm/gpu"]
 snd = ["devices/snd", "vmm/snd"]
 tee = ["devices/tee", "vmm/tee"]
