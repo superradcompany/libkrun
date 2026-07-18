@@ -7,20 +7,31 @@
 
 use std::cmp;
 use std::convert::From;
+#[cfg(feature = "block-io-profile")]
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 #[cfg(target_os = "linux")]
 use std::os::linux::fs::MetadataExt;
 #[cfg(target_os = "macos")]
 use std::os::macos::fs::MetadataExt;
+#[cfg(feature = "block-io-profile")]
+use std::path::Path;
 use std::path::PathBuf;
 use std::result;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+#[cfg(feature = "block-io-profile")]
+use std::time::{Duration, Instant};
 
 use imago::{
     file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk, DynStorage, FormatAccess,
     FormatDriverBuilder, PermissiveImplicitOpenGate, Storage, StorageOpenOptions,
+};
+#[cfg(feature = "block-io-profile")]
+use imago::{
+    io_buffers::{IoVector, IoVectorMut},
+    storage::{drivers::CommonStorageHelper, PreallocateMode},
 };
 use log::{error, warn};
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
@@ -80,6 +91,8 @@ pub(crate) struct DiskProperties {
     windows_raw_file: Option<Arc<WindowsRawFile>>,
     nsectors: u64,
     image_id: Vec<u8>,
+    #[cfg(feature = "block-io-profile")]
+    pub(crate) metrics: BlockMetricsWriter,
 }
 
 impl DiskProperties {
@@ -87,6 +100,7 @@ impl DiskProperties {
         disk_image: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
         disk_image_id: Vec<u8>,
         cache_type: CacheType,
+        _metrics: BlockMetricsWriter,
     ) -> io::Result<Self> {
         let disk_size = disk_image.lock().unwrap().size();
 
@@ -104,6 +118,8 @@ impl DiskProperties {
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id: disk_image_id,
             file: disk_image,
+            #[cfg(feature = "block-io-profile")]
+            metrics: _metrics,
             #[cfg(windows)]
             windows_raw_file: None,
         })
@@ -297,6 +313,113 @@ impl DiskProperties {
     }
 }
 
+/// Storage wrapper used only by diagnostic builds to isolate actual host-storage time from Imago's
+/// format mapping and range coordination.
+#[cfg(feature = "block-io-profile")]
+#[derive(Debug)]
+struct ProfiledStorage<S> {
+    inner: S,
+    metrics: BlockMetricsWriter,
+}
+
+#[cfg(feature = "block-io-profile")]
+impl<S: fmt::Display> fmt::Display for ProfiledStorage<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(formatter)
+    }
+}
+
+#[cfg(feature = "block-io-profile")]
+impl<S: Storage> Storage for ProfiledStorage<S> {
+    fn mem_align(&self) -> usize {
+        self.inner.mem_align()
+    }
+
+    fn req_align(&self) -> usize {
+        self.inner.req_align()
+    }
+
+    fn zero_align(&self) -> usize {
+        self.inner.zero_align()
+    }
+
+    fn discard_align(&self) -> usize {
+        self.inner.discard_align()
+    }
+
+    fn size(&self) -> io::Result<u64> {
+        self.inner.size()
+    }
+
+    fn resolve_relative_path<P: AsRef<Path>>(&self, relative: P) -> io::Result<PathBuf> {
+        self.inner.resolve_relative_path(relative)
+    }
+
+    fn get_filename(&self) -> Option<PathBuf> {
+        self.inner.get_filename()
+    }
+
+    unsafe fn pure_readv(&self, bufv: IoVectorMut<'_>, offset: u64) -> io::Result<()> {
+        let started = Instant::now();
+        let result = unsafe { self.inner.pure_readv(bufv, offset) };
+        self.metrics
+            .record_storage_read_ns(duration_ns(started.elapsed()));
+        result
+    }
+
+    unsafe fn pure_writev(&self, bufv: IoVector<'_>, offset: u64) -> io::Result<()> {
+        let started = Instant::now();
+        let result = unsafe { self.inner.pure_writev(bufv, offset) };
+        self.metrics
+            .record_storage_write_ns(duration_ns(started.elapsed()));
+        result
+    }
+
+    unsafe fn pure_write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        unsafe { self.inner.pure_write_zeroes(offset, length) }
+    }
+
+    unsafe fn pure_write_allocated_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        unsafe { self.inner.pure_write_allocated_zeroes(offset, length) }
+    }
+
+    unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
+        unsafe { self.inner.pure_discard(offset, length) }
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        let started = Instant::now();
+        let result = self.inner.flush();
+        self.metrics
+            .record_storage_flush_ns(duration_ns(started.elapsed()));
+        result
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        let started = Instant::now();
+        let result = self.inner.sync();
+        self.metrics.record_sync_ns(duration_ns(started.elapsed()));
+        result
+    }
+
+    unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        unsafe { self.inner.invalidate_cache() }
+    }
+
+    fn get_storage_helper(&self) -> &CommonStorageHelper {
+        self.inner.get_storage_helper()
+    }
+
+    fn resize(&self, new_size: u64, prealloc_mode: PreallocateMode) -> io::Result<()> {
+        self.inner.resize(new_size, prealloc_mode)
+    }
+}
+
+#[cfg(feature = "block-io-profile")]
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().try_into().unwrap_or(u64::MAX)
+}
+
 impl Drop for DiskProperties {
     fn drop(&mut self) {
         match self.cache_type {
@@ -441,26 +564,34 @@ impl Block {
         let file = ImagoFile::open(file_opts)?;
         let discard_alignment = file.discard_align();
 
+        #[cfg(feature = "block-io-profile")]
+        let file: Box<dyn DynStorage> = {
+            metrics.enable_io_profile();
+            Box::new(ProfiledStorage {
+                inner: file,
+                metrics: metrics.clone(),
+            })
+        };
+        #[cfg(not(feature = "block-io-profile"))]
+        let file: Box<dyn DynStorage> = Box::new(file);
+
         let disk_image = match disk_image_format {
             ImageType::Qcow2 => {
                 let mut qcow2 =
                     Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image(
-                        Box::new(file),
+                        file,
                         !is_disk_read_only,
                     )?;
                 qcow2.open_implicit_dependencies()?;
                 FormatAccess::new(qcow2)
             }
             ImageType::Raw => {
-                let raw =
-                    Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), !is_disk_read_only)?;
+                let raw = Raw::<Box<dyn DynStorage>>::open_image(file, !is_disk_read_only)?;
                 FormatAccess::new(raw)
             }
             ImageType::Vmdk => {
-                let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(
-                    Box::new(file),
-                )
-                .open(PermissiveImplicitOpenGate::default())?;
+                let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(file)
+                    .open(PermissiveImplicitOpenGate::default())?;
                 FormatAccess::new(vmdk)
             }
         };
@@ -468,8 +599,12 @@ impl Block {
         let disk_image = Arc::new(Mutex::new(disk_image));
 
         let disk_properties = {
-            let disk_properties =
-                DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
+            let disk_properties = DiskProperties::new(
+                disk_image.clone(),
+                disk_image_id.clone(),
+                cache_type,
+                metrics.clone(),
+            )?;
             #[cfg(windows)]
             {
                 let mut disk_properties = disk_properties;
@@ -614,6 +749,7 @@ impl VirtioDevice for Block {
                     Arc::clone(&self.disk_image),
                     self.disk_image_id.clone(),
                     self.cache_type,
+                    self.metrics.clone(),
                 )
                 .map_err(|_| ActivateError::BadActivate)?;
                 #[cfg(windows)]

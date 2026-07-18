@@ -55,8 +55,8 @@ pub use api::builders::{
 pub use api::error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use api::exit_handle::ExitHandle;
 pub use api::metrics::{
-    BlockDeviceMetrics, BlockMetrics, CpuMetrics, FilesystemMetrics, MemoryMetrics, MetricsHandle,
-    VmMetrics,
+    BlockDeviceIoProfile, BlockDeviceMetrics, BlockIoProfile, BlockMetrics, CpuMetrics,
+    FilesystemMetrics, LatencyHistogram, MemoryMetrics, MetricsHandle, VmMetrics,
 };
 pub use api::vm::Vm;
 #[cfg(not(feature = "tee"))]

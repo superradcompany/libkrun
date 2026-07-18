@@ -53,8 +53,8 @@ pub use builders::{
 pub use error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use exit_handle::ExitHandle;
 pub use metrics::{
-    BlockDeviceMetrics, BlockMetrics, CpuMetrics, FilesystemMetrics, MemoryMetrics, MetricsHandle,
-    VmMetrics,
+    BlockDeviceIoProfile, BlockDeviceMetrics, BlockIoProfile, BlockMetrics, CpuMetrics,
+    FilesystemMetrics, LatencyHistogram, MemoryMetrics, MetricsHandle, VmMetrics,
 };
 pub use vm::Vm;
 #[cfg(not(feature = "tee"))]
