@@ -42,7 +42,7 @@ pub fn update_largest_extended_fn_entry(
 
     // Preserve KVM's filtered maximum so newer leaves, including AMD Automatic IBRS in
     // CPUID.80000021H, remain visible. Older KVM versions can report only 0x80000000, so retain the
-    // minimum required by the extended cache-topology transformation.
+    // historical libkrun floor needed by the topology surface it exposes.
     let largest_extended_fn = entry
         .eax
         .read_bits_in_range(&eax::LARGEST_EXTENDED_FN_BITRANGE)
@@ -211,7 +211,7 @@ mod tests {
             function: LEAF_NUM,
             index: 0,
             flags: 0,
-            eax: 0,
+            eax: 0x8000_0000,
             ebx: 0,
             ecx: 0,
             edx: 0,
@@ -227,10 +227,12 @@ mod tests {
             MIN_LARGEST_EXTENDED_FN
         );
 
-        // Do not hide newer KVM-filtered feature leaves such as CPUID.80000021H (AutoIBRS).
-        entry.eax = 0x8000_0022;
-        assert!(update_largest_extended_fn_entry(&mut entry, &vm_spec).is_ok());
-        assert_eq!(entry.eax, 0x8000_0022);
+        for largest_extended_fn in [0x8000_001f, 0x8000_0021, 0x8000_0022] {
+            // Do not hide newer KVM-filtered feature leaves such as CPUID.80000021H (AutoIBRS).
+            entry.eax = largest_extended_fn;
+            assert!(update_largest_extended_fn_entry(&mut entry, &vm_spec).is_ok());
+            assert_eq!(entry.eax, largest_extended_fn);
+        }
     }
 
     #[test]
