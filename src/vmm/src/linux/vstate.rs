@@ -39,7 +39,7 @@ use kbs_types::Tee;
 
 #[cfg(feature = "tee")]
 use crate::resources::TeeConfig;
-use crate::vmm_config::machine_config::CpuFeaturesTemplate;
+use crate::vmm_config::machine_config::{CpuFeaturesTemplate, HostCpuId};
 #[cfg(target_arch = "x86_64")]
 use cpuid::{c3, filter_cpuid, t2, VmSpec};
 #[cfg(target_arch = "x86_64")]
@@ -226,6 +226,8 @@ pub enum Error {
     VcpuSetXsave(kvm_ioctls::Error),
     /// Cannot spawn a new vCPU thread.
     VcpuSpawn(io::Error),
+    /// Cannot bind a vCPU thread to its resolved host logical processor.
+    VcpuAffinity(io::Error),
     /// Cannot cleanly initialize vcpu TLS.
     VcpuTlsInit,
     /// Vcpu not present in TLS.
@@ -396,6 +398,7 @@ impl Display for Error {
             #[cfg(target_arch = "x86_64")]
             VcpuSetXsave(e) => write!(f, "Failed to set KVM vcpu xsave: {e}"),
             VcpuSpawn(e) => write!(f, "Cannot spawn a new vCPU thread: {e}"),
+            VcpuAffinity(e) => write!(f, "Cannot set vCPU host affinity: {e}"),
             VcpuTlsInit => write!(f, "Cannot clean init vcpu TLS"),
             VcpuTlsNotPresent => write!(f, "Vcpu not present in TLS"),
             VcpuUnhandledKvmExit => write!(f, "Unexpected KVM_RUN exit reason"),
@@ -925,6 +928,8 @@ type VcpuCell = Cell<Option<*mut Vcpu>>;
 pub struct Vcpu {
     fd: VcpuFd,
     id: u8,
+    // Resolved host placement is applied inside the vCPU thread before KVM_RUN.
+    host_cpu: Option<HostCpuId>,
     // Host-authoritative online ceiling; vCPUs at or above it park between
     // emulation steps regardless of guest cooperation.
     enforcement: Option<std::sync::Arc<devices::virtio::CpuEnforcement>>,
@@ -1082,6 +1087,7 @@ impl Vcpu {
         Ok(Vcpu {
             fd: kvm_vcpu,
             id,
+            host_cpu: None,
             enforcement: None,
             kick_slot: None,
             mmio_bus: None,
@@ -1122,6 +1128,7 @@ impl Vcpu {
         Ok(Vcpu {
             fd: kvm_vcpu,
             id,
+            host_cpu: None,
             enforcement: None,
             kick_slot: None,
             mmio_bus: None,
@@ -1157,6 +1164,7 @@ impl Vcpu {
         Ok(Vcpu {
             fd: kvm_vcpu,
             id,
+            host_cpu: None,
             enforcement: None,
             kick_slot: None,
             mmio_bus: None,
@@ -1172,6 +1180,11 @@ impl Vcpu {
     /// Returns the cpu index as seen by the guest OS.
     pub fn cpu_index(&self) -> u8 {
         self.id
+    }
+
+    /// Selects the host logical processor this vCPU thread must run on.
+    pub(crate) fn set_host_cpu(&mut self, host_cpu: HostCpuId) {
+        self.host_cpu = Some(host_cpu);
     }
 
     pub fn set_enforcement(
@@ -1314,26 +1327,59 @@ impl Vcpu {
         let vcpu_thread = thread::Builder::new()
             .name(format!("fc_vcpu {}", self.cpu_index()))
             .spawn(move || {
-                self.init_thread_local_data()
-                    .expect("Cannot cleanly initialize vcpu TLS.");
+                let init_result = self
+                    .apply_host_cpu_affinity()
+                    .and_then(|()| self.init_thread_local_data());
 
+                let initialized = init_result.is_ok();
                 init_tls_sender
-                    .send(true)
-                    .expect("Cannot notify vcpu TLS initialization.");
+                    .send(init_result)
+                    .expect("Cannot notify vcpu initialization.");
 
-                self.run();
+                if initialized {
+                    self.run();
+                }
             })
             .map_err(Error::VcpuSpawn)?;
 
         init_tls_receiver
             .recv()
-            .expect("Error waiting for TLS initialization.");
+            .expect("Error waiting for vcpu initialization.")?;
 
         Ok(VcpuHandle::new(
             event_sender,
             response_receiver,
             vcpu_thread,
         ))
+    }
+
+    /// Applies the resolved affinity from within the vCPU thread itself.
+    fn apply_host_cpu_affinity(&self) -> Result<()> {
+        let Some(host_cpu) = self.host_cpu else {
+            return Ok(());
+        };
+
+        let index = host_cpu.index as usize;
+        if index >= libc::CPU_SETSIZE as usize {
+            return Err(Error::VcpuAffinity(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("host CPU {index} exceeds CPU_SETSIZE"),
+            )));
+        }
+
+        // SAFETY: cpu_set_t is initialized before use, the validated index is in range, and pid 0
+        // asks Linux to bind only the current vCPU thread.
+        let result = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_ZERO(&mut set);
+            libc::CPU_SET(index, &mut set);
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
+        };
+        if result != 0 {
+            return Err(Error::VcpuAffinity(io::Error::last_os_error()));
+        }
+
+        Ok(())
     }
 
     #[allow(unused)]

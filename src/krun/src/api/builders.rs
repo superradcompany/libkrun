@@ -8,6 +8,7 @@ use devices::virtio::console::port_io::{
     ConsolePortBackend, ConsolePortBackendInputAdapter, ConsolePortBackendOutputAdapter,
 };
 use vmm::resources::PortConfig;
+pub use vmm::vmm_config::machine_config::HostCpuId;
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use crate::backends::fs::DynFileSystem;
@@ -55,6 +56,7 @@ pub struct MachineBuilder {
     pub(crate) rng: bool,
     pub(crate) msb_metrics: bool,
     pub(crate) enable_inet_hijack: bool,
+    pub(crate) vcpu_affinity: Option<Vec<HostCpuId>>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -367,6 +369,7 @@ impl MachineBuilder {
             rng: true,
             msb_metrics: true,
             enable_inet_hijack: false,
+            vcpu_affinity: None,
         }
     }
 
@@ -390,6 +393,15 @@ impl MachineBuilder {
     /// effective vCPU count, which reserves no extra capacity.
     pub fn max_vcpus(mut self, count: u8) -> Self {
         self.max_vcpus = Some(count);
+        self
+    }
+
+    /// Pins each possible vCPU thread to one resolved host logical processor.
+    ///
+    /// The map must contain one entry for every possible vCPU, including reserved capacity declared
+    /// with [`max_vcpus`](Self::max_vcpus). This is currently supported on Linux hosts only.
+    pub fn vcpu_affinity(mut self, affinity: Vec<HostCpuId>) -> Self {
+        self.vcpu_affinity = Some(affinity);
         self
     }
 
@@ -1061,6 +1073,22 @@ impl From<SyncMode> for devices::virtio::block::SyncMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_cpu_id_defaults_to_group_zero() {
+        assert_eq!(HostCpuId::new(7), HostCpuId::in_group(0, 7));
+        assert_eq!(HostCpuId::in_group(3, 11).group, 3);
+    }
+
+    #[test]
+    fn machine_builder_records_vcpu_affinity() {
+        let affinity = vec![HostCpuId::new(2), HostCpuId::new(6)];
+        let builder = MachineBuilder::new()
+            .vcpus(2)
+            .vcpu_affinity(affinity.clone());
+
+        assert_eq!(builder.vcpu_affinity, Some(affinity));
+    }
 
     #[test]
     fn machine_builder_msb_metrics_defaults_on_and_can_be_disabled() {
