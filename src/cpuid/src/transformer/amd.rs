@@ -9,8 +9,8 @@ use crate::bit_helper::BitHelper;
 use crate::cpu_leaf::*;
 use crate::transformer::common::use_host_cpuid_function;
 
-// Largest extended function. It has to be larger then 0x8000001d (Extended Cache Topology).
-const LARGEST_EXTENDED_FN: u32 = 0x8000_001f;
+// Preserve the historical libkrun floor, which includes the transformed extended APIC ID leaf.
+const MIN_LARGEST_EXTENDED_FN: u32 = 0x8000_001f;
 // This value allows at most 64 logical threads within a package.
 // See also the documentation for leaf_0x80000008::ecx::THREAD_ID_SIZE_BITRANGE
 const THREAD_ID_MAX_SIZE: u32 = 6;
@@ -40,11 +40,16 @@ pub fn update_largest_extended_fn_entry(
 ) -> Result<(), Error> {
     use crate::cpu_leaf::leaf_0x80000000::*;
 
-    // KVM sets the largest extended function to 0x80000000. Change it to 0x8000001f
-    // Since we also use the leaf 0x8000001d (Extended Cache Topology).
+    // Preserve KVM's filtered maximum so newer leaves, including AMD Automatic IBRS in
+    // CPUID.80000021H, remain visible. Older KVM versions can report only 0x80000000, so retain the
+    // minimum required by the extended cache-topology transformation.
+    let largest_extended_fn = entry
+        .eax
+        .read_bits_in_range(&eax::LARGEST_EXTENDED_FN_BITRANGE)
+        .max(MIN_LARGEST_EXTENDED_FN);
     entry
         .eax
-        .write_bits_in_range(&eax::LARGEST_EXTENDED_FN_BITRANGE, LARGEST_EXTENDED_FN);
+        .write_bits_in_range(&eax::LARGEST_EXTENDED_FN_BITRANGE, largest_extended_fn);
 
     Ok(())
 }
@@ -219,8 +224,13 @@ mod tests {
             entry
                 .eax
                 .read_bits_in_range(&eax::LARGEST_EXTENDED_FN_BITRANGE),
-            LARGEST_EXTENDED_FN
+            MIN_LARGEST_EXTENDED_FN
         );
+
+        // Do not hide newer KVM-filtered feature leaves such as CPUID.80000021H (AutoIBRS).
+        entry.eax = 0x8000_0022;
+        assert!(update_largest_extended_fn_entry(&mut entry, &vm_spec).is_ok());
+        assert_eq!(entry.eax, 0x8000_0022);
     }
 
     #[test]
