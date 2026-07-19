@@ -13,6 +13,17 @@ use vm_memory::{GuestAddress, GuestMemoryMmap};
 use crate::vmm_config::machine_config::HostMemoryPolicy;
 
 //--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Preserve process-level THP exclusion except for VMAs explicitly marked with `MADV_HUGEPAGE`.
+///
+/// This flag is part of Linux's `PR_SET_THP_DISABLE` ABI but is not exposed by every supported
+/// version of the libc crate.
+#[cfg(all(target_os = "linux", not(any(feature = "tee", feature = "aws-nitro"))))]
+const PR_THP_DISABLE_EXCEPT_ADVISED: libc::c_ulong = 1 << 1;
+
+//--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
 
@@ -88,6 +99,10 @@ fn apply_linux(
     ranges: &[GuestAddressRange],
     policy: HostMemoryPolicy,
 ) -> Result<(), Error> {
+    if policy == HostMemoryPolicy::PreferHugePages {
+        allow_advised_huge_pages()?;
+    }
+
     let advice = match policy {
         HostMemoryPolicy::Inherit => return Ok(()),
         HostMemoryPolicy::PreferHugePages => libc::MADV_HUGEPAGE,
@@ -123,6 +138,27 @@ fn apply_linux(
                 return Err(Error::Advice(io::Error::last_os_error()));
             }
         }
+    }
+
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", not(any(feature = "tee", feature = "aws-nitro"))))]
+fn allow_advised_huge_pages() -> Result<(), Error> {
+    // Launchers such as Bun may disable THP before exec, and Linux preserves that process setting
+    // across execve. Except-advised mode keeps THP disabled for every unrelated VMA while allowing
+    // the guest-RAM ranges below to opt in with MADV_HUGEPAGE.
+    let result = unsafe {
+        libc::prctl(
+            libc::PR_SET_THP_DISABLE,
+            1,
+            PR_THP_DISABLE_EXCEPT_ADVISED,
+            0,
+            0,
+        )
+    };
+    if result != 0 {
+        return Err(Error::Advice(io::Error::last_os_error()));
     }
 
     Ok(())
@@ -233,6 +269,8 @@ mod tests {
     #[cfg(all(target_os = "linux", not(any(feature = "tee", feature = "aws-nitro"))))]
     #[test]
     fn linux_marks_anonymous_guest_memory_with_requested_advice() {
+        let previous_thp_mode = unsafe { libc::prctl(libc::PR_GET_THP_DISABLE, 0, 0, 0, 0) };
+        assert!(previous_thp_mode >= 0, "read process THP mode");
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         let guest_memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), page_size * 2)])
             .expect("anonymous guest memory");
@@ -243,6 +281,11 @@ mod tests {
 
         apply_linux(&guest_memory, &ranges, HostMemoryPolicy::PreferHugePages)
             .expect("MADV_HUGEPAGE");
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_GET_THP_DISABLE, 0, 0, 0, 0) },
+            3,
+            "huge-page preference must survive an inherited process-wide THP disable"
+        );
         let host_addr = guest_memory
             .find_region(GuestAddress(0))
             .expect("guest region")
@@ -252,6 +295,18 @@ mod tests {
         apply_linux(&guest_memory, &ranges, HostMemoryPolicy::PreferBasePages)
             .expect("MADV_NOHUGEPAGE");
         assert!(mapping_vm_flags(host_addr).contains("nh"));
+
+        let (disable, flags) = match previous_thp_mode {
+            0 => (0, 0),
+            1 => (1, 0),
+            3 => (1, PR_THP_DISABLE_EXCEPT_ADVISED),
+            other => panic!("unexpected process THP mode {other}"),
+        };
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, disable, flags, 0, 0) },
+            0,
+            "restore process THP mode"
+        );
     }
 
     #[cfg(all(target_os = "linux", not(any(feature = "tee", feature = "aws-nitro"))))]
