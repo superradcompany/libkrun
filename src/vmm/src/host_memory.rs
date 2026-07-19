@@ -20,6 +20,10 @@ use crate::vmm_config::machine_config::HostMemoryPolicy;
 #[derive(Debug)]
 pub(crate) enum Error {
     /// The current host or build cannot apply explicit page-size advice safely.
+    #[cfg_attr(
+        all(target_os = "linux", not(any(feature = "tee", feature = "aws-nitro"))),
+        allow(dead_code)
+    )]
     Unsupported,
     /// The host rejected advice for a guest RAM mapping.
     #[cfg_attr(
