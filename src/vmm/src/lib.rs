@@ -19,6 +19,7 @@ pub(crate) mod device_manager;
 /// Cross-platform exit signal handlers (SIGTERM, SIGUSR1).
 #[cfg(unix)]
 pub mod exit_signal;
+mod host_memory;
 /// Resource store for configured microVM resources.
 pub mod resources;
 /// Signal handling utilities.

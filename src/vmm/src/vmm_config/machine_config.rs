@@ -24,6 +24,22 @@ pub struct HostCpuId {
     pub index: u16,
 }
 
+/// Controls the host kernel's page-size preference for anonymous guest RAM.
+///
+/// The preference is advisory: the host kernel still decides whether and when
+/// to promote or split transparent huge pages. It applies only to guest RAM,
+/// not device shared-memory windows or file-backed mappings.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HostMemoryPolicy {
+    /// Preserve the host's inherited virtual-memory policy.
+    #[default]
+    Inherit,
+    /// Ask the host kernel to prefer transparent huge pages for guest RAM.
+    PreferHugePages,
+    /// Ask the host kernel to keep guest RAM backed by base pages.
+    PreferBasePages,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------

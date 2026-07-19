@@ -362,6 +362,13 @@ impl VmBuilder {
             }
         }
 
+        #[cfg(any(not(target_os = "linux"), feature = "tee", feature = "aws-nitro"))]
+        if self.machine.host_memory_policy
+            != vmm::vmm_config::machine_config::HostMemoryPolicy::Inherit
+        {
+            return Err(Error::Config(ConfigError::HostMemoryPolicyUnsupported));
+        }
+
         // Build VmResources
         let mut vmr = VmResources::default();
 
@@ -376,6 +383,7 @@ impl VmBuilder {
         };
         vmr.set_vm_config(&vm_config)
             .map_err(|err| map_vm_config_error(&self.machine, err))?;
+        vmr.host_memory_policy = self.machine.host_memory_policy;
 
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
@@ -762,6 +770,27 @@ mod tests {
                 expected: 4,
                 actual: 2,
             }) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[cfg(any(not(target_os = "linux"), feature = "tee", feature = "aws-nitro"))]
+    #[test]
+    fn build_rejects_explicit_host_memory_policy_when_unsupported() {
+        let err = match VmBuilder::new()
+            .machine(|machine| {
+                machine.host_memory_policy(
+                    vmm::vmm_config::machine_config::HostMemoryPolicy::PreferHugePages,
+                )
+            })
+            .build()
+        {
+            Ok(_) => panic!("explicit host memory policy should fail on unsupported builds"),
+            Err(err) => err,
+        };
+
+        match err {
+            Error::Config(ConfigError::HostMemoryPolicyUnsupported) => {}
             other => panic!("unexpected error: {other:?}"),
         }
     }

@@ -185,6 +185,10 @@ pub enum StartMicrovmError {
     GuestMemoryRegion,
     /// Guest memory region collection operation failed.
     GuestMemoryRegionCollection(vm_memory::GuestRegionCollectionError),
+    /// The host rejected page-size advice for guest RAM.
+    HostMemoryAdvice(io::Error),
+    /// The requested host guest-RAM memory policy is unsupported by this build.
+    HostMemoryPolicyUnsupported,
     /// The BZIP2 decoder couldn't decompress the kernel.
     ImageBz2Decoder(io::Error),
     /// Cannot find compressed kernel in file.
@@ -395,6 +399,13 @@ impl Display for StartMicrovmError {
                 err_msg = err_msg.replace('\"', "");
                 write!(f, "Invalid Memory Configuration: {err_msg}")
             }
+            HostMemoryAdvice(ref err) => {
+                write!(f, "Cannot apply host page-size advice to guest RAM: {err}")
+            }
+            HostMemoryPolicyUnsupported => write!(
+                f,
+                "Explicit host guest-memory page-size policies are unsupported by this build."
+            ),
             ImageBz2Decoder(ref err) => {
                 write!(f, "The BZIP2 decoder couldn't decompress the kernel. {err}")
             }
@@ -2534,6 +2545,10 @@ pub fn create_guest_memory(
     // host memory; the region is deliberately absent from the FDT/MPTABLE
     // memory nodes — the guest discovers it through the virtio-mem device.
     #[cfg(not(feature = "tee"))]
+    let mut hotplug_range = None;
+    #[cfg(feature = "tee")]
+    let hotplug_range: Option<(GuestAddress, usize)> = None;
+    #[cfg(not(feature = "tee"))]
     if let Some(mem_device) = &vm_resources.mem_device {
         let boot_mib = vm_resources.vm_config().mem_size_mib.unwrap_or(128) as u64;
         let max_mib = vm_resources
@@ -2552,11 +2567,23 @@ pub fn create_guest_memory(
                 .set_region(base, hotplug_bytes)
                 .expect("hotplug region is block-aligned by construction");
             arch_mem_regions.push((GuestAddress(base), hotplug_bytes as usize));
+            hotplug_range = Some((GuestAddress(base), hotplug_bytes as usize));
         }
     }
 
     let guest_mem = GuestMemoryMmap::from_ranges(&arch_mem_regions)
         .map_err(StartMicrovmError::GuestMemoryMmapFromRanges)?;
+
+    crate::host_memory::apply(
+        &guest_mem,
+        &arch_mem_info,
+        hotplug_range,
+        vm_resources.host_memory_policy,
+    )
+    .map_err(|err| match err {
+        crate::host_memory::Error::Unsupported => StartMicrovmError::HostMemoryPolicyUnsupported,
+        crate::host_memory::Error::Advice(err) => StartMicrovmError::HostMemoryAdvice(err),
+    })?;
 
     let (guest_mem, entry_addr, initrd_config, cmdline) =
         load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;

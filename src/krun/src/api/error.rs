@@ -48,6 +48,9 @@ pub enum ConfigError {
     /// vCPU affinity is not supported on the current host platform.
     VcpuAffinityUnsupported,
 
+    /// Explicit host guest-RAM page-size policies are not supported by this build.
+    HostMemoryPolicyUnsupported,
+
     /// The selected host processor group is not supported on the current platform.
     InvalidHostCpuGroup(u16),
 
@@ -140,6 +143,10 @@ impl fmt::Display for ConfigError {
             ConfigError::VcpuAffinityUnsupported => {
                 write!(f, "vCPU affinity is not supported on this host platform")
             }
+            ConfigError::HostMemoryPolicyUnsupported => write!(
+                f,
+                "explicit host guest-memory page-size policies are not supported by this build"
+            ),
             ConfigError::InvalidHostCpuGroup(group) => {
                 write!(f, "host processor group {group} is not supported")
             }

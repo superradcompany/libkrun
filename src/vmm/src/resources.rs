@@ -28,7 +28,7 @@ use crate::vmm_config::kernel_bundle::{QbootBundle, QbootBundleError};
 use crate::vmm_config::kernel_cmdline::{KernelCmdlineConfig, KernelCmdlineConfigError};
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::vmm_config::machine_config::HostCpuId;
-use crate::vmm_config::machine_config::{VmConfig, VmConfigError};
+use crate::vmm_config::machine_config::{HostMemoryPolicy, VmConfig, VmConfigError};
 #[cfg(feature = "net")]
 use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig, NetworkInterfaceError};
 use crate::vmm_config::vsock::*;
@@ -157,6 +157,8 @@ pub enum VsockConfig {
 pub struct VmResources {
     /// The vCpu and memory configuration for this microVM.
     vm_config: VmConfig,
+    /// Host page-size preference for anonymous guest RAM.
+    pub host_memory_policy: HostMemoryPolicy,
     /// Resolved host logical processor for every possible vCPU thread.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub vcpu_affinity: Option<Vec<HostCpuId>>,
@@ -254,6 +256,7 @@ impl Default for VmResources {
     fn default() -> Self {
         Self {
             vm_config: VmConfig::default(),
+            host_memory_policy: HostMemoryPolicy::Inherit,
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             vcpu_affinity: None,
             firmware_config: None,

@@ -8,7 +8,7 @@ use devices::virtio::console::port_io::{
     ConsolePortBackend, ConsolePortBackendInputAdapter, ConsolePortBackendOutputAdapter,
 };
 use vmm::resources::PortConfig;
-pub use vmm::vmm_config::machine_config::HostCpuId;
+pub use vmm::vmm_config::machine_config::{HostCpuId, HostMemoryPolicy};
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use crate::backends::fs::DynFileSystem;
@@ -57,6 +57,7 @@ pub struct MachineBuilder {
     pub(crate) msb_metrics: bool,
     pub(crate) enable_inet_hijack: bool,
     pub(crate) vcpu_affinity: Option<Vec<HostCpuId>>,
+    pub(crate) host_memory_policy: HostMemoryPolicy,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -370,6 +371,7 @@ impl MachineBuilder {
             msb_metrics: true,
             enable_inet_hijack: false,
             vcpu_affinity: None,
+            host_memory_policy: HostMemoryPolicy::Inherit,
         }
     }
 
@@ -402,6 +404,17 @@ impl MachineBuilder {
     /// with [`max_vcpus`](Self::max_vcpus). This is currently supported on Linux hosts only.
     pub fn vcpu_affinity(mut self, affinity: Vec<HostCpuId>) -> Self {
         self.vcpu_affinity = Some(affinity);
+        self
+    }
+
+    /// Set the host page-size preference for anonymous guest RAM.
+    ///
+    /// This is an advisory Linux host policy. [`HostMemoryPolicy::Inherit`]
+    /// preserves existing behavior and is the default. Explicit preferences
+    /// fail during build on unsupported hosts rather than silently doing
+    /// nothing.
+    pub fn host_memory_policy(mut self, policy: HostMemoryPolicy) -> Self {
+        self.host_memory_policy = policy;
         self
     }
 
@@ -1088,6 +1101,24 @@ mod tests {
             .vcpu_affinity(affinity.clone());
 
         assert_eq!(builder.vcpu_affinity, Some(affinity));
+    }
+
+    #[test]
+    fn machine_builder_inherits_host_memory_policy_by_default() {
+        assert_eq!(
+            MachineBuilder::new().host_memory_policy,
+            HostMemoryPolicy::Inherit
+        );
+    }
+
+    #[test]
+    fn machine_builder_records_host_memory_policy() {
+        let builder = MachineBuilder::new().host_memory_policy(HostMemoryPolicy::PreferHugePages);
+
+        assert_eq!(
+            builder.host_memory_policy,
+            HostMemoryPolicy::PreferHugePages
+        );
     }
 
     #[test]
