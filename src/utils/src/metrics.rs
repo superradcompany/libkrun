@@ -302,7 +302,7 @@ impl MetricsHandle {
     /// Counters are monotonic atomics. Callers that need rates should compute
     /// deltas between snapshots.
     pub fn snapshot(&self) -> VmMetrics {
-        self.snapshot_inner(true)
+        self.snapshot_inner(true, true)
     }
 
     /// Return aggregate VM metrics without per-device block details.
@@ -310,7 +310,24 @@ impl MetricsHandle {
     /// This avoids cloning the per-device vector for high-frequency samplers
     /// that only publish aggregate counters.
     pub fn aggregate_snapshot(&self) -> VmMetrics {
-        self.snapshot_inner(false)
+        self.snapshot_inner(false, true)
+    }
+
+    /// Return aggregate VM metrics while reusing the last host-residency sample.
+    ///
+    /// Guest-memory residency can require inspecting every mapped guest page. High-frequency
+    /// callers should use this method between explicit [`Self::refresh_host_resident_memory`]
+    /// calls so cheap counters keep their normal cadence without repeatedly scanning guest RAM.
+    pub fn aggregate_snapshot_cached_residency(&self) -> VmMetrics {
+        self.snapshot_inner(false, false)
+    }
+
+    /// Refresh and return the host-resident guest-memory sample.
+    ///
+    /// This potentially scans every guest-memory page and should run at a deliberately coarse
+    /// cadence or on a background worker.
+    pub fn refresh_host_resident_memory(&self) -> Option<u64> {
+        self.host_resident_bytes(true)
     }
 
     /// Return block-path diagnostics when an instrumented block device is active.
@@ -336,13 +353,13 @@ impl MetricsHandle {
         Some(aggregate)
     }
 
-    fn snapshot_inner(&self, include_block_devices: bool) -> VmMetrics {
+    fn snapshot_inner(&self, include_block_devices: bool, refresh_residency: bool) -> VmMetrics {
         let total_bytes = self.state.memory_total_bytes.load(Ordering::Relaxed);
         let available_bytes = valid_value(
             &self.state.memory_available_valid,
             &self.state.memory_available_bytes,
         );
-        let host_resident_bytes = self.host_resident_bytes();
+        let host_resident_bytes = self.host_resident_bytes(refresh_residency);
         VmMetrics {
             cpu: CpuMetrics {
                 vcpu_time_ns: valid_value(&self.state.vcpu_time_valid, &self.state.vcpu_time_ns),
@@ -390,14 +407,15 @@ impl MetricsHandle {
         }
     }
 
-    fn host_resident_bytes(&self) -> Option<u64> {
-        let sampler = self
-            .state
-            .memory_host_resident_sampler
-            .lock()
-            .unwrap()
-            .clone();
-        if let Some(sampler) = sampler {
+    fn host_resident_bytes(&self, refresh: bool) -> Option<u64> {
+        let sampler = refresh.then(|| {
+            self.state
+                .memory_host_resident_sampler
+                .lock()
+                .unwrap()
+                .clone()
+        });
+        if let Some(Some(sampler)) = sampler {
             match sampler() {
                 Some(bytes) => {
                     self.state
@@ -575,6 +593,14 @@ impl BlockMetricsWriter {
                 .interrupts
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Record one batched used-queue interrupt independently of completions.
+    pub fn record_interrupt(&self) {
+        self.device
+            .io_profile
+            .interrupts
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Add known heap-backed scratch-vector construction events.
@@ -913,6 +939,38 @@ mod tests {
             writer.handle().snapshot().memory.host_resident_bytes,
             Some(8192)
         );
+    }
+
+    #[test]
+    fn cached_residency_snapshot_does_not_call_expensive_sampler() {
+        let writer = MetricsWriter::default();
+        let calls = Arc::new(AtomicU64::new(0));
+        let sampler_calls = Arc::clone(&calls);
+        writer.set_memory_host_resident_sampler(move || {
+            sampler_calls.fetch_add(1, Ordering::Relaxed);
+            Some(4096)
+        });
+
+        let handle = writer.handle();
+        assert_eq!(
+            handle
+                .aggregate_snapshot_cached_residency()
+                .memory
+                .host_resident_bytes,
+            None
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        assert_eq!(handle.refresh_host_resident_memory(), Some(4096));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            handle
+                .aggregate_snapshot_cached_residency()
+                .memory
+                .host_resident_bytes,
+            Some(4096)
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

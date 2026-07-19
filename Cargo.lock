@@ -417,7 +417,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -866,7 +866,7 @@ dependencies = [
 [[package]]
 name = "msb-imago"
 version = "0.2.4"
-source = "git+https://github.com/superradcompany/imago?rev=1c7b1e6e264deeadb32617569da0290607ba7d61#1c7b1e6e264deeadb32617569da0290607ba7d61"
+source = "git+https://github.com/superradcompany/imago?rev=99a36e1daa1d67267d4cfc8c578c8bb94a612912#99a36e1daa1d67267d4cfc8c578c8bb94a612912"
 dependencies = [
  "bincode",
  "cfg-if",
@@ -1417,7 +1417,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

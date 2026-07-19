@@ -28,6 +28,7 @@ use utils::eventfd::EventFd;
 use utils::metrics::BlockMetricsWriter;
 #[cfg(feature = "block-io-profile")]
 use utils::metrics::BlockRequestKind;
+use utils::performance::PerfExperiment;
 use virtio_bindings::virtio_blk::*;
 #[cfg(windows)]
 use vm_memory::{Address, GuestMemoryBackend};
@@ -92,6 +93,8 @@ pub struct BlockWorker {
     disk: DiskProperties,
     stop_fd: EventFd,
     metrics: BlockMetricsWriter,
+    parse_descriptors_once: bool,
+    batch_completions: bool,
 }
 
 #[cfg(windows)]
@@ -195,6 +198,8 @@ impl BlockWorker {
             disk,
             stop_fd,
             metrics,
+            parse_descriptors_once: PerfExperiment::BlockDescriptors.enabled(),
+            batch_completions: PerfExperiment::BlockCompletions.enabled(),
         }
     }
 
@@ -377,27 +382,22 @@ impl BlockWorker {
     fn process_queue(&mut self, mem: &GuestMemoryMmap) {
         #[cfg(feature = "block-io-profile")]
         let drain_started = Instant::now();
+        let mut completed_any = false;
         while let Some(head) = self.device_queue.queue.pop(mem) {
             #[cfg(feature = "block-io-profile")]
             let mut profile = RequestProfile::new(self.metrics.clone(), drain_started.elapsed());
-            let mut reader = match Reader::new(mem, head.clone()) {
-                Ok(r) => {
-                    #[cfg(feature = "block-io-profile")]
-                    profile.add_scratch_vectors(1);
-                    r
-                }
-                Err(e) => {
-                    #[cfg(feature = "block-io-profile")]
-                    profile.record_failure();
-                    error!("invalid descriptor chain: {e:?}");
-                    continue;
-                }
+            let views = if self.parse_descriptors_once {
+                Reader::new_pair(mem, head.clone())
+            } else {
+                Reader::new(mem, head.clone()).and_then(|reader| {
+                    Writer::new(mem, head.clone()).map(|writer| (reader, writer))
+                })
             };
-            let mut writer = match Writer::new(mem, head.clone()) {
-                Ok(r) => {
+            let (mut reader, mut writer) = match views {
+                Ok(views) => {
                     #[cfg(feature = "block-io-profile")]
-                    profile.add_scratch_vectors(1);
-                    r
+                    profile.add_scratch_vectors(2);
+                    views
                 }
                 Err(e) => {
                     #[cfg(feature = "block-io-profile")]
@@ -454,11 +454,13 @@ impl BlockWorker {
                 #[cfg(feature = "block-io-profile")]
                 profile.record_failure();
                 error!("failed to add used elements to the queue: {e:?}");
+            } else {
+                completed_any = true;
             }
 
             #[cfg(feature = "block-io-profile")]
             let mut interrupted = false;
-            if self.device_queue.queue.needs_notification(mem).unwrap() {
+            if !self.batch_completions && self.device_queue.queue.needs_notification(mem).unwrap() {
                 if let Err(e) = self.interrupt.try_signal_used_queue() {
                     #[cfg(feature = "block-io-profile")]
                     profile.record_failure();
@@ -472,6 +474,18 @@ impl BlockWorker {
             }
             #[cfg(feature = "block-io-profile")]
             profile.record_completion(completion_started, interrupted);
+        }
+
+        if self.batch_completions
+            && completed_any
+            && self.device_queue.queue.needs_notification(mem).unwrap()
+        {
+            if let Err(e) = self.interrupt.try_signal_used_queue() {
+                error!("error signalling batched block completions: {e:?}");
+            } else {
+                #[cfg(feature = "block-io-profile")]
+                self.metrics.record_interrupt();
+            }
         }
     }
 

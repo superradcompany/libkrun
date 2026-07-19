@@ -60,6 +60,7 @@ use kvm_bindings::{kvm_memory_attributes, KVM_MEMORY_ATTRIBUTE_PRIVATE};
 use kvm_ioctls::{Cap::*, *};
 use utils::eventfd::EventFd;
 use utils::metrics::MetricsWriter;
+use utils::performance::PerfExperiment;
 use utils::signal::{register_signal_handler, sigrtmin, Killable};
 use utils::sm::StateMachine;
 use utils::time::{get_time, ClockType};
@@ -1668,6 +1669,8 @@ impl Vcpu {
         // This loop is here just for optimizing the emulation path.
         // No point in ticking the state machine if there are no external events.
         let mut last_thread_cpu_ns = get_time(ClockType::ThreadCpu);
+        let batch_accounting = PerfExperiment::VcpuAccounting.enabled();
+        let mut unaccounted_exits = 0u16;
         let mut enforcement_deadline: Option<std::time::Instant> = None;
         loop {
             // Host-side enforcement: stop scheduling this vCPU while its index
@@ -1701,10 +1704,20 @@ impl Vcpu {
             if let Some(slot) = &self.kick_slot {
                 slot.leave_guest();
             }
-            let thread_cpu_ns = get_time(ClockType::ThreadCpu);
-            self.metrics
-                .add_vcpu_time_ns(thread_cpu_ns.saturating_sub(last_thread_cpu_ns));
-            last_thread_cpu_ns = thread_cpu_ns;
+            unaccounted_exits = unaccounted_exits.saturating_add(1);
+            // Thread CPU time is cumulative, so sampling every 64 ordinary exits preserves the
+            // exact total while removing two hot operations (clock_gettime + atomic update) from
+            // the common KVM-exit path. State-changing exits are always flushed immediately.
+            let flush_accounting = !batch_accounting
+                || unaccounted_exits >= 64
+                || !matches!(&emulation, Ok(VcpuEmulation::Handled));
+            if flush_accounting {
+                let thread_cpu_ns = get_time(ClockType::ThreadCpu);
+                self.metrics
+                    .add_vcpu_time_ns(thread_cpu_ns.saturating_sub(last_thread_cpu_ns));
+                last_thread_cpu_ns = thread_cpu_ns;
+                unaccounted_exits = 0;
+            }
 
             match emulation {
                 // Emulation ran successfully, continue.

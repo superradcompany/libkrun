@@ -30,6 +30,7 @@ pub use windows::epoll;
 #[cfg(target_os = "windows")]
 pub use windows::eventfd;
 pub mod metrics;
+pub mod performance;
 pub mod pollable_channel;
 #[cfg(target_arch = "x86_64")]
 pub mod rand;

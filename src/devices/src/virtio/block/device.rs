@@ -36,6 +36,7 @@ use imago::{
 use log::{error, warn};
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use utils::metrics::BlockMetricsWriter;
+use utils::performance::PerfExperiment;
 use virtio_bindings::{
     virtio_blk::*, virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX,
 };
@@ -183,7 +184,11 @@ impl DiskProperties {
 
         let diskfile = self.file.lock().unwrap();
         diskfile.flush()?;
-        diskfile.sync()
+        if PerfExperiment::BlockFdatasync.enabled() {
+            diskfile.sync_data()
+        } else {
+            diskfile.sync()
+        }
     }
 
     pub(crate) fn discard_to_any(&self, offset: u64, length: u64) -> io::Result<()> {

@@ -42,7 +42,7 @@ arch = { package = "msb_krun_arch", version = "0.1.25", path = "../arch" }
 utils = { package = "msb_krun_utils", version = "0.1.25", path = "../utils" }
 polly = { package = "msb_krun_polly", version = "0.1.25", path = "../polly" }
 rutabaga_gfx = { package = "msb_krun_rutabaga_gfx", version = "0.1.25", path = "../rutabaga_gfx", features = ["virgl_renderer", "virgl_renderer_next"], optional = true }
-imago = { package = "msb-imago", git = "https://github.com/superradcompany/imago", rev = "1c7b1e6e264deeadb32617569da0290607ba7d61", default-features = false, features = ["sync", "vm-memory"] }
+imago = { package = "msb-imago", git = "https://github.com/superradcompany/imago", rev = "99a36e1daa1d67267d4cfc8c578c8bb94a612912", default-features = false, features = ["sync", "vm-memory"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hvf = { package = "msb_krun_hvf", version = "0.1.25", path = "../hvf" }

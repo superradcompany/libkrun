@@ -225,6 +225,68 @@ impl<'a> Reader<'a> {
         })
     }
 
+    /// Construct the readable and writable views with one descriptor-chain traversal.
+    ///
+    /// Virtio requires all device-readable descriptors to precede device-writable descriptors.
+    /// Building the two consumers together both enforces that invariant and avoids independently
+    /// walking and resolving the same chain for block requests.
+    pub fn new_pair(
+        mem: &'a GuestMemoryMmap,
+        chain: DescriptorChain<'a>,
+    ) -> Result<(Reader<'a>, Writer<'a>)> {
+        let mut readable = VecDeque::new();
+        let mut writable = VecDeque::new();
+        let mut readable_len = 0usize;
+        let mut writable_len = 0usize;
+        let mut saw_writable = false;
+
+        for desc in chain.into_iter() {
+            let region = mem.find_region(desc.addr).ok_or(Error::FindMemoryRegion)?;
+            let offset = desc
+                .addr
+                .checked_sub(region.start_addr().raw_value())
+                .ok_or(Error::InvalidChain)?;
+            let slice = region
+                .deref()
+                .get_slice(offset.raw_value() as usize, desc.len as usize)
+                .map_err(Error::VolatileMemoryError)?;
+
+            if desc.is_write_only() {
+                saw_writable = true;
+                writable_len = writable_len
+                    .checked_add(desc.len as usize)
+                    .ok_or(Error::DescriptorChainOverflow)?;
+                writable.push_back(slice);
+            } else {
+                if saw_writable {
+                    return Err(Error::InvalidChain);
+                }
+                readable_len = readable_len
+                    .checked_add(desc.len as usize)
+                    .ok_or(Error::DescriptorChainOverflow)?;
+                readable.push_back(slice);
+            }
+        }
+
+        // Keep the checked totals live as an explicit guard against future edits that accidentally
+        // remove the overflow validation while refactoring the buffer construction.
+        let _ = (readable_len, writable_len);
+        Ok((
+            Reader {
+                buffer: DescriptorChainConsumer {
+                    buffers: readable,
+                    bytes_consumed: 0,
+                },
+            },
+            Writer {
+                buffer: DescriptorChainConsumer {
+                    buffers: writable,
+                    bytes_consumed: 0,
+                },
+            },
+        ))
+    }
+
     /// Reads an object from the descriptor chain buffer.
     pub fn read_obj<T: ByteValued>(&mut self) -> io::Result<T> {
         let mut obj = MaybeUninit::<T>::uninit();
@@ -728,6 +790,50 @@ mod tests {
         assert_eq!(reader.bytes_read(), 128);
         assert_eq!(writer.available_bytes(), 0);
         assert_eq!(writer.bytes_written(), 68);
+    }
+
+    #[test]
+    fn reader_writer_pair_splits_valid_chain_in_one_pass() {
+        use DescriptorType::*;
+
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0),
+            GuestAddress(0x100),
+            vec![
+                (Readable, 32),
+                (Readable, 16),
+                (Writable, 64),
+                (Writable, 1),
+            ],
+            0,
+        )
+        .unwrap();
+
+        let (reader, writer) = Reader::new_pair(&memory, chain).unwrap();
+        assert_eq!(reader.available_bytes(), 48);
+        assert_eq!(writer.available_bytes(), 65);
+    }
+
+    #[test]
+    fn reader_writer_pair_rejects_readable_descriptor_after_writable() {
+        use DescriptorType::*;
+
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0),
+            GuestAddress(0x100),
+            vec![(Readable, 16), (Writable, 1), (Readable, 16)],
+            0,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            Reader::new_pair(&memory, chain),
+            Err(Error::InvalidChain)
+        ));
     }
 
     #[test]

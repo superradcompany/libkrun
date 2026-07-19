@@ -24,6 +24,7 @@ use devices::legacy::VcpuList;
 use hvf::{vcpu_request_exit, HvfVcpu, HvfVm, VcpuExit, Vcpus};
 use utils::eventfd::EventFd;
 use utils::metrics::MetricsWriter;
+use utils::performance::PerfExperiment;
 use vm_memory::{
     Address, GuestAddress, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
 };
@@ -534,6 +535,8 @@ impl Vcpu {
             .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
 
         let mut last_exec_time_ns = hvf_vcpu.exec_time_ns().unwrap_or(0);
+        let batch_accounting = PerfExperiment::VcpuAccounting.enabled();
+        let mut unaccounted_exits = 0u16;
         let mut enforcement_deadline: Option<std::time::Instant> = None;
         loop {
             // Host-side enforcement: stop scheduling this vCPU while its index
@@ -565,10 +568,17 @@ impl Vcpu {
             if let Some(slot) = &kick_slot {
                 slot.leave_guest();
             }
-            if let Some(exec_time_ns) = hvf_vcpu.exec_time_ns() {
-                self.metrics
-                    .add_vcpu_time_ns(exec_time_ns.saturating_sub(last_exec_time_ns));
-                last_exec_time_ns = exec_time_ns;
+            unaccounted_exits = unaccounted_exits.saturating_add(1);
+            let flush_accounting = !batch_accounting
+                || unaccounted_exits >= 64
+                || !matches!(&emulation, Ok(VcpuEmulation::Handled));
+            if flush_accounting {
+                if let Some(exec_time_ns) = hvf_vcpu.exec_time_ns() {
+                    self.metrics
+                        .add_vcpu_time_ns(exec_time_ns.saturating_sub(last_exec_time_ns));
+                    last_exec_time_ns = exec_time_ns;
+                }
+                unaccounted_exits = 0;
             }
 
             match emulation {
