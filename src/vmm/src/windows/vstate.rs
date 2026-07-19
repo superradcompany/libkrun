@@ -54,6 +54,8 @@ use windows_sys::Win32::System::Hypervisor::{
     WHV_X64_SEGMENT_REGISTER, WHV_X64_SEGMENT_REGISTER_0, WHV_X64_TABLE_REGISTER,
 };
 use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
+#[cfg(test)]
+use windows_sys::Win32::System::Threading::GetThreadGroupAffinity;
 use windows_sys::Win32::System::Threading::{
     GetCurrentThread, GetThreadTimes, SetThreadGroupAffinity,
 };
@@ -2707,5 +2709,25 @@ mod tests {
         };
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn host_affinity_binds_the_current_thread_to_one_allowed_processor() {
+        let mut inherited = GROUP_AFFINITY::default();
+        let result = unsafe { GetThreadGroupAffinity(GetCurrentThread(), &mut inherited) };
+        assert_ne!(result, 0, "GetThreadGroupAffinity failed");
+        assert_ne!(
+            inherited.Mask, 0,
+            "current thread has an empty affinity mask"
+        );
+
+        let index = inherited.Mask.trailing_zeros() as u16;
+        apply_host_cpu_affinity(Some(HostCpuId::in_group(inherited.Group, index))).unwrap();
+
+        let mut applied = GROUP_AFFINITY::default();
+        let result = unsafe { GetThreadGroupAffinity(GetCurrentThread(), &mut applied) };
+        assert_ne!(result, 0, "GetThreadGroupAffinity failed after binding");
+        assert_eq!(applied.Group, inherited.Group);
+        assert_eq!(applied.Mask, 1usize << index);
     }
 }
