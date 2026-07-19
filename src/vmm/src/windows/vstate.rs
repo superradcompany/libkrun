@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
-use crate::vmm_config::machine_config::CpuFeaturesTemplate;
+use crate::vmm_config::machine_config::{CpuFeaturesTemplate, HostCpuId};
 
 use arch::ArchMemoryInfo;
 #[cfg(target_arch = "x86_64")]
@@ -53,7 +53,10 @@ use windows_sys::Win32::System::Hypervisor::{
     WHV_TRANSLATE_GVA_RESULT_CODE, WHV_X64_CPUID_ACCESS_CONTEXT, WHV_X64_IO_PORT_ACCESS_CONTEXT,
     WHV_X64_SEGMENT_REGISTER, WHV_X64_SEGMENT_REGISTER_0, WHV_X64_TABLE_REGISTER,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentThread, GetThreadTimes, SetThreadGroupAffinity,
+};
 
 #[cfg(target_arch = "aarch64")]
 const AARCH64_PSR_MODE_EL1H: u64 = 0x0000_0005;
@@ -261,6 +264,7 @@ pub enum Error {
         id: u8,
         reason: WHV_RUN_VP_EXIT_REASON,
     },
+    VcpuAffinity(std::io::Error),
     VcpuThreadSpawn(std::io::Error),
     VcpuCountZero,
 }
@@ -398,6 +402,9 @@ impl Display for Error {
             Error::UnhandledExit { id, reason } => {
                 write!(f, "WHP vCPU {id} exited with unhandled reason {reason}")
             }
+            Error::VcpuAffinity(error) => {
+                write!(f, "cannot apply WHP vCPU host affinity: {error}")
+            }
             Error::VcpuThreadSpawn(e) => write!(f, "cannot spawn WHP vCPU thread: {e}"),
             Error::VcpuCountZero => write!(f, "WHP partition requires at least one vCPU"),
         }
@@ -428,6 +435,7 @@ pub struct VcpuConfig {
 
 pub struct Vcpu {
     id: u8,
+    host_cpu: Option<HostCpuId>,
     partition_handle: WHV_PARTITION_HANDLE,
     guest_mem: Option<GuestMemoryMmap>,
     mmio_bus: Option<devices::Bus>,
@@ -846,6 +854,7 @@ impl Vcpu {
 
         Ok(Self {
             id,
+            host_cpu: None,
             partition_handle,
             guest_mem: None,
             mmio_bus: None,
@@ -864,6 +873,11 @@ impl Vcpu {
 
     pub fn set_mmio_bus(&mut self, mmio_bus: devices::Bus) {
         self.mmio_bus = Some(mmio_bus);
+    }
+
+    /// Selects the host processor group and logical processor for this vCPU thread.
+    pub(crate) fn set_host_cpu(&mut self, host_cpu: HostCpuId) {
+        self.host_cpu = Some(host_cpu);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -917,6 +931,7 @@ impl Vcpu {
             .expect("response receiver missing before vcpu start");
 
         let id = self.id;
+        let host_cpu = self.host_cpu;
         let partition_handle = self.partition_handle;
         let guest_mem = self
             .guest_mem
@@ -930,26 +945,53 @@ impl Vcpu {
         let exit_evt = self.exit_evt.try_clone().map_err(Error::VcpuThreadSpawn)?;
         let metrics = self.metrics.clone();
         self.partition_handle = 0;
+        let (init_sender, init_receiver) = unbounded();
 
         let vcpu_thread = thread::Builder::new()
             .name(format!("whp-vcpu-{id}"))
             .spawn(move || {
-                run_vcpu(
-                    id,
-                    partition_handle,
-                    guest_mem,
-                    mmio_bus,
-                    #[cfg(target_arch = "x86_64")]
-                    pio_bus,
-                    #[cfg(target_arch = "x86_64")]
-                    sipi_router,
-                    exit_evt,
-                    metrics,
-                    event_receiver,
-                    response_sender,
-                )
+                let init_result = apply_host_cpu_affinity(host_cpu);
+                let initialized = init_result.is_ok();
+                init_sender
+                    .send(init_result)
+                    .expect("cannot notify WHP vCPU initialization");
+
+                if initialized {
+                    run_vcpu(
+                        id,
+                        partition_handle,
+                        guest_mem,
+                        mmio_bus,
+                        #[cfg(target_arch = "x86_64")]
+                        pio_bus,
+                        #[cfg(target_arch = "x86_64")]
+                        sipi_router,
+                        exit_evt,
+                        metrics,
+                        event_receiver,
+                        response_sender,
+                    );
+                } else {
+                    // Ownership moved out of `Vcpu` before the thread was spawned. If affinity
+                    // initialization fails, release the WHP processor here instead of leaking it.
+                    let hresult = unsafe {
+                        WHvDeleteVirtualProcessor(partition_handle, id as u32)
+                    };
+                    if hresult < 0 {
+                        error!(
+                            "WHvDeleteVirtualProcessor({id}) after affinity failure returned HRESULT 0x{:08x}",
+                            hresult as u32
+                        );
+                    }
+                }
             })
             .map_err(Error::VcpuThreadSpawn)?;
+
+        // Affinity is part of VM correctness: fail construction before any vCPU can execute if
+        // Windows rejects a processor-group coordinate or the inherited host constraints.
+        init_receiver
+            .recv()
+            .expect("error waiting for WHP vCPU initialization")?;
 
         Ok(VcpuHandle::new(
             id,
@@ -1061,6 +1103,47 @@ impl Vcpu {
 
         set_vcpu_registers(self.partition_handle, self.id, &names, &values)
     }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions: Host CPU Affinity
+//--------------------------------------------------------------------------------------------------
+
+fn apply_host_cpu_affinity(host_cpu: Option<HostCpuId>) -> Result<()> {
+    let Some(host_cpu) = host_cpu else {
+        return Ok(());
+    };
+    let affinity = group_affinity(host_cpu).map_err(Error::VcpuAffinity)?;
+
+    // SAFETY: the pseudo-handle refers to this vCPU thread, `affinity` is initialized and remains
+    // live for the call, and a null previous-affinity pointer is explicitly accepted by Windows.
+    let result =
+        unsafe { SetThreadGroupAffinity(GetCurrentThread(), &affinity, std::ptr::null_mut()) };
+    if result == 0 {
+        return Err(Error::VcpuAffinity(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+fn group_affinity(host_cpu: HostCpuId) -> std::io::Result<GROUP_AFFINITY> {
+    let index = u32::from(host_cpu.index);
+    if index >= usize::BITS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "host CPU {}:{} exceeds the {}-processor group width",
+                host_cpu.group,
+                host_cpu.index,
+                usize::BITS
+            ),
+        ));
+    }
+
+    Ok(GROUP_AFFINITY {
+        Mask: 1usize << index,
+        Group: host_cpu.group,
+        Reserved: [0; 3],
+    })
 }
 
 impl VcpuHandle {
@@ -2597,4 +2680,32 @@ unsafe extern "system" fn emulator_translate_gva_callback(
     }
 
     hresult
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_affinity_encodes_processor_group_and_single_cpu_mask() {
+        let affinity = group_affinity(HostCpuId::in_group(3, 7)).unwrap();
+
+        assert_eq!(affinity.Group, 3);
+        assert_eq!(affinity.Mask, 1usize << 7);
+        assert_eq!(affinity.Reserved, [0; 3]);
+    }
+
+    #[test]
+    fn group_affinity_rejects_index_outside_windows_group_width() {
+        let error = match group_affinity(HostCpuId::new(usize::BITS as u16)) {
+            Ok(_) => panic!("processor index outside the group width should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
 }
