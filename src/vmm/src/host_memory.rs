@@ -157,6 +157,20 @@ fn allow_advised_huge_pages() -> Result<(), Error> {
             0,
         )
     };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::EINVAL) {
+        return Err(Error::Advice(error));
+    }
+
+    // PR_THP_DISABLE_EXCEPT_ADVISED was added after Linux 6.12. On older kernels, clear a
+    // launcher's inherited process-wide disable before advising only the guest-RAM VMAs. Libkrun
+    // already marks VMM thread stacks MADV_NOHUGEPAGE, and non-anonymous device mappings remain
+    // governed by their own mapping and host-shmem policy.
+    let result = unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 0, 0, 0, 0) };
     if result != 0 {
         return Err(Error::Advice(io::Error::last_os_error()));
     }
@@ -281,10 +295,12 @@ mod tests {
 
         apply_linux(&guest_memory, &ranges, HostMemoryPolicy::PreferHugePages)
             .expect("MADV_HUGEPAGE");
-        assert_eq!(
-            unsafe { libc::prctl(libc::PR_GET_THP_DISABLE, 0, 0, 0, 0) },
-            3,
-            "huge-page preference must survive an inherited process-wide THP disable"
+        assert!(
+            matches!(
+                unsafe { libc::prctl(libc::PR_GET_THP_DISABLE, 0, 0, 0, 0) },
+                0 | 3
+            ),
+            "huge-page preference must override an inherited process-wide THP disable"
         );
         let host_addr = guest_memory
             .find_region(GuestAddress(0))
