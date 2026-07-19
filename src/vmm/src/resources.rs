@@ -26,7 +26,7 @@ use crate::vmm_config::kernel_bundle::{KernelBundle, KernelBundleError};
 #[cfg(feature = "tee")]
 use crate::vmm_config::kernel_bundle::{QbootBundle, QbootBundleError};
 use crate::vmm_config::kernel_cmdline::{KernelCmdlineConfig, KernelCmdlineConfigError};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::vmm_config::machine_config::HostCpuId;
 use crate::vmm_config::machine_config::{VmConfig, VmConfigError};
 #[cfg(feature = "net")]
@@ -158,7 +158,7 @@ pub struct VmResources {
     /// The vCpu and memory configuration for this microVM.
     vm_config: VmConfig,
     /// Resolved host logical processor for every possible vCPU thread.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub vcpu_affinity: Option<Vec<HostCpuId>>,
     /// The firmware to be loaded into the microVM.
     pub firmware_config: Option<FirmwareConfig>,
@@ -254,7 +254,7 @@ impl Default for VmResources {
     fn default() -> Self {
         Self {
             vm_config: VmConfig::default(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             vcpu_affinity: None,
             firmware_config: None,
             kernel_cmdline: KernelCmdlineConfig::default(),

@@ -353,7 +353,7 @@ impl VmBuilder {
                 }));
             }
 
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
             return Err(Error::Config(ConfigError::VcpuAffinityUnsupported));
 
             #[cfg(target_os = "linux")]
@@ -377,7 +377,7 @@ impl VmBuilder {
         vmr.set_vm_config(&vm_config)
             .map_err(|err| map_vm_config_error(&self.machine, err))?;
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
             vmr.vcpu_affinity = self.machine.vcpu_affinity;
         }
@@ -766,7 +766,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     #[test]
     fn build_rejects_vcpu_affinity_on_unsupported_hosts() {
         let err = match VmBuilder::new()
