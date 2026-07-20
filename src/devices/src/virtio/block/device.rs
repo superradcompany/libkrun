@@ -51,7 +51,7 @@ use super::windows::{
 use super::worker::BlockWorker;
 use super::{
     super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice, TYPE_BLOCK},
-    Error, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
+    Error, MAX_EXPERIMENTAL_QUEUES, QUEUE_SIZE, SECTOR_SHIFT, SECTOR_SIZE,
 };
 
 use crate::virtio::{
@@ -487,6 +487,8 @@ pub struct Block {
     cache_type: CacheType,
     disk_image: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
+    #[cfg(target_os = "linux")]
+    linux_raw_file: Option<Arc<File>>,
     #[cfg(windows)]
     windows_raw_file: Option<Arc<WindowsRawFile>>,
     metrics: BlockMetricsWriter,
@@ -497,6 +499,7 @@ pub struct Block {
     pub(crate) avail_features: u64,
     pub(crate) acked_features: u64,
     config: VirtioBlkConfig,
+    queue_config: Vec<QueueConfig>,
 
     // Transport related fields.
     pub(crate) device_state: DeviceState,
@@ -533,6 +536,21 @@ impl Block {
             .read(true)
             .write(!is_disk_read_only)
             .open(PathBuf::from(&disk_image_path))?;
+
+        #[cfg(target_os = "linux")]
+        let linux_raw_file = if PerfExperiment::BlockIoUring.enabled()
+            && matches!(&disk_image_format, ImageType::Raw)
+            && !direct_io
+        {
+            Some(Arc::new(
+                OpenOptions::new()
+                    .read(true)
+                    .write(!is_disk_read_only)
+                    .open(&disk_image_path)?,
+            ))
+        } else {
+            None
+        };
 
         #[cfg(windows)]
         let windows_raw_file = if matches!(&disk_image_format, ImageType::Raw) {
@@ -635,6 +653,12 @@ impl Block {
         if is_disk_read_only {
             avail_features |= 1u64 << VIRTIO_BLK_F_RO;
         };
+        let num_queues = if PerfExperiment::BlockMultiqueue.enabled() {
+            avail_features |= 1u64 << VIRTIO_BLK_F_MQ;
+            MAX_EXPERIMENTAL_QUEUES
+        } else {
+            1
+        };
 
         let config = VirtioBlkConfig {
             capacity: disk_properties.nsectors(),
@@ -647,17 +671,22 @@ impl Block {
             max_write_zeroes_sectors: u32::MAX,
             max_write_zeroes_seg: 1,
             write_zeroes_may_unmap: 1,
+            num_queues,
             ..Default::default()
         };
+        let queue_config = vec![QueueConfig::new(QUEUE_SIZE); usize::from(num_queues)];
 
         Ok(Block {
             id,
             partuuid,
             config,
+            queue_config,
             disk: Some(disk_properties),
             cache_type,
             disk_image,
             disk_image_id,
+            #[cfg(target_os = "linux")]
+            linux_raw_file,
             #[cfg(windows)]
             windows_raw_file,
             metrics,
@@ -695,7 +724,7 @@ impl VirtioDevice for Block {
     }
 
     fn queue_config(&self) -> &[QueueConfig] {
-        &QUEUE_CONFIG
+        &self.queue_config
     }
 
     fn avail_features(&self) -> u64 {
@@ -742,10 +771,13 @@ impl VirtioDevice for Block {
             panic!("virtio_blk: worker thread already exists");
         }
 
-        let [blk_q]: [_; NUM_QUEUES] = queues.try_into().map_err(|_| {
-            error!("Cannot perform activate. Expected {} queue(s)", NUM_QUEUES);
-            ActivateError::BadActivate
-        })?;
+        if queues.len() != self.queue_config.len() {
+            error!(
+                "Cannot perform activate. Expected {} queue(s)",
+                self.queue_config.len()
+            );
+            return Err(ActivateError::BadActivate);
+        }
 
         let disk = match self.disk.take() {
             Some(d) => d,
@@ -771,10 +803,12 @@ impl VirtioDevice for Block {
         };
 
         let worker = BlockWorker::new(
-            blk_q,
+            queues,
             interrupt.clone(),
             mem.clone(),
             disk,
+            #[cfg(target_os = "linux")]
+            self.linux_raw_file.clone(),
             self.worker_stopfd.try_clone().unwrap(),
             self.metrics.clone(),
         );
