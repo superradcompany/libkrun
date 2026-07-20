@@ -70,11 +70,21 @@ impl PerfExperiment {
     }
 
     fn enabled_in(self, raw: &str) -> bool {
-        raw.split(',').map(str::trim).any(|selector| {
-            selector.eq_ignore_ascii_case("all")
-                || selector.eq_ignore_ascii_case(self.group())
-                || selector.eq_ignore_ascii_case(self.name())
-        })
+        raw.split(',')
+            .map(str::trim)
+            .fold(false, |enabled, selector| {
+                let (selected, selector) = selector
+                    .strip_prefix('-')
+                    .map_or((true, selector), |selector| (false, selector));
+                if selector.eq_ignore_ascii_case("all")
+                    || selector.eq_ignore_ascii_case(self.group())
+                    || selector.eq_ignore_ascii_case(self.name())
+                {
+                    selected
+                } else {
+                    enabled
+                }
+            })
     }
 }
 
@@ -92,5 +102,7 @@ mod tests {
         assert!(PerfExperiment::BlockIoUring.enabled_in("block"));
         assert!(PerfExperiment::VcpuAccounting.enabled_in("all"));
         assert!(!PerfExperiment::VcpuAccounting.enabled_in("network"));
+        assert!(!PerfExperiment::BlockIoUring.enabled_in("all,-block-io-uring"));
+        assert!(PerfExperiment::BlockCompletions.enabled_in("all,-block-io-uring"));
     }
 }
