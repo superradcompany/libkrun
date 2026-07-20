@@ -97,12 +97,17 @@ impl<'a> DescriptorChainConsumer<'a> {
                 break;
             }
 
-            bufs.push(vs);
-
             let rem = count - buflen;
             if rem < vs.len() {
+                // The callback must never see bytes beyond the caller's requested range. This is
+                // especially important for status bytes that share a descriptor with block data.
+                let (prefix, _) = vs
+                    .split_at(rem)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                bufs.push(prefix);
                 buflen += rem;
             } else {
+                bufs.push(vs);
                 buflen += vs.len();
             }
         }
@@ -112,6 +117,14 @@ impl<'a> DescriptorChainConsumer<'a> {
         }
 
         let bytes_consumed = f(&bufs)?;
+        if bytes_consumed > buflen {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "descriptor callback consumed {bytes_consumed} bytes after receiving {buflen}"
+                ),
+            ));
+        }
 
         // This can happen if a driver tricks a device into reading/writing more data than
         // fits in a `usize`.
@@ -159,9 +172,9 @@ impl<'a> DescriptorChainConsumer<'a> {
                 // There must be at least one element in `other` because we checked
                 // its `size` value in the call to `position` above.
                 let front = other.pop_front().expect("empty VecDeque after split");
-                self.buffers
-                    .push_back(front.offset(rem).map_err(Error::VolatileMemoryError)?);
-                other.push_front(front.offset(rem).map_err(Error::VolatileMemoryError)?);
+                let (prefix, suffix) = front.split_at(rem).map_err(Error::VolatileMemoryError)?;
+                self.buffers.push_back(prefix);
+                other.push_front(suffix);
             }
 
             Ok(DescriptorChainConsumer {
@@ -613,6 +626,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn consume_clips_the_final_slice_to_the_requested_count() {
+        let mut bytes = [0u8; 16];
+        let slice = VolatileSlice::from(&mut bytes[..]);
+        let mut consumer = DescriptorChainConsumer {
+            buffers: VecDeque::from([slice]),
+            bytes_consumed: 0,
+        };
+
+        let consumed = consumer
+            .consume(5, |buffers| {
+                Ok(buffers.iter().map(VolatileSlice::len).sum())
+            })
+            .unwrap();
+
+        assert_eq!(consumed, 5);
+        assert_eq!(consumer.bytes_consumed(), 5);
+        assert_eq!(consumer.available_bytes(), 11);
+    }
+
+    #[test]
+    fn consume_rejects_callback_overconsumption_without_advancing() {
+        let mut bytes = [0u8; 16];
+        let slice = VolatileSlice::from(&mut bytes[..]);
+        let mut consumer = DescriptorChainConsumer {
+            buffers: VecDeque::from([slice]),
+            bytes_consumed: 0,
+        };
+
+        let error = consumer.consume(5, |_| Ok(6)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(consumer.bytes_consumed(), 0);
+        assert_eq!(consumer.available_bytes(), 16);
+    }
+
+    #[test]
     fn reader_test_simple_chain() {
         use DescriptorType::*;
 
@@ -961,6 +1010,33 @@ mod tests {
         let other = reader.split_at(24).expect("failed to split Reader");
         assert_eq!(reader.available_bytes(), 24);
         assert_eq!(other.available_bytes(), 104);
+    }
+
+    #[test]
+    fn split_middle_preserves_prefix_and_suffix_contents() {
+        use DescriptorType::*;
+
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0),
+            GuestAddress(0x100),
+            vec![(Readable, 16), (Readable, 16), (Readable, 32)],
+            0,
+        )
+        .unwrap();
+        let expected = (0u8..64).collect::<Vec<_>>();
+        memory.write(&expected, GuestAddress(0x100)).unwrap();
+
+        let mut prefix = Reader::new(&memory, chain).unwrap();
+        let mut suffix = prefix.split_at(24).unwrap();
+        let mut prefix_bytes = Vec::new();
+        let mut suffix_bytes = Vec::new();
+        prefix.read_to_end(&mut prefix_bytes).unwrap();
+        suffix.read_to_end(&mut suffix_bytes).unwrap();
+
+        assert_eq!(prefix_bytes, expected[..24]);
+        assert_eq!(suffix_bytes, expected[24..]);
     }
 
     #[test]
