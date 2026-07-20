@@ -1288,6 +1288,15 @@ impl BlockWorker {
         completions.clear();
         {
             let backend = self.linux_raw.as_mut().expect("io_uring backend selected");
+            if self.batch_completions && !pending.is_empty() {
+                // The ring fd becomes readable on the first CQE. Reaping immediately would turn a
+                // depth-64 guest submission into a stream of tiny completion/interrupt/refill
+                // cycles. Wait for one terminal CQE from every request already in this bounded
+                // epoch, then publish the whole batch and refill at full depth.
+                if let Err(error) = backend.ring.submit_and_wait(pending.len) {
+                    error!("io_uring completion-batch wait failed: {error:?}");
+                }
+            }
             completions.extend(
                 backend
                     .ring
