@@ -64,6 +64,12 @@ const MAX_PENDING_LINUX_RAW_REQUESTS: usize = 64;
 const MAX_LINUX_RAW_REQUEST_BYTES: usize = 1024 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_LINUX_RAW_BOUNCE_FAST_PATH_BYTES: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
+const BLOCK_CQ_POLICY_ENV: &str = "MSB_BLOCK_CQ_POLICY";
+#[cfg(target_os = "linux")]
+const BLOCK_CQ_WATERMARK_LOW: usize = 8;
+#[cfg(target_os = "linux")]
+const BLOCK_CQ_WATERMARK_HIGH: usize = 16;
 #[cfg(windows)]
 const MAX_PENDING_WINDOWS_RAW_REQUESTS: usize = 64;
 
@@ -120,6 +126,8 @@ pub struct BlockWorker {
     metrics: BlockMetricsWriter,
     parse_descriptors_once: bool,
     batch_completions: bool,
+    #[cfg(target_os = "linux")]
+    linux_raw_completion_policy: LinuxRawCompletionPolicy,
 }
 
 #[cfg(target_os = "linux")]
@@ -197,6 +205,25 @@ enum LinuxRawDirection {
     Write,
 }
 
+/// Development-only policy for isolating persistent io_uring completion cadence.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum LinuxRawCompletionPolicy {
+    /// Preserve the current behavior: wait for every request in the bounded epoch.
+    #[default]
+    WaitAll,
+    /// Reap every CQE already available when the ring fd becomes readable.
+    Immediate,
+    /// Wait for up to eight CQEs before publishing and refilling.
+    WatermarkLow,
+    /// Wait for up to sixteen CQEs before publishing and refilling.
+    WatermarkHigh,
+    /// Reap immediately and honor the guest's EVENT_IDX interrupt decision.
+    EventIdx,
+    /// Drain one admitted virtqueue batch locally before returning to epoll.
+    LocalDrain,
+}
+
 #[cfg(target_os = "linux")]
 impl LinuxRawFile {
     pub(super) fn new(
@@ -211,6 +238,52 @@ impl LinuxRawFile {
             req_align,
             mem_align,
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxRawCompletionPolicy {
+    fn from_env() -> Self {
+        let raw = std::env::var(BLOCK_CQ_POLICY_ENV).ok();
+        match Self::parse(raw.as_deref()) {
+            Some(policy) => policy,
+            None => {
+                log::warn!(
+                    "ignoring invalid {BLOCK_CQ_POLICY_ENV}={:?}; using wait-all",
+                    raw.as_deref().unwrap_or_default()
+                );
+                Self::WaitAll
+            }
+        }
+    }
+
+    fn parse(raw: Option<&str>) -> Option<Self> {
+        match raw.map(str::trim).filter(|raw| !raw.is_empty()) {
+            None | Some("wait-all") => Some(Self::WaitAll),
+            Some("immediate") => Some(Self::Immediate),
+            Some("watermark-8") => Some(Self::WatermarkLow),
+            Some("watermark-16") => Some(Self::WatermarkHigh),
+            Some("event-idx") => Some(Self::EventIdx),
+            Some("local-drain") => Some(Self::LocalDrain),
+            Some(_) => None,
+        }
+    }
+
+    fn completion_target(self, pending: usize) -> usize {
+        match self {
+            Self::WaitAll => pending,
+            Self::WatermarkLow => pending.min(BLOCK_CQ_WATERMARK_LOW),
+            Self::WatermarkHigh => pending.min(BLOCK_CQ_WATERMARK_HIGH),
+            Self::Immediate | Self::EventIdx | Self::LocalDrain => 0,
+        }
+    }
+
+    fn uses_conditional_interrupts(self) -> bool {
+        matches!(self, Self::EventIdx | Self::LocalDrain)
+    }
+
+    fn uses_local_drain(self) -> bool {
+        self == Self::LocalDrain
     }
 }
 
@@ -500,6 +573,8 @@ impl BlockWorker {
             metrics,
             parse_descriptors_once: PerfExperiment::BlockDescriptors.enabled(),
             batch_completions: PerfExperiment::BlockCompletions.enabled(),
+            #[cfg(target_os = "linux")]
+            linux_raw_completion_policy: LinuxRawCompletionPolicy::from_env(),
         }
     }
 
@@ -557,13 +632,40 @@ impl BlockWorker {
                                 if let Err(error) = self.device_queues[queue_index].event.read() {
                                     error!("Failed to get queue event: {error:?}");
                                 } else if self.linux_raw.is_some() {
-                                    self.process_linux_virtio_queue(
-                                        queue_index,
-                                        &mut pending,
-                                        &mut bounce_pool,
-                                        &mut completions,
-                                    );
-                                    self.submit_linux_raw_requests();
+                                    if self.linux_raw_completion_policy.uses_local_drain() {
+                                        let mut completed_queues = 0u64;
+                                        loop {
+                                            self.process_linux_virtio_queue(
+                                                queue_index,
+                                                &mut pending,
+                                                &mut bounce_pool,
+                                                &mut completions,
+                                            );
+                                            if pending.is_empty() {
+                                                break;
+                                            }
+                                            self.submit_linux_raw_requests();
+                                            completed_queues |= self.drain_linux_raw_requests(
+                                                &mut pending,
+                                                &mut bounce_pool,
+                                                &mut completions,
+                                            );
+                                        }
+                                        if self.batch_completions && completed_queues != 0 {
+                                            self.signal_linux_raw_batch(
+                                                completed_queues,
+                                                &self.mem.clone(),
+                                            );
+                                        }
+                                    } else {
+                                        self.process_linux_virtio_queue(
+                                            queue_index,
+                                            &mut pending,
+                                            &mut bounce_pool,
+                                            &mut completions,
+                                        );
+                                        self.submit_linux_raw_requests();
+                                    }
                                 } else {
                                     self.process_virtio_queue(queue_index);
                                 }
@@ -1188,7 +1290,7 @@ impl BlockWorker {
             // completions are enabled, publish its one shared interrupt here; otherwise a flush
             // can sit in the used ring forever and deadlock the guest during boot.
             if self.batch_completions {
-                self.signal_linux_raw_queue(queue_index, mem);
+                self.signal_linux_raw_batch(1u64 << queue_index, mem);
             }
         }
     }
@@ -1292,17 +1394,22 @@ impl BlockWorker {
         pending: &mut PendingLinuxRawRequests,
         bounce_pool: &mut LinuxRawBouncePool,
         completions: &mut Vec<(u64, i32)>,
-    ) {
-        let mut completed_any = false;
+    ) -> u64 {
+        let mut completed_queues = 0u64;
         completions.clear();
         {
             let backend = self.linux_raw.as_mut().expect("io_uring backend selected");
-            if self.batch_completions && !pending.is_empty() {
-                // The ring fd becomes readable on the first CQE. Reaping immediately would turn a
-                // depth-64 guest submission into a stream of tiny completion/interrupt/refill
-                // cycles. Wait for one terminal CQE from every request already in this bounded
-                // epoch, then publish the whole batch and refill at full depth.
-                if let Err(error) = backend.ring.submit_and_wait(pending.len) {
+            let completion_target = if self.batch_completions {
+                self.linux_raw_completion_policy
+                    .completion_target(pending.len)
+            } else {
+                0
+            };
+            if completion_target > 0 {
+                // The watermark is always bounded by the 64-request table. `wait-all` preserves
+                // the previous experiment; lower watermarks isolate completion cadence without
+                // changing request buffers, descriptor ownership, or flush ordering.
+                if let Err(error) = backend.ring.submit_and_wait(completion_target) {
                     error!("io_uring completion-batch wait failed: {error:?}");
                 }
             }
@@ -1350,25 +1457,19 @@ impl BlockWorker {
 
             let success = completed == Some(remaining);
             let request = pending.remove(request_id).expect("request still pending");
-            completed_any = true;
+            if request.queue_index < u64::BITS as usize {
+                completed_queues |= 1u64 << request.queue_index;
+            }
             self.complete_linux_raw_request(request, success, result, &mem, bounce_pool);
         }
 
-        if self.batch_completions && completed_any {
-            // Consume each queue's EVENT_IDX accounting, then raise one shared interrupt for the
-            // whole CQ batch. A request can complete after the guest has suppressed the next
-            // indexed interrupt and gone idle; waiting for a later CQE in that state deadlocks the
-            // queue. One interrupt per non-empty reap preserves batching without relying on future
-            // I/O for forward progress.
-            for queue_index in 0..self.device_queues.len() {
-                let _ = self.device_queues[queue_index]
-                    .queue
-                    .needs_notification(&mem);
-            }
-            if let Err(error) = self.interrupt.try_signal_used_queue() {
-                log::error!("failed to signal batched io_uring completions: {error:?}");
-            }
+        if self.batch_completions
+            && completed_queues != 0
+            && !self.linux_raw_completion_policy.uses_local_drain()
+        {
+            self.signal_linux_raw_batch(completed_queues, &mem);
         }
+        completed_queues
     }
 
     #[cfg(target_os = "linux")]
@@ -1377,7 +1478,8 @@ impl BlockWorker {
         pending: &mut PendingLinuxRawRequests,
         bounce_pool: &mut LinuxRawBouncePool,
         completions: &mut Vec<(u64, i32)>,
-    ) {
+    ) -> u64 {
+        let mut completed_queues = 0u64;
         while !pending.is_empty() {
             let backend = self.linux_raw.as_mut().expect("io_uring backend selected");
             if let Err(error) = backend.ring.submit_and_wait(1) {
@@ -1387,8 +1489,9 @@ impl BlockWorker {
                 thread::yield_now();
                 continue;
             }
-            self.reap_linux_raw_requests(pending, bounce_pool, completions);
+            completed_queues |= self.reap_linux_raw_requests(pending, bounce_pool, completions);
         }
+        completed_queues
     }
 
     #[cfg(target_os = "linux")]
@@ -1530,6 +1633,30 @@ impl BlockWorker {
             .needs_notification(mem);
         if let Err(error) = self.interrupt.try_signal_used_queue() {
             log::error!("failed to signal io_uring block completion: {error:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn signal_linux_raw_batch(&mut self, completed_queues: u64, mem: &GuestMemoryMmap) {
+        let mut notification_requested = false;
+        for queue_index in 0..self.device_queues.len().min(u64::BITS as usize) {
+            if completed_queues & (1u64 << queue_index) == 0 {
+                continue;
+            }
+            notification_requested |= self.device_queues[queue_index]
+                .queue
+                .needs_notification(mem)
+                .unwrap_or(false);
+        }
+
+        if !self
+            .linux_raw_completion_policy
+            .uses_conditional_interrupts()
+            || notification_requested
+        {
+            if let Err(error) = self.interrupt.try_signal_used_queue() {
+                log::error!("failed to signal batched io_uring completions: {error:?}");
+            }
         }
     }
 
@@ -2464,5 +2591,42 @@ mod tests {
         let mut second = pool.acquire(4096, 4096).unwrap();
 
         assert_eq!(second.as_mut().as_ptr(), first_ptr);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_policy_parses_development_modes() {
+        assert_eq!(
+            LinuxRawCompletionPolicy::parse(None),
+            Some(LinuxRawCompletionPolicy::WaitAll)
+        );
+        assert_eq!(
+            LinuxRawCompletionPolicy::parse(Some("watermark-8")),
+            Some(LinuxRawCompletionPolicy::WatermarkLow)
+        );
+        assert_eq!(
+            LinuxRawCompletionPolicy::parse(Some("watermark-16")),
+            Some(LinuxRawCompletionPolicy::WatermarkHigh)
+        );
+        assert_eq!(
+            LinuxRawCompletionPolicy::parse(Some("local-drain")),
+            Some(LinuxRawCompletionPolicy::LocalDrain)
+        );
+        assert_eq!(LinuxRawCompletionPolicy::parse(Some("unknown")), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_policy_targets_are_bounded_by_pending_work() {
+        assert_eq!(LinuxRawCompletionPolicy::WaitAll.completion_target(64), 64);
+        assert_eq!(
+            LinuxRawCompletionPolicy::WatermarkLow.completion_target(64),
+            BLOCK_CQ_WATERMARK_LOW
+        );
+        assert_eq!(
+            LinuxRawCompletionPolicy::WatermarkHigh.completion_target(4),
+            4
+        );
+        assert_eq!(LinuxRawCompletionPolicy::Immediate.completion_target(64), 0);
     }
 }
