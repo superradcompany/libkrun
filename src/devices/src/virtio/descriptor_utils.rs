@@ -380,6 +380,12 @@ impl<'a> Reader<'a> {
         self.buffer.bytes_consumed()
     }
 
+    /// Returns the validated slices that have not yet been consumed.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn remaining_slices(&self) -> impl Iterator<Item = VolatileSlice<'a>> + '_ {
+        self.buffer.buffers.iter().copied()
+    }
+
     /// Splits this `Reader` into two at the given offset in the `DescriptorChain` buffer.
     /// After the split, `self` will be able to read up to `offset` bytes while the returned
     /// `Reader` can read up to `available_bytes() - offset` bytes.  Returns an error if
@@ -522,6 +528,12 @@ impl<'a> Writer<'a> {
     /// Returns number of bytes already written to the descriptor chain buffer.
     pub fn bytes_written(&self) -> usize {
         self.buffer.bytes_consumed()
+    }
+
+    /// Returns the validated slices that have not yet been consumed.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn remaining_slices(&self) -> impl Iterator<Item = VolatileSlice<'a>> + '_ {
+        self.buffer.buffers.iter().copied()
     }
 
     /// Splits this `Writer` into two at the given offset in the `DescriptorChain` buffer.

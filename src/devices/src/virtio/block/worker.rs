@@ -17,16 +17,16 @@ use io_uring::{opcode, types, IoUring};
 #[cfg(windows)]
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
-use std::collections::HashMap;
-#[cfg(target_os = "linux")]
 use std::fs::File;
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(windows)]
 use std::io::Read;
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, RawHandle};
+#[cfg(target_os = "linux")]
+use std::ptr::{copy_nonoverlapping, write_volatile};
 use std::result;
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
@@ -40,9 +40,14 @@ use utils::metrics::BlockMetricsWriter;
 use utils::metrics::BlockRequestKind;
 use utils::performance::PerfExperiment;
 use virtio_bindings::virtio_blk::*;
+#[cfg(target_os = "linux")]
+use vm_memory::VolatileSlice;
 #[cfg(windows)]
 use vm_memory::{Address, GuestMemoryBackend};
 use vm_memory::{ByteValued, GuestMemoryMmap};
+
+#[cfg(target_os = "linux")]
+use smallvec::SmallVec;
 
 #[cfg(unix)]
 type Pollable = std::os::fd::RawFd;
@@ -51,6 +56,8 @@ type Pollable = RawHandle;
 
 const QUEUE_EVENT_BASE: u64 = 0;
 const STOP_EVENT: u64 = 64;
+#[cfg(target_os = "linux")]
+const LINUX_RAW_EVENT: u64 = 65;
 #[cfg(target_os = "linux")]
 const MAX_PENDING_LINUX_RAW_REQUESTS: usize = 64;
 #[cfg(target_os = "linux")]
@@ -117,7 +124,6 @@ pub struct BlockWorker {
 struct LinuxRawBackend {
     file: Arc<File>,
     ring: IoUring,
-    next_request_id: u64,
     direct_io: bool,
     req_align: usize,
     mem_align: usize,
@@ -137,9 +143,49 @@ struct PendingLinuxRawRequest {
     queue_index: usize,
     head_index: u16,
     direction: LinuxRawDirection,
-    buffer: IoBuffer,
+    data: LinuxRawRequestData,
+    status_ptr: *mut u8,
+    data_len: usize,
     offset: u64,
     completed: usize,
+}
+
+#[cfg(target_os = "linux")]
+enum LinuxRawRequestData {
+    Guest {
+        buffers: SmallVec<[LinuxRawFileBuffer; 4]>,
+        iovecs: SmallVec<[libc::iovec; 4]>,
+    },
+    Bounce {
+        buffer: IoBuffer,
+        guest_buffers: SmallVec<[LinuxRawFileBuffer; 4]>,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct LinuxRawFileBuffer {
+    ptr: *mut u8,
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+struct PendingLinuxRawRequests {
+    slots: Vec<PendingLinuxRawSlot>,
+    free: Vec<usize>,
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+struct PendingLinuxRawSlot {
+    generation: u32,
+    request: Option<PendingLinuxRawRequest>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct LinuxRawBouncePool {
+    buffers: Vec<IoBuffer>,
 }
 
 #[cfg(target_os = "linux")]
@@ -162,6 +208,169 @@ impl LinuxRawFile {
             direct_io,
             req_align,
             mem_align,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxRawFileBuffer {
+    /// # Safety
+    ///
+    /// `ptr..ptr+len` must remain valid until the matching io_uring completion is reaped.
+    unsafe fn new(ptr: *mut u8, len: usize) -> Self {
+        Self { ptr, len }
+    }
+
+    fn is_direct_io_aligned(self, alignment: usize) -> bool {
+        alignment > 0
+            && (self.ptr as usize).is_multiple_of(alignment)
+            && self.len.is_multiple_of(alignment)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PendingLinuxRawRequest {
+    fn remaining(&self) -> usize {
+        self.data_len - self.completed
+    }
+
+    fn rebuild_iovecs(&mut self) -> io::Result<()> {
+        let LinuxRawRequestData::Guest { buffers, iovecs } = &mut self.data else {
+            return Ok(());
+        };
+
+        iovecs.clear();
+        let mut skip = self.completed;
+        for buffer in buffers {
+            if skip >= buffer.len {
+                skip -= buffer.len;
+                continue;
+            }
+
+            let ptr = unsafe { buffer.ptr.add(skip) };
+            iovecs.push(libc::iovec {
+                iov_base: ptr.cast(),
+                iov_len: buffer.len - skip,
+            });
+            skip = 0;
+        }
+
+        if skip != 0 || iovecs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "guest iovec cursor exceeded the request length",
+            ));
+        }
+        Ok(())
+    }
+
+    fn copy_bounce_read_to_guest(&self) -> io::Result<()> {
+        let LinuxRawRequestData::Bounce {
+            buffer,
+            guest_buffers,
+        } = &self.data
+        else {
+            return Ok(());
+        };
+
+        let mut copied = 0usize;
+        for guest in guest_buffers {
+            let end = copied
+                .checked_add(guest.len)
+                .ok_or_else(|| io::Error::other("bounce read length overflow"))?;
+            let buffer_ref = buffer.as_ref();
+            let source = buffer_ref
+                .into_slice()
+                .get(copied..end)
+                .ok_or_else(|| io::Error::other("bounce read exceeded its buffer"))?;
+            unsafe {
+                copy_nonoverlapping(source.as_ptr(), guest.ptr, guest.len);
+            }
+            copied = end;
+        }
+
+        (copied == self.data_len)
+            .then_some(())
+            .ok_or_else(|| io::Error::other("bounce read did not cover every guest byte"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PendingLinuxRawRequests {
+    fn new() -> Self {
+        let slots = (0..MAX_PENDING_LINUX_RAW_REQUESTS)
+            .map(|_| PendingLinuxRawSlot {
+                generation: 0,
+                request: None,
+            })
+            .collect();
+        let free = (0..MAX_PENDING_LINUX_RAW_REQUESTS).rev().collect();
+        Self {
+            slots,
+            free,
+            len: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn is_full(&self) -> bool {
+        self.len == MAX_PENDING_LINUX_RAW_REQUESTS
+    }
+
+    fn insert(&mut self, request: PendingLinuxRawRequest) -> io::Result<u64> {
+        let index = self
+            .free
+            .pop()
+            .ok_or_else(|| io::Error::other("io_uring request table is full"))?;
+        let slot = &mut self.slots[index];
+        slot.generation = slot.generation.wrapping_add(1).max(1);
+        slot.request = Some(request);
+        self.len += 1;
+        Ok((u64::from(slot.generation) << 32) | index as u64)
+    }
+
+    fn get_mut(&mut self, request_id: u64) -> Option<&mut PendingLinuxRawRequest> {
+        let (index, generation) = Self::decode(request_id)?;
+        let slot = self.slots.get_mut(index)?;
+        (slot.generation == generation)
+            .then_some(slot.request.as_mut())
+            .flatten()
+    }
+
+    fn remove(&mut self, request_id: u64) -> Option<PendingLinuxRawRequest> {
+        let (index, generation) = Self::decode(request_id)?;
+        let slot = self.slots.get_mut(index)?;
+        if slot.generation != generation {
+            return None;
+        }
+        let request = slot.request.take()?;
+        self.free.push(index);
+        self.len -= 1;
+        Some(request)
+    }
+
+    fn decode(request_id: u64) -> Option<(usize, u32)> {
+        let index = usize::try_from(request_id & u64::from(u32::MAX)).ok()?;
+        let generation = u32::try_from(request_id >> 32).ok()?;
+        (generation != 0 && index < MAX_PENDING_LINUX_RAW_REQUESTS).then_some((index, generation))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxRawBouncePool {
+    fn acquire(&mut self, len: usize, alignment: usize) -> io::Result<IoBuffer> {
+        if let Some(index) = self.buffers.iter().position(|buffer| buffer.len() == len) {
+            return Ok(self.buffers.swap_remove(index));
+        }
+        IoBuffer::new(len, alignment)
+    }
+
+    fn release(&mut self, buffer: IoBuffer) {
+        if self.buffers.len() < MAX_PENDING_LINUX_RAW_REQUESTS {
+            self.buffers.push(buffer);
         }
     }
 }
@@ -268,7 +477,6 @@ impl BlockWorker {
                 Ok(ring) => Some(LinuxRawBackend {
                     file: raw.file,
                     ring,
-                    next_request_id: 1,
                     direct_io: raw.direct_io,
                     req_align: raw.req_align,
                     mem_align: raw.mem_align,
@@ -300,7 +508,99 @@ impl BlockWorker {
             .unwrap()
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    fn work(mut self) {
+        let epoll = Epoll::new().unwrap();
+        for (index, queue) in self.device_queues.iter().enumerate() {
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                eventfd_pollable(&queue.event),
+                &EpollEvent::new(EventSet::IN, QUEUE_EVENT_BASE + index as u64),
+            );
+        }
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            eventfd_pollable(&self.stop_fd),
+            &EpollEvent::new(EventSet::IN, STOP_EVENT),
+        );
+        if let Some(backend) = self.linux_raw.as_ref() {
+            if let Err(error) = epoll.ctl(
+                ControlOperation::Add,
+                backend.ring.as_raw_fd(),
+                &EpollEvent::new(EventSet::IN, LINUX_RAW_EVENT),
+            ) {
+                log::warn!(
+                    "cannot poll io_uring completions, using synchronous block I/O: {error}"
+                );
+                self.linux_raw = None;
+            }
+        }
+
+        let mut pending = PendingLinuxRawRequests::new();
+        let mut bounce_pool = LinuxRawBouncePool::default();
+        let mut completions = Vec::with_capacity(MAX_PENDING_LINUX_RAW_REQUESTS);
+        let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
+        loop {
+            match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
+                Ok(event_count) => {
+                    for event in &epoll_events[..event_count] {
+                        let source = event.data();
+                        let event_set = event.event_set();
+                        match source {
+                            source
+                                if source < self.device_queues.len() as u64
+                                    && event_set.contains(EventSet::IN) =>
+                            {
+                                let queue_index = source as usize;
+                                if let Err(error) = self.device_queues[queue_index].event.read() {
+                                    error!("Failed to get queue event: {error:?}");
+                                } else if self.linux_raw.is_some() {
+                                    self.process_linux_virtio_queue(
+                                        queue_index,
+                                        &mut pending,
+                                        &mut bounce_pool,
+                                        &mut completions,
+                                    );
+                                    self.submit_linux_raw_requests();
+                                } else {
+                                    self.process_virtio_queue(queue_index);
+                                }
+                            }
+                            LINUX_RAW_EVENT if event_set.contains(EventSet::IN) => {
+                                self.reap_linux_raw_requests(
+                                    &mut pending,
+                                    &mut bounce_pool,
+                                    &mut completions,
+                                );
+                                self.process_all_linux_raw_queues(
+                                    &mut pending,
+                                    &mut bounce_pool,
+                                    &mut completions,
+                                );
+                                self.submit_linux_raw_requests();
+                            }
+                            STOP_EVENT if event_set.contains(EventSet::IN) => {
+                                debug!("stopping worker thread");
+                                let _ = self.stop_fd.read();
+                                self.drain_linux_raw_requests(
+                                    &mut pending,
+                                    &mut bounce_pool,
+                                    &mut completions,
+                                );
+                                return;
+                            }
+                            _ => log::warn!(
+                                "Received unknown event: {event_set:?} from fd: {source:?}"
+                            ),
+                        }
+                    }
+                }
+                Err(error) => debug!("failed to consume muxer epoll event: {error}"),
+            }
+        }
+    }
+
+    #[cfg(all(not(windows), not(target_os = "linux")))]
     fn work(mut self) {
         let stop_ev = eventfd_pollable(&self.stop_fd);
 
@@ -415,7 +715,7 @@ impl BlockWorker {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "linux")))]
     fn process_queue_event(&mut self, queue_index: usize) {
         if let Err(e) = self.device_queues[queue_index].event.read() {
             error!("Failed to get queue event: {e:?}");
@@ -505,12 +805,6 @@ impl BlockWorker {
 
     #[cfg(not(windows))]
     fn process_queue(&mut self, queue_index: usize, mem: &GuestMemoryMmap) {
-        #[cfg(target_os = "linux")]
-        if self.linux_raw.is_some() {
-            self.process_linux_raw_queue(queue_index, mem);
-            return;
-        }
-
         #[cfg(feature = "block-io-profile")]
         let drain_started = Instant::now();
         let mut completed_any = false;
@@ -628,9 +922,55 @@ impl BlockWorker {
     }
 
     #[cfg(target_os = "linux")]
-    fn process_linux_raw_queue(&mut self, queue_index: usize, mem: &GuestMemoryMmap) {
-        let mut pending = HashMap::new();
-        while pending.len() < MAX_PENDING_LINUX_RAW_REQUESTS {
+    fn process_linux_virtio_queue(
+        &mut self,
+        queue_index: usize,
+        pending: &mut PendingLinuxRawRequests,
+        bounce_pool: &mut LinuxRawBouncePool,
+        completions: &mut Vec<(u64, i32)>,
+    ) {
+        let mem = self.mem.clone();
+        loop {
+            self.device_queues[queue_index]
+                .queue
+                .disable_notification(&mem)
+                .unwrap();
+            self.process_linux_raw_queue(queue_index, &mem, pending, bounce_pool, completions);
+            let queue_needs_more_processing = self.device_queues[queue_index]
+                .queue
+                .enable_notification(&mem)
+                .unwrap();
+            if pending.is_full() || !queue_needs_more_processing {
+                break;
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_all_linux_raw_queues(
+        &mut self,
+        pending: &mut PendingLinuxRawRequests,
+        bounce_pool: &mut LinuxRawBouncePool,
+        completions: &mut Vec<(u64, i32)>,
+    ) {
+        for queue_index in 0..self.device_queues.len() {
+            self.process_linux_virtio_queue(queue_index, pending, bounce_pool, completions);
+            if pending.is_full() {
+                break;
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_linux_raw_queue(
+        &mut self,
+        queue_index: usize,
+        mem: &GuestMemoryMmap,
+        pending: &mut PendingLinuxRawRequests,
+        bounce_pool: &mut LinuxRawBouncePool,
+        completions: &mut Vec<(u64, i32)>,
+    ) {
+        while !pending.is_full() {
             let Some(head) = self.device_queues[queue_index].queue.pop(mem) else {
                 break;
             };
@@ -692,50 +1032,125 @@ impl BlockWorker {
             };
 
             if let Some((direction, length, offset)) = async_request {
-                let mut buffer = match IoBuffer::new(length, mem_align) {
-                    Ok(buffer) => buffer,
+                let status_offset = writer.available_bytes().saturating_sub(1);
+                let status_writer = match writer.split_at(status_offset) {
+                    Ok(status_writer) => status_writer,
                     Err(error) => {
-                        error!("failed to allocate aligned io_uring block buffer: {error:?}");
-                        self.drain_linux_raw_requests(mem, &mut pending);
-                        let (status, len) =
-                            match self.process_request(request_header, &mut reader, &mut writer) {
-                                Ok(length) => (VIRTIO_BLK_S_OK as u8, length),
-                                Err(error) => {
-                                    log::error!(
-                                        "error processing synchronous block request: {error:?}"
-                                    );
-                                    (VIRTIO_BLK_S_IOERR as u8, 0)
-                                }
-                            };
-                        self.complete_linux_sync_request(
+                        error!("failed to isolate io_uring status byte: {error:?}");
+                        self.complete_linux_raw_error(queue_index, head.index, mem);
+                        continue;
+                    }
+                };
+                let status_buffers =
+                    snapshot_linux_raw_buffers(status_writer.remaining_slices(), true, 1);
+                let status_ptr = match status_buffers {
+                    Ok(buffers) if buffers.len() == 1 && buffers[0].len == 1 => buffers[0].ptr,
+                    Ok(_) => {
+                        error!("io_uring status snapshot was not exactly one byte");
+                        self.complete_linux_raw_error(queue_index, head.index, mem);
+                        continue;
+                    }
+                    Err(error) => {
+                        error!("failed to snapshot io_uring status byte: {error:?}");
+                        self.complete_linux_raw_error(queue_index, head.index, mem);
+                        continue;
+                    }
+                };
+                let guest_buffers = match direction {
+                    LinuxRawDirection::Read => {
+                        snapshot_linux_raw_buffers(writer.remaining_slices(), true, length)
+                    }
+                    LinuxRawDirection::Write => {
+                        snapshot_linux_raw_buffers(reader.remaining_slices(), false, length)
+                    }
+                };
+                let guest_buffers = match guest_buffers {
+                    Ok(buffers) => buffers,
+                    Err(error) => {
+                        error!("failed to snapshot io_uring data buffers: {error:?}");
+                        self.complete_linux_raw_admission_error(
                             queue_index,
                             head.index,
+                            status_ptr,
                             mem,
-                            &mut writer,
-                            status,
-                            len,
                         );
                         continue;
                     }
                 };
-                if direction == LinuxRawDirection::Write {
-                    if let Err(error) = reader.read_exact(buffer.as_mut().into_slice()) {
-                        error!("failed to stage io_uring block write: {error:?}");
-                        self.complete_linux_raw_error(queue_index, head.index, mem);
-                        continue;
+
+                let can_use_guest_iovecs = !direct_io
+                    || guest_buffers
+                        .iter()
+                        .all(|buffer| buffer.is_direct_io_aligned(mem_align));
+                let data = if can_use_guest_iovecs {
+                    LinuxRawRequestData::Guest {
+                        iovecs: SmallVec::with_capacity(guest_buffers.len()),
+                        buffers: guest_buffers,
                     }
-                }
-                let request = PendingLinuxRawRequest {
+                } else {
+                    let mut buffer = match bounce_pool.acquire(length, mem_align) {
+                        Ok(buffer) => buffer,
+                        Err(error) => {
+                            error!("failed to acquire aligned io_uring buffer: {error:?}");
+                            self.complete_linux_raw_admission_error(
+                                queue_index,
+                                head.index,
+                                status_ptr,
+                                mem,
+                            );
+                            continue;
+                        }
+                    };
+                    if direction == LinuxRawDirection::Write {
+                        if let Err(error) = copy_linux_guest_buffers_to_bounce(
+                            &guest_buffers,
+                            buffer.as_mut().into_slice(),
+                        ) {
+                            error!("failed to stage io_uring block write: {error:?}");
+                            bounce_pool.release(buffer);
+                            self.complete_linux_raw_admission_error(
+                                queue_index,
+                                head.index,
+                                status_ptr,
+                                mem,
+                            );
+                            continue;
+                        }
+                    }
+                    LinuxRawRequestData::Bounce {
+                        buffer,
+                        guest_buffers,
+                    }
+                };
+                let mut request = PendingLinuxRawRequest {
                     queue_index,
                     head_index: head.index,
                     direction,
-                    buffer,
+                    data,
+                    status_ptr,
+                    data_len: length,
                     offset,
                     completed: 0,
                 };
-                if let Err(error) = self.submit_linux_raw_request(request, &mut pending) {
+                if let Err(error) = request.rebuild_iovecs() {
+                    error!("failed to build io_uring guest iovecs: {error:?}");
+                    self.complete_linux_raw_request(
+                        request,
+                        false,
+                        -libc::EINVAL,
+                        mem,
+                        bounce_pool,
+                    );
+                    continue;
+                }
+                if let Err(error) = self.submit_linux_raw_request(request, pending) {
                     error!("failed to submit io_uring block request: {error:?}");
-                    self.complete_linux_raw_error(queue_index, head.index, mem);
+                    self.complete_linux_raw_admission_error(
+                        queue_index,
+                        head.index,
+                        status_ptr,
+                        mem,
+                    );
                 }
                 continue;
             }
@@ -743,7 +1158,7 @@ impl BlockWorker {
             // Flush, discard, write-zeroes, identity, and malformed read/write requests use the
             // mature synchronous path. Draining first is the global write-epoch barrier: every
             // request dequeued before a flush is complete before the durability syscall begins.
-            self.drain_linux_raw_requests(mem, &mut pending);
+            self.drain_linux_raw_requests(pending, bounce_pool, completions);
             let (status, len): (u8, usize) =
                 match self.process_request(request_header, &mut reader, &mut writer) {
                     Ok(length) => (VIRTIO_BLK_S_OK as u8, length),
@@ -761,25 +1176,19 @@ impl BlockWorker {
                 len,
             );
         }
-        self.drain_linux_raw_requests(mem, &mut pending);
-        if self.batch_completions {
-            self.signal_linux_raw_queue(queue_index, mem);
-        }
     }
 
     #[cfg(target_os = "linux")]
     fn submit_linux_raw_request(
         &mut self,
         request: PendingLinuxRawRequest,
-        pending: &mut HashMap<u64, PendingLinuxRawRequest>,
+        pending: &mut PendingLinuxRawRequests,
     ) -> io::Result<()> {
+        let request_id = pending.insert(request)?;
+        let request = pending.get_mut(request_id).expect("request was inserted");
         let backend = self.linux_raw.as_mut().expect("io_uring backend selected");
-        let request_id = backend.next_request_id;
-        backend.next_request_id = backend.next_request_id.wrapping_add(1).max(1);
-        pending.insert(request_id, request);
-        let request = pending.get_mut(&request_id).expect("request was inserted");
         if let Err(error) = Self::push_linux_raw_entry(backend, request_id, request) {
-            pending.remove(&request_id);
+            pending.remove(request_id);
             return Err(error);
         }
         Ok(())
@@ -791,31 +1200,52 @@ impl BlockWorker {
         request_id: u64,
         request: &mut PendingLinuxRawRequest,
     ) -> io::Result<()> {
-        let remaining = request.buffer.len() - request.completed;
+        let remaining = request.remaining();
         let length = u32::try_from(remaining)
             .map_err(|_| io::Error::other("io_uring block request is too large"))?;
         let offset = request
             .offset
             .checked_add(request.completed as u64)
             .ok_or_else(|| io::Error::other("io_uring block offset overflow"))?;
-        let entry = match request.direction {
-            LinuxRawDirection::Read => opcode::Read::new(
-                types::Fd(backend.file.as_raw_fd()),
-                // SAFETY: `completed` never exceeds the buffer length, and the buffer remains
-                // owned by the pending request until the matching CQE is reaped.
-                unsafe { request.buffer.as_mut().as_ptr().add(request.completed) },
-                length,
-            )
-            .offset(offset)
-            .build(),
-            LinuxRawDirection::Write => opcode::Write::new(
-                types::Fd(backend.file.as_raw_fd()),
-                // SAFETY: same bounded offset and lifetime argument as the read buffer above.
-                unsafe { request.buffer.as_ref().as_ptr().add(request.completed) },
-                length,
-            )
-            .offset(offset)
-            .build(),
+        let entry = match (&mut request.data, request.direction) {
+            (LinuxRawRequestData::Guest { iovecs, .. }, LinuxRawDirection::Read) => {
+                opcode::Readv::new(
+                    types::Fd(backend.file.as_raw_fd()),
+                    iovecs.as_ptr(),
+                    u32::try_from(iovecs.len())
+                        .map_err(|_| io::Error::other("too many guest iovecs"))?,
+                )
+                .offset(offset)
+                .build()
+            }
+            (LinuxRawRequestData::Guest { iovecs, .. }, LinuxRawDirection::Write) => {
+                opcode::Writev::new(
+                    types::Fd(backend.file.as_raw_fd()),
+                    iovecs.as_ptr(),
+                    u32::try_from(iovecs.len())
+                        .map_err(|_| io::Error::other("too many guest iovecs"))?,
+                )
+                .offset(offset)
+                .build()
+            }
+            (LinuxRawRequestData::Bounce { buffer, .. }, LinuxRawDirection::Read) => {
+                opcode::Read::new(
+                    types::Fd(backend.file.as_raw_fd()),
+                    unsafe { buffer.as_mut().as_ptr().add(request.completed) },
+                    length,
+                )
+                .offset(offset)
+                .build()
+            }
+            (LinuxRawRequestData::Bounce { buffer, .. }, LinuxRawDirection::Write) => {
+                opcode::Write::new(
+                    types::Fd(backend.file.as_raw_fd()),
+                    unsafe { buffer.as_ref().as_ptr().add(request.completed) },
+                    length,
+                )
+                .offset(offset)
+                .build()
+            }
         }
         .user_data(request_id);
 
@@ -832,76 +1262,96 @@ impl BlockWorker {
     }
 
     #[cfg(target_os = "linux")]
-    fn drain_linux_raw_requests(
+    fn submit_linux_raw_requests(&mut self) {
+        let Some(backend) = self.linux_raw.as_mut() else {
+            return;
+        };
+        if let Err(error) = backend.ring.submit() {
+            error!("io_uring submission failed: {error:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reap_linux_raw_requests(
         &mut self,
-        mem: &GuestMemoryMmap,
-        pending: &mut HashMap<u64, PendingLinuxRawRequest>,
+        pending: &mut PendingLinuxRawRequests,
+        bounce_pool: &mut LinuxRawBouncePool,
+        completions: &mut Vec<(u64, i32)>,
     ) {
-        while !pending.is_empty() {
-            let completions = {
-                let backend = self.linux_raw.as_mut().expect("io_uring backend selected");
-                if let Err(error) = backend.ring.submit_and_wait(1) {
-                    error!("io_uring completion wait failed: {error:?}");
-                    // An interrupted or transient submit may still have handed requests to the
-                    // kernel. Keep every backing buffer alive and retry the reap rather than
-                    // turning an uncertain submission into a use-after-free.
-                    thread::yield_now();
-                    continue;
-                }
+        completions.clear();
+        {
+            let backend = self.linux_raw.as_mut().expect("io_uring backend selected");
+            completions.extend(
                 backend
                     .ring
                     .completion()
-                    .map(|entry| (entry.user_data(), entry.result()))
-                    .collect::<Vec<_>>()
+                    .map(|entry| (entry.user_data(), entry.result())),
+            );
+        }
+
+        let mem = self.mem.clone();
+        for (request_id, result) in completions.drain(..) {
+            let Some(request) = pending.get_mut(request_id) else {
+                error!("io_uring returned unknown or stale block request {request_id}");
+                continue;
             };
-            for (request_id, result) in completions {
-                let Some(request) = pending.get_mut(&request_id) else {
-                    error!("io_uring returned unknown block request {request_id}");
-                    continue;
-                };
-                let completed = usize::try_from(result).ok();
-                let remaining = request.buffer.len() - request.completed;
-                if let Some(completed) = completed.filter(|completed| *completed < remaining) {
-                    if completed > 0 {
-                        request.completed += completed;
-                        let can_resubmit = {
-                            let backend =
-                                self.linux_raw.as_ref().expect("io_uring backend selected");
-                            request
-                                .offset
-                                .checked_add(request.completed as u64)
-                                .is_some_and(|offset| {
-                                    linux_raw_request_is_aligned(
-                                        backend.direct_io,
-                                        backend.req_align,
-                                        offset,
-                                        request.buffer.len() - request.completed,
-                                    ) && (!backend.direct_io
-                                        || request.completed.is_multiple_of(backend.mem_align))
-                                })
-                        };
-                        let resubmit_result = if can_resubmit {
+            let completed = usize::try_from(result).ok();
+            let remaining = request.remaining();
+            if let Some(completed) = completed.filter(|completed| *completed < remaining) {
+                if completed > 0 {
+                    request.completed += completed;
+                    let resubmit_result = request.rebuild_iovecs().and_then(|()| {
+                        let can_resubmit = self.linux_raw.as_ref().is_some_and(|backend| {
+                            linux_raw_remainder_is_aligned(backend, request)
+                        });
+                        if can_resubmit {
                             let backend =
                                 self.linux_raw.as_mut().expect("io_uring backend selected");
                             Self::push_linux_raw_entry(backend, request_id, request)
                         } else {
                             Err(io::Error::other(
-                                "partial direct-I/O completion left an unaligned remainder",
+                                "partial direct I/O left an unaligned remainder",
                             ))
-                        };
-                        if let Err(error) = resubmit_result {
-                            error!("failed to resubmit partial io_uring request: {error:?}");
-                            let request =
-                                pending.remove(&request_id).expect("request still pending");
-                            self.complete_linux_raw_request(request, false, result, mem);
                         }
+                    });
+                    if resubmit_result.is_ok() {
                         continue;
                     }
+                    if let Err(error) = resubmit_result {
+                        error!("failed to resubmit partial io_uring request: {error:?}");
+                    }
                 }
-                let success = completed == Some(remaining);
-                let request = pending.remove(&request_id).expect("request still pending");
-                self.complete_linux_raw_request(request, success, result, mem);
             }
+
+            let success = completed == Some(remaining);
+            let request = pending.remove(request_id).expect("request still pending");
+            self.complete_linux_raw_request(request, success, result, &mem, bounce_pool);
+        }
+
+        if self.batch_completions {
+            for queue_index in 0..self.device_queues.len() {
+                self.signal_linux_raw_queue(queue_index, &mem);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn drain_linux_raw_requests(
+        &mut self,
+        pending: &mut PendingLinuxRawRequests,
+        bounce_pool: &mut LinuxRawBouncePool,
+        completions: &mut Vec<(u64, i32)>,
+    ) {
+        while !pending.is_empty() {
+            let backend = self.linux_raw.as_mut().expect("io_uring backend selected");
+            if let Err(error) = backend.ring.submit_and_wait(1) {
+                error!("io_uring completion wait failed: {error:?}");
+                // The kernel may already own SQEs. Retain every guest pointer and buffer until a
+                // target CQE is observed instead of turning an uncertain submit into use-after-free.
+                thread::yield_now();
+                continue;
+            }
+            self.reap_linux_raw_requests(pending, bounce_pool, completions);
         }
     }
 
@@ -912,46 +1362,56 @@ impl BlockWorker {
         success: bool,
         result: i32,
         mem: &GuestMemoryMmap,
+        bounce_pool: &mut LinuxRawBouncePool,
     ) {
-        let mut writer = match self.linux_raw_writer(request.queue_index, request.head_index, mem) {
-            Ok(writer) => writer,
-            Err(error) => {
-                error!("failed to reconstruct io_uring completion descriptors: {error:?}");
-                self.complete_linux_raw_error(request.queue_index, request.head_index, mem);
-                return;
-            }
+        let data_result = if success && request.direction == LinuxRawDirection::Read {
+            request.copy_bounce_read_to_guest()
+        } else {
+            Ok(())
         };
-        let status = if success {
-            let data_result = match request.direction {
-                LinuxRawDirection::Read => writer.write_all(request.buffer.as_ref().into_slice()),
-                LinuxRawDirection::Write => Ok(()),
-            };
-            if data_result.is_ok() {
-                match request.direction {
-                    LinuxRawDirection::Read => {
-                        self.metrics.add_read_bytes(request.buffer.len() as u64)
-                    }
-                    LinuxRawDirection::Write => {
-                        self.metrics.add_write_bytes(request.buffer.len() as u64)
-                    }
-                }
-                VIRTIO_BLK_S_OK as u8
-            } else {
-                VIRTIO_BLK_S_IOERR as u8
+        let status = if success && data_result.is_ok() {
+            match request.direction {
+                LinuxRawDirection::Read => self.metrics.add_read_bytes(request.data_len as u64),
+                LinuxRawDirection::Write => self.metrics.add_write_bytes(request.data_len as u64),
             }
+            VIRTIO_BLK_S_OK as u8
         } else {
             if result < 0 {
                 error!("io_uring block operation failed with errno {}", -result);
             }
+            if let Err(error) = data_result {
+                error!("failed to copy io_uring bounce read into guest memory: {error:?}");
+            }
             VIRTIO_BLK_S_IOERR as u8
         };
-        let _ = writer.write_obj(status);
+        unsafe {
+            write_volatile(request.status_ptr, status);
+        }
         let used_len = if status == VIRTIO_BLK_S_OK as u8 {
-            request.buffer.len()
+            request.data_len
         } else {
             0
         };
-        self.publish_linux_raw_completion(request.queue_index, request.head_index, used_len, mem);
+        let queue_index = request.queue_index;
+        let head_index = request.head_index;
+        if let LinuxRawRequestData::Bounce { buffer, .. } = request.data {
+            bounce_pool.release(buffer);
+        }
+        self.publish_linux_raw_completion(queue_index, head_index, used_len, mem);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn complete_linux_raw_admission_error(
+        &mut self,
+        queue_index: usize,
+        head_index: u16,
+        status_ptr: *mut u8,
+        mem: &GuestMemoryMmap,
+    ) {
+        unsafe {
+            write_volatile(status_ptr, VIRTIO_BLK_S_IOERR as u8);
+        }
+        self.publish_linux_raw_completion(queue_index, head_index, 0, mem);
     }
 
     #[cfg(target_os = "linux")]
@@ -1593,6 +2053,100 @@ impl BlockWorker {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn snapshot_linux_raw_buffers<'a>(
+    slices: impl IntoIterator<Item = VolatileSlice<'a>>,
+    writable: bool,
+    expected_len: usize,
+) -> io::Result<SmallVec<[LinuxRawFileBuffer; 4]>> {
+    let mut buffers = SmallVec::new();
+    let mut total = 0usize;
+    for slice in slices {
+        if slice.is_empty() {
+            continue;
+        }
+        let ptr = if writable {
+            slice.ptr_guard_mut().as_ptr()
+        } else {
+            slice.ptr_guard().as_ptr() as *mut u8
+        };
+        let buffer = unsafe { LinuxRawFileBuffer::new(ptr, slice.len()) };
+        push_or_merge_linux_raw_buffer(&mut buffers, buffer);
+        total = total
+            .checked_add(slice.len())
+            .ok_or_else(|| io::Error::other("guest iovec length overflow"))?;
+    }
+
+    if total != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("guest iovecs contain {total} bytes, expected {expected_len}"),
+        ));
+    }
+    Ok(buffers)
+}
+
+#[cfg(target_os = "linux")]
+fn push_or_merge_linux_raw_buffer(
+    buffers: &mut SmallVec<[LinuxRawFileBuffer; 4]>,
+    buffer: LinuxRawFileBuffer,
+) {
+    if let Some(last) = buffers.last_mut() {
+        let last_end = (last.ptr as usize).saturating_add(last.len);
+        if last_end == buffer.ptr as usize {
+            last.len += buffer.len;
+            return;
+        }
+    }
+    buffers.push(buffer);
+}
+
+#[cfg(target_os = "linux")]
+fn copy_linux_guest_buffers_to_bounce(
+    guest_buffers: &[LinuxRawFileBuffer],
+    bounce: &mut [u8],
+) -> io::Result<()> {
+    let mut copied = 0usize;
+    for guest in guest_buffers {
+        let end = copied
+            .checked_add(guest.len)
+            .ok_or_else(|| io::Error::other("bounce write length overflow"))?;
+        let destination = bounce
+            .get_mut(copied..end)
+            .ok_or_else(|| io::Error::other("bounce write exceeded its buffer"))?;
+        unsafe {
+            copy_nonoverlapping(guest.ptr.cast_const(), destination.as_mut_ptr(), guest.len);
+        }
+        copied = end;
+    }
+    (copied == bounce.len())
+        .then_some(())
+        .ok_or_else(|| io::Error::other("bounce write did not cover every source byte"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_raw_remainder_is_aligned(
+    backend: &LinuxRawBackend,
+    request: &PendingLinuxRawRequest,
+) -> bool {
+    if !backend.direct_io {
+        return true;
+    }
+    let Some(offset) = request.offset.checked_add(request.completed as u64) else {
+        return false;
+    };
+    if !linux_raw_request_is_aligned(true, backend.req_align, offset, request.remaining()) {
+        return false;
+    }
+    match &request.data {
+        LinuxRawRequestData::Guest { iovecs, .. } => iovecs.iter().all(|iovec| {
+            (iovec.iov_base as usize).is_multiple_of(backend.mem_align)
+                && iovec.iov_len.is_multiple_of(backend.mem_align)
+        }),
+        LinuxRawRequestData::Bounce { .. } => request.completed.is_multiple_of(backend.mem_align),
+    }
+}
+
 #[cfg(windows)]
 fn collect_windows_raw_buffers(
     mem: &GuestMemoryMmap,
@@ -1754,6 +2308,27 @@ fn linux_raw_request_is_aligned(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    fn pending_guest_request(
+        buffers: SmallVec<[LinuxRawFileBuffer; 4]>,
+        status_ptr: *mut u8,
+        data_len: usize,
+    ) -> PendingLinuxRawRequest {
+        PendingLinuxRawRequest {
+            queue_index: 0,
+            head_index: 0,
+            direction: LinuxRawDirection::Read,
+            data: LinuxRawRequestData::Guest {
+                iovecs: SmallVec::with_capacity(buffers.len()),
+                buffers,
+            },
+            status_ptr,
+            data_len,
+            offset: 0,
+            completed: 0,
+        }
+    }
+
     #[test]
     fn sector_offset_rejects_overflow() {
         assert!(matches!(
@@ -1779,5 +2354,78 @@ mod tests {
     #[test]
     fn buffered_linux_raw_requests_do_not_require_direct_alignment() {
         assert!(linux_raw_request_is_aligned(false, 4096, 512, 512));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guest_iovec_cursor_advances_across_segments() {
+        let mut first = [0u8; 4];
+        let mut second = [0u8; 8];
+        let mut status = 0u8;
+        let buffers = SmallVec::from_vec(vec![
+            unsafe { LinuxRawFileBuffer::new(first.as_mut_ptr(), first.len()) },
+            unsafe { LinuxRawFileBuffer::new(second.as_mut_ptr(), second.len()) },
+        ]);
+        let mut request = pending_guest_request(buffers, &mut status, 12);
+
+        request.rebuild_iovecs().unwrap();
+        let LinuxRawRequestData::Guest { iovecs, .. } = &request.data else {
+            unreachable!();
+        };
+        assert_eq!(iovecs.len(), 2);
+        assert_eq!(iovecs[0].iov_base, first.as_mut_ptr().cast());
+        assert_eq!(iovecs[0].iov_len, 4);
+
+        request.completed = 6;
+        request.rebuild_iovecs().unwrap();
+        let LinuxRawRequestData::Guest { iovecs, .. } = &request.data else {
+            unreachable!();
+        };
+        assert_eq!(iovecs.len(), 1);
+        assert_eq!(
+            iovecs[0].iov_base,
+            unsafe { second.as_mut_ptr().add(2) }.cast()
+        );
+        assert_eq!(iovecs[0].iov_len, 6);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn request_table_rejects_stale_generation_ids() {
+        let mut data = [0u8; 512];
+        let mut status = 0u8;
+        let buffer = unsafe { LinuxRawFileBuffer::new(data.as_mut_ptr(), data.len()) };
+        let mut pending = PendingLinuxRawRequests::new();
+        let first_id = pending
+            .insert(pending_guest_request(
+                SmallVec::from_slice(&[buffer]),
+                &mut status,
+                data.len(),
+            ))
+            .unwrap();
+        pending.remove(first_id).unwrap();
+        let second_id = pending
+            .insert(pending_guest_request(
+                SmallVec::from_slice(&[buffer]),
+                &mut status,
+                data.len(),
+            ))
+            .unwrap();
+
+        assert_ne!(first_id, second_id);
+        assert!(pending.get_mut(first_id).is_none());
+        assert!(pending.get_mut(second_id).is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounce_pool_reuses_matching_allocations() {
+        let mut pool = LinuxRawBouncePool::default();
+        let mut first = pool.acquire(4096, 4096).unwrap();
+        let first_ptr = first.as_mut().as_ptr();
+        pool.release(first);
+        let mut second = pool.acquire(4096, 4096).unwrap();
+
+        assert_eq!(second.as_mut().as_ptr(), first_ptr);
     }
 }

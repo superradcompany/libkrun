@@ -15,8 +15,6 @@ use std::io::{self, Write};
 use std::os::linux::fs::MetadataExt;
 #[cfg(target_os = "macos")]
 use std::os::macos::fs::MetadataExt;
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::OpenOptionsExt;
 #[cfg(feature = "block-io-profile")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -580,15 +578,11 @@ impl Block {
         let linux_raw_file = if PerfExperiment::BlockIoUring.enabled()
             && matches!(&disk_image_format, ImageType::Raw)
         {
-            let mut options = OpenOptions::new();
-            options.read(true).write(!is_disk_read_only);
-            if direct_io {
-                // This descriptor is owned by the io_uring backend. Imago still owns the
-                // synchronous fallback descriptor and its alignment-aware read/modify/write path.
-                options.custom_flags(libc::O_DIRECT);
-            }
+            // Duplicate Imago's already-open object rather than resolving the pathname again. A
+            // second open could race with replacement and make synchronous and ring I/O target
+            // different inodes.
             Some(LinuxRawFile::new(
-                Arc::new(options.open(&disk_image_path)?),
+                Arc::new(file.try_clone_file()?),
                 direct_io,
                 file.req_align(),
                 file.mem_align(),

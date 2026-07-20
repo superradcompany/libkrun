@@ -877,7 +877,7 @@ dependencies = [
 [[package]]
 name = "msb-imago"
 version = "0.2.4"
-source = "git+https://github.com/superradcompany/imago?rev=99a36e1daa1d67267d4cfc8c578c8bb94a612912#99a36e1daa1d67267d4cfc8c578c8bb94a612912"
+source = "git+https://github.com/superradcompany/imago?rev=5c07403b2fdfe7b4b68bd8c600b75fa03735ad44#5c07403b2fdfe7b4b68bd8c600b75fa03735ad44"
 dependencies = [
  "bincode",
  "cfg-if",
@@ -981,6 +981,7 @@ dependencies = [
  "nix 0.30.1",
  "pipewire",
  "rand",
+ "smallvec",
  "thiserror 2.0.18",
  "virtio-bindings",
  "vm-fdt",
