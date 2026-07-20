@@ -5,12 +5,10 @@ use std::{io, mem, result};
 
 use virtio_bindings::virtio_net::virtio_net_hdr_v1;
 
-use super::QueueConfig;
-
 pub const MAX_BUFFER_SIZE: usize = 65562;
-const QUEUE_SIZE: u16 = 1024;
-pub const NUM_QUEUES: usize = 2;
-pub static QUEUE_CONFIG: [QueueConfig; NUM_QUEUES] = [QueueConfig::new(QUEUE_SIZE); NUM_QUEUES];
+pub(crate) const QUEUE_SIZE: u16 = 1024;
+pub(crate) const BASE_QUEUE_PAIRS: u16 = 1;
+pub(crate) const MAX_EXPERIMENTAL_QUEUE_PAIRS: u16 = 2;
 
 pub mod backend;
 pub mod device;

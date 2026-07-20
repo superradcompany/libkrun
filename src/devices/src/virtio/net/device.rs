@@ -5,7 +5,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 use crate::virtio::net::Result;
-use crate::virtio::net::{NUM_QUEUES, QUEUE_CONFIG};
+use crate::virtio::net::{BASE_QUEUE_PAIRS, MAX_EXPERIMENTAL_QUEUE_PAIRS, QUEUE_SIZE};
 use crate::virtio::queue::Error as QueueError;
 use crate::virtio::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
@@ -22,7 +22,7 @@ use std::io::Write;
 use std::os::fd::RawFd;
 #[cfg(unix)]
 use std::path::PathBuf;
-use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
+use virtio_bindings::virtio_net::{VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_MAC, VIRTIO_NET_F_MQ};
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
 
@@ -87,6 +87,8 @@ pub struct Net {
     pub(crate) device_state: DeviceState,
 
     config: VirtioNetConfig,
+    queue_pairs: u16,
+    queue_config: Vec<QueueConfig>,
 }
 
 impl Net {
@@ -97,21 +99,31 @@ impl Net {
         mac: [u8; 6],
         features: u32,
     ) -> Result<Self> {
-        let backend_features = match &cfg_backend {
-            VirtioNetBackend::Custom(backend) => backend.supported_features(),
-            _ => 0,
+        let (backend_features, queue_pairs) = match &cfg_backend {
+            VirtioNetBackend::Custom(backend) => (
+                backend.supported_features(),
+                backend
+                    .max_queue_pairs()
+                    .clamp(BASE_QUEUE_PAIRS, MAX_EXPERIMENTAL_QUEUE_PAIRS),
+            ),
+            _ => (0, BASE_QUEUE_PAIRS),
         };
-        let avail_features = features as u64
+        let mut avail_features = features as u64
             | backend_features
             | (1 << VIRTIO_NET_F_MAC)
             | (1 << VIRTIO_RING_F_EVENT_IDX)
             | (1 << VIRTIO_F_VERSION_1);
+        if queue_pairs > 1 {
+            avail_features |= (1 << VIRTIO_NET_F_CTRL_VQ) | (1 << VIRTIO_NET_F_MQ);
+        }
 
         let config = VirtioNetConfig {
             mac,
             status: 0,
-            max_virtqueue_pairs: 0,
+            max_virtqueue_pairs: queue_pairs,
         };
+        let queue_count = usize::from(queue_pairs) * 2 + usize::from(queue_pairs > 1);
+        let queue_config = vec![QueueConfig::new(QUEUE_SIZE); queue_count];
 
         Ok(Net {
             id,
@@ -122,6 +134,8 @@ impl Net {
 
             device_state: DeviceState::Inactive,
             config,
+            queue_pairs,
+            queue_config,
         })
     }
 
@@ -153,7 +167,7 @@ impl VirtioDevice for Net {
     }
 
     fn queue_config(&self) -> &[QueueConfig] {
-        &QUEUE_CONFIG
+        &self.queue_config
     }
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
@@ -184,10 +198,24 @@ impl VirtioDevice for Net {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
-        let [rx_q, tx_q]: [_; NUM_QUEUES] = queues.try_into().map_err(|_| {
-            error!("Cannot perform activate. Expected {} queue(s)", NUM_QUEUES);
-            ActivateError::BadActivate
-        })?;
+        let expected_queues = usize::from(self.queue_pairs) * 2 + usize::from(self.queue_pairs > 1);
+        if queues.len() != expected_queues {
+            error!("Cannot perform activate. Expected {expected_queues} queue(s)");
+            return Err(ActivateError::BadActivate);
+        }
+        let mut queues = queues.into_iter();
+        let mut rx_queues = Vec::with_capacity(usize::from(self.queue_pairs));
+        let mut tx_queues = Vec::with_capacity(usize::from(self.queue_pairs));
+        for _ in 0..self.queue_pairs {
+            rx_queues.push(queues.next().ok_or(ActivateError::BadActivate)?);
+            tx_queues.push(queues.next().ok_or(ActivateError::BadActivate)?);
+        }
+        let control_queue = (self.queue_pairs > 1)
+            .then(|| queues.next().ok_or(ActivateError::BadActivate))
+            .transpose()?;
+        if queues.next().is_some() {
+            return Err(ActivateError::BadActivate);
+        }
 
         let cfg_backend = self.cfg_backend.take().ok_or_else(|| {
             error!("Cannot activate net device: backend already taken");
@@ -195,8 +223,9 @@ impl VirtioDevice for Net {
         })?;
 
         match NetWorker::new(
-            rx_q,
-            tx_q,
+            rx_queues,
+            tx_queues,
+            control_queue,
             interrupt.clone(),
             mem.clone(),
             self.acked_features,
@@ -219,5 +248,73 @@ impl VirtioDevice for Net {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::backend::{ReadError, WriteError};
+    use super::*;
+
+    struct TestBackend {
+        queue_pairs: u16,
+    }
+
+    impl NetBackend for TestBackend {
+        fn max_queue_pairs(&self) -> u16 {
+            self.queue_pairs
+        }
+
+        fn read_frame(&mut self, _buf: &mut [u8]) -> std::result::Result<usize, ReadError> {
+            Err(ReadError::NothingRead)
+        }
+
+        fn write_frame(
+            &mut self,
+            _hdr_len: usize,
+            _buf: &mut [u8],
+        ) -> std::result::Result<(), WriteError> {
+            Ok(())
+        }
+
+        fn has_unfinished_write(&self) -> bool {
+            false
+        }
+
+        fn try_finish_write(
+            &mut self,
+            _hdr_len: usize,
+            _buf: &[u8],
+        ) -> std::result::Result<(), WriteError> {
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        fn raw_socket_fd(&self) -> RawFd {
+            -1
+        }
+
+        #[cfg(windows)]
+        fn event_source(&self, token: utils::event::EventToken) -> utils::event::EventSource {
+            utils::event::EventSource::waitable_handle(std::ptr::null_mut(), token)
+        }
+    }
+
+    #[test]
+    fn backend_multiqueue_capability_adds_pairs_control_queue_and_features() {
+        let device = Net::new(
+            "net".to_string(),
+            VirtioNetBackend::Custom(Box::new(TestBackend { queue_pairs: 2 })),
+            [0x02, 0, 0, 0, 0, 1],
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(device.queue_config().len(), 5);
+        assert_ne!(device.avail_features() & (1 << VIRTIO_NET_F_MQ), 0);
+        assert_ne!(device.avail_features() & (1 << VIRTIO_NET_F_CTRL_VQ), 0);
+        let mut max_pairs = [0u8; 2];
+        device.read_config(8, &mut max_pairs);
+        assert_eq!(u16::from_le_bytes(max_pairs), 2);
     }
 }

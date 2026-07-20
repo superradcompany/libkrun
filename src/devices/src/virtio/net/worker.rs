@@ -1,3 +1,4 @@
+use crate::virtio::descriptor_utils::Reader;
 use crate::virtio::net::backend::ConnectError;
 #[cfg(windows)]
 use crate::virtio::net::namedpipe::NamedPipe;
@@ -24,6 +25,9 @@ use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::event::{EventSource, RawEventSource};
 use utils::eventfd::EventFd;
+use virtio_bindings::virtio_net::{
+    VIRTIO_NET_CTRL_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET, VIRTIO_NET_ERR, VIRTIO_NET_OK,
+};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 #[cfg(unix)]
@@ -31,13 +35,16 @@ type Pollable = std::os::fd::RawFd;
 #[cfg(windows)]
 type Pollable = RawHandle;
 
-const RX_QUEUE_EVENT: u64 = 0;
-const TX_QUEUE_EVENT: u64 = 1;
-const BACKEND_EVENT: u64 = 2;
+const RX_QUEUE_EVENT_BASE: u64 = 0;
+const TX_QUEUE_EVENT_BASE: u64 = 16;
+const CONTROL_QUEUE_EVENT: u64 = 32;
+const BACKEND_EVENT: u64 = 33;
 
 pub struct NetWorker {
-    rx_q: DeviceQueue,
-    tx_q: DeviceQueue,
+    rx_queues: Vec<DeviceQueue>,
+    tx_queues: Vec<DeviceQueue>,
+    control_queue: Option<DeviceQueue>,
+    active_queue_pairs: usize,
     interrupt: InterruptTransport,
 
     mem: GuestMemoryMmap,
@@ -54,13 +61,16 @@ pub struct NetWorker {
 
 impl NetWorker {
     pub fn new(
-        rx_q: DeviceQueue,
-        tx_q: DeviceQueue,
+        rx_queues: Vec<DeviceQueue>,
+        tx_queues: Vec<DeviceQueue>,
+        control_queue: Option<DeviceQueue>,
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
         _vnet_features: u64,
         cfg_backend: VirtioNetBackend,
     ) -> Result<Self, ConnectError> {
+        debug_assert_eq!(rx_queues.len(), tx_queues.len());
+        debug_assert!(!rx_queues.is_empty());
         let backend = match cfg_backend {
             #[cfg(unix)]
             VirtioNetBackend::UnixstreamFd(fd) => {
@@ -96,8 +106,10 @@ impl NetWorker {
         };
 
         Ok(Self {
-            rx_q,
-            tx_q,
+            rx_queues,
+            tx_queues,
+            control_queue,
+            active_queue_pairs: 1,
 
             mem,
             backend,
@@ -121,8 +133,6 @@ impl NetWorker {
     }
 
     fn work(mut self) {
-        let virtq_rx_ev = eventfd_pollable(&self.rx_q.event);
-        let virtq_tx_ev = eventfd_pollable(&self.tx_q.event);
         let backend_source = self.backend.event_source(BACKEND_EVENT);
         let backend_pollable = match event_source_pollable(backend_source) {
             Ok(pollable) => pollable,
@@ -134,16 +144,27 @@ impl NetWorker {
 
         let epoll = Epoll::new().unwrap();
 
-        let _ = epoll.ctl(
-            ControlOperation::Add,
-            virtq_rx_ev,
-            &EpollEvent::new(EventSet::IN, RX_QUEUE_EVENT),
-        );
-        let _ = epoll.ctl(
-            ControlOperation::Add,
-            virtq_tx_ev,
-            &EpollEvent::new(EventSet::IN, TX_QUEUE_EVENT),
-        );
+        for (index, queue) in self.rx_queues.iter().enumerate() {
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                eventfd_pollable(&queue.event),
+                &EpollEvent::new(EventSet::IN, RX_QUEUE_EVENT_BASE + index as u64),
+            );
+        }
+        for (index, queue) in self.tx_queues.iter().enumerate() {
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                eventfd_pollable(&queue.event),
+                &EpollEvent::new(EventSet::IN, TX_QUEUE_EVENT_BASE + index as u64),
+            );
+        }
+        if let Some(queue) = &self.control_queue {
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                eventfd_pollable(&queue.event),
+                &EpollEvent::new(EventSet::IN, CONTROL_QUEUE_EVENT),
+            );
+        }
         let _ = epoll.ctl(
             ControlOperation::Add,
             backend_pollable,
@@ -161,11 +182,22 @@ impl NetWorker {
                         let source = event.data();
                         let event_set = event.event_set();
                         match source {
-                            RX_QUEUE_EVENT if event_set.contains(EventSet::IN) => {
-                                self.process_rx_queue_event();
+                            source
+                                if is_rx_queue_event(source, self.rx_queues.len())
+                                    && event_set.contains(EventSet::IN) =>
+                            {
+                                self.process_rx_queue_event(source as usize);
                             }
-                            TX_QUEUE_EVENT if event_set.contains(EventSet::IN) => {
-                                self.process_tx_queue_event();
+                            source
+                                if is_tx_queue_event(source, self.tx_queues.len())
+                                    && event_set.contains(EventSet::IN) =>
+                            {
+                                self.process_tx_queue_event(
+                                    (source - TX_QUEUE_EVENT_BASE) as usize,
+                                );
+                            }
+                            CONTROL_QUEUE_EVENT if event_set.contains(EventSet::IN) => {
+                                self.process_control_queue_event();
                             }
                             BACKEND_EVENT => {
                                 if event_set.contains(EventSet::HANG_UP)
@@ -198,26 +230,32 @@ impl NetWorker {
         }
     }
 
-    pub(crate) fn process_rx_queue_event(&mut self) {
-        if let Err(e) = self.rx_q.event.read() {
+    pub(crate) fn process_rx_queue_event(&mut self, queue_index: usize) {
+        if let Err(e) = self.rx_queues[queue_index].event.read() {
             log::error!("Failed to get rx event from queue: {e:?}");
         }
-        if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
+        if let Err(e) = self.rx_queues[queue_index]
+            .queue
+            .disable_notification(&self.mem)
+        {
             error!("error disabling queue notifications: {e:?}");
         }
         if let Err(e) = self.process_rx() {
             log::error!("Failed to process rx: {e:?} (triggered by queue event)")
         };
-        if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
+        if let Err(e) = self.rx_queues[queue_index]
+            .queue
+            .enable_notification(&self.mem)
+        {
             error!("error disabling queue notifications: {e:?}");
         }
     }
 
-    pub(crate) fn process_tx_queue_event(&mut self) {
-        match self.tx_q.event.read() {
+    pub(crate) fn process_tx_queue_event(&mut self, queue_index: usize) {
+        match self.tx_queues[queue_index].event.read() {
             Ok(_) => {
-                log::debug!("virtio-net tx queue event");
-                self.process_tx_loop()
+                log::debug!("virtio-net tx queue event: {queue_index}");
+                self.process_tx_loop(queue_index)
             }
             Err(e) => {
                 log::error!("Failed to get tx queue event from queue: {e:?}");
@@ -225,15 +263,93 @@ impl NetWorker {
         }
     }
 
+    pub(crate) fn process_control_queue_event(&mut self) {
+        let max_queue_pairs = self.rx_queues.len();
+        let Some(control_queue) = self.control_queue.as_mut() else {
+            return;
+        };
+        if let Err(error) = control_queue.event.read() {
+            log::error!("failed to read virtio-net control queue event: {error:?}");
+            return;
+        }
+
+        let mut completed = false;
+        while let Some(head) = control_queue.queue.pop(&self.mem) {
+            let mut used_len = 0;
+            let status = match Reader::new_pair(&self.mem, head.clone()) {
+                Ok((mut reader, mut writer)) => {
+                    let requested_pairs = match (
+                        reader.read_obj::<u8>(),
+                        reader.read_obj::<u8>(),
+                        reader.read_obj::<u16>(),
+                    ) {
+                        (Ok(class), Ok(command), Ok(pairs))
+                            if u32::from(class) == VIRTIO_NET_CTRL_MQ
+                                && u32::from(command) == VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET
+                                && pairs > 0
+                                && usize::from(pairs) <= max_queue_pairs =>
+                        {
+                            Some(usize::from(pairs))
+                        }
+                        _ => None,
+                    };
+                    let status = if let Some(requested_pairs) = requested_pairs {
+                        self.active_queue_pairs = requested_pairs;
+                        VIRTIO_NET_OK as u8
+                    } else {
+                        VIRTIO_NET_ERR as u8
+                    };
+                    if let Err(error) = writer.write_obj(status) {
+                        log::error!("failed to write virtio-net control status: {error:?}");
+                        VIRTIO_NET_ERR as u8
+                    } else {
+                        used_len = 1;
+                        status
+                    }
+                }
+                Err(error) => {
+                    log::error!("invalid virtio-net control descriptor chain: {error:?}");
+                    VIRTIO_NET_ERR as u8
+                }
+            };
+
+            if let Err(error) = control_queue
+                .queue
+                .add_used(&self.mem, head.index, used_len)
+            {
+                log::error!("failed to complete virtio-net control request: {error:?}");
+            } else {
+                completed = true;
+            }
+            if status != VIRTIO_NET_OK as u8 {
+                log::debug!("virtio-net rejected control request");
+            }
+        }
+        if completed
+            && control_queue
+                .queue
+                .needs_notification(&self.mem)
+                .unwrap_or(false)
+        {
+            if let Err(error) = self.interrupt.try_signal_used_queue() {
+                log::error!("failed to signal virtio-net control completion: {error:?}");
+            }
+        }
+    }
+
     pub(crate) fn process_backend_socket_readable(&mut self) {
-        if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
+        for queue in self.rx_queues.iter_mut().take(self.active_queue_pairs) {
+            if let Err(e) = queue.queue.enable_notification(&self.mem) {
+                error!("error enabling queue notifications: {e:?}");
+            }
         }
         if let Err(e) = self.process_rx() {
             log::error!("Failed to process rx: {e:?} (triggered by backend socket readable)");
         };
-        if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
+        for queue in self.rx_queues.iter_mut().take(self.active_queue_pairs) {
+            if let Err(e) = queue.queue.disable_notification(&self.mem) {
+                error!("error disabling queue notifications: {e:?}");
+            }
         }
     }
 
@@ -242,7 +358,11 @@ impl NetWorker {
             .backend
             .try_finish_write(vnet_hdr_len(), &self.tx_frame_buf[..self.tx_frame_len])
         {
-            Ok(()) => self.process_tx_loop(),
+            Ok(()) => {
+                for queue_index in 0..self.active_queue_pairs {
+                    self.process_tx_loop(queue_index);
+                }
+            }
             Err(WriteError::PartialWrite | WriteError::NothingWritten) => {}
             Err(e @ WriteError::Internal(_)) => {
                 log::error!("Failed to finish write: {e:?}");
@@ -293,22 +413,32 @@ impl NetWorker {
         result
     }
 
-    fn process_tx_loop(&mut self) {
+    fn process_tx_loop(&mut self, queue_index: usize) {
+        if queue_index >= self.active_queue_pairs {
+            return;
+        }
         loop {
-            self.tx_q.queue.disable_notification(&self.mem).unwrap();
+            self.tx_queues[queue_index]
+                .queue
+                .disable_notification(&self.mem)
+                .unwrap();
 
-            if let Err(e) = self.process_tx() {
+            if let Err(e) = self.process_tx(queue_index) {
                 log::error!("Failed to process rx: {e:?} (triggered by backend socket readable)");
             };
 
-            if !self.tx_q.queue.enable_notification(&self.mem).unwrap() {
+            if !self.tx_queues[queue_index]
+                .queue
+                .enable_notification(&self.mem)
+                .unwrap()
+            {
                 break;
             }
         }
     }
 
-    fn process_tx(&mut self) -> result::Result<(), TxError> {
-        let tx_queue = &mut self.tx_q.queue;
+    fn process_tx(&mut self, queue_index: usize) -> result::Result<(), TxError> {
+        let tx_queue = &mut self.tx_queues[queue_index].queue;
 
         if self.backend.has_unfinished_write()
             && self
@@ -408,10 +538,13 @@ impl NetWorker {
     }
 
     // Copies a single frame from `self.rx_frame_buf` into the guest.
-    fn write_frame_to_guest_impl(&mut self) -> result::Result<(), FrontendError> {
+    fn write_frame_to_guest_impl(
+        &mut self,
+        queue_index: usize,
+    ) -> result::Result<(), FrontendError> {
         let mut result: std::result::Result<(), FrontendError> = Ok(());
 
-        let queue = &mut self.rx_q.queue;
+        let queue = &mut self.rx_queues[queue_index].queue;
         let head_descriptor = queue.pop(&self.mem).ok_or(FrontendError::EmptyQueue)?;
         let head_index = head_descriptor.index;
 
@@ -459,18 +592,14 @@ impl NetWorker {
     // Copies a single frame from `self.rx_frame_buf` into the guest. In case of an error retries
     // the operation if possible. Returns true if the operation was successfull.
     fn write_frame_to_guest(&mut self) -> bool {
-        let max_iterations = self.rx_q.queue.actual_size();
+        let ethernet_frame = &self.rx_frame_buf[vnet_hdr_len()..self.rx_frame_buf_len];
+        let queue_index = flow_queue_index(ethernet_frame, self.active_queue_pairs);
+        let max_iterations = self.rx_queues[queue_index].queue.actual_size();
         for _ in 0..max_iterations {
-            match self.write_frame_to_guest_impl() {
+            match self.write_frame_to_guest_impl(queue_index) {
                 Ok(()) => return true,
-                Err(FrontendError::EmptyQueue) => {
-                    // retry
-                    continue;
-                }
-                Err(_) => {
-                    // retry
-                    continue;
-                }
+                Err(FrontendError::EmptyQueue) => break,
+                Err(_) => continue,
             }
         }
 
@@ -482,6 +611,64 @@ impl NetWorker {
         self.rx_frame_buf_len = self.backend.read_frame(&mut self.rx_frame_buf)?;
         Ok(())
     }
+}
+
+fn is_rx_queue_event(source: u64, queue_count: usize) -> bool {
+    source < RX_QUEUE_EVENT_BASE + queue_count as u64
+}
+
+fn is_tx_queue_event(source: u64, queue_count: usize) -> bool {
+    source >= TX_QUEUE_EVENT_BASE && source < TX_QUEUE_EVENT_BASE + queue_count as u64
+}
+
+/// Choose a stable receive queue from immutable flow fields so packets in one flow never reorder.
+fn flow_queue_index(frame: &[u8], queue_pairs: usize) -> usize {
+    if queue_pairs <= 1 {
+        return 0;
+    }
+
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut hash_bytes = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    };
+    if frame.len() < 14 {
+        hash_bytes(frame);
+        return hash as usize % queue_pairs;
+    }
+
+    hash_bytes(&frame[..12]);
+    let mut network_start = 14usize;
+    let mut ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    while matches!(ethertype, 0x8100 | 0x88a8) && network_start + 4 <= frame.len() {
+        hash_bytes(&frame[network_start..network_start + 2]);
+        ethertype = u16::from_be_bytes([frame[network_start + 2], frame[network_start + 3]]);
+        network_start += 4;
+    }
+    match ethertype {
+        0x0800 if network_start + 20 <= frame.len() => {
+            let protocol = frame[network_start + 9];
+            hash_bytes(&frame[network_start + 12..network_start + 20]);
+            hash_bytes(&[protocol]);
+            let transport = network_start + usize::from(frame[network_start] & 0x0f) * 4;
+            if matches!(protocol, 6 | 17) && transport + 4 <= frame.len() {
+                hash_bytes(&frame[transport..transport + 4]);
+            }
+        }
+        0x86dd if network_start + 40 <= frame.len() => {
+            let protocol = frame[network_start + 6];
+            hash_bytes(&frame[network_start + 8..network_start + 40]);
+            hash_bytes(&[protocol]);
+            let transport = network_start + 40;
+            if matches!(protocol, 6 | 17) && transport + 4 <= frame.len() {
+                hash_bytes(&frame[transport..transport + 4]);
+            }
+        }
+        _ => hash_bytes(&ethertype.to_be_bytes()),
+    }
+    hash as usize % queue_pairs
 }
 
 #[cfg(unix)]
@@ -498,6 +685,44 @@ fn eventfd_pollable(event: &EventFd) -> Pollable {
 fn event_source_pollable(source: EventSource) -> io::Result<Pollable> {
     match source.raw() {
         RawEventSource::Fd(fd) => Ok(fd),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flow_queue_hash_ignores_tcp_payload_changes() {
+        let mut first = ipv4_tcp_frame(1234, 443, &[1, 2, 3]);
+        let mut second = ipv4_tcp_frame(1234, 443, &[9, 8, 7, 6]);
+
+        assert_eq!(flow_queue_index(&first, 2), flow_queue_index(&second, 2));
+        first[34 + 4..34 + 8].copy_from_slice(&100u32.to_be_bytes());
+        second[34 + 4..34 + 8].copy_from_slice(&200u32.to_be_bytes());
+        assert_eq!(flow_queue_index(&first, 2), flow_queue_index(&second, 2));
+    }
+
+    #[test]
+    fn event_tokens_do_not_overlap_queue_classes() {
+        assert!(is_rx_queue_event(0, 2));
+        assert!(is_rx_queue_event(1, 2));
+        assert!(!is_rx_queue_event(TX_QUEUE_EVENT_BASE, 2));
+        assert!(is_tx_queue_event(TX_QUEUE_EVENT_BASE + 1, 2));
+        assert!(!is_tx_queue_event(CONTROL_QUEUE_EVENT, 2));
+    }
+
+    fn ipv4_tcp_frame(source_port: u16, destination_port: u16, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0u8; 14 + 20 + 20];
+        frame.extend_from_slice(payload);
+        frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        frame[14] = 0x45;
+        frame[23] = 6;
+        frame[26..30].copy_from_slice(&[192, 0, 2, 1]);
+        frame[30..34].copy_from_slice(&[198, 51, 100, 2]);
+        frame[34..36].copy_from_slice(&source_port.to_be_bytes());
+        frame[36..38].copy_from_slice(&destination_port.to_be_bytes());
+        frame
     }
 }
 

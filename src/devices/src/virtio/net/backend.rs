@@ -59,6 +59,14 @@ pub enum WriteError {
 }
 
 pub trait NetBackend {
+    /// Return the maximum RX/TX queue pairs this backend can service.
+    ///
+    /// A value greater than one opts the device into virtio-net MQ negotiation. Implementations
+    /// must still preserve packet ordering within each flow and bound aggregate queue resources.
+    fn max_queue_pairs(&self) -> u16 {
+        1
+    }
+
     /// Return virtio-net features this backend can honor end to end.
     ///
     /// The default is deliberately empty: advertising an offload without consuming the associated
