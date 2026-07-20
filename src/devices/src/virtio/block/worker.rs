@@ -1284,6 +1284,7 @@ impl BlockWorker {
         bounce_pool: &mut LinuxRawBouncePool,
         completions: &mut Vec<(u64, i32)>,
     ) {
+        let mut completed_any = false;
         completions.clear();
         {
             let backend = self.linux_raw.as_mut().expect("io_uring backend selected");
@@ -1331,12 +1332,23 @@ impl BlockWorker {
 
             let success = completed == Some(remaining);
             let request = pending.remove(request_id).expect("request still pending");
+            completed_any = true;
             self.complete_linux_raw_request(request, success, result, &mem, bounce_pool);
         }
 
-        if self.batch_completions {
+        if self.batch_completions && completed_any {
+            // Consume each queue's EVENT_IDX accounting, then raise one shared interrupt for the
+            // whole CQ batch. A request can complete after the guest has suppressed the next
+            // indexed interrupt and gone idle; waiting for a later CQE in that state deadlocks the
+            // queue. One interrupt per non-empty reap preserves batching without relying on future
+            // I/O for forward progress.
             for queue_index in 0..self.device_queues.len() {
-                self.signal_linux_raw_queue(queue_index, &mem);
+                let _ = self.device_queues[queue_index]
+                    .queue
+                    .needs_notification(&mem);
+            }
+            if let Err(error) = self.interrupt.try_signal_used_queue() {
+                log::error!("failed to signal batched io_uring completions: {error:?}");
             }
         }
     }
