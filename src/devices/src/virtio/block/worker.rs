@@ -1175,6 +1175,12 @@ impl BlockWorker {
                 status,
                 len,
             );
+            // A synchronous barrier has no io_uring CQE to wake the worker again. When batched
+            // completions are enabled, publish its one shared interrupt here; otherwise a flush
+            // can sit in the used ring forever and deadlock the guest during boot.
+            if self.batch_completions {
+                self.signal_linux_raw_queue(queue_index, mem);
+            }
         }
     }
 
