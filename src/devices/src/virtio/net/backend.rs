@@ -4,6 +4,19 @@ use std::os::fd::RawFd;
 
 use utils::event::{EventSource, EventToken};
 
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Device completes checksums for packets transmitted by the guest.
+pub const NET_F_CSUM: u64 = 1 << virtio_bindings::virtio_net::VIRTIO_NET_F_CSUM;
+
+/// Device segments IPv4 TCP packets transmitted by the guest.
+pub const NET_F_HOST_TSO4: u64 = 1 << virtio_bindings::virtio_net::VIRTIO_NET_F_HOST_TSO4;
+
+/// Device segments IPv6 TCP packets transmitted by the guest.
+pub const NET_F_HOST_TSO6: u64 = 1 << virtio_bindings::virtio_net::VIRTIO_NET_F_HOST_TSO6;
+
 #[cfg(unix)]
 type BackendError = nix::Error;
 #[cfg(windows)]
@@ -46,6 +59,14 @@ pub enum WriteError {
 }
 
 pub trait NetBackend {
+    /// Return virtio-net features this backend can honor end to end.
+    ///
+    /// The default is deliberately empty: advertising an offload without consuming the associated
+    /// virtio header would silently corrupt packets produced with partial checksums or GSO.
+    fn supported_features(&self) -> u64 {
+        0
+    }
+
     fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize, ReadError>;
     fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError>;
     fn has_unfinished_write(&self) -> bool;

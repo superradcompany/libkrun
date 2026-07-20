@@ -97,7 +97,12 @@ impl Net {
         mac: [u8; 6],
         features: u32,
     ) -> Result<Self> {
+        let backend_features = match &cfg_backend {
+            VirtioNetBackend::Custom(backend) => backend.supported_features(),
+            _ => 0,
+        };
         let avail_features = features as u64
+            | backend_features
             | (1 << VIRTIO_NET_F_MAC)
             | (1 << VIRTIO_RING_F_EVENT_IDX)
             | (1 << VIRTIO_F_VERSION_1);

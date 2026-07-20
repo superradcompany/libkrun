@@ -54,7 +54,9 @@
 //--------------------------------------------------------------------------------------------------
 
 #[cfg(feature = "net")]
-pub use devices::virtio::net::backend::{ConnectError, NetBackend, ReadError, WriteError};
+pub use devices::virtio::net::backend::{
+    ConnectError, NetBackend, ReadError, WriteError, NET_F_CSUM, NET_F_HOST_TSO4, NET_F_HOST_TSO6,
+};
 
 #[cfg(feature = "net")]
 pub use utils::event::{EventSource, EventToken};
