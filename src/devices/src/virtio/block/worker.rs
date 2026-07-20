@@ -1503,14 +1503,15 @@ impl BlockWorker {
 
     #[cfg(target_os = "linux")]
     fn signal_linux_raw_queue(&mut self, queue_index: usize, mem: &GuestMemoryMmap) {
-        if self.device_queues[queue_index]
+        // Consume EVENT_IDX accounting, but do not let suppression defer progress to a future
+        // request: persistent io_uring may have no later event after publishing this used entry.
+        // The async path therefore emits one interrupt per completion, or one per CQ batch when
+        // `block-completions` is enabled.
+        let _ = self.device_queues[queue_index]
             .queue
-            .needs_notification(mem)
-            .unwrap_or(false)
-        {
-            if let Err(error) = self.interrupt.try_signal_used_queue() {
-                log::error!("failed to signal io_uring block completion: {error:?}");
-            }
+            .needs_notification(mem);
+        if let Err(error) = self.interrupt.try_signal_used_queue() {
+            log::error!("failed to signal io_uring block completion: {error:?}");
         }
     }
 
