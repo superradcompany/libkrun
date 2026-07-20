@@ -15,6 +15,8 @@ use std::io::{self, Write};
 use std::os::linux::fs::MetadataExt;
 #[cfg(target_os = "macos")]
 use std::os::macos::fs::MetadataExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(feature = "block-io-profile")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -49,6 +51,8 @@ use super::windows::{
     PendingWindowsRawFileOperation, WindowsRawFile, WindowsRawFileBuffer, WindowsRawFileCompletion,
 };
 use super::worker::BlockWorker;
+#[cfg(target_os = "linux")]
+use super::worker::LinuxRawFile;
 use super::{
     super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice, TYPE_BLOCK},
     Error, MAX_EXPERIMENTAL_QUEUES, QUEUE_SIZE, SECTOR_SHIFT, SECTOR_SIZE,
@@ -488,7 +492,7 @@ pub struct Block {
     disk_image: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
     #[cfg(target_os = "linux")]
-    linux_raw_file: Option<Arc<File>>,
+    linux_raw_file: Option<LinuxRawFile>,
     #[cfg(windows)]
     windows_raw_file: Option<Arc<WindowsRawFile>>,
     metrics: BlockMetricsWriter,
@@ -537,21 +541,6 @@ impl Block {
             .write(!is_disk_read_only)
             .open(PathBuf::from(&disk_image_path))?;
 
-        #[cfg(target_os = "linux")]
-        let linux_raw_file = if PerfExperiment::BlockIoUring.enabled()
-            && matches!(&disk_image_format, ImageType::Raw)
-            && !direct_io
-        {
-            Some(Arc::new(
-                OpenOptions::new()
-                    .read(true)
-                    .write(!is_disk_read_only)
-                    .open(&disk_image_path)?,
-            ))
-        } else {
-            None
-        };
-
         #[cfg(windows)]
         let windows_raw_file = if matches!(&disk_image_format, ImageType::Raw) {
             Some(Arc::new(WindowsRawFile::open(
@@ -579,13 +568,34 @@ impl Block {
 
         let file_opts = StorageOpenOptions::new()
             .write(!is_disk_read_only)
-            .filename(disk_image_path)
+            .filename(disk_image_path.clone())
             .direct(direct_io);
 
         #[cfg(target_os = "macos")]
         let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
         let file = ImagoFile::open(file_opts)?;
         let discard_alignment = file.discard_align();
+
+        #[cfg(target_os = "linux")]
+        let linux_raw_file = if PerfExperiment::BlockIoUring.enabled()
+            && matches!(&disk_image_format, ImageType::Raw)
+        {
+            let mut options = OpenOptions::new();
+            options.read(true).write(!is_disk_read_only);
+            if direct_io {
+                // This descriptor is owned by the io_uring backend. Imago still owns the
+                // synchronous fallback descriptor and its alignment-aware read/modify/write path.
+                options.custom_flags(libc::O_DIRECT);
+            }
+            Some(LinuxRawFile::new(
+                Arc::new(options.open(&disk_image_path)?),
+                direct_io,
+                file.req_align(),
+                file.mem_align(),
+            ))
+        } else {
+            None
+        };
 
         #[cfg(feature = "block-io-profile")]
         let file: Box<dyn DynStorage> = {

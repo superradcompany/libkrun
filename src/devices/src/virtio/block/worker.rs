@@ -11,6 +11,8 @@ use super::windows::{
 use crate::virtio::queue::DescriptorChain;
 use crate::virtio::InterruptTransport;
 #[cfg(target_os = "linux")]
+use imago::io_buffers::IoBuffer;
+#[cfg(target_os = "linux")]
 use io_uring::{opcode, types, IoUring};
 #[cfg(windows)]
 use std::collections::HashMap;
@@ -116,6 +118,18 @@ struct LinuxRawBackend {
     file: Arc<File>,
     ring: IoUring,
     next_request_id: u64,
+    direct_io: bool,
+    req_align: usize,
+    mem_align: usize,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub(super) struct LinuxRawFile {
+    file: Arc<File>,
+    direct_io: bool,
+    req_align: usize,
+    mem_align: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -123,7 +137,7 @@ struct PendingLinuxRawRequest {
     queue_index: usize,
     head_index: u16,
     direction: LinuxRawDirection,
-    buffer: Vec<u8>,
+    buffer: IoBuffer,
     offset: u64,
     completed: usize,
 }
@@ -133,6 +147,23 @@ struct PendingLinuxRawRequest {
 enum LinuxRawDirection {
     Read,
     Write,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxRawFile {
+    pub(super) fn new(
+        file: Arc<File>,
+        direct_io: bool,
+        req_align: usize,
+        mem_align: usize,
+    ) -> Self {
+        Self {
+            file,
+            direct_io,
+            req_align,
+            mem_align,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -227,17 +258,20 @@ impl BlockWorker {
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
         disk: DiskProperties,
-        #[cfg(target_os = "linux")] linux_raw_file: Option<Arc<File>>,
+        #[cfg(target_os = "linux")] linux_raw_file: Option<LinuxRawFile>,
         stop_fd: EventFd,
         metrics: BlockMetricsWriter,
     ) -> Self {
         #[cfg(target_os = "linux")]
-        let linux_raw = linux_raw_file.and_then(|file| {
+        let linux_raw = linux_raw_file.and_then(|raw| {
             match IoUring::new(MAX_PENDING_LINUX_RAW_REQUESTS as u32) {
                 Ok(ring) => Some(LinuxRawBackend {
-                    file,
+                    file: raw.file,
                     ring,
                     next_request_id: 1,
+                    direct_io: raw.direct_io,
+                    req_align: raw.req_align,
+                    mem_align: raw.mem_align,
                 }),
                 Err(error) => {
                     log::warn!("io_uring unavailable, using synchronous block I/O: {error}");
@@ -622,43 +656,75 @@ impl BlockWorker {
                 }
             };
 
+            let (direct_io, req_align, mem_align) = {
+                let backend = self.linux_raw.as_ref().expect("io_uring backend selected");
+                (backend.direct_io, backend.req_align, backend.mem_align)
+            };
             let async_request = match request_header.request_type {
                 VIRTIO_BLK_T_IN => writer
                     .available_bytes()
                     .checked_sub(1)
                     .filter(|length| {
-                        length.is_multiple_of(512) && *length <= MAX_LINUX_RAW_REQUEST_BYTES
+                        *length > 0
+                            && length.is_multiple_of(512)
+                            && *length <= MAX_LINUX_RAW_REQUEST_BYTES
                     })
-                    .map(|length| {
-                        (
-                            LinuxRawDirection::Read,
-                            vec![0u8; length],
-                            sector_offset(request_header.sector),
-                        )
+                    .and_then(|length| {
+                        let offset = sector_offset(request_header.sector).ok()?;
+                        linux_raw_request_is_aligned(direct_io, req_align, offset, length)
+                            .then_some((LinuxRawDirection::Read, length, offset))
                     }),
                 VIRTIO_BLK_T_OUT => {
                     let length = reader.available_bytes();
-                    if length.is_multiple_of(512) && length <= MAX_LINUX_RAW_REQUEST_BYTES {
-                        let mut buffer = vec![0u8; length];
-                        match reader.read_exact(&mut buffer) {
-                            Ok(()) => Some((
-                                LinuxRawDirection::Write,
-                                buffer,
-                                sector_offset(request_header.sector),
-                            )),
-                            Err(error) => {
-                                error!("failed to stage io_uring block write: {error:?}");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    }
+                    let offset = sector_offset(request_header.sector).ok();
+                    offset
+                        .filter(|offset| {
+                            length > 0
+                                && length.is_multiple_of(512)
+                                && length <= MAX_LINUX_RAW_REQUEST_BYTES
+                                && linux_raw_request_is_aligned(
+                                    direct_io, req_align, *offset, length,
+                                )
+                        })
+                        .map(|offset| (LinuxRawDirection::Write, length, offset))
                 }
                 _ => None,
             };
 
-            if let Some((direction, buffer, Ok(offset))) = async_request {
+            if let Some((direction, length, offset)) = async_request {
+                let mut buffer = match IoBuffer::new(length, mem_align) {
+                    Ok(buffer) => buffer,
+                    Err(error) => {
+                        error!("failed to allocate aligned io_uring block buffer: {error:?}");
+                        self.drain_linux_raw_requests(mem, &mut pending);
+                        let (status, len) =
+                            match self.process_request(request_header, &mut reader, &mut writer) {
+                                Ok(length) => (VIRTIO_BLK_S_OK as u8, length),
+                                Err(error) => {
+                                    log::error!(
+                                        "error processing synchronous block request: {error:?}"
+                                    );
+                                    (VIRTIO_BLK_S_IOERR as u8, 0)
+                                }
+                            };
+                        self.complete_linux_sync_request(
+                            queue_index,
+                            head.index,
+                            mem,
+                            &mut writer,
+                            status,
+                            len,
+                        );
+                        continue;
+                    }
+                };
+                if direction == LinuxRawDirection::Write {
+                    if let Err(error) = reader.read_exact(buffer.as_mut().into_slice()) {
+                        error!("failed to stage io_uring block write: {error:?}");
+                        self.complete_linux_raw_error(queue_index, head.index, mem);
+                        continue;
+                    }
+                }
                 let request = PendingLinuxRawRequest {
                     queue_index,
                     head_index: head.index,
@@ -735,9 +801,9 @@ impl BlockWorker {
         let entry = match request.direction {
             LinuxRawDirection::Read => opcode::Read::new(
                 types::Fd(backend.file.as_raw_fd()),
-                // SAFETY: `completed` never exceeds the vector length, and the vector remains
+                // SAFETY: `completed` never exceeds the buffer length, and the buffer remains
                 // owned by the pending request until the matching CQE is reaped.
-                unsafe { request.buffer.as_mut_ptr().add(request.completed) },
+                unsafe { request.buffer.as_mut().as_ptr().add(request.completed) },
                 length,
             )
             .offset(offset)
@@ -745,7 +811,7 @@ impl BlockWorker {
             LinuxRawDirection::Write => opcode::Write::new(
                 types::Fd(backend.file.as_raw_fd()),
                 // SAFETY: same bounded offset and lifetime argument as the read buffer above.
-                unsafe { request.buffer.as_ptr().add(request.completed) },
+                unsafe { request.buffer.as_ref().as_ptr().add(request.completed) },
                 length,
             )
             .offset(offset)
@@ -756,9 +822,7 @@ impl BlockWorker {
         // SAFETY: the request remains in `pending`, keeping its heap allocation and file alive
         // until the matching CQE is consumed. The queue depth and all buffers are bounded.
         if unsafe { backend.ring.submission().push(&entry) }.is_err() {
-            if let Err(error) = backend.ring.submit() {
-                return Err(error);
-            }
+            backend.ring.submit()?;
             // SAFETY: same ownership argument as above; submission cannot outlive `pending`.
             if unsafe { backend.ring.submission().push(&entry) }.is_err() {
                 return Err(io::Error::other("io_uring submission queue remained full"));
@@ -800,9 +864,32 @@ impl BlockWorker {
                 if let Some(completed) = completed.filter(|completed| *completed < remaining) {
                     if completed > 0 {
                         request.completed += completed;
-                        let backend = self.linux_raw.as_mut().expect("io_uring backend selected");
-                        if let Err(error) = Self::push_linux_raw_entry(backend, request_id, request)
-                        {
+                        let can_resubmit = {
+                            let backend =
+                                self.linux_raw.as_ref().expect("io_uring backend selected");
+                            request
+                                .offset
+                                .checked_add(request.completed as u64)
+                                .is_some_and(|offset| {
+                                    linux_raw_request_is_aligned(
+                                        backend.direct_io,
+                                        backend.req_align,
+                                        offset,
+                                        request.buffer.len() - request.completed,
+                                    ) && (!backend.direct_io
+                                        || request.completed.is_multiple_of(backend.mem_align))
+                                })
+                        };
+                        let resubmit_result = if can_resubmit {
+                            let backend =
+                                self.linux_raw.as_mut().expect("io_uring backend selected");
+                            Self::push_linux_raw_entry(backend, request_id, request)
+                        } else {
+                            Err(io::Error::other(
+                                "partial direct-I/O completion left an unaligned remainder",
+                            ))
+                        };
+                        if let Err(error) = resubmit_result {
                             error!("failed to resubmit partial io_uring request: {error:?}");
                             let request =
                                 pending.remove(&request_id).expect("request still pending");
@@ -826,7 +913,7 @@ impl BlockWorker {
         result: i32,
         mem: &GuestMemoryMmap,
     ) {
-        let mut writer = match self.linux_raw_writer(&request, mem) {
+        let mut writer = match self.linux_raw_writer(request.queue_index, request.head_index, mem) {
             Ok(writer) => writer,
             Err(error) => {
                 error!("failed to reconstruct io_uring completion descriptors: {error:?}");
@@ -836,7 +923,7 @@ impl BlockWorker {
         };
         let status = if success {
             let data_result = match request.direction {
-                LinuxRawDirection::Read => writer.write_all(&request.buffer),
+                LinuxRawDirection::Read => writer.write_all(request.buffer.as_ref().into_slice()),
                 LinuxRawDirection::Write => Ok(()),
             };
             if data_result.is_ok() {
@@ -870,17 +957,16 @@ impl BlockWorker {
     #[cfg(target_os = "linux")]
     fn linux_raw_writer<'a>(
         &self,
-        request: &PendingLinuxRawRequest,
+        queue_index: usize,
+        head_index: u16,
         mem: &'a GuestMemoryMmap,
     ) -> io::Result<Writer<'a>> {
-        let queue = &self.device_queues[request.queue_index].queue;
-        let chain = DescriptorChain::checked_new(
-            mem,
-            queue.desc_table,
-            queue.actual_size(),
-            request.head_index,
-        )
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid descriptor chain"))?;
+        let queue = &self.device_queues[queue_index].queue;
+        let chain =
+            DescriptorChain::checked_new(mem, queue.desc_table, queue.actual_size(), head_index)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid descriptor chain")
+                })?;
         Writer::new(mem, chain).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
@@ -891,15 +977,7 @@ impl BlockWorker {
         head_index: u16,
         mem: &GuestMemoryMmap,
     ) {
-        let request = PendingLinuxRawRequest {
-            queue_index,
-            head_index,
-            direction: LinuxRawDirection::Write,
-            buffer: Vec::new(),
-            offset: 0,
-            completed: 0,
-        };
-        if let Ok(mut writer) = self.linux_raw_writer(&request, mem) {
+        if let Ok(mut writer) = self.linux_raw_writer(queue_index, head_index, mem) {
             let status_offset = writer.available_bytes().saturating_sub(1);
             if let Ok(mut status_writer) = writer.split_at(status_offset) {
                 let _ = status_writer.write_obj(VIRTIO_BLK_S_IOERR as u8);
@@ -1654,6 +1732,20 @@ fn sector_count_bytes(sectors: u32) -> result::Result<u64, RequestError> {
         .ok_or(RequestError::InvalidDataLength)
 }
 
+#[cfg(target_os = "linux")]
+fn linux_raw_request_is_aligned(
+    direct_io: bool,
+    req_align: usize,
+    offset: u64,
+    length: usize,
+) -> bool {
+    if !direct_io {
+        return true;
+    }
+
+    req_align > 0 && offset.is_multiple_of(req_align as u64) && length.is_multiple_of(req_align)
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
@@ -1673,5 +1765,19 @@ mod tests {
     #[test]
     fn sector_count_bytes_converts_to_bytes() {
         assert_eq!(sector_count_bytes(8).unwrap(), 4096);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_linux_raw_requests_require_file_alignment() {
+        assert!(linux_raw_request_is_aligned(true, 4096, 8192, 4096));
+        assert!(!linux_raw_request_is_aligned(true, 4096, 512, 4096));
+        assert!(!linux_raw_request_is_aligned(true, 4096, 8192, 512));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buffered_linux_raw_requests_do_not_require_direct_alignment() {
+        assert!(linux_raw_request_is_aligned(false, 4096, 512, 512));
     }
 }
