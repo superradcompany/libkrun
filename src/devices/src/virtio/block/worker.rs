@@ -62,6 +62,8 @@ const LINUX_RAW_EVENT: u64 = 65;
 const MAX_PENDING_LINUX_RAW_REQUESTS: usize = 64;
 #[cfg(target_os = "linux")]
 const MAX_LINUX_RAW_REQUEST_BYTES: usize = 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_LINUX_RAW_BOUNCE_FAST_PATH_BYTES: usize = 64 * 1024;
 #[cfg(windows)]
 const MAX_PENDING_WINDOWS_RAW_REQUESTS: usize = 64;
 
@@ -1078,10 +1080,17 @@ impl BlockWorker {
                     }
                 };
 
-                let can_use_guest_iovecs = !direct_io
-                    || guest_buffers
+                // Small buffered requests use the bounded reusable pool: copying at most 64 KiB
+                // is cheaper than importing and pinning arbitrary guest mappings in io_uring for
+                // every operation. Large requests retain the zero-bounce guest-iovec path where
+                // avoiding a full data copy and request-sized allocator churn matters most.
+                let can_use_guest_iovecs = if direct_io {
+                    guest_buffers
                         .iter()
-                        .all(|buffer| buffer.is_direct_io_aligned(mem_align));
+                        .all(|buffer| buffer.is_direct_io_aligned(mem_align))
+                } else {
+                    length > MAX_LINUX_RAW_BOUNCE_FAST_PATH_BYTES
+                };
                 let data = if can_use_guest_iovecs {
                     LinuxRawRequestData::Guest {
                         iovecs: SmallVec::with_capacity(guest_buffers.len()),
