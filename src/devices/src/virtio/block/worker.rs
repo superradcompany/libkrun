@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::fs::File;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use std::io::Read;
 use std::io::{self, Write};
 #[cfg(unix)]
@@ -792,7 +792,7 @@ impl BlockWorker {
             };
             for (request_id, result) in completions {
                 let Some(request) = pending.get_mut(&request_id) else {
-                    error!(request_id, "io_uring returned an unknown block request");
+                    error!("io_uring returned unknown block request {request_id}");
                     continue;
                 };
                 let completed = usize::try_from(result).ok();
@@ -854,7 +854,7 @@ impl BlockWorker {
             }
         } else {
             if result < 0 {
-                error!(errno = -result, "io_uring block operation failed");
+                error!("io_uring block operation failed with errno {}", -result);
             }
             VIRTIO_BLK_S_IOERR as u8
         };
@@ -946,7 +946,7 @@ impl BlockWorker {
     }
 
     #[cfg(target_os = "linux")]
-    fn signal_linux_raw_queue(&self, queue_index: usize, mem: &GuestMemoryMmap) {
+    fn signal_linux_raw_queue(&mut self, queue_index: usize, mem: &GuestMemoryMmap) {
         if self.device_queues[queue_index]
             .queue
             .needs_notification(mem)
