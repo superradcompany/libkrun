@@ -380,12 +380,12 @@ extern "C" {
 }
 #[cfg(feature = "virgl_resource_map2")]
 extern "C" {
-    pub fn virgl_renderer_resource_map2(
+    // Upstream virglrenderer never took the crosvm-lineage resource_map2 API;
+    // its equivalent is resource_map_fixed (>= 1.1x): size/prot are derived
+    // from the resource itself, the map lands at the caller's fixed addr.
+    pub fn virgl_renderer_resource_map_fixed(
         res_handle: u32,
-        map: *const ::std::os::raw::c_void,
-        size: u64,
-        prot: i32,
-        flags: i32,
+        addr: *mut ::std::os::raw::c_void,
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
