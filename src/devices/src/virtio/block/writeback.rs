@@ -53,6 +53,7 @@ struct WritebackWindow {
     trigger_bytes: u64,
     logical_bytes: u64,
     dirty_range: Option<DirtyRange>,
+    submitted: bool,
 }
 
 impl WritebackWindow {
@@ -61,10 +62,17 @@ impl WritebackWindow {
             trigger_bytes,
             logical_bytes: 0,
             dirty_range: None,
+            submitted: false,
         }
     }
 
     fn record_write(&mut self, offset: u64, length: u64) -> Option<DirtyRange> {
+        // One advisory submission is enough to start background writeout for this durability
+        // epoch. Later writes are still covered by the mandatory full sync at guest flush time.
+        if self.submitted {
+            return None;
+        }
+
         let range = DirtyRange::new(offset, length)?;
         self.logical_bytes = self.logical_bytes.saturating_add(length);
         self.dirty_range = Some(
@@ -77,8 +85,7 @@ impl WritebackWindow {
             return None;
         }
 
-        self.logical_bytes = 0;
-        self.dirty_range = None;
+        self.submitted = true;
         Some(dirty_range)
     }
 
@@ -89,6 +96,39 @@ impl WritebackWindow {
     fn complete_flush(&mut self) {
         self.logical_bytes = 0;
         self.dirty_range = None;
+        self.submitted = false;
+    }
+}
+
+/// Immutable inputs used to create a fresh controller when a block device is reactivated.
+#[derive(Clone)]
+pub(crate) struct BufferedWritebackConfig {
+    file: Arc<File>,
+    trigger_bytes: u64,
+}
+
+impl BufferedWritebackConfig {
+    pub(crate) fn from_environment(file: Arc<File>) -> Option<Self> {
+        let trigger_bytes = env::var(TRIGGER_ENV)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_TRIGGER_BYTES);
+        if trigger_bytes == 0 {
+            return None;
+        }
+
+        Some(Self {
+            file,
+            trigger_bytes,
+        })
+    }
+
+    pub(crate) fn controller(&self) -> BufferedWritebackController {
+        BufferedWritebackController {
+            file: Arc::clone(&self.file),
+            window: WritebackWindow::new(self.trigger_bytes),
+            disabled: false,
+        }
     }
 }
 
@@ -104,38 +144,12 @@ pub(crate) struct BufferedWritebackController {
 }
 
 impl BufferedWritebackController {
-    pub(crate) fn from_environment(file: Arc<File>) -> Option<Self> {
-        let trigger_bytes = env::var(TRIGGER_ENV)
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(DEFAULT_TRIGGER_BYTES);
-        if trigger_bytes == 0 {
-            return None;
-        }
-
-        Some(Self {
-            file,
-            window: WritebackWindow::new(trigger_bytes),
-            disabled: false,
-        })
-    }
-
     pub(crate) fn record_write(&mut self, offset: u64, length: u64) {
         if self.disabled {
             return;
         }
 
         if let Some(range) = self.window.record_write(offset, length) {
-            self.submit(range);
-        }
-    }
-
-    pub(crate) fn prepare_flush(&mut self) {
-        if self.disabled {
-            return;
-        }
-
-        if let Some(range) = self.window.pending_range() {
             self.submit(range);
         }
     }
@@ -154,8 +168,8 @@ impl BufferedWritebackController {
             return;
         };
 
-        // Safe: the controller owns a live duplicate of the exact file object used by Imago, and
-        // the remaining arguments are validated integer values and a Linux-defined flag.
+        // Safe: the controller owns a live descriptor for the exact backing inode reopened by
+        // Imago, and the remaining arguments are validated integers plus a Linux-defined flag.
         let result = unsafe {
             libc::sync_file_range(
                 self.file.as_raw_fd(),
@@ -202,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn threshold_submits_one_coalesced_range_and_starts_a_new_window() {
+    fn threshold_submits_only_once_until_durability_completes() {
         let mut window = WritebackWindow::new(96 * 1024 * 1024);
         assert_eq!(window.record_write(0, 64 * 1024 * 1024), None);
         assert_eq!(
@@ -212,31 +226,32 @@ mod tests {
                 end: 96 * 1024 * 1024
             })
         );
-        assert_eq!(window.pending_range(), None);
+        assert_eq!(
+            window.pending_range(),
+            Some(DirtyRange {
+                start: 0,
+                end: 96 * 1024 * 1024
+            })
+        );
 
         assert_eq!(window.record_write(256 * 1024 * 1024, 512), None);
         assert_eq!(
             window.pending_range(),
             Some(DirtyRange {
-                start: 256 * 1024 * 1024,
-                end: 256 * 1024 * 1024 + 512
+                start: 0,
+                end: 96 * 1024 * 1024
             })
         );
-    }
-
-    #[test]
-    fn flush_keeps_pending_range_until_durability_completes() {
-        let mut window = WritebackWindow::new(u64::MAX);
-        window.record_write(4096, 128 * 1024 * 1024);
-        let expected = DirtyRange {
-            start: 4096,
-            end: 4096 + 128 * 1024 * 1024,
-        };
-        assert_eq!(window.pending_range(), Some(expected));
-        assert_eq!(window.pending_range(), Some(expected));
 
         window.complete_flush();
         assert_eq!(window.pending_range(), None);
+        assert_eq!(
+            window.record_write(512 * 1024 * 1024, 96 * 1024 * 1024),
+            Some(DirtyRange {
+                start: 512 * 1024 * 1024,
+                end: 608 * 1024 * 1024
+            })
+        );
     }
 
     #[test]
@@ -264,7 +279,13 @@ mod tests {
         };
         controller.record_write(0, MINIMUM_RANGE_BYTES);
         assert!(!controller.disabled);
-        assert_eq!(controller.window.pending_range(), None);
+        assert_eq!(
+            controller.window.pending_range(),
+            Some(DirtyRange {
+                start: 0,
+                end: MINIMUM_RANGE_BYTES
+            })
+        );
 
         drop(controller);
         std::fs::remove_file(path).unwrap();
