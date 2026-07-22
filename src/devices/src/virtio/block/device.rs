@@ -13,6 +13,8 @@ use std::io::{self, Write};
 use std::os::linux::fs::MetadataExt;
 #[cfg(target_os = "macos")]
 use std::os::macos::fs::MetadataExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::result;
 use std::sync::{Arc, Mutex};
@@ -38,7 +40,7 @@ use super::windows::{
 };
 use super::worker::BlockWorker;
 #[cfg(target_os = "linux")]
-use super::writeback::BufferedWritebackController;
+use super::writeback::{BufferedWritebackConfig, BufferedWritebackController};
 use super::{
     super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice, TYPE_BLOCK},
     Error, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
@@ -170,13 +172,6 @@ impl DiskProperties {
     }
 
     pub(crate) fn flush_to_disk(&self) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
-        if let Some(controller) = &self.writeback_controller {
-            // Advisory writeout only moves data toward the device. The full sync below remains the
-            // durability boundary and the worker does not acknowledge the guest before it returns.
-            controller.lock().unwrap().prepare_flush();
-        }
-
         #[cfg(windows)]
         if let Some(raw_file) = &self.windows_raw_file {
             raw_file.flush()?;
@@ -205,9 +200,9 @@ impl DiskProperties {
     }
 
     #[cfg(target_os = "linux")]
-    fn set_writeback_file(&mut self, file: Option<Arc<File>>) {
-        self.writeback_controller = file
-            .and_then(BufferedWritebackController::from_environment)
+    fn set_writeback_config(&mut self, config: Option<&BufferedWritebackConfig>) {
+        self.writeback_controller = config
+            .map(BufferedWritebackConfig::controller)
             .map(Mutex::new);
     }
 
@@ -401,7 +396,7 @@ pub struct Block {
     disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
     #[cfg(target_os = "linux")]
-    writeback_file: Option<Arc<File>>,
+    writeback_config: Option<BufferedWritebackConfig>,
     #[cfg(windows)]
     windows_raw_file: Option<Arc<WindowsRawFile>>,
     metrics: BlockMetricsWriter,
@@ -474,30 +469,37 @@ impl Block {
             padded
         };
 
-        let file_opts = StorageOpenOptions::new()
-            .write(!is_disk_read_only)
-            .filename(&disk_image_path)
-            .direct(direct_io);
-
-        #[cfg(target_os = "macos")]
-        let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
-
         #[cfg(target_os = "linux")]
-        let (file, writeback_file) = if matches!(disk_image_format, ImageType::Raw)
+        let writeback_config = if matches!(disk_image_format, ImageType::Raw)
             && !is_disk_read_only
             && !direct_io
             && cache_type == CacheType::Writeback
             && sync_mode != SyncMode::None
         {
-            // Use one opened object for both Imago I/O and advisory writeback. Reopening the path
-            // for either side could race with replacement and target different inodes.
-            let writeback_file = Arc::new(disk_image.try_clone()?);
-            (ImagoFile::try_from(disk_image)?, Some(writeback_file))
+            BufferedWritebackConfig::from_environment(Arc::new(disk_image.try_clone()?))
         } else {
-            (ImagoFile::open_sync(file_opts)?, None)
+            None
         };
 
+        // Keep Imago on its established open path. When advisory writeback is active, procfs
+        // provides a race-free name for the already-verified inode without giving Imago the
+        // controller's file description or changing its storage implementation.
+        #[cfg(target_os = "linux")]
+        let imago_path = writeback_config
+            .as_ref()
+            .map(|_| format!("/proc/self/fd/{}", disk_image.as_raw_fd()))
+            .unwrap_or_else(|| disk_image_path.clone());
         #[cfg(not(target_os = "linux"))]
+        let imago_path = disk_image_path.clone();
+
+        let file_opts = StorageOpenOptions::new()
+            .write(!is_disk_read_only)
+            .filename(&imago_path)
+            .direct(direct_io);
+
+        #[cfg(target_os = "macos")]
+        let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
+
         let file = ImagoFile::open_sync(file_opts)?;
         let discard_alignment = file.discard_align();
 
@@ -535,7 +537,7 @@ impl Block {
             #[cfg(target_os = "linux")]
             let disk_properties = {
                 let mut disk_properties = disk_properties;
-                disk_properties.set_writeback_file(writeback_file.clone());
+                disk_properties.set_writeback_config(writeback_config.as_ref());
                 disk_properties
             };
             #[cfg(windows)]
@@ -587,7 +589,7 @@ impl Block {
             disk_image,
             disk_image_id,
             #[cfg(target_os = "linux")]
-            writeback_file,
+            writeback_config,
             #[cfg(windows)]
             windows_raw_file,
             metrics,
@@ -689,7 +691,7 @@ impl VirtioDevice for Block {
                 #[cfg(target_os = "linux")]
                 let disk = {
                     let mut disk = disk;
-                    disk.set_writeback_file(self.writeback_file.clone());
+                    disk.set_writeback_config(self.writeback_config.as_ref());
                     disk
                 };
                 #[cfg(windows)]
