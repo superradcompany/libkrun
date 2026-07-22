@@ -505,11 +505,12 @@ impl FileReadWriteAtVolatile for DiskProperties {
             })
             .collect::<Vec<_>>();
         let iovec = IoVector::from(buffers);
-        let full_length = iovec
-            .len()
+        let full_length_u64 = iovec.len();
+        let full_length = full_length_u64
             .try_into()
             .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
         self.file.lock().unwrap().writev(iovec, offset)?;
+        self.record_buffered_write(offset, full_length_u64);
         Ok(full_length)
     }
 }
