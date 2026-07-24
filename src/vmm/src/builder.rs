@@ -4067,6 +4067,57 @@ fn attach_vfio_device(
         }
     }
 
+    // Step 7: identity-map all guest RAM into the device's IOMMU (iova == gpa)
+    // so the GPU can DMA to/from guest memory.
+    {
+        let gm = vmm.guest_memory();
+        for region in gm.iter() {
+            let gpa = region.start_addr().raw_value();
+            let host = gm.get_host_address(region.start_addr()).map_err(|e| {
+                StartMicrovmError::AttachVfioDevice(format!("{bdf} dma host addr: {e}"))
+            })? as u64;
+            let size = region.len();
+            device
+                .vfio()
+                .container()
+                .map_dma(host, gpa, size)
+                .map_err(|e| {
+                    StartMicrovmError::AttachVfioDevice(format!("{bdf} dma map: {e}"))
+                })?;
+        }
+        info!("vfio: {bdf} guest RAM identity-mapped into device IOMMU");
+    }
+
+    // Step 8: bind the VFIO group to KVM (KVM_DEV_VFIO) so KVM can coordinate
+    // interrupt routing and IOMMU coherence with the device.
+    {
+        let mut kvm_vfio = kvm_bindings::kvm_create_device {
+            type_: kvm_bindings::kvm_device_type_KVM_DEV_TYPE_VFIO,
+            fd: 0,
+            flags: 0,
+        };
+        let kvm_vfio_fd = vmm
+            .kvm_vm()
+            .fd()
+            .create_device(&mut kvm_vfio)
+            .map_err(|e| {
+                StartMicrovmError::AttachVfioDevice(format!("{bdf} kvm vfio device: {e}"))
+            })?;
+        let group_fd: i32 = device.vfio().group_as_raw_fd();
+        let attr = kvm_bindings::kvm_device_attr {
+            group: kvm_bindings::KVM_DEV_VFIO_GROUP,
+            attr: u64::from(kvm_bindings::KVM_DEV_VFIO_GROUP_ADD),
+            addr: &group_fd as *const i32 as u64,
+            flags: 0,
+        };
+        kvm_vfio_fd.set_device_attr(&attr).map_err(|e| {
+            StartMicrovmError::AttachVfioDevice(format!("{bdf} kvm vfio group add: {e}"))
+        })?;
+        // The KVM VFIO device fd must outlive the VM; leak it (closed at exit).
+        std::mem::forget(kvm_vfio_fd);
+        info!("vfio: {bdf} group bound to KVM");
+    }
+
     let mut bus = pci_bus.lock().unwrap();
     let slot = bus
         .allocate_device_id(None)

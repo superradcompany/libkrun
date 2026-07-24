@@ -221,8 +221,8 @@ impl VfioRegion {
 pub struct VfioDevice {
     device: File,
     // Container and group are kept alive for the lifetime of the device.
-    _container: VfioContainer,
-    _group: VfioGroup,
+    container: VfioContainer,
+    group: VfioGroup,
     regions: Vec<VfioRegion>,
     pub num_irqs: u32,
 }
@@ -291,11 +291,21 @@ impl VfioDevice {
 
         Ok(VfioDevice {
             device,
-            _container: container,
-            _group: group,
+            container,
+            group,
             regions,
             num_irqs: dev_info.num_irqs,
         })
+    }
+
+    /// The VFIO container (for IOMMU DMA mapping of guest RAM).
+    pub fn container(&self) -> &VfioContainer {
+        &self.container
+    }
+
+    /// The raw fd of the VFIO group (for binding to KVM via KVM_DEV_VFIO).
+    pub fn group_as_raw_fd(&self) -> RawFd {
+        self.group.group.as_raw_fd()
     }
 
     fn iommu_group_id(name: &str) -> Result<u32, VfioError> {
