@@ -4070,7 +4070,7 @@ fn attach_vfio_device(
     // Step 7: identity-map all guest RAM into the device's IOMMU (iova == gpa)
     // so the GPU can DMA to/from guest memory.
     {
-        use vm_memory::{GuestMemory, GuestMemoryRegion};
+        use vm_memory::GuestMemoryRegion;
         let gm = vmm.guest_memory();
         for region in gm.iter() {
             let gpa = region.start_addr().raw_value();
