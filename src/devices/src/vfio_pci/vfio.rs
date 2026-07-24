@@ -30,6 +30,7 @@ ioctl_io_nr!(VFIO_GROUP_UNSET_CONTAINER, VFIO_TYPE.into(), VFIO_BASE + 5);
 ioctl_io_nr!(VFIO_GROUP_GET_DEVICE_FD, VFIO_TYPE.into(), VFIO_BASE + 6);
 ioctl_io_nr!(VFIO_DEVICE_GET_INFO, VFIO_TYPE.into(), VFIO_BASE + 7);
 ioctl_io_nr!(VFIO_DEVICE_GET_REGION_INFO, VFIO_TYPE.into(), VFIO_BASE + 8);
+ioctl_io_nr!(VFIO_DEVICE_SET_IRQS, VFIO_TYPE.into(), VFIO_BASE + 10);
 ioctl_io_nr!(VFIO_IOMMU_MAP_DMA, VFIO_TYPE.into(), VFIO_BASE + 13);
 ioctl_io_nr!(VFIO_IOMMU_UNMAP_DMA, VFIO_TYPE.into(), VFIO_BASE + 14);
 
@@ -402,6 +403,99 @@ impl VfioDevice {
             return Err(VfioError::Mmap(index, std::io::Error::last_os_error()));
         }
         Ok((addr, region.size as usize))
+    }
+
+    /// mmap a page-aligned sub-range `[region_offset, region_offset+len)` of a
+    /// region over the device fd. Used to map a BAR around a trapped MSI-X table
+    /// page (step 9): the table page is left unmapped so guest accesses fall
+    /// through to emulation. `region_offset` and `len` must be page-aligned.
+    pub fn mmap_region_range(
+        &self,
+        index: u32,
+        region_offset: u64,
+        len: u64,
+    ) -> Result<(*mut libc::c_void, usize), VfioError> {
+        let region = self.region(index).ok_or(VfioError::RegionBounds(index))?;
+        if !region.is_mmappable() {
+            return Err(VfioError::RegionNotMmappable(index));
+        }
+        if region_offset + len > region.size {
+            return Err(VfioError::RegionBounds(index));
+        }
+        let mut prot = 0;
+        if region.flags & VFIO_REGION_INFO_FLAG_READ != 0 {
+            prot |= libc::PROT_READ;
+        }
+        if region.flags & VFIO_REGION_INFO_FLAG_WRITE != 0 {
+            prot |= libc::PROT_WRITE;
+        }
+        // SAFETY: mmap over the device fd at the region's opaque offset plus the
+        // requested sub-range offset.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len as usize,
+                prot,
+                libc::MAP_SHARED,
+                self.device.as_raw_fd(),
+                (region.offset + region_offset) as libc::off_t,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            return Err(VfioError::Mmap(index, std::io::Error::last_os_error()));
+        }
+        Ok((addr, len as usize))
+    }
+
+    /// Arm a set of interrupt vectors by handing the kernel an eventfd per
+    /// vector (`VFIO_DEVICE_SET_IRQS`, DATA_EVENTFD | ACTION_TRIGGER). The
+    /// device signals `eventfds[i]` when it raises vector `i`. Used for MSI-X
+    /// (index = `VFIO_PCI_MSIX_IRQ_INDEX`).
+    pub fn set_irqs_eventfds(&self, index: u32, eventfds: &[RawFd]) -> Result<(), VfioError> {
+        let header = mem::size_of::<vfio_irq_set>();
+        let mut buf = vec![0u8; header + eventfds.len() * mem::size_of::<i32>()];
+
+        // SAFETY: `buf` is at least `header` bytes; we only write the fixed
+        // header fields through this pointer.
+        unsafe {
+            let irq_set = buf.as_mut_ptr() as *mut vfio_irq_set;
+            (*irq_set).argsz = buf.len() as u32;
+            (*irq_set).flags = VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER;
+            (*irq_set).index = index;
+            (*irq_set).start = 0;
+            (*irq_set).count = eventfds.len() as u32;
+        }
+        for (i, fd) in eventfds.iter().enumerate() {
+            let off = header + i * mem::size_of::<i32>();
+            buf[off..off + 4].copy_from_slice(&(*fd as i32).to_ne_bytes());
+        }
+
+        // SAFETY: `buf` holds a valid `vfio_irq_set` header followed by `count`
+        // little-endian i32 eventfds, as the ioctl expects.
+        let ret = unsafe { ioctl_with_ptr(&self.device, VFIO_DEVICE_SET_IRQS(), buf.as_ptr()) };
+        if ret < 0 {
+            return Err(last_os_error("VFIO_DEVICE_SET_IRQS"));
+        }
+        Ok(())
+    }
+
+    /// Disarm all vectors of an interrupt index (DATA_NONE | ACTION_TRIGGER,
+    /// count 0), releasing the eventfd bindings established by `set_irqs_eventfds`.
+    pub fn disable_irqs(&self, index: u32) -> Result<(), VfioError> {
+        let irq_set = vfio_irq_set {
+            argsz: mem::size_of::<vfio_irq_set>() as u32,
+            flags: VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER,
+            index,
+            start: 0,
+            count: 0,
+            data: Default::default(),
+        };
+        // SAFETY: DATA_NONE takes no trailing data; the header is read by pointer.
+        let ret = unsafe { ioctl_with_ref(&self.device, VFIO_DEVICE_SET_IRQS(), &irq_set) };
+        if ret < 0 {
+            return Err(last_os_error("VFIO_DEVICE_SET_IRQS"));
+        }
+        Ok(())
     }
 }
 

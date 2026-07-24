@@ -8,15 +8,40 @@
 // build on this.
 
 use std::any::Any;
+use std::os::unix::io::{AsRawFd, RawFd};
 
 use arch::aarch64::layout::{PCIE_MMIO32_BASE, PCIE_MMIO64_BASE};
+use crossbeam_channel::{unbounded, Sender};
+use kvm_bindings::{
+    kvm_irq_routing_entry, kvm_irq_routing_entry__bindgen_ty_1, kvm_irq_routing_irqchip,
+    kvm_irq_routing_msi, kvm_irq_routing_msi__bindgen_ty_1, KVM_IRQ_ROUTING_IRQCHIP,
+    KVM_IRQ_ROUTING_MSI, KVM_MSI_VALID_DEVID,
+};
+use kvm_ioctls::VmFd;
+use utils::eventfd::EventFd;
+use utils::worker_message::WorkerMessage;
 
+use super::msix::MsixState;
 use super::vfio::{VfioDevice, VfioError};
 use crate::pci::configuration::{
     PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciClassCode, PciConfiguration,
     PciHeaderType, PciSubclass,
 };
 use crate::pci::device::{BarReprogrammingParams, PciDevice};
+
+// VFIO PCI interrupt index for MSI-X (VFIO_PCI_MSIX_IRQ_INDEX).
+const VFIO_PCI_MSIX_IRQ_INDEX: u32 = 2;
+
+// Number of SPIs in the guest GICv3 (nr_irqs 224 − 32 private). Installing an
+// explicit KVM GSI routing table replaces the kernel's default SPI routing, so
+// we must re-emit an identity IRQCHIP route for every SPI to keep the virtio /
+// legacy interrupts working, alongside the MSI routes. Kept in sync with
+// `KvmGicV3::new` (`(IRQ_MAX+1).div_ceil(32)*32`).
+const AARCH64_NR_SPIS: u32 = 192;
+
+// Base GSI for MSI-X vectors: immediately above the SPI GSI range so it never
+// collides with a virtio SPI route.
+const MSI_GSI_BASE: u32 = AARCH64_NR_SPIS;
 
 // Config-space dword indices.
 const BAR0_REG_IDX: usize = 4;
@@ -61,6 +86,19 @@ pub struct VfioPciDevice {
     /// Emulated config — only the BAR registers are authoritative here.
     config: PciConfiguration,
     mmio_regions: Vec<MmioRegion>,
+    /// Parsed MSI-X capability + shadow table, if the device has MSI-X.
+    msix: Option<MsixState>,
+    /// One eventfd (irqfd) per MSI-X vector, created and bound to a GSI by the
+    /// builder. The physical device signals `msix_eventfds[i]` for vector `i`.
+    msix_eventfds: Vec<EventFd>,
+    /// GSI assigned to MSI-X vector 0 (vector `i` uses `msix_gsi_base + i`).
+    msix_gsi_base: u32,
+    /// PCI requester id (bus/dev/fn) used as the ITS device id in MSI routing.
+    devid: u32,
+    /// Channel to the VMM worker for `KVM_SET_GSI_ROUTING` from the vCPU thread.
+    irq_sender: Option<Sender<WorkerMessage>>,
+    /// Whether the physical MSI-X vectors are currently armed (VFIO SET_IRQS).
+    msix_armed: bool,
 }
 
 impl VfioPciDevice {
@@ -91,8 +129,21 @@ impl VfioPciDevice {
             vfio,
             config,
             mmio_regions: Vec::new(),
+            msix: None,
+            msix_eventfds: Vec::new(),
+            msix_gsi_base: 0,
+            devid: 0,
+            irq_sender: None,
+            msix_armed: false,
         };
         dev.allocate_bars()?;
+        dev.msix = MsixState::parse(&dev.vfio);
+        if let Some(msix) = &dev.msix {
+            debug!(
+                "vfio-pci {}: MSI-X cap @ {:#x}, {} vectors, table BAR{}+{:#x}",
+                dev.id, msix.cap_offset, msix.table_size, msix.table_bir, msix.table_offset
+            );
+        }
         Ok(dev)
     }
 
@@ -214,6 +265,15 @@ impl PciDevice for VfioPciDevice {
         if Self::is_bar_reg(reg_idx) {
             return self.config.write_config_register(reg_idx, offset, data);
         }
+        // Intercept the MSI-X capability control dword: emulate enable/mask
+        // ourselves rather than forwarding to the device (VFIO owns hardware
+        // MSI-X enablement).
+        if let Some(msix) = &self.msix {
+            if reg_idx as u64 == msix.cap_offset / 4 {
+                self.write_msix_ctl(offset, data);
+                return Vec::new();
+            }
+        }
         self.vfio
             .write_config(reg_idx as u64 * 4 + offset, data);
         Vec::new()
@@ -229,14 +289,28 @@ impl PciDevice for VfioPciDevice {
         if reg_idx == HEADER_TYPE_REG_IDX {
             value &= MULTIFUNCTION_MASK;
         }
+        // Overlay our shadow MSI-X message control (enable/mask) so the guest
+        // sees the state we emulate, not the device's.
+        if let Some(msix) = &self.msix {
+            if reg_idx as u64 == msix.cap_offset / 4 {
+                value = (value & 0x0000_ffff) | ((msix.msg_ctl as u32) << 16);
+            }
+        }
         value
     }
 
     fn read_bar(&mut self, base: u64, offset: u64, data: &mut [u8]) {
-        // Trapped-BAR path (used once the MSI-X page is trapped; mmappable BARs
-        // go through memslots and never reach here). Dispatch to the owning BAR.
+        // Trapped-BAR path: mmappable BAR bytes go through memslots and never
+        // reach here; only the trapped MSI-X table page (and any non-mmappable
+        // BAR) does. Serve MSI-X table reads from the shadow table.
         if let Some(region) = self.find_region(base + offset) {
             let region_offset = base + offset - region.start;
+            if let Some(msix) = &self.msix {
+                if msix.table_accessed(region.index, region_offset, data.len() as u64) {
+                    msix.read_table(region_offset, data);
+                    return;
+                }
+            }
             let _ = self.vfio.region_read(region.index, region_offset, data);
         }
     }
@@ -244,6 +318,17 @@ impl PciDevice for VfioPciDevice {
     fn write_bar(&mut self, base: u64, offset: u64, data: &[u8]) {
         if let Some(region) = self.find_region(base + offset) {
             let region_offset = base + offset - region.start;
+            let is_table = self
+                .msix
+                .as_ref()
+                .is_some_and(|m| m.table_accessed(region.index, region_offset, data.len() as u64));
+            if is_table {
+                // Capture the guest's per-vector message into the shadow table
+                // and re-push routing.
+                self.msix.as_mut().unwrap().write_table(region_offset, data);
+                self.on_msix_changed();
+                return;
+            }
             let _ = self.vfio.region_write(region.index, region_offset, data);
         }
     }
@@ -263,5 +348,164 @@ impl VfioPciDevice {
             .iter()
             .find(|r| addr >= r.start && addr < r.start + r.length)
             .copied()
+    }
+
+    /// The parsed MSI-X capability, if the device has one (used by the builder
+    /// to size the vector table and locate the table page to trap).
+    pub fn msix(&self) -> Option<&MsixState> {
+        self.msix.as_ref()
+    }
+
+    /// Wire up the runtime MSI-X handles: the per-vector eventfds (already
+    /// bound to GSIs by the builder), the GSI base, the requester id, and the
+    /// worker channel used to update KVM routing from the vCPU thread.
+    pub fn set_msix_runtime(
+        &mut self,
+        gsi_base: u32,
+        devid: u32,
+        eventfds: Vec<EventFd>,
+        irq_sender: Sender<WorkerMessage>,
+    ) {
+        self.msix_gsi_base = gsi_base;
+        self.devid = devid;
+        self.msix_eventfds = eventfds;
+        self.irq_sender = Some(irq_sender);
+    }
+
+    /// The base GSI to assign this device's MSI-X vectors (single passthrough
+    /// device for now; a real allocator lands with multi-device support).
+    pub fn default_msi_gsi_base() -> u32 {
+        MSI_GSI_BASE
+    }
+
+    /// Raw fds of the MSI-X eventfds, for `VFIO_DEVICE_SET_IRQS`.
+    fn msix_eventfd_fds(&self) -> Vec<RawFd> {
+        self.msix_eventfds.iter().map(|e| e.as_raw_fd()).collect()
+    }
+
+    /// Build the full guest GSI routing table: an identity IRQCHIP route for
+    /// every SPI (replicating the kernel default so virtio keeps working) plus
+    /// an MSI route per MSI-X vector. Vectors that are disabled or masked route
+    /// with a null message (never translated to an LPI).
+    pub fn build_routing(&self) -> Vec<kvm_irq_routing_entry> {
+        let mut routes = Vec::with_capacity(AARCH64_NR_SPIS as usize + self.msix_eventfds.len());
+        for i in 0..AARCH64_NR_SPIS {
+            routes.push(kvm_irq_routing_entry {
+                gsi: i,
+                type_: KVM_IRQ_ROUTING_IRQCHIP,
+                flags: 0,
+                u: kvm_irq_routing_entry__bindgen_ty_1 {
+                    irqchip: kvm_irq_routing_irqchip { irqchip: 0, pin: i },
+                },
+                ..Default::default()
+            });
+        }
+
+        if let Some(msix) = &self.msix {
+            let deliver = msix.enabled() && !msix.function_masked();
+            for (v, entry) in msix.entries.iter().enumerate() {
+                let gsi = self.msix_gsi_base + v as u32;
+                let (address_lo, address_hi, data) = if deliver && !entry.masked() {
+                    (entry.msg_addr_lo, entry.msg_addr_hi, entry.msg_data)
+                } else {
+                    (0, 0, 0)
+                };
+                routes.push(kvm_irq_routing_entry {
+                    gsi,
+                    type_: KVM_IRQ_ROUTING_MSI,
+                    flags: KVM_MSI_VALID_DEVID,
+                    u: kvm_irq_routing_entry__bindgen_ty_1 {
+                        msi: kvm_irq_routing_msi {
+                            address_lo,
+                            address_hi,
+                            data,
+                            __bindgen_anon_1: kvm_irq_routing_msi__bindgen_ty_1 {
+                                devid: self.devid,
+                            },
+                        },
+                    },
+                    ..Default::default()
+                });
+            }
+        }
+        routes
+    }
+
+    /// Install the initial GSI routing table and bind each MSI-X eventfd to its
+    /// GSI. Ordering matters on aarch64: routing must exist before the irqfd is
+    /// registered. Called once by the builder at attach time (main thread).
+    pub fn setup_msix_kvm(&self, vm: &VmFd) -> Result<(), VfioError> {
+        if self.msix.is_none() {
+            return Ok(());
+        }
+        let entries = self.build_routing();
+        let mut routing = kvm_bindings::KvmIrqRouting::new(entries.len()).unwrap();
+        routing.as_mut_slice().copy_from_slice(&entries);
+        vm.set_gsi_routing(&routing).map_err(|e| {
+            VfioError::Ioctl(
+                "KVM_SET_GSI_ROUTING",
+                std::io::Error::from_raw_os_error(e.errno()),
+            )
+        })?;
+
+        for (i, evt) in self.msix_eventfds.iter().enumerate() {
+            vm.register_irqfd(evt, self.msix_gsi_base + i as u32)
+                .map_err(|e| {
+                    VfioError::Ioctl("KVM_IRQFD", std::io::Error::from_raw_os_error(e.errno()))
+                })?;
+        }
+        Ok(())
+    }
+
+    /// React to a change in MSI-X state (enable/mask bit or a table entry):
+    /// push the updated routing to KVM and arm/disarm the physical vectors.
+    /// Runs on the vCPU thread, so routing goes through the worker channel.
+    fn on_msix_changed(&mut self) {
+        let Some(sender) = self.irq_sender.clone() else {
+            return;
+        };
+        let routing = self.build_routing();
+        let (tx, rx) = unbounded();
+        if sender.send(WorkerMessage::GsiRoute(tx, routing)).is_ok() {
+            if let Ok(false) = rx.recv() {
+                error!("vfio-pci {}: KVM_SET_GSI_ROUTING (MSI-X update) failed", self.id);
+            }
+        }
+
+        let enabled = self.msix.as_ref().is_some_and(|m| m.enabled());
+        if enabled && !self.msix_armed {
+            let fds = self.msix_eventfd_fds();
+            match self.vfio.set_irqs_eventfds(VFIO_PCI_MSIX_IRQ_INDEX, &fds) {
+                Ok(()) => {
+                    self.msix_armed = true;
+                    info!("vfio-pci {}: MSI-X armed ({} vectors)", self.id, fds.len());
+                }
+                Err(e) => error!("vfio-pci {}: VFIO SET_IRQS (arm MSI-X) failed: {e}", self.id),
+            }
+        } else if !enabled && self.msix_armed {
+            let _ = self.vfio.disable_irqs(VFIO_PCI_MSIX_IRQ_INDEX);
+            self.msix_armed = false;
+        }
+    }
+
+    /// Handle a guest write to the MSI-X capability's message-control dword:
+    /// update the shadow control register (enable / function-mask) and react.
+    /// The write is NOT forwarded to the device — VFIO owns hardware MSI-X
+    /// enablement via SET_IRQS.
+    fn write_msix_ctl(&mut self, offset: u64, data: &[u8]) {
+        let Some(msix) = &self.msix else { return };
+        // The dword is [cap_id, next_ptr, msg_ctl_lo, msg_ctl_hi]; only the
+        // upper 16 bits (message control) are writable and shadowed.
+        let mut ctl = msix.msg_ctl.to_le_bytes();
+        for (i, b) in data.iter().enumerate() {
+            match offset as usize + i {
+                2 => ctl[0] = *b,
+                3 => ctl[1] = *b,
+                _ => {}
+            }
+        }
+        let new_ctl = u16::from_le_bytes(ctl);
+        self.msix.as_mut().unwrap().msg_ctl = new_ctl;
+        self.on_msix_changed();
     }
 }

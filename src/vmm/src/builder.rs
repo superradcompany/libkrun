@@ -1714,7 +1714,7 @@ pub fn build_microvm(
         #[cfg(feature = "vfio")]
         if let Ok(bdfs) = std::env::var("KRUN_VFIO_PCI") {
             for bdf in bdfs.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                attach_vfio_device(&mut vmm, &_pci_bus, bdf)?;
+                attach_vfio_device(&mut vmm, &_pci_bus, bdf, _sender.clone())?;
             }
         }
     }
@@ -4037,32 +4037,76 @@ fn attach_vfio_device(
     vmm: &mut Vmm,
     pci_bus: &Arc<Mutex<devices::pci::PciBus>>,
     bdf: &str,
+    irq_sender: Sender<WorkerMessage>,
 ) -> std::result::Result<(), StartMicrovmError> {
     let id = format!("vfio-{bdf}");
-    let device = devices::vfio_pci::VfioPciDevice::new(id, bdf)
+    let mut device = devices::vfio_pci::VfioPciDevice::new(id, bdf)
         .map_err(|e| StartMicrovmError::AttachVfioDevice(format!("{bdf}: {e}")))?;
+
+    // The 4 KiB page(s) holding the MSI-X table are left unmapped so guest
+    // accesses trap to the device's read_bar/write_bar (MSI-X emulation, step 9)
+    // instead of hitting the hardware table directly. Compute that window for
+    // the BAR that holds the table.
+    const PAGE: u64 = 4096;
+    let table_trap: Option<(u32, u64, u64)> = device.msix().map(|m| {
+        let (t_off, t_size) = m.table_range();
+        let start = t_off & !(PAGE - 1);
+        let end = (t_off + t_size).div_ceil(PAGE) * PAGE;
+        (m.table_bir, start, end)
+    });
 
     // Step 6: mmap each mmappable BAR from the device fd and register it as a
     // guest MMIO memslot at the allocated BAR address, so guest accesses reach
-    // the hardware directly. (The MSI-X table page is trapped separately once
-    // MSI-X remapping lands; whole-BAR mapping is the intermediate state.)
+    // the hardware directly — except the MSI-X table page, which is carved out
+    // and left to trap (step 9).
     for region in device.mmio_regions() {
-        match device.vfio().mmap_region(region.index) {
-            Ok((host_addr, len)) => {
-                vmm.register_mmio_memslot(region.start, host_addr as u64, len as u64)
-                    .map_err(|e| {
-                        StartMicrovmError::AttachVfioDevice(format!("{bdf} BAR{}: {e}", region.index))
-                    })?;
+        // Sub-ranges of this BAR to mmap as (region_offset, len). Normally the
+        // whole BAR; for the table BAR, the parts before and after the table page.
+        let ranges: Vec<(u64, u64)> = match table_trap {
+            Some((bir, start, end)) if bir == region.index => {
+                let end = end.min(region.length);
+                let mut v = Vec::new();
+                if start > 0 {
+                    v.push((0, start));
+                }
+                if end < region.length {
+                    v.push((end, region.length - end));
+                }
                 info!(
-                    "vfio: {bdf} BAR{} mapped guest {:#x} len {:#x}",
-                    region.index, region.start, len
+                    "vfio: {bdf} BAR{} MSI-X table page [{:#x},{:#x}) trapped",
+                    region.index, start, end
                 );
+                v
             }
-            Err(e) => {
-                warn!(
-                    "vfio: {bdf} BAR{} not mmappable ({e}); accesses will be trapped",
-                    region.index
-                );
+            _ => vec![(0, region.length)],
+        };
+
+        for (off, len) in ranges {
+            if len == 0 {
+                continue;
+            }
+            match device.vfio().mmap_region_range(region.index, off, len) {
+                Ok((host_addr, mlen)) => {
+                    vmm.register_mmio_memslot(region.start + off, host_addr as u64, mlen as u64)
+                        .map_err(|e| {
+                            StartMicrovmError::AttachVfioDevice(format!(
+                                "{bdf} BAR{}: {e}",
+                                region.index
+                            ))
+                        })?;
+                    info!(
+                        "vfio: {bdf} BAR{} mapped guest {:#x} len {:#x}",
+                        region.index,
+                        region.start + off,
+                        mlen
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "vfio: {bdf} BAR{} range {:#x}+{:#x} not mmappable ({e}); accesses will be trapped",
+                        region.index, off, len
+                    );
+                }
             }
         }
     }
@@ -4119,12 +4163,41 @@ fn attach_vfio_device(
         info!("vfio: {bdf} group bound to KVM");
     }
 
-    let mut bus = pci_bus.lock().unwrap();
-    let slot = bus
-        .allocate_device_id(None)
-        .map_err(|e| StartMicrovmError::AttachVfioDevice(format!("{bdf}: {e:?}")))?;
-    bus.add_device(slot, Arc::new(Mutex::new(device)))
-        .map_err(|e| StartMicrovmError::AttachVfioDevice(format!("{bdf}: {e:?}")))?;
+    let slot = {
+        let mut bus = pci_bus.lock().unwrap();
+        bus.allocate_device_id(None)
+            .map_err(|e| StartMicrovmError::AttachVfioDevice(format!("{bdf}: {e:?}")))?
+    };
+
+    // Step 9: set up MSI-X interrupt delivery. Create one eventfd (irqfd) per
+    // vector, assign a GSI range, and install the initial routing + irqfd
+    // bindings. The requester id (devid) is the guest BDF (bus 0, dev = slot,
+    // fn 0), matching the PCIe node's `msi-map` (identity rid→devid).
+    if device.msix().is_some() {
+        let table_size = device.msix().unwrap().table_size as usize;
+        let mut eventfds = Vec::with_capacity(table_size);
+        for _ in 0..table_size {
+            let evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(|e| {
+                StartMicrovmError::AttachVfioDevice(format!("{bdf} msix eventfd: {e}"))
+            })?;
+            eventfds.push(evt);
+        }
+        let gsi_base = devices::vfio_pci::VfioPciDevice::default_msi_gsi_base();
+        let devid = (slot as u32) << 3;
+        device.set_msix_runtime(gsi_base, devid, eventfds, irq_sender);
+        device.setup_msix_kvm(vmm.kvm_vm().fd()).map_err(|e| {
+            StartMicrovmError::AttachVfioDevice(format!("{bdf} msix kvm setup: {e}"))
+        })?;
+        info!(
+            "vfio: {bdf} MSI-X ready ({table_size} vectors, gsi {gsi_base}.., devid {devid:#x})"
+        );
+    }
+
+    {
+        let mut bus = pci_bus.lock().unwrap();
+        bus.add_device(slot, Arc::new(Mutex::new(device)))
+            .map_err(|e| StartMicrovmError::AttachVfioDevice(format!("{bdf}: {e:?}")))?;
+    }
     info!("vfio: attached {bdf} at 0000:00:{slot:02x}.0");
 
     Ok(())

@@ -7,7 +7,7 @@ pub struct MemoryProperties {
 
 #[derive(Debug)]
 pub enum WorkerMessage {
-    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), target_os = "linux"))]
     GsiRoute(
         crossbeam_channel::Sender<bool>,
         Vec<kvm_bindings::kvm_irq_routing_entry>,

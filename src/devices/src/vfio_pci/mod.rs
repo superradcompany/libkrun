@@ -6,6 +6,7 @@
 // into guest physical address space. See CUDA_PASSTHROUGH_IMPL.md steps 4-10.
 
 pub mod device;
+pub mod msix;
 pub mod vfio;
 
 pub use device::{MmioRegion, VfioPciDevice};
