@@ -22,6 +22,8 @@ pub mod fdt;
 pub mod legacy;
 #[cfg(feature = "pci")]
 pub mod pci;
+#[cfg(all(target_os = "linux", target_arch = "aarch64", feature = "vfio"))]
+pub mod vfio_pci;
 pub mod virtio;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows;

@@ -268,6 +268,9 @@ pub enum StartMicrovmError {
     /// Cannot register the PCIe host bridge (ECAM) on the MMIO Bus.
     #[cfg(feature = "pci")]
     RegisterPciDevice(device_manager::mmio::Error),
+    /// Cannot open or attach a VFIO passthrough PCI device.
+    #[cfg(feature = "vfio")]
+    AttachVfioDevice(String),
     /// Cannot initialize a MMIO Input device or add a device to the MMIO Bus.
     RegisterInputDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Network Device or add a device to the MMIO Bus.
@@ -581,6 +584,10 @@ impl Display for StartMicrovmError {
                     f,
                     "Cannot register the PCIe host bridge on the MMIO Bus. {err_msg}"
                 )
+            }
+            #[cfg(feature = "vfio")]
+            AttachVfioDevice(ref msg) => {
+                write!(f, "Cannot attach VFIO passthrough device. {msg}")
             }
             RegisterNetDevice(ref err) => {
                 let mut err_msg = format!("{err}");
@@ -1701,7 +1708,16 @@ pub fn build_microvm(
 
     // Register the PCIe host bridge (ECAM) so the guest enumerates the PCI bus.
     #[cfg(all(target_arch = "aarch64", feature = "pci"))]
-    attach_pci_root(&mut vmm)?;
+    {
+        let _pci_bus = attach_pci_root(&mut vmm)?;
+        // Attach VFIO passthrough devices named in KRUN_VFIO_PCI (comma-separated BDFs).
+        #[cfg(feature = "vfio")]
+        if let Ok(bdfs) = std::env::var("KRUN_VFIO_PCI") {
+            for bdf in bdfs.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                attach_vfio_device(&mut vmm, &_pci_bus, bdf)?;
+            }
+        }
+    }
 
     #[cfg(not(feature = "tee"))]
     if vm_resources.enable_balloon {
@@ -3982,7 +3998,9 @@ fn attach_rng_device(
 /// MMIO bus, so the guest kernel enumerates a (initially empty) PCI bus. VFIO
 /// devices are added to this same bus in a later step.
 #[cfg(all(target_arch = "aarch64", feature = "pci"))]
-fn attach_pci_root(vmm: &mut Vmm) -> std::result::Result<(), StartMicrovmError> {
+fn attach_pci_root(
+    vmm: &mut Vmm,
+) -> std::result::Result<Arc<Mutex<devices::pci::PciBus>>, StartMicrovmError> {
     // No-op BAR relocation for now: the host bridge has no BARs to move, and
     // VFIO BAR reprogramming is wired with the VFIO device in a later step.
     struct NoopRelocation;
@@ -4005,8 +4023,32 @@ fn attach_pci_root(vmm: &mut Vmm) -> std::result::Result<(), StartMicrovmError> 
         Arc::new(NoopRelocation),
     )));
     vmm.mmio_device_manager
-        .register_pci(pci_bus)
+        .register_pci(pci_bus.clone())
         .map_err(StartMicrovmError::RegisterPciDevice)?;
+
+    Ok(pci_bus)
+}
+
+/// Open a physical PCI device via VFIO and add it to the guest PCI bus. Config
+/// space passes through to the device; BARs are emulated (and mmap'd in a later
+/// step). The device is selected by BDF (e.g. "0002:01:00.0").
+#[cfg(all(target_arch = "aarch64", feature = "vfio"))]
+fn attach_vfio_device(
+    vmm: &mut Vmm,
+    pci_bus: &Arc<Mutex<devices::pci::PciBus>>,
+    bdf: &str,
+) -> std::result::Result<(), StartMicrovmError> {
+    let id = format!("vfio-{bdf}");
+    let device = devices::vfio_pci::VfioPciDevice::new(id, bdf)
+        .map_err(|e| StartMicrovmError::AttachVfioDevice(format!("{bdf}: {e}")))?;
+
+    let mut bus = pci_bus.lock().unwrap();
+    let slot = bus
+        .allocate_device_id(None)
+        .map_err(|e| StartMicrovmError::AttachVfioDevice(format!("{bdf}: {e:?}")))?;
+    bus.add_device(slot, Arc::new(Mutex::new(device)))
+        .map_err(|e| StartMicrovmError::AttachVfioDevice(format!("{bdf}: {e:?}")))?;
+    info!("vfio: attached {bdf} at 0000:00:{slot:02x}.0");
 
     Ok(())
 }
