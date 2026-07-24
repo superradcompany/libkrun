@@ -444,6 +444,19 @@ impl Vmm {
         &self.vm
     }
 
+    /// Register a VFIO BAR mmap as a guest MMIO memslot (passthrough BAR access).
+    #[cfg(all(target_arch = "aarch64", feature = "vfio"))]
+    pub(crate) fn register_mmio_memslot(
+        &mut self,
+        guest_addr: u64,
+        host_addr: u64,
+        size: u64,
+    ) -> std::result::Result<(), String> {
+        self.vm
+            .register_mmio_memslot(guest_addr, host_addr, size)
+            .map_err(|e| format!("{e:?}"))
+    }
+
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn add_mapping(
         &self,

@@ -4034,13 +4034,38 @@ fn attach_pci_root(
 /// step). The device is selected by BDF (e.g. "0002:01:00.0").
 #[cfg(all(target_arch = "aarch64", feature = "vfio"))]
 fn attach_vfio_device(
-    _vmm: &mut Vmm,
+    vmm: &mut Vmm,
     pci_bus: &Arc<Mutex<devices::pci::PciBus>>,
     bdf: &str,
 ) -> std::result::Result<(), StartMicrovmError> {
     let id = format!("vfio-{bdf}");
     let device = devices::vfio_pci::VfioPciDevice::new(id, bdf)
         .map_err(|e| StartMicrovmError::AttachVfioDevice(format!("{bdf}: {e}")))?;
+
+    // Step 6: mmap each mmappable BAR from the device fd and register it as a
+    // guest MMIO memslot at the allocated BAR address, so guest accesses reach
+    // the hardware directly. (The MSI-X table page is trapped separately once
+    // MSI-X remapping lands; whole-BAR mapping is the intermediate state.)
+    for region in device.mmio_regions() {
+        match device.vfio().mmap_region(region.index) {
+            Ok((host_addr, len)) => {
+                vmm.register_mmio_memslot(region.start, host_addr as u64, len as u64)
+                    .map_err(|e| {
+                        StartMicrovmError::AttachVfioDevice(format!("{bdf} BAR{}: {e}", region.index))
+                    })?;
+                info!(
+                    "vfio: {bdf} BAR{} mapped guest {:#x} len {:#x}",
+                    region.index, region.start, len
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "vfio: {bdf} BAR{} not mmappable ({e}); accesses will be trapped",
+                    region.index
+                );
+            }
+        }
+    }
 
     let mut bus = pci_bus.lock().unwrap();
     let slot = bus
