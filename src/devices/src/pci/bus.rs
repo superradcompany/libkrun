@@ -98,6 +98,8 @@ impl PciDevice for PciRoot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeviceIdState {
     Free,
+    // Reserved is used by device-id reservation, wired with the VFIO device step.
+    #[allow(dead_code)]
     Reserved,
     Allocated,
 }
