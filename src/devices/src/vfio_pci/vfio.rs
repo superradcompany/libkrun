@@ -149,7 +149,6 @@ impl AsRawFd for VfioContainer {
 /// A VFIO group — the IOMMU-group granularity of assignment.
 struct VfioGroup {
     group: File,
-    id: u32,
 }
 
 impl VfioGroup {
@@ -174,7 +173,7 @@ impl VfioGroup {
             return Err(VfioError::GroupNotViable(id));
         }
 
-        Ok(VfioGroup { group, id })
+        Ok(VfioGroup { group })
     }
 
     /// Bind this group to a container (pass the container fd by pointer).
