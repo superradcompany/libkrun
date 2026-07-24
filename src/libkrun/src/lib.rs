@@ -2963,6 +2963,10 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     #[cfg(any(feature = "amd-sev", feature = "tdx"))]
     vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
 
+    // aarch64 Linux: worker services vCPU-thread GSI-routing updates (VFIO-PCI MSI-X).
+    #[cfg(all(target_os = "linux", target_arch = "aarch64", not(any(feature = "amd-sev", feature = "tdx"))))]
+    vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
+
     loop {
         match event_manager.run() {
             Ok(_) => {}

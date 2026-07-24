@@ -311,6 +311,14 @@ impl Vm {
         #[cfg(any(feature = "amd-sev", feature = "tdx"))]
         vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone())
             .map_err(|e| Error::Runtime(RuntimeError::EventLoop(format!("{e:?}"))))?;
+
+        // aarch64 Linux: the vmm worker services GSI-routing updates issued from the
+        // vCPU thread (VFIO-PCI MSI-X enable/mask/table changes go through it). Without
+        // a running worker those blocking round-trips deadlock the vCPU. No other branch
+        // above starts a worker on aarch64 Linux, so start one here.
+        #[cfg(all(target_os = "linux", target_arch = "aarch64", not(any(feature = "amd-sev", feature = "tdx"))))]
+        vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone())
+            .map_err(|e| Error::Runtime(RuntimeError::EventLoop(format!("{e:?}"))))?;
         trace.mark("event_loop.start");
 
         // Run the event loop. On normal guest exit, the VMM calls _exit() directly.
