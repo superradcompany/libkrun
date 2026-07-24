@@ -8,8 +8,10 @@
 pub mod bus;
 pub mod configuration;
 pub mod device;
+pub mod root_port;
 
 pub use bus::{PciBus, PciConfigMmio, PciRoot, PciRootError, NUM_DEVICE_IDS, PCI_ROOT_DEVICE_ID};
+pub use root_port::PciRootPort;
 pub use configuration::{
     PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciCapability, PciCapabilityId,
     PciClassCode, PciConfiguration, PciHeaderType, PciProgrammingInterface, PciSubclass,

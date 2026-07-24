@@ -9,5 +9,5 @@ pub mod device;
 pub mod msix;
 pub mod vfio;
 
-pub use device::{MmioRegion, VfioPciDevice};
+pub use device::{MmioRegion, VfioBarTrap, VfioPciDevice};
 pub use vfio::{VfioDevice, VfioError};

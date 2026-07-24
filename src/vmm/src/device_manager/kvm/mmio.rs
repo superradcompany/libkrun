@@ -137,6 +137,20 @@ impl MMIODeviceManager {
         Ok(())
     }
 
+    /// Register a trap `BusDevice` over a carved-out BAR sub-region (the MSI-X
+    /// table page), so guest accesses that fault out of the memslot gap are
+    /// dispatched to the VFIO device's `read_bar`/`write_bar` (MSI-X emulation).
+    #[cfg(all(target_arch = "aarch64", feature = "vfio"))]
+    pub fn register_mmio_bar_trap(
+        &mut self,
+        trap: Arc<Mutex<dyn devices::BusDevice>>,
+        addr: u64,
+        size: u64,
+    ) -> Result<()> {
+        self.bus.insert(trap, addr, size).map_err(Error::BusError)?;
+        Ok(())
+    }
+
     /// Register an already created MMIO device to be used via MMIO transport.
     pub fn register_mmio_device(
         &mut self,

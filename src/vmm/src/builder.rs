@@ -4026,8 +4026,25 @@ fn attach_pci_root(
         .register_pci(pci_bus.clone())
         .map_err(StartMicrovmError::RegisterPciDevice)?;
 
+    // Place a PCIe root port at 00:01.0 (secondary bus 1). Passed-through devices
+    // are attached behind it (bus 1) rather than directly on the root bus, because
+    // NVIDIA's RM requires the GPU to have an upstream PCIe port (on Linux,
+    // `pci_dev->bus->self != NULL`) or it fails osVerifySystemEnvironment.
+    let root_port = devices::pci::PciRootPort::new(PCI_SECONDARY_BUS);
+    pci_bus
+        .lock()
+        .unwrap()
+        .add_bridge(PCI_ROOT_PORT_SLOT, Arc::new(Mutex::new(root_port)));
+
     Ok(pci_bus)
 }
+
+/// Bus-0 slot holding the PCIe root port that fronts passed-through devices.
+#[cfg(all(target_arch = "aarch64", feature = "pci"))]
+const PCI_ROOT_PORT_SLOT: u8 = 1;
+/// Secondary bus number assigned to the root port (where the GPU lives).
+#[cfg(all(target_arch = "aarch64", feature = "pci"))]
+const PCI_SECONDARY_BUS: u8 = 1;
 
 /// Open a physical PCI device via VFIO and add it to the guest PCI bus. Config
 /// space passes through to the device; BARs are emulated (and mmap'd in a later
@@ -4055,6 +4072,10 @@ fn attach_vfio_device(
         (m.table_bir, start, end)
     });
 
+    // Guest address + length of the trapped MSI-X table page, captured below so
+    // it can be registered on the MMIO bus (step 9) once the device is shared.
+    let mut table_page_gpa: Option<(u64, u64)> = None;
+
     // Step 6: mmap each mmappable BAR from the device fd and register it as a
     // guest MMIO memslot at the allocated BAR address, so guest accesses reach
     // the hardware directly — except the MSI-X table page, which is carved out
@@ -4065,6 +4086,7 @@ fn attach_vfio_device(
         let ranges: Vec<(u64, u64)> = match table_trap {
             Some((bir, start, end)) if bir == region.index => {
                 let end = end.min(region.length);
+                table_page_gpa = Some((region.start + start, end - start));
                 let mut v = Vec::new();
                 if start > 0 {
                     v.push((0, start));
@@ -4163,16 +4185,14 @@ fn attach_vfio_device(
         info!("vfio: {bdf} group bound to KVM");
     }
 
-    let slot = {
-        let mut bus = pci_bus.lock().unwrap();
-        bus.allocate_device_id(None)
-            .map_err(|e| StartMicrovmError::AttachVfioDevice(format!("{bdf}: {e:?}")))?
-    };
+    // The GPU is attached behind the root port on the secondary bus, at slot 0.
+    let slot: u8 = 0;
 
     // Step 9: set up MSI-X interrupt delivery. Create one eventfd (irqfd) per
     // vector, assign a GSI range, and install the initial routing + irqfd
-    // bindings. The requester id (devid) is the guest BDF (bus 0, dev = slot,
-    // fn 0), matching the PCIe node's `msi-map` (identity rid→devid).
+    // bindings. The requester id (devid) is the guest BDF
+    // (bus = secondary bus, dev = slot, fn 0), matching the PCIe node's
+    // `msi-map` (identity rid→devid).
     if device.msix().is_some() {
         let table_size = device.msix().unwrap().table_size as usize;
         let mut eventfds = Vec::with_capacity(table_size);
@@ -4183,7 +4203,7 @@ fn attach_vfio_device(
             eventfds.push(evt);
         }
         let gsi_base = devices::vfio_pci::VfioPciDevice::default_msi_gsi_base();
-        let devid = (slot as u32) << 3;
+        let devid = (u32::from(PCI_SECONDARY_BUS) << 8) | (u32::from(slot) << 3);
         device.set_msix_runtime(gsi_base, devid, eventfds, irq_sender);
         device.setup_msix_kvm(vmm.kvm_vm().fd()).map_err(|e| {
             StartMicrovmError::AttachVfioDevice(format!("{bdf} msix kvm setup: {e}"))
@@ -4193,12 +4213,32 @@ fn attach_vfio_device(
         );
     }
 
+    let device_arc: Arc<Mutex<dyn devices::pci::PciDevice>> = Arc::new(Mutex::new(device));
+
+    // Register the MSI-X table page trap on the MMIO bus so the guest's table
+    // writes reach `write_bar` (they'd otherwise fall into the unmapped memslot
+    // gap and be dropped, leaving MSI routing with a null message).
+    if let Some((addr, len)) = table_page_gpa {
+        let trap = Arc::new(Mutex::new(devices::vfio_pci::VfioBarTrap::new(
+            device_arc.clone(),
+            addr,
+        )));
+        vmm.mmio_device_manager
+            .register_mmio_bar_trap(trap, addr, len)
+            .map_err(|e| {
+                StartMicrovmError::AttachVfioDevice(format!("{bdf} msix table trap: {e:?}"))
+            })?;
+        info!("vfio: {bdf} MSI-X table page trap at {addr:#x} len {len:#x}");
+    }
+
     {
         let mut bus = pci_bus.lock().unwrap();
-        bus.add_device(slot, Arc::new(Mutex::new(device)))
-            .map_err(|e| StartMicrovmError::AttachVfioDevice(format!("{bdf}: {e:?}")))?;
+        bus.add_secondary_device(slot, device_arc);
     }
-    info!("vfio: attached {bdf} at 0000:00:{slot:02x}.0");
+    info!(
+        "vfio: attached {bdf} at 0000:{:02x}:{slot:02x}.0 (behind root port)",
+        PCI_SECONDARY_BUS
+    );
 
     Ok(())
 }

@@ -483,7 +483,8 @@ fn create_pcie_node(fdt: &mut FdtWriter, msi_phandle: Option<u32>) -> Result<()>
     fdt.property_string("device_type", "pci")?;
     fdt.property("reg", &reg_prop)?;
     fdt.property("ranges", &ranges_prop)?;
-    fdt.property_array_u32("bus-range", &[0, 0])?;
+    // bus 0 (host bridge + root port) and bus 1 (devices behind the root port).
+    fdt.property_array_u32("bus-range", &[0, 1])?;
     fdt.property_u32("#address-cells", 3)?;
     fdt.property_u32("#size-cells", 2)?;
     fdt.property_u32("#interrupt-cells", 1)?;

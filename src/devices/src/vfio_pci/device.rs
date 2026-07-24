@@ -9,6 +9,7 @@
 
 use std::any::Any;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::{Arc, Mutex};
 
 use arch::aarch64::layout::{PCIE_MMIO32_BASE, PCIE_MMIO64_BASE};
 use crossbeam_channel::{unbounded, Sender};
@@ -27,6 +28,7 @@ use crate::pci::configuration::{
     PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciClassCode, PciConfiguration,
     PciHeaderType, PciSubclass,
 };
+use crate::bus::BusDevice;
 use crate::pci::device::{BarReprogrammingParams, PciDevice};
 
 // VFIO PCI interrupt index for MSI-X (VFIO_PCI_MSIX_IRQ_INDEX).
@@ -507,5 +509,36 @@ impl VfioPciDevice {
         let new_ctl = u16::from_le_bytes(ctl);
         self.msix.as_mut().unwrap().msg_ctl = new_ctl;
         self.on_msix_changed();
+    }
+}
+
+/// A `BusDevice` shim registered on the MMIO bus over the MSI-X table page.
+///
+/// The step-6 BAR mapping carves the 4 KiB MSI-X table page out of the BAR's
+/// memslots so guest accesses to it fault to userspace instead of hitting the
+/// hardware table. Those faults are dispatched by the MMIO bus, which needs a
+/// `BusDevice` at that address — this shim, which forwards to the owning
+/// `PciDevice`'s `read_bar`/`write_bar` (the MSI-X table emulation). Without it
+/// the guest's table writes are dropped, the shadow table stays empty, and MSI
+/// routing carries a null message (no interrupt is ever delivered).
+pub struct VfioBarTrap {
+    device: Arc<Mutex<dyn PciDevice>>,
+    /// Guest address of the trapped BAR sub-region (the table page).
+    base: u64,
+}
+
+impl VfioBarTrap {
+    pub fn new(device: Arc<Mutex<dyn PciDevice>>, base: u64) -> Self {
+        Self { device, base }
+    }
+}
+
+impl BusDevice for VfioBarTrap {
+    fn read(&mut self, _vcpuid: u64, offset: u64, data: &mut [u8]) {
+        self.device.lock().unwrap().read_bar(self.base, offset, data);
+    }
+
+    fn write(&mut self, _vcpuid: u64, offset: u64, data: &[u8]) {
+        self.device.lock().unwrap().write_bar(self.base, offset, data);
     }
 }
