@@ -4034,7 +4034,7 @@ fn attach_pci_root(
 /// step). The device is selected by BDF (e.g. "0002:01:00.0").
 #[cfg(all(target_arch = "aarch64", feature = "vfio"))]
 fn attach_vfio_device(
-    vmm: &mut Vmm,
+    _vmm: &mut Vmm,
     pci_bus: &Arc<Mutex<devices::pci::PciBus>>,
     bdf: &str,
 ) -> std::result::Result<(), StartMicrovmError> {
