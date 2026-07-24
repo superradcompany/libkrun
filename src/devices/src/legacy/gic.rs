@@ -13,4 +13,11 @@ pub trait GICDevice {
 
     /// Returns the GIC version of the device
     fn version(&self) -> u32;
+
+    /// Returns `[base, size]` of the GICv3 ITS (MSI controller) MMIO window if
+    /// this GIC has an ITS, or `None`. Used to emit the FDT `msi-controller`
+    /// node and the PCIe `msi-map`. Only the KVM GICv3 provides one.
+    fn its_properties(&self) -> Option<Vec<u64>> {
+        None
+    }
 }

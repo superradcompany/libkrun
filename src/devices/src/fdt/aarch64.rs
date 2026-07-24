@@ -23,6 +23,9 @@ const GIC_PHANDLE: u32 = 1;
 const CLOCK_PHANDLE: u32 = 2;
 // This is a value for uniquely identifying the FDT node containing the gpio controller.
 const GPIO_PHANDLE: u32 = 4;
+// Uniquely identifies the GICv3 ITS (MSI controller) node, referenced by the
+// PCIe host bridge's `msi-map`/`msi-parent`.
+const ITS_PHANDLE: u32 = 5;
 // Read the documentation specified when appending the root node to the FDT.
 const ADDRESS_CELLS: u32 = 0x2;
 const SIZE_CELLS: u32 = 0x2;
@@ -104,7 +107,10 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     create_psci_node(&mut fdt)?;
     create_devices_node(&mut fdt, device_info)?;
     #[cfg(feature = "pci")]
-    create_pcie_node(&mut fdt)?;
+    {
+        let has_its = gic_device.lock().unwrap().its_properties().is_some();
+        create_pcie_node(&mut fdt, has_its.then_some(ITS_PHANDLE))?;
+    }
 
     // End Header node.
     fdt.end_node(root_node)?;
@@ -245,6 +251,22 @@ fn create_gic_node(fdt: &mut FdtWriter, gic_device: &IrqChip) -> Result<()> {
     let gic_intr_prop = generate_prop32(&gic_intr);
 
     fdt.property("interrupts", &gic_intr_prop)?;
+
+    // Nest the GICv3 ITS (MSI controller) inside the interrupt-controller node,
+    // when present. Its `reg` uses the intc's #address-cells/#size-cells (2/2)
+    // and the null `ranges` above makes child addresses identity-map to CPU
+    // physical addresses.
+    if let Some(its) = gic_device.its_properties() {
+        let its_reg_prop = generate_prop64(&its);
+        let its_node = fdt.begin_node(&format!("msi-controller@{:x}", its[0]))?;
+        fdt.property_string("compatible", "arm,gic-v3-its")?;
+        fdt.property_null("msi-controller")?;
+        fdt.property_u32("#msi-cells", 1)?;
+        fdt.property("reg", &its_reg_prop)?;
+        fdt.property_u32("phandle", ITS_PHANDLE)?;
+        fdt.end_node(its_node)?;
+    }
+
     fdt.end_node(intc_node)?;
 
     Ok(())
@@ -421,7 +443,7 @@ fn create_gpio_node<T: DeviceInfoForFDT + Clone + Debug>(
 /// and legacy `interrupt-map` properties are added with the GIC ITS in a later
 /// step; enumeration and BAR assignment need only the ECAM `reg` + `ranges`.
 #[cfg(feature = "pci")]
-fn create_pcie_node(fdt: &mut FdtWriter) -> Result<()> {
+fn create_pcie_node(fdt: &mut FdtWriter, msi_phandle: Option<u32>) -> Result<()> {
     use arch::aarch64::layout::{
         PCIE_ECAM_BASE, PCIE_ECAM_SIZE, PCIE_MMIO32_BASE, PCIE_MMIO32_SIZE, PCIE_MMIO64_BASE,
         PCIE_MMIO64_SIZE,
@@ -466,6 +488,13 @@ fn create_pcie_node(fdt: &mut FdtWriter) -> Result<()> {
     fdt.property_u32("#size-cells", 2)?;
     fdt.property_u32("#interrupt-cells", 1)?;
     fdt.property_null("dma-coherent")?;
+
+    // MSI routing to the GICv3 ITS: map the whole 16-bit requester-id space
+    // (rid-base 0, length 0x10000) to the ITS with devid == rid.
+    if let Some(its_phandle) = msi_phandle {
+        fdt.property_array_u32("msi-map", &[0, its_phandle, 0, 0x1_0000])?;
+    }
+
     fdt.end_node(node)?;
 
     Ok(())

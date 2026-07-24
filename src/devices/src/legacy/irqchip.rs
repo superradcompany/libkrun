@@ -73,6 +73,12 @@ impl GICDevice for IrqChipDevice {
     fn version(&self) -> u32 {
         self.inner.version()
     }
+
+    /// Forward the ITS MMIO window from the inner GIC (else the default `None`
+    /// hides a GICv3 ITS from the FDT).
+    fn its_properties(&self) -> Option<Vec<u64>> {
+        self.inner.its_properties()
+    }
 }
 
 #[cfg(target_arch = "riscv64")]
