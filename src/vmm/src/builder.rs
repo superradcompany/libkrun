@@ -265,6 +265,9 @@ pub enum StartMicrovmError {
     RegisterFsSigwinch(kvm_ioctls::Error),
     /// Cannot initialize a MMIO Gpu device or add a device to the MMIO Bus.
     RegisterGpuDevice(device_manager::mmio::Error),
+    /// Cannot register the PCIe host bridge (ECAM) on the MMIO Bus.
+    #[cfg(feature = "pci")]
+    RegisterPciDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Input device or add a device to the MMIO Bus.
     RegisterInputDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Network Device or add a device to the MMIO Bus.
@@ -568,6 +571,15 @@ impl Display for StartMicrovmError {
                 write!(
                     f,
                     "Cannot initialize a MMIO Input Device or add a device to the MMIO Bus. {err_msg}"
+                )
+            }
+            #[cfg(feature = "pci")]
+            RegisterPciDevice(ref err) => {
+                let mut err_msg = format!("{err}");
+                err_msg = err_msg.replace('\"', "");
+                write!(
+                    f,
+                    "Cannot register the PCIe host bridge on the MMIO Bus. {err_msg}"
                 )
             }
             RegisterNetDevice(ref err) => {
@@ -1686,6 +1698,10 @@ pub fn build_microvm(
     for serial_tty in serial_ttys {
         setup_terminal_raw_mode(&mut vmm, Some(serial_tty), false);
     }
+
+    // Register the PCIe host bridge (ECAM) so the guest enumerates the PCI bus.
+    #[cfg(all(target_arch = "aarch64", feature = "pci"))]
+    attach_pci_root(&mut vmm)?;
 
     #[cfg(not(feature = "tee"))]
     if vm_resources.enable_balloon {
@@ -3958,6 +3974,39 @@ fn attach_rng_device(
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc.clone(), rng).map_err(RegisterRngDevice)?;
+
+    Ok(())
+}
+
+/// Creates the PCIe host bridge and registers its ECAM config window on the
+/// MMIO bus, so the guest kernel enumerates a (initially empty) PCI bus. VFIO
+/// devices are added to this same bus in a later step.
+#[cfg(all(target_arch = "aarch64", feature = "pci"))]
+fn attach_pci_root(vmm: &mut Vmm) -> std::result::Result<(), StartMicrovmError> {
+    // No-op BAR relocation for now: the host bridge has no BARs to move, and
+    // VFIO BAR reprogramming is wired with the VFIO device in a later step.
+    struct NoopRelocation;
+    impl devices::pci::DeviceRelocation for NoopRelocation {
+        fn move_bar(
+            &self,
+            _old_base: u64,
+            _new_base: u64,
+            _len: u64,
+            _pci_dev: &mut dyn devices::pci::PciDevice,
+            _region_type: devices::pci::PciBarRegionType,
+        ) -> std::result::Result<(), std::io::Error> {
+            Ok(())
+        }
+    }
+
+    let pci_root = devices::pci::PciRoot::new(None);
+    let pci_bus = Arc::new(Mutex::new(devices::pci::PciBus::new(
+        pci_root,
+        Arc::new(NoopRelocation),
+    )));
+    vmm.mmio_device_manager
+        .register_pci(pci_bus)
+        .map_err(StartMicrovmError::RegisterPciDevice)?;
 
     Ok(())
 }
