@@ -99,6 +99,12 @@ pub const PCIE_MMIO32_SIZE: u64 = 0x2000_0000; // 512 MiB, ends at PCIE_ECAM_BAS
 /// PCIe ECAM window — buses 0-1 (root bus + root port), 256 devices x 4 KiB x 2 = 2 MiB.
 pub const PCIE_ECAM_BASE: u64 = 0x3000_0000;
 pub const PCIE_ECAM_SIZE: u64 = 0x0020_0000;
+/// Highest bus number the ECAM window can address (1 MiB of config space per
+/// bus). The FDT `bus-range` and every assigned bus number (e.g. the root
+/// port's secondary bus) must stay <= this, or that bus's config space would
+/// fall outside the ECAM MMIO region and be invisible. Derived from
+/// `PCIE_ECAM_SIZE` so the two never drift.
+pub const PCIE_MAX_BUS: u8 = (PCIE_ECAM_SIZE / 0x0010_0000 - 1) as u8;
 /// 64-bit high PCI MMIO / BAR aperture — above any realistic guest RAM+shm, holds
 /// large 64-bit prefetchable BARs (incl. resizable-BAR datacenter GPUs).
 pub const PCIE_MMIO64_BASE: u64 = 0x40_0000_0000; // 256 GiB

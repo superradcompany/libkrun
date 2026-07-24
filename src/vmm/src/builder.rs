@@ -1711,9 +1711,36 @@ pub fn build_microvm(
     {
         let _pci_bus = attach_pci_root(&mut vmm)?;
         // Attach VFIO passthrough devices named in KRUN_VFIO_PCI (comma-separated BDFs).
+        //
+        // Exactly one device is supported today. Attaching N>1 would require, and
+        // currently silently breaks without, three pieces of per-device resource
+        // management (see buildlog "multi-device" follow-up, flagged for review):
+        //   1. a shared BAR allocator — `allocate_bars` restarts its cursors from
+        //      the aperture base per device, so a 2nd device's BARs collide;
+        //   2. per-device slot / requester-id / GSI base (indexing off the device
+        //      position — the extension point is `attach_vfio_device`'s hardcoded
+        //      slot 0 / devid / `default_msi_gsi_base`);
+        //   3. AGGREGATE GSI routing — `KVM_SET_GSI_ROUTING` replaces the *entire*
+        //      table, so each device's `build_routing` (SPIs + its own MSI vectors)
+        //      would clobber the others'. A central routing owner must emit SPIs +
+        //      every VFIO device's MSI routes on any change.
+        // Until those land, reject N>1 loudly rather than corrupt interrupts/BARs.
         #[cfg(feature = "vfio")]
-        if let Ok(bdfs) = std::env::var("KRUN_VFIO_PCI") {
-            for bdf in bdfs.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Ok(bdfs_env) = std::env::var("KRUN_VFIO_PCI") {
+            let bdfs: Vec<&str> = bdfs_env
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if bdfs.len() > 1 {
+                return Err(StartMicrovmError::AttachVfioDevice(format!(
+                    "KRUN_VFIO_PCI lists {} devices; only one passthrough device is \
+                     supported (multi-device needs shared BAR/GSI allocation and \
+                     aggregate GSI routing)",
+                    bdfs.len()
+                )));
+            }
+            for bdf in bdfs {
                 attach_vfio_device(&mut vmm, &_pci_bus, bdf, _sender.clone())?;
             }
         }
@@ -4001,26 +4028,39 @@ fn attach_rng_device(
 fn attach_pci_root(
     vmm: &mut Vmm,
 ) -> std::result::Result<Arc<Mutex<devices::pci::PciBus>>, StartMicrovmError> {
-    // No-op BAR relocation for now: the host bridge has no BARs to move, and
-    // VFIO BAR reprogramming is wired with the VFIO device in a later step.
-    struct NoopRelocation;
-    impl devices::pci::DeviceRelocation for NoopRelocation {
+    // BAR relocation is unsupported: a VFIO BAR is mmap'd into a fixed KVM
+    // memslot at attach time (`register_mmio_memslot`), and `DeviceRelocation`
+    // has no path back to the VMM to re-register that memslot. Rather than
+    // silently accept a guest BAR move — which would leave the config register
+    // pointing at a new address while the memslot stays at the old one, breaking
+    // all BAR access — we return an error. `PciConfigMmio::config_space_write`
+    // then rolls the write back (`restore_bar_addr`) and warns, keeping config
+    // consistent with the mapping. In practice Linux re-assigns the GPU BARs to
+    // the same addresses we pre-allocated (both pack from the aperture base), so
+    // `move_bar` is never actually hit; this just makes the unsupported case
+    // fail safe instead of silently corrupting. (A real implementation would
+    // thread VMM memslot access through here — see buildlog follow-ups.)
+    struct UnsupportedRelocation;
+    impl devices::pci::DeviceRelocation for UnsupportedRelocation {
         fn move_bar(
             &self,
-            _old_base: u64,
-            _new_base: u64,
+            old_base: u64,
+            new_base: u64,
             _len: u64,
             _pci_dev: &mut dyn devices::pci::PciDevice,
             _region_type: devices::pci::PciBarRegionType,
         ) -> std::result::Result<(), std::io::Error> {
-            Ok(())
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("VFIO BAR relocation {old_base:#x}->{new_base:#x} not supported"),
+            ))
         }
     }
 
     let pci_root = devices::pci::PciRoot::new(None);
     let pci_bus = Arc::new(Mutex::new(devices::pci::PciBus::new(
         pci_root,
-        Arc::new(NoopRelocation),
+        Arc::new(UnsupportedRelocation),
     )));
     vmm.mmio_device_manager
         .register_pci(pci_bus.clone())
@@ -4045,6 +4085,10 @@ const PCI_ROOT_PORT_SLOT: u8 = 1;
 /// Secondary bus number assigned to the root port (where the GPU lives).
 #[cfg(all(target_arch = "aarch64", feature = "pci"))]
 const PCI_SECONDARY_BUS: u8 = 1;
+// The secondary bus must be addressable by the ECAM window, or its config space
+// falls outside the mapped region (see `PCIE_MAX_BUS`). Enforced at compile time.
+#[cfg(all(target_arch = "aarch64", feature = "pci"))]
+const _: () = assert!(PCI_SECONDARY_BUS <= arch::aarch64::layout::PCIE_MAX_BUS);
 
 /// Open a physical PCI device via VFIO and add it to the guest PCI bus. Config
 /// space passes through to the device; BARs are emulated (and mmap'd in a later

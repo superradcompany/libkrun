@@ -445,8 +445,8 @@ fn create_gpio_node<T: DeviceInfoForFDT + Clone + Debug>(
 #[cfg(feature = "pci")]
 fn create_pcie_node(fdt: &mut FdtWriter, msi_phandle: Option<u32>) -> Result<()> {
     use arch::aarch64::layout::{
-        PCIE_ECAM_BASE, PCIE_ECAM_SIZE, PCIE_MMIO32_BASE, PCIE_MMIO32_SIZE, PCIE_MMIO64_BASE,
-        PCIE_MMIO64_SIZE,
+        PCIE_ECAM_BASE, PCIE_ECAM_SIZE, PCIE_MAX_BUS, PCIE_MMIO32_BASE, PCIE_MMIO32_SIZE,
+        PCIE_MMIO64_BASE, PCIE_MMIO64_SIZE,
     };
 
     // PCI address-space codes for a range entry's "phys.hi" cell.
@@ -483,8 +483,9 @@ fn create_pcie_node(fdt: &mut FdtWriter, msi_phandle: Option<u32>) -> Result<()>
     fdt.property_string("device_type", "pci")?;
     fdt.property("reg", &reg_prop)?;
     fdt.property("ranges", &ranges_prop)?;
-    // bus 0 (host bridge + root port) and bus 1 (devices behind the root port).
-    fdt.property_array_u32("bus-range", &[0, 1])?;
+    // bus 0 (host bridge + root port) up to the highest bus the ECAM window
+    // covers (bus 1 = devices behind the root port, at 2 MiB ECAM).
+    fdt.property_array_u32("bus-range", &[0, u32::from(PCIE_MAX_BUS)])?;
     fdt.property_u32("#address-cells", 3)?;
     fdt.property_u32("#size-cells", 2)?;
     fdt.property_u32("#interrupt-cells", 1)?;

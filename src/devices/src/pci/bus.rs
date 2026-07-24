@@ -33,6 +33,12 @@ pub const NUM_DEVICE_IDS: u8 = 32;
 // osVerifySystemEnvironment fails. 0x1d0f:0x0200 is the Amazon/Annapurna
 // Graviton host bridge — the exact ID of this g5g platform's real root complex,
 // and the single Amazon entry on the RM's aarch64 allow list.
+//
+// Portability: this is chosen to match the g5g (Graviton) host. On a different
+// ARM host, pick another id that is BOTH on the RM allow list and appropriate —
+// the allow list (dump `armChipsetAllowListInfo` from the unstripped
+// `nv-kernel.o_binary`) also carries e.g. QEMU/Red Hat 0x1b36, Ampere 0x1def,
+// Marvell 0x177d and Mellanox 0x15b3. 0x1b36 is the portable "generic VM" choice.
 const VENDOR_ID_AMAZON: u16 = 0x1d0f;
 const DEVICE_ID_AMAZON_HOST_BRIDGE: u16 = 0x0200;
 
