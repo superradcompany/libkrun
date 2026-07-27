@@ -884,7 +884,7 @@ const X86_IOAPIC_BASE: u64 = 0xfec0_0000;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 const X86_IOAPIC_SIZE: u64 = 0x1000;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-const X86_IOAPIC_NUM_PINS: usize = 24;
+const X86_IOAPIC_NUM_PINS: usize = 64;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 const X86_IOAPIC_REG_SEL: u64 = 0x00;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
@@ -1434,7 +1434,34 @@ pub fn build_microvm(
     // Instantiate the MMIO device manager.
     // 'mmio_base' address has to be an address which is protected by the kernel
     // and is architectural specific.
-    #[cfg(target_arch = "x86_64")]
+    //
+    // x86_64 exposes only IRQ_BASE..=IRQ_MAX (the legacy ISA range) of MMIO interrupt lines with
+    // the in-kernel IOAPIC, which a guest with many virtio-mmio devices (each device takes one
+    // IRQ) can exhaust. The userspace IOAPIC exposes IRQ_BASE..=IRQ_MAX_SPLIT instead. On KVM that
+    // is the split irqchip: enable it automatically when the configured device count would overflow
+    // the in-kernel range, leaving light guests on the faster in-kernel chip. On Windows the IOAPIC
+    // is always userspace, so its full pin range is used unconditionally.
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+    if !vm_resources.split_irqchip {
+        // Each virtio-fs share and block device takes one IOAPIC pin; the other configured platform
+        // devices (balloon, virtio-mem, cpu, rng, metrics, console, net, vsock) take a fixed handful
+        // more. A conservative base plus the per-share count errs toward enabling the split irqchip
+        // (which costs a worker thread) rather than exhausting IRQs at device-registration time.
+        // Light guests stay under the range and keep the in-kernel irqchip.
+        const PLATFORM_IRQ_DEVICES: usize = 9;
+        let dynamic = vm_resources.fs.len();
+        let pool = (arch::IRQ_MAX - arch::IRQ_BASE + 1) as usize;
+        if PLATFORM_IRQ_DEVICES + dynamic > pool {
+            vm_resources.split_irqchip = true;
+        }
+    }
+    // Use the WhpIrqChip IOAPIC's full pin range. WHP has no in-kernel irqchip, so the guest IOAPIC
+    // is emulated in userspace with X86_IOAPIC_NUM_PINS redirection entries; the usable ceiling is
+    // pin NUM_PINS-1, not the legacy in-kernel IRQ_MAX. This lifts the virtio MMIO IRQ count from 11
+    // (IRQ_BASE..=IRQ_MAX) to NUM_PINS-IRQ_BASE, enough for a guest with several virtiofs mounts.
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    let irq_max = X86_IOAPIC_NUM_PINS as u32 - 1;
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
     let irq_max = if vm_resources.split_irqchip {
         arch::IRQ_MAX_SPLIT
     } else {
