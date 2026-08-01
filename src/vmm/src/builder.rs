@@ -2076,6 +2076,43 @@ fn load_elf64_kernel(
 }
 
 #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+fn decode_image_bz2_kernel(data: &[u8]) -> std::result::Result<Vec<u8>, StartMicrovmError> {
+    const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+
+    let mut decoder_error = None;
+    let mut decoded_non_elf = false;
+
+    // An Image prefix can contain bytes that resemble a BZIP2 header, so keep looking until a
+    // candidate both decompresses successfully and contains the expected ELF payload.
+    for (magic, window) in data.windows(3).enumerate() {
+        if window != b"BZh" {
+            continue;
+        }
+
+        let mut kernel_data = Vec::new();
+        let mut bz2 = bzip2::read::BzDecoder::new(&data[magic..]);
+        match bz2.read_to_end(&mut kernel_data) {
+            Ok(_) if kernel_data.starts_with(ELF_MAGIC) => {
+                debug!("Found BZIP2 kernel payload in Image file at: 0x{magic:x}");
+                return Ok(kernel_data);
+            }
+            Ok(_) => decoded_non_elf = true,
+            Err(err) => decoder_error = Some(err),
+        }
+    }
+
+    if decoded_non_elf {
+        Err(StartMicrovmError::ImageBz2LoadKernel(
+            ElfLoadError::InvalidMagic,
+        ))
+    } else if let Some(err) = decoder_error {
+        Err(StartMicrovmError::ImageBz2Decoder(err))
+    } else {
+        Err(StartMicrovmError::ImageBz2Invalid)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 fn read_elf_u16(data: &[u8], offset: usize) -> std::result::Result<u16, ElfLoadError> {
     let bytes = data
         .get(offset..offset + 2)
@@ -2157,21 +2194,9 @@ fn load_external_kernel(
         KernelFormat::ImageBz2 => {
             let data: Vec<u8> = std::fs::read(external_kernel.path.clone())
                 .map_err(StartMicrovmError::ImageBz2OpenKernel)?;
-            if let Some(magic) = data
-                .windows(4)
-                .position(|window| window == [b'B', b'Z', b'h'])
-            {
-                debug!("Found BZIP2 header on Image file at: 0x{magic:x}");
-                let (_, compressed) = data.split_at(magic);
-                let mut kernel_data: Vec<u8> = Vec::new();
-                let mut bz2 = bzip2::read::BzDecoder::new(compressed);
-                bz2.read_to_end(&mut kernel_data)
-                    .map_err(StartMicrovmError::ImageBz2Decoder)?;
-                load_elf64_kernel(guest_mem, &kernel_data)
-                    .map_err(StartMicrovmError::ImageBz2LoadKernel)?
-            } else {
-                return Err(StartMicrovmError::ImageBz2Invalid);
-            }
+            let kernel_data = decode_image_bz2_kernel(&data)?;
+            load_elf64_kernel(guest_mem, &kernel_data)
+                .map_err(StartMicrovmError::ImageBz2LoadKernel)?
         }
         #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
         KernelFormat::ImageGz => {
@@ -4052,6 +4077,23 @@ pub mod tests {
     use super::*;
     #[cfg(not(target_os = "windows"))]
     use crate::vmm_config::kernel_bundle::KernelBundle;
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+    fn image_bz2_skips_false_header_candidates() {
+        use std::io::Write;
+
+        const KERNEL_DATA: &[u8] = b"\x7fELFminimal-kernel";
+
+        let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        encoder.write_all(KERNEL_DATA).unwrap();
+        let compressed_kernel = encoder.finish().unwrap();
+
+        let mut image = b"Image-prefix-BZh0-not-a-stream".to_vec();
+        image.extend_from_slice(&compressed_kernel);
+
+        assert_eq!(decode_image_bz2_kernel(&image).unwrap(), KERNEL_DATA);
+    }
 
     #[cfg(not(target_os = "windows"))]
     fn default_guest_memory(
