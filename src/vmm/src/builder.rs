@@ -2158,8 +2158,8 @@ fn load_external_kernel(
             let data: Vec<u8> = std::fs::read(external_kernel.path.clone())
                 .map_err(StartMicrovmError::ImageBz2OpenKernel)?;
             if let Some(magic) = data
-                .windows(4)
-                .position(|window| window == [b'B', b'Z', b'h'])
+                .windows(3)
+                .position(|window| window == b"BZh")
             {
                 debug!("Found BZIP2 header on Image file at: 0x{magic:x}");
                 let (_, compressed) = data.split_at(magic);
