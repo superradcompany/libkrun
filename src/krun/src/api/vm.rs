@@ -406,17 +406,17 @@ impl Vm {
 
     /// Configure the vsock device.
     ///
-    /// The device is only attached when actually needed — either because the
-    /// caller explicitly requested it (`MachineBuilder::vsock(true)`), or
-    /// because the caller opted in to TSI as a transport
-    /// (`MachineBuilder::enable_inet_hijack(true)` with no virtio-net →
-    /// HIJACK_INET; single root virtio-fs on Linux → HIJACK_UNIX). This
-    /// keeps the per-VM IRQ/MMIO budget free when nothing uses vsock.
+    /// The device is only attached when a typed host route exists or the
+    /// caller enabled TSI as a transport. This keeps the per-VM IRQ/MMIO
+    /// budget free when nothing uses vsock.
     #[cfg(not(target_os = "windows"))]
     fn configure_vsock(&mut self) -> Result<()> {
         let tsi_flags = self.compute_tsi_flags();
 
-        if !self.vmr.request_vsock && tsi_flags.is_empty() {
+        if self.vsock_unix_ipc_port_map.is_none()
+            && self.vsock_custom_port_map.is_none()
+            && tsi_flags.is_empty()
+        {
             return Ok(());
         }
 
@@ -769,7 +769,9 @@ mod tests {
     fn typed_vsock_routes_imply_attachment_and_reach_vm_config() {
         use std::io;
 
-        use devices::virtio::vsock::{VsockConnectRequest, VsockPortBackend, VsockStreamBackend};
+        use devices::virtio::vsock::{
+            VsockConnectRequest, VsockNotifier, VsockPortBackend, VsockStreamBackend,
+        };
 
         struct RejectService;
 
@@ -777,6 +779,7 @@ mod tests {
             fn connect(
                 &self,
                 _request: VsockConnectRequest,
+                _notifier: VsockNotifier,
             ) -> io::Result<Box<dyn VsockStreamBackend>> {
                 Err(io::Error::from(io::ErrorKind::ConnectionRefused))
             }
@@ -794,7 +797,6 @@ mod tests {
             .build()
             .expect("typed vsock configuration should build");
 
-        assert!(vm.vmr.request_vsock);
         assert_eq!(
             vm.vsock_unix_ipc_port_map
                 .as_ref()

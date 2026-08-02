@@ -49,4 +49,6 @@ pub use fs::DynFileSystem;
 pub use net::NetBackend;
 
 #[cfg(not(target_os = "windows"))]
-pub use vsock::{VsockConnectRequest, VsockPortBackend, VsockShutdown, VsockStreamBackend};
+pub use vsock::{
+    VsockConnectRequest, VsockNotifier, VsockPortBackend, VsockShutdown, VsockStreamBackend,
+};

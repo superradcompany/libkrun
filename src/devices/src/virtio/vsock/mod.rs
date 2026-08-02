@@ -21,7 +21,9 @@ mod tsi_dgram;
 mod tsi_stream;
 mod unix;
 
-pub use self::backend::{VsockConnectRequest, VsockPortBackend, VsockShutdown, VsockStreamBackend};
+pub use self::backend::{
+    VsockConnectRequest, VsockNotifier, VsockPortBackend, VsockShutdown, VsockStreamBackend,
+};
 pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
 pub use self::defs::TsiFlags;
 pub use self::device::Vsock;

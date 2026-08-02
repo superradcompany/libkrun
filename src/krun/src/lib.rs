@@ -73,5 +73,5 @@ pub use backends::net::NetBackend;
 
 #[cfg(not(target_os = "windows"))]
 pub use backends::vsock::{
-    VsockConnectRequest, VsockPortBackend, VsockShutdown, VsockStreamBackend,
+    VsockConnectRequest, VsockNotifier, VsockPortBackend, VsockShutdown, VsockStreamBackend,
 };

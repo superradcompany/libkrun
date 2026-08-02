@@ -133,8 +133,7 @@ impl VmBuilder {
 
     /// Configure host services exposed through virtio-vsock.
     ///
-    /// Routes imply device attachment; [`MachineBuilder::vsock`] remains an
-    /// independent force-attach request for guests that manage vsock directly.
+    /// A route or enabled TSI transport automatically attaches the device.
     #[cfg(not(target_os = "windows"))]
     pub fn vsock(mut self, f: impl FnOnce(VsockBuilder) -> VsockBuilder) -> Self {
         self.vsock = f(self.vsock);
@@ -363,14 +362,14 @@ impl VmBuilder {
         }
 
         #[cfg(target_os = "windows")]
-        if self.machine.vsock || self.machine.enable_inet_hijack {
+        if self.machine.enable_inet_hijack {
             return Err(Error::Config(ConfigError::Vsock(
                 "virtio-vsock is not supported on Windows".to_string(),
             )));
         }
 
         #[cfg(not(target_os = "windows"))]
-        let (vsock_unix_ipc_port_map, vsock_custom_port_map, vsock_host_port_map, has_vsock_routes) = {
+        let (vsock_unix_ipc_port_map, vsock_custom_port_map, vsock_host_port_map) = {
             let mut occupied_ports = HashSet::new();
             let mut unix_routes = HashMap::new();
             let mut custom_routes = HashMap::new();
@@ -440,12 +439,10 @@ impl VmBuilder {
                 }
             }
 
-            let has_routes = !unix_routes.is_empty() || !custom_routes.is_empty();
             (
                 (!unix_routes.is_empty()).then_some(unix_routes),
                 (!custom_routes.is_empty()).then_some(custom_routes),
                 (!host_map.is_empty()).then_some(host_map),
-                has_routes,
             )
         };
 
@@ -526,14 +523,6 @@ impl VmBuilder {
         }
         vmr.nested_enabled = self.machine.nested_virt;
         vmr.split_irqchip = self.machine.split_irqchip;
-        #[cfg(not(target_os = "windows"))]
-        {
-            vmr.request_vsock = self.machine.vsock || has_vsock_routes;
-        }
-        #[cfg(target_os = "windows")]
-        {
-            vmr.request_vsock = self.machine.vsock;
-        }
         vmr.enable_balloon = self.machine.balloon;
         vmr.balloon_stats_interval = self.machine.balloon_stats_interval;
         vmr.enable_rng = self.machine.rng;

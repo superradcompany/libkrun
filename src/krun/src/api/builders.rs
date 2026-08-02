@@ -52,7 +52,6 @@ pub struct MachineBuilder {
     pub(crate) hyperthreading: bool,
     pub(crate) nested_virt: bool,
     pub(crate) split_irqchip: bool,
-    pub(crate) vsock: bool,
     pub(crate) balloon: bool,
     pub(crate) balloon_stats_interval: Option<Duration>,
     pub(crate) rng: bool,
@@ -409,7 +408,6 @@ impl MachineBuilder {
             hyperthreading: false,
             nested_virt: false,
             split_irqchip: false,
-            vsock: false,
             balloon: true,
             balloon_stats_interval: Some(Duration::from_secs(1)),
             rng: true,
@@ -484,17 +482,6 @@ impl MachineBuilder {
     /// aarch64 or riscv64.
     pub fn split_irqchip(mut self, enabled: bool) -> Self {
         self.split_irqchip = enabled;
-        self
-    }
-
-    /// Force-attach a virtio-vsock device to the guest.
-    ///
-    /// By default, vsock is only attached when needed as a TSI transport
-    /// (no virtio-net → HIJACK_INET, or single root virtio-fs on Linux →
-    /// HIJACK_UNIX). Set this to `true` when the guest needs a vsock for
-    /// its own purposes even though TSI would not otherwise require one.
-    pub fn vsock(mut self, enabled: bool) -> Self {
-        self.vsock = enabled;
         self
     }
 

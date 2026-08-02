@@ -17,7 +17,7 @@ use super::tsi_dgram::TsiDgramProxy;
 use super::tsi_stream::TsiStreamProxy;
 use super::unix::UnixProxy;
 use super::VsockError;
-use super::{TsiFlags, VsockConnectRequest, VsockPortBackend};
+use super::{TsiFlags, VsockConnectRequest, VsockNotifier, VsockPortBackend};
 use crossbeam_channel::{unbounded, Sender};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
@@ -179,6 +179,13 @@ impl VsockMuxer {
     pub(crate) fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> super::Result<()> {
         debug!("recv_stream_pkt");
         if self.rxq.lock().unwrap().is_empty() {
+            // A custom backend notification may have arrived before the guest
+            // supplied an RX descriptor. Re-kick streams now that the guest is
+            // explicitly asking us to fill one, without exposing event fds to
+            // backend implementations.
+            for proxy in self.proxy_map.read().unwrap().values() {
+                proxy.lock().unwrap().kick();
+            }
             return Err(VsockError::NoData);
         }
 
@@ -570,7 +577,24 @@ impl VsockMuxer {
                 guest_port: pkt.src_port(),
                 host_port: pkt.dst_port(),
             };
-            match service.connect(request) {
+            let notifier = match VsockNotifier::new() {
+                Ok(notifier) => notifier,
+                Err(err) => {
+                    warn!("failed to create custom vsock notifier: {err}");
+                    push_packet(
+                        self.cid,
+                        MuxerRx::Reset {
+                            local_port: pkt.dst_port(),
+                            peer_port: pkt.src_port(),
+                        },
+                        &self.rxq,
+                        queue,
+                        mem,
+                    );
+                    return;
+                }
+            };
+            match service.connect(request, notifier.clone()) {
                 Ok(backend) => {
                     let proxy = UnixProxy::new_custom(
                         id,
@@ -578,6 +602,7 @@ impl VsockMuxer {
                         pkt.dst_port(),
                         pkt.src_port(),
                         backend,
+                        notifier,
                         mem.clone(),
                         queue.clone(),
                         self.rxq.clone(),

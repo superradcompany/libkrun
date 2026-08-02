@@ -4,5 +4,5 @@
 //! responsibility for the transport protocol, flow control, and interrupts.
 
 pub use devices::virtio::vsock::{
-    VsockConnectRequest, VsockPortBackend, VsockShutdown, VsockStreamBackend,
+    VsockConnectRequest, VsockNotifier, VsockPortBackend, VsockShutdown, VsockStreamBackend,
 };
