@@ -190,6 +190,14 @@ impl DiskProperties {
     }
 
     pub(crate) fn record_buffered_write(&self, offset: u64, length: u64) {
+        // Imago accepts writes beyond the virtual capacity and clips writes crossing the end. Only
+        // account for bytes the guest-visible raw disk could actually have dirtied, so an invalid
+        // request cannot amplify the advisory sync range.
+        let length = Self::clamp_buffered_write_length(self.nsectors, offset, length);
+        if length == 0 {
+            return;
+        }
+
         #[cfg(target_os = "linux")]
         if let Some(controller) = &self.writeback_controller {
             controller.lock().unwrap().record_write(offset, length);
@@ -197,6 +205,11 @@ impl DiskProperties {
 
         #[cfg(not(target_os = "linux"))]
         let _ = (offset, length);
+    }
+
+    fn clamp_buffered_write_length(nsectors: u64, offset: u64, length: u64) -> u64 {
+        let visible_size = nsectors.saturating_mul(SECTOR_SIZE);
+        length.min(visible_size.saturating_sub(offset))
     }
 
     #[cfg(target_os = "linux")]
@@ -223,6 +236,8 @@ impl DiskProperties {
         }
 
         let mut diskfile = self.file.lock().unwrap();
+        // Raw discard and zero-range operations use filesystem allocation primitives rather than
+        // the buffered data-write path, so they intentionally do not advance the preflush window.
         diskfile.discard_to_zero(offset, length)
     }
 
@@ -233,6 +248,7 @@ impl DiskProperties {
         }
 
         let diskfile = self.file.lock().unwrap();
+        // See `discard_to_zero`: advisory page-cache writeback tracks ordinary buffered writes.
         diskfile.write_zeroes(offset, length)
     }
 
@@ -449,8 +465,9 @@ impl Block {
     /// Create a virtio block device with an optional buffered-writeback preflush threshold.
     ///
     /// Preflush is supported on Linux for writable raw disks using writeback caching, buffered I/O
-    /// and an active sync mode. It starts advisory background writeback but does not replace the
-    /// full sync that completes a guest flush.
+    /// and an active sync mode. It starts at most one advisory background writeback range between
+    /// successful guest flushes, but does not replace the full sync that completes a guest flush or
+    /// provide a dirty-memory containment boundary. A zero threshold disables the option.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_writeback_preflush(
         id: String,
@@ -464,6 +481,9 @@ impl Block {
         writeback_preflush_bytes: Option<u64>,
         metrics: BlockMetricsWriter,
     ) -> io::Result<Block> {
+        // Keep zero equivalent to the builder's disabled state for callers of this lower-level API.
+        let writeback_preflush_bytes = writeback_preflush_bytes.filter(|bytes| *bytes != 0);
+
         if matches!(disk_image_format, ImageType::Vmdk) && !is_disk_read_only {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -471,16 +491,9 @@ impl Block {
             ));
         }
 
-        if let Some(trigger_bytes) = writeback_preflush_bytes {
-            if trigger_bytes == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "writeback preflush threshold must be greater than zero",
-                ));
-            }
-
+        if let Some(_trigger_bytes) = writeback_preflush_bytes {
             #[cfg(target_os = "linux")]
-            if trigger_bytes < MINIMUM_RANGE_BYTES {
+            if _trigger_bytes < MINIMUM_RANGE_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
@@ -834,25 +847,42 @@ mod tests {
     }
 
     #[test]
-    fn zero_writeback_preflush_threshold_is_rejected() {
+    fn zero_writeback_preflush_threshold_disables_the_option() {
         let result = Block::new_with_writeback_preflush(
             "raw".to_string(),
             None,
-            CacheType::Writeback,
+            CacheType::Unsafe,
             "missing.raw".to_string(),
             ImageType::Raw,
             false,
-            false,
-            SyncMode::Full,
+            true,
+            SyncMode::None,
             Some(0),
             MetricsWriter::default().register_block_device("raw".to_string()),
         );
 
         let error = match result {
-            Ok(_) => panic!("zero preflush threshold should fail"),
+            Ok(_) => panic!("missing raw disk should fail"),
             Err(error) => error,
         };
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn buffered_write_accounting_is_clamped_to_visible_capacity() {
+        let nsectors = 8;
+        assert_eq!(
+            DiskProperties::clamp_buffered_write_length(nsectors, 512, 4096),
+            3584
+        );
+        assert_eq!(
+            DiskProperties::clamp_buffered_write_length(nsectors, 4096, 512),
+            0
+        );
+        assert_eq!(
+            DiskProperties::clamp_buffered_write_length(nsectors, u64::MAX, u64::MAX),
+            0
+        );
     }
 
     #[cfg(target_os = "linux")]

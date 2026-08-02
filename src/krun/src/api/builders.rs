@@ -323,7 +323,7 @@ pub enum SyncMode {
 #[cfg(feature = "blk")]
 #[derive(Debug, Clone)]
 pub struct DiskBuilder {
-    pub(crate) configs: Vec<DiskConfig>,
+    pub(crate) configs: Vec<ConfiguredDisk>,
     current_path: Option<PathBuf>,
     current_id: Option<String>,
     current_read_only: bool,
@@ -347,8 +347,14 @@ pub struct DiskConfig {
     pub cache: CacheMode,
     pub direct_io: bool,
     pub sync: SyncMode,
-    /// Host dirty-data threshold that starts advisory writeback before a guest flush.
-    pub writeback_preflush_bytes: Option<u64>,
+}
+
+/// Internal disk configuration paired with host-only tuning state.
+#[cfg(feature = "blk")]
+#[derive(Debug, Clone)]
+pub(crate) struct ConfiguredDisk {
+    pub(crate) config: DiskConfig,
+    pub(crate) writeback_preflush_bytes: Option<u64>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -966,14 +972,16 @@ impl DiskBuilder {
     pub fn path(mut self, path: impl AsRef<Path>) -> Self {
         // Finalize any pending config
         if let Some(pending_path) = self.current_path.take() {
-            self.configs.push(DiskConfig {
-                path: pending_path,
-                id: self.current_id.take(),
-                read_only: self.current_read_only,
-                format: self.current_format,
-                cache: self.current_cache,
-                direct_io: self.current_direct_io,
-                sync: self.current_sync,
+            self.configs.push(ConfiguredDisk {
+                config: DiskConfig {
+                    path: pending_path,
+                    id: self.current_id.take(),
+                    read_only: self.current_read_only,
+                    format: self.current_format,
+                    cache: self.current_cache,
+                    direct_io: self.current_direct_io,
+                    sync: self.current_sync,
+                },
                 writeback_preflush_bytes: self.current_writeback_preflush_bytes,
             });
             self.current_read_only = false;
@@ -1012,11 +1020,14 @@ impl DiskBuilder {
         self
     }
 
-    /// Start advisory host writeback after this many buffered bytes have been written.
+    /// Start one advisory host writeback range after this many buffered bytes have been written.
     ///
     /// This Linux-only optimization is valid for writable raw disks using writeback caching,
     /// buffered I/O and an active sync mode. The minimum active threshold is 64 MiB; a value of
     /// zero disables the optimization. Invalid combinations fail explicitly when the VM is built.
+    /// The advisory writeback is issued at most once between successful guest flushes; it is not a
+    /// dirty-memory limit. Hosts running untrusted workloads must enforce memory and dirty-page
+    /// containment independently, for example with cgroups and Linux writeback policy.
     pub fn writeback_preflush_bytes(mut self, bytes: u64) -> Self {
         self.current_writeback_preflush_bytes = (bytes > 0).then_some(bytes);
         self
@@ -1025,14 +1036,16 @@ impl DiskBuilder {
     /// Finalize the builder (called internally).
     pub(crate) fn finalize(mut self) -> Self {
         if let Some(path) = self.current_path.take() {
-            self.configs.push(DiskConfig {
-                path,
-                id: self.current_id.take(),
-                read_only: self.current_read_only,
-                format: self.current_format,
-                cache: self.current_cache,
-                direct_io: self.current_direct_io,
-                sync: self.current_sync,
+            self.configs.push(ConfiguredDisk {
+                config: DiskConfig {
+                    path,
+                    id: self.current_id.take(),
+                    read_only: self.current_read_only,
+                    format: self.current_format,
+                    cache: self.current_cache,
+                    direct_io: self.current_direct_io,
+                    sync: self.current_sync,
+                },
                 writeback_preflush_bytes: self.current_writeback_preflush_bytes,
             });
         }

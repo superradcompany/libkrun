@@ -479,6 +479,20 @@ impl VmResources {
         self.block.insert(config, self.metrics.clone())
     }
 
+    /// Adds a block device with an optional one-shot writeback threshold between guest flushes.
+    #[cfg(feature = "blk")]
+    pub fn add_block_device_with_writeback_preflush(
+        &mut self,
+        config: BlockDeviceConfig,
+        writeback_preflush_bytes: Option<u64>,
+    ) -> Result<BlockConfigError> {
+        self.block.insert_with_writeback_preflush(
+            config,
+            writeback_preflush_bytes,
+            self.metrics.clone(),
+        )
+    }
+
     /// Sets a vsock device to be attached when the VM starts.
     pub fn set_vsock_device(&mut self, config: VsockDeviceConfig) -> Result<VsockConfigError> {
         self.vsock.insert(config)

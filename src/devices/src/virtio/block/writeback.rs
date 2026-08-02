@@ -117,11 +117,13 @@ impl BufferedWritebackConfig {
     }
 }
 
-/// Schedules bounded advisory data writeback for one buffered raw-file block device.
+/// Schedules one advisory data-writeback range per guest durability epoch.
 ///
 /// `sync_file_range(..., SYNC_FILE_RANGE_WRITE)` does not claim durability. Guest flush
 /// completion still depends on the existing full file sync after every earlier write has been
-/// processed by the block worker.
+/// processed by the block worker. This controller is a latency hint rather than a dirty-memory
+/// containment boundary: after the first submission, later writes wait for the mandatory guest
+/// flush. Hosts running untrusted guests must enforce memory and dirty-page limits independently.
 pub(crate) struct BufferedWritebackController {
     file: Arc<File>,
     window: WritebackWindow,

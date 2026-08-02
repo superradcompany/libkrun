@@ -532,7 +532,8 @@ impl VmBuilder {
 
         // Apply block device configuration
         #[cfg(feature = "blk")]
-        for (i, config) in self.disk.configs.into_iter().enumerate() {
+        for (i, configured_disk) in self.disk.configs.into_iter().enumerate() {
+            let config = configured_disk.config;
             let block_id = config
                 .id
                 .clone()
@@ -549,11 +550,13 @@ impl VmBuilder {
                 is_disk_read_only: config.read_only,
                 direct_io: config.direct_io,
                 sync_mode,
-                writeback_preflush_bytes: config.writeback_preflush_bytes,
             };
 
-            vmr.add_block_device(blk_config)
-                .map_err(|e| Error::Config(ConfigError::Block(e.to_string())))?;
+            vmr.add_block_device_with_writeback_preflush(
+                blk_config,
+                configured_disk.writeback_preflush_bytes,
+            )
+            .map_err(|e| Error::Config(ConfigError::Block(e.to_string())))?;
         }
 
         // Format execution configuration
@@ -880,11 +883,14 @@ mod tests {
             .disk
             .configs
             .iter()
-            .map(|c| c.path.to_string_lossy().into_owned())
+            .map(|c| c.config.path.to_string_lossy().into_owned())
             .collect();
         assert_eq!(paths, vec!["/a.raw", "/b.qcow2", "/c.vmdk"]);
-        assert_eq!(builder.disk.configs[1].format, DiskImageFormat::Qcow2);
-        assert!(builder.disk.configs[2].read_only);
+        assert_eq!(
+            builder.disk.configs[1].config.format,
+            DiskImageFormat::Qcow2
+        );
+        assert!(builder.disk.configs[2].config.read_only);
     }
 
     #[cfg(feature = "blk")]
@@ -895,9 +901,9 @@ mod tests {
             .disk(|d| d.path("/b.raw").id("data"))
             .disk(|d| d.path("/c.raw"));
 
-        assert!(builder.disk.configs[0].id.is_none());
-        assert_eq!(builder.disk.configs[1].id.as_deref(), Some("data"));
-        assert!(builder.disk.configs[2].id.is_none());
+        assert!(builder.disk.configs[0].config.id.is_none());
+        assert_eq!(builder.disk.configs[1].config.id.as_deref(), Some("data"));
+        assert!(builder.disk.configs[2].config.id.is_none());
     }
 
     #[cfg(feature = "blk")]
@@ -916,19 +922,19 @@ mod tests {
             })
             .disk(|d| d.path("/b.raw"));
 
-        assert!(builder.disk.configs[0].read_only);
-        assert_eq!(builder.disk.configs[0].cache, CacheMode::Unsafe);
-        assert!(builder.disk.configs[0].direct_io);
-        assert_eq!(builder.disk.configs[0].sync, SyncMode::None);
+        assert!(builder.disk.configs[0].config.read_only);
+        assert_eq!(builder.disk.configs[0].config.cache, CacheMode::Unsafe);
+        assert!(builder.disk.configs[0].config.direct_io);
+        assert_eq!(builder.disk.configs[0].config.sync, SyncMode::None);
         assert_eq!(
             builder.disk.configs[0].writeback_preflush_bytes,
             Some(128 * 1024 * 1024)
         );
 
-        assert!(!builder.disk.configs[1].read_only);
-        assert_eq!(builder.disk.configs[1].cache, CacheMode::Writeback);
-        assert!(!builder.disk.configs[1].direct_io);
-        assert_eq!(builder.disk.configs[1].sync, SyncMode::Full);
+        assert!(!builder.disk.configs[1].config.read_only);
+        assert_eq!(builder.disk.configs[1].config.cache, CacheMode::Writeback);
+        assert!(!builder.disk.configs[1].config.direct_io);
+        assert_eq!(builder.disk.configs[1].config.sync, SyncMode::Full);
         assert_eq!(builder.disk.configs[1].writeback_preflush_bytes, None);
     }
 }
