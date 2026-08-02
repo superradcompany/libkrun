@@ -413,7 +413,7 @@ mod tests {
         let start_addr2 = GuestAddress(0x1000);
         let guest_mem =
             GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
-        let vm = builder::setup_vm(&guest_mem, false).unwrap();
+        let vm = builder::setup_vm(&guest_mem, false, 1).unwrap();
         let mut device_manager =
             MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
         #[cfg(target_arch = "x86_64")]
@@ -435,7 +435,7 @@ mod tests {
         let start_addr2 = GuestAddress(0x1000);
         let guest_mem =
             GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
-        let vm = builder::setup_vm(&guest_mem, false).unwrap();
+        let vm = builder::setup_vm(&guest_mem, false, 1).unwrap();
         let mut device_manager =
             MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
         #[cfg(target_arch = "x86_64")]
@@ -538,7 +538,7 @@ mod tests {
         let start_addr2 = GuestAddress(0x1000);
         let guest_mem =
             GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
-        let vm = builder::setup_vm(&guest_mem, false).unwrap();
+        let vm = builder::setup_vm(&guest_mem, false, 1).unwrap();
         let mut device_manager =
             MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);

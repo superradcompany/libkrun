@@ -28,6 +28,11 @@ impl IrqChipDevice {
         self.inner.get_mmio_size()
     }
 
+    #[cfg(target_arch = "x86_64")]
+    pub fn num_pins(&self) -> usize {
+        self.inner.num_pins()
+    }
+
     pub fn set_irq(
         &self,
         irq_line: Option<u32>,
@@ -116,6 +121,7 @@ impl AIADevice for IrqChipDevice {
 pub trait IrqChipT: BusDevice {
     fn get_mmio_addr(&self) -> u64;
     fn get_mmio_size(&self) -> u64;
+    fn num_pins(&self) -> usize;
     fn set_irq(
         &self,
         irq_line: Option<u32>,
@@ -215,6 +221,10 @@ pub mod test_utils {
         }
         fn get_mmio_size(&self) -> u64 {
             0
+        }
+        #[cfg(target_arch = "x86_64")]
+        fn num_pins(&self) -> usize {
+            arch::x86_64::layout::KVM_IOAPIC_NUM_PINS
         }
         fn set_irq(
             &self,

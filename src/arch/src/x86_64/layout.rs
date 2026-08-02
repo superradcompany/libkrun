@@ -29,11 +29,12 @@ pub const IRQ_BASE: u32 = 5;
 /// Last usable IRQ ID for virtio device interrupts on x86_64 when using
 /// KVM's in-kernel IOAPIC (hardcoded to 24 pins by KVM_IOAPIC_NUM_PINS).
 pub const IRQ_MAX: u32 = 15;
-/// Number of redirection entries exposed by the userspace IOAPIC.
-pub const IOAPIC_NUM_PINS: usize = 256;
-/// Last usable IRQ ID when using the userspace split irqchip. The upper
-/// IOAPIC pins are left out of the virtio allocation range for platform use.
-pub const IRQ_MAX_SPLIT: u32 = 223;
+/// Number of redirection entries exposed by KVM's in-kernel IOAPIC.
+pub const KVM_IOAPIC_NUM_PINS: usize = 24;
+/// Number of redirection entries addressable through one 8-bit IOREGSEL.
+pub const IOAPIC_NUM_PINS: usize = 120;
+/// Last usable IRQ ID when using the userspace split irqchip.
+pub const IRQ_MAX_SPLIT: u32 = IOAPIC_NUM_PINS as u32 - 1;
 
 /// Address for the TSS setup.
 pub const KVM_TSS_ADDRESS: u64 = 0xfffb_d000;

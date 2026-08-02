@@ -323,6 +323,7 @@ impl Vmm {
 
         #[cfg(target_arch = "x86_64")]
         {
+            let ioapic_num_pins = _intc.lock().unwrap().num_pins();
             let cmdline_len = if cfg!(feature = "tee") {
                 arch::x86_64::layout::CMDLINE_SEV_SIZE
             } else {
@@ -336,6 +337,7 @@ impl Vmm {
                 cmdline_len,
                 initrd,
                 vcpus.len() as u8,
+                ioapic_num_pins,
             )
             .map_err(Error::ConfigureSystem)?;
         }
