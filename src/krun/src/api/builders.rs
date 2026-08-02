@@ -399,7 +399,7 @@ impl MachineBuilder {
     /// Pins each possible vCPU thread to one resolved host logical processor.
     ///
     /// The map must contain one entry for every possible vCPU, including reserved capacity declared
-    /// with [`max_vcpus`](Self::max_vcpus). This is currently supported on Linux hosts only.
+    /// with [`max_vcpus`](Self::max_vcpus). This is supported on Linux and Windows hosts.
     pub fn vcpu_affinity(mut self, affinity: Vec<HostCpuId>) -> Self {
         self.vcpu_affinity = Some(affinity);
         self
