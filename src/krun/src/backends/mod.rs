@@ -32,6 +32,9 @@ pub mod fs;
 #[cfg(feature = "net")]
 pub mod net;
 
+#[cfg(not(target_os = "windows"))]
+pub mod vsock;
+
 //--------------------------------------------------------------------------------------------------
 // Re-Exports
 //--------------------------------------------------------------------------------------------------
@@ -44,3 +47,8 @@ pub use fs::DynFileSystem;
 
 #[cfg(feature = "net")]
 pub use net::NetBackend;
+
+#[cfg(not(target_os = "windows"))]
+pub use vsock::{
+    VsockConnectRequest, VsockNotifier, VsockPortBackend, VsockShutdown, VsockStreamBackend,
+};

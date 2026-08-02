@@ -215,11 +215,6 @@ pub struct VmResources {
     pub split_irqchip: bool,
     /// Shared metrics state for VMM and device counters.
     pub metrics: MetricsWriter,
-    /// Force-enable the virtio-vsock device even when no TSI transport is
-    /// required. When `false`, vsock is only attached if `configure_vsock`
-    /// determines it is needed (HIJACK_INET when there's no virtio-net, or
-    /// HIJACK_UNIX when there's a single root virtio-fs on Linux).
-    pub request_vsock: bool,
     /// Whether to attach the virtio-balloon device.
     pub enable_balloon: bool,
     /// The virtio-mem device backing live memory resize, created by the API
@@ -289,7 +284,6 @@ impl Default for VmResources {
             nested_enabled: false,
             split_irqchip: false,
             metrics: MetricsWriter::default(),
-            request_vsock: false,
             enable_balloon: true,
             #[cfg(not(feature = "tee"))]
             mem_device: None,

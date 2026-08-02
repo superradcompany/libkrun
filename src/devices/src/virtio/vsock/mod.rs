@@ -5,6 +5,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+mod backend;
 mod device;
 mod event_handler;
 mod muxer;
@@ -20,6 +21,9 @@ mod tsi_dgram;
 mod tsi_stream;
 mod unix;
 
+pub use self::backend::{
+    VsockConnectRequest, VsockNotifier, VsockPortBackend, VsockShutdown, VsockStreamBackend,
+};
 pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
 pub use self::defs::TsiFlags;
 pub use self::device::Vsock;

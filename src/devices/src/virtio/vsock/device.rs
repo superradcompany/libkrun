@@ -20,6 +20,7 @@ use super::super::{
 use super::muxer::VsockMuxer;
 use super::packet::VsockPacket;
 use super::TsiFlags;
+use super::VsockPortBackend;
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
 
@@ -54,11 +55,18 @@ impl Vsock {
         cid: u64,
         host_port_map: Option<HashMap<u16, u16>>,
         unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+        custom_port_map: Option<HashMap<u32, Arc<dyn VsockPortBackend>>>,
         tsi_flags: TsiFlags,
     ) -> super::Result<Vsock> {
         Ok(Vsock {
             cid,
-            muxer: VsockMuxer::new(cid, host_port_map, unix_ipc_port_map, tsi_flags),
+            muxer: VsockMuxer::new(
+                cid,
+                host_port_map,
+                unix_ipc_port_map,
+                custom_port_map,
+                tsi_flags,
+            ),
             queue_rx: None,
             queue_tx: None,
             queue_events: Vec::new(),

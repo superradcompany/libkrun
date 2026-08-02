@@ -95,4 +95,6 @@ pub trait Proxy: Send + AsRawFd {
     fn shutdown(&mut self, _pkt: &VsockPacket) {}
     fn release(&mut self) -> ProxyUpdate;
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate;
+    /// Retry backend work after the guest makes receive capacity available.
+    fn kick(&self) {}
 }

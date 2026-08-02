@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[cfg(not(target_os = "windows"))]
+use devices::virtio::vsock::VsockPortBackend;
+#[cfg(not(target_os = "windows"))]
 use devices::virtio::{TsiFlags, Vsock, VsockError};
 
 #[cfg(target_os = "windows")]
@@ -79,7 +81,7 @@ type Result<T> = std::result::Result<T, VsockConfigError>;
 
 /// This struct represents the strongly typed equivalent of the json body
 /// from vsock related requests.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct VsockDeviceConfig {
     /// ID of the vsock device.
     pub vsock_id: String,
@@ -89,8 +91,31 @@ pub struct VsockDeviceConfig {
     pub host_port_map: Option<HashMap<u16, u16>>,
     /// An optional map of guest port to host UNIX domain sockets for IPC.
     pub unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+    /// Optional custom in-process services keyed by host vsock port.
+    #[cfg(not(target_os = "windows"))]
+    pub custom_port_map: Option<HashMap<u32, Arc<dyn VsockPortBackend>>>,
     /// TSI feature flags
     pub tsi_flags: TsiFlags,
+}
+
+impl fmt::Debug for VsockDeviceConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_struct("VsockDeviceConfig");
+        debug
+            .field("vsock_id", &self.vsock_id)
+            .field("guest_cid", &self.guest_cid)
+            .field("host_port_map", &self.host_port_map)
+            .field("unix_ipc_port_map", &self.unix_ipc_port_map);
+        #[cfg(not(target_os = "windows"))]
+        debug.field(
+            "custom_ports",
+            &self
+                .custom_port_map
+                .as_ref()
+                .map(|services| services.keys().collect::<Vec<_>>()),
+        );
+        debug.field("tsi_flags", &self.tsi_flags).finish()
+    }
 }
 
 struct VsockWrapper {
@@ -148,6 +173,7 @@ impl VsockBuilder {
             u64::from(cfg.guest_cid),
             cfg.host_port_map,
             cfg.unix_ipc_port_map,
+            cfg.custom_port_map,
             cfg.tsi_flags,
         )
         .map_err(VsockConfigError::CreateVsockDevice)
@@ -186,6 +212,7 @@ pub(crate) mod tests {
             guest_cid: 3,
             host_port_map: None,
             unix_ipc_port_map: None,
+            custom_port_map: None,
             tsi_flags: TsiFlags::empty(),
         }
     }

@@ -22,6 +22,8 @@ use std::sync::Arc;
 
 #[cfg(feature = "net")]
 use crate::backends::net::NetBackend;
+#[cfg(not(target_os = "windows"))]
+use crate::backends::vsock::VsockPortBackend;
 
 //--------------------------------------------------------------------------------------------------
 // Types: Machine Builder
@@ -50,13 +52,56 @@ pub struct MachineBuilder {
     pub(crate) hyperthreading: bool,
     pub(crate) nested_virt: bool,
     pub(crate) split_irqchip: bool,
-    pub(crate) vsock: bool,
     pub(crate) balloon: bool,
     pub(crate) balloon_stats_interval: Option<Duration>,
     pub(crate) rng: bool,
     pub(crate) msb_metrics: bool,
     pub(crate) enable_inet_hijack: bool,
     pub(crate) vcpu_affinity: Option<Vec<HostCpuId>>,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Types: Vsock Builder
+//--------------------------------------------------------------------------------------------------
+
+/// Builder for host services exposed through virtio-vsock.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use std::sync::Arc;
+/// use msb_krun::VmBuilder;
+///
+/// VmBuilder::new().vsock(|vsock| {
+///     vsock
+///         .unix_connect(5000, "/run/supervisor.sock")
+///         .unix_listen(5001, "/run/events.sock")
+///         .custom(6000, Arc::new(my_service))
+/// });
+/// ```
+#[cfg(not(target_os = "windows"))]
+#[derive(Default)]
+pub struct VsockBuilder {
+    pub(crate) routes: Vec<VsockRoute>,
+    pub(crate) tcp_listen_remaps: Vec<(u16, u16)>,
+    pub(crate) enable_inet_hijack: bool,
+}
+
+/// One typed host-side route for a guest vsock destination port.
+#[cfg(not(target_os = "windows"))]
+pub(crate) enum VsockRoute {
+    UnixConnect {
+        port: u32,
+        path: PathBuf,
+    },
+    UnixListen {
+        port: u32,
+        path: PathBuf,
+    },
+    Custom {
+        port: u32,
+        backend: Arc<dyn VsockPortBackend>,
+    },
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -363,7 +408,6 @@ impl MachineBuilder {
             hyperthreading: false,
             nested_virt: false,
             split_irqchip: false,
-            vsock: false,
             balloon: true,
             balloon_stats_interval: Some(Duration::from_secs(1)),
             rng: true,
@@ -441,17 +485,6 @@ impl MachineBuilder {
         self
     }
 
-    /// Force-attach a virtio-vsock device to the guest.
-    ///
-    /// By default, vsock is only attached when needed as a TSI transport
-    /// (no virtio-net → HIJACK_INET, or single root virtio-fs on Linux →
-    /// HIJACK_UNIX). Set this to `true` when the guest needs a vsock for
-    /// its own purposes even though TSI would not otherwise require one.
-    pub fn vsock(mut self, enabled: bool) -> Self {
-        self.vsock = enabled;
-        self
-    }
-
     /// Enable or disable the virtio-balloon device.
     ///
     /// The device is enabled by default for general-purpose VMs. Latency-sensitive
@@ -506,6 +539,61 @@ impl MachineBuilder {
     /// hijack) is gated on `HIJACK_INET` already being set, so leaving
     /// INET hijack off also leaves the UNIX hijack auto-enable path off.
     pub fn enable_inet_hijack(mut self, enabled: bool) -> Self {
+        self.enable_inet_hijack = enabled;
+        self
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods: Vsock Builder
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(not(target_os = "windows"))]
+impl VsockBuilder {
+    /// Create an empty vsock service builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Route guest connections to `port` into an existing host Unix socket.
+    pub fn unix_connect(mut self, port: u32, path: impl AsRef<Path>) -> Self {
+        self.routes.push(VsockRoute::UnixConnect {
+            port,
+            path: path.as_ref().to_path_buf(),
+        });
+        self
+    }
+
+    /// Listen on a host Unix socket and inject accepted streams into guest `port`.
+    pub fn unix_listen(mut self, port: u32, path: impl AsRef<Path>) -> Self {
+        self.routes.push(VsockRoute::UnixListen {
+            port,
+            path: path.as_ref().to_path_buf(),
+        });
+        self
+    }
+
+    /// Serve guest connections to `port` with a custom in-process backend.
+    ///
+    /// Unlike a Unix route, this does not ask libkrun to create or map a data
+    /// socket. The backend supplies a nonblocking byte stream and readiness
+    /// source; libkrun retains virtio-vsock framing and flow control.
+    pub fn custom(mut self, port: u32, backend: Arc<dyn VsockPortBackend>) -> Self {
+        self.routes.push(VsockRoute::Custom { port, backend });
+        self
+    }
+
+    /// Remap a guest TCP listen port to a host port through TSI.
+    ///
+    /// This requires [`inet_hijack(true)`](Self::inet_hijack); validation
+    /// rejects remaps that would otherwise be silently ignored.
+    pub fn tcp_listen_remap(mut self, guest_port: u16, host_port: u16) -> Self {
+        self.tcp_listen_remaps.push((guest_port, host_port));
+        self
+    }
+
+    /// Enable or disable TSI interception of guest INET sockets.
+    pub fn inet_hijack(mut self, enabled: bool) -> Self {
         self.enable_inet_hijack = enabled;
         self
     }

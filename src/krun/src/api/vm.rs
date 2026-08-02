@@ -1,5 +1,7 @@
 //! VM handle for entering microVMs.
 
+#[cfg(not(target_os = "windows"))]
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
@@ -12,14 +14,18 @@ use std::env;
 use std::ffi::CString;
 
 use crossbeam_channel::unbounded;
+#[cfg(not(target_os = "windows"))]
+use devices::virtio::vsock::VsockPortBackend;
 use log::error;
 use polly::event_manager::EventManager;
 use utils::eventfd::EventFd;
+#[cfg(not(target_os = "windows"))]
 use vmm::resources::TsiFlags;
 use vmm::resources::VmResources;
 use vmm::vmm_config::kernel_bundle::InitrdBundle;
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 use vmm::vmm_config::kernel_cmdline::KernelCmdlineConfig;
+#[cfg(not(target_os = "windows"))]
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 
 use super::error::{BuildError, Error, Result, RuntimeError};
@@ -59,7 +65,14 @@ pub struct Vm {
     /// bridges guest INET sockets to the host via vsock when no
     /// virtio-net device is configured. Set via
     /// [`MachineBuilder::enable_inet_hijack`](super::builders::MachineBuilder::enable_inet_hijack).
+    #[cfg(not(target_os = "windows"))]
     enable_inet_hijack: bool,
+    #[cfg(not(target_os = "windows"))]
+    vsock_unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+    #[cfg(not(target_os = "windows"))]
+    vsock_custom_port_map: Option<HashMap<u32, Arc<dyn VsockPortBackend>>>,
+    #[cfg(not(target_os = "windows"))]
+    vsock_host_port_map: Option<HashMap<u16, u16>>,
     /// Keeps the libkrunfw library loaded so kernel memory pointers remain valid.
     _krunfw_library: Option<libloading::Library>,
     /// Keeps an explicit initramfs allocation alive until it is copied to guest memory.
@@ -138,7 +151,14 @@ impl Vm {
         exit_observers: Vec<Box<dyn Fn(i32) + Send + 'static>>,
         exit_evt: EventFd,
         exit_code: Arc<AtomicI32>,
-        enable_inet_hijack: bool,
+        #[cfg(not(target_os = "windows"))] enable_inet_hijack: bool,
+        #[cfg(not(target_os = "windows"))] vsock_unix_ipc_port_map: Option<
+            HashMap<u32, (PathBuf, bool)>,
+        >,
+        #[cfg(not(target_os = "windows"))] vsock_custom_port_map: Option<
+            HashMap<u32, Arc<dyn VsockPortBackend>>,
+        >,
+        #[cfg(not(target_os = "windows"))] vsock_host_port_map: Option<HashMap<u16, u16>>,
     ) -> Self {
         Self {
             vmr,
@@ -154,7 +174,14 @@ impl Vm {
             exit_observers,
             exit_evt,
             exit_code,
+            #[cfg(not(target_os = "windows"))]
             enable_inet_hijack,
+            #[cfg(not(target_os = "windows"))]
+            vsock_unix_ipc_port_map,
+            #[cfg(not(target_os = "windows"))]
+            vsock_custom_port_map,
+            #[cfg(not(target_os = "windows"))]
+            vsock_host_port_map,
             _krunfw_library: None,
             _initramfs_data: None,
         }
@@ -379,24 +406,26 @@ impl Vm {
 
     /// Configure the vsock device.
     ///
-    /// The device is only attached when actually needed — either because the
-    /// caller explicitly requested it (`MachineBuilder::vsock(true)`), or
-    /// because the caller opted in to TSI as a transport
-    /// (`MachineBuilder::enable_inet_hijack(true)` with no virtio-net →
-    /// HIJACK_INET; single root virtio-fs on Linux → HIJACK_UNIX). This
-    /// keeps the per-VM IRQ/MMIO budget free when nothing uses vsock.
+    /// The device is only attached when a typed host route exists or the
+    /// caller enabled TSI as a transport. This keeps the per-VM IRQ/MMIO
+    /// budget free when nothing uses vsock.
+    #[cfg(not(target_os = "windows"))]
     fn configure_vsock(&mut self) -> Result<()> {
         let tsi_flags = self.compute_tsi_flags();
 
-        if !self.vmr.request_vsock && tsi_flags.is_empty() {
+        if self.vsock_unix_ipc_port_map.is_none()
+            && self.vsock_custom_port_map.is_none()
+            && tsi_flags.is_empty()
+        {
             return Ok(());
         }
 
         let vsock_config = VsockDeviceConfig {
             vsock_id: "vsock0".to_string(),
             guest_cid: 3,
-            host_port_map: None,
-            unix_ipc_port_map: None,
+            host_port_map: self.vsock_host_port_map.take(),
+            unix_ipc_port_map: self.vsock_unix_ipc_port_map.take(),
+            custom_port_map: self.vsock_custom_port_map.take(),
             tsi_flags,
         };
 
@@ -407,11 +436,19 @@ impl Vm {
         Ok(())
     }
 
+    #[cfg(target_os = "windows")]
+    fn configure_vsock(&mut self) -> Result<()> {
+        // Unsupported requests are rejected by VmBuilder::build; keep VM
+        // startup free of placeholder devices on Windows.
+        Ok(())
+    }
+
     /// Decide which `TsiFlags` should be enabled for this VM.
     ///
     /// Extracted from [`configure_vsock`](Self::configure_vsock) so the
     /// flag-selection logic can be exercised by unit tests without
     /// touching `VmResources::set_vsock_device`.
+    #[cfg(not(target_os = "windows"))]
     fn compute_tsi_flags(&self) -> TsiFlags {
         let mut tsi_flags = TsiFlags::empty();
 
@@ -604,15 +641,41 @@ fn load_krunfw_library(path: Option<&std::path::Path>) -> Result<KrunfwBindings>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_os = "windows"))]
+    use crate::VmBuilder;
     use utils::eventfd::EFD_NONBLOCK;
+    #[cfg(not(target_os = "windows"))]
     use vmm::resources::TsiFlags;
     #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     use vmm::vmm_config::fs::FsDeviceConfig;
 
     fn make_vm() -> Vm {
-        make_vm_with(false)
+        Vm::new(
+            VmResources::default(),
+            Some("debug loglevel=7".to_string()),
+            None,
+            Some("\"--flag\"".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            Arc::new(AtomicI32::new(i32::MAX)),
+            #[cfg(not(target_os = "windows"))]
+            false,
+            #[cfg(not(target_os = "windows"))]
+            None,
+            #[cfg(not(target_os = "windows"))]
+            None,
+            #[cfg(not(target_os = "windows"))]
+            None,
+        )
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn make_vm_with(enable_inet_hijack: bool) -> Vm {
         Vm::new(
             VmResources::default(),
@@ -629,6 +692,9 @@ mod tests {
             EventFd::new(EFD_NONBLOCK).unwrap(),
             Arc::new(AtomicI32::new(i32::MAX)),
             enable_inet_hijack,
+            None,
+            None,
+            None,
         )
     }
 
@@ -683,6 +749,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn compute_tsi_flags_air_gaps_by_default_with_no_net() {
         let vm = make_vm();
         let flags = vm.compute_tsi_flags();
@@ -690,10 +757,69 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn compute_tsi_flags_enables_inet_hijack_when_opted_in() {
         let vm = make_vm_with(true);
         let flags = vm.compute_tsi_flags();
         assert!(flags.contains(TsiFlags::HIJACK_INET));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn typed_vsock_routes_imply_attachment_and_reach_vm_config() {
+        use std::io;
+
+        use devices::virtio::vsock::{
+            VsockConnectRequest, VsockNotifier, VsockPortBackend, VsockStreamBackend,
+        };
+
+        struct RejectService;
+
+        impl VsockPortBackend for RejectService {
+            fn connect(
+                &self,
+                _request: VsockConnectRequest,
+                _notifier: VsockNotifier,
+            ) -> io::Result<Box<dyn VsockStreamBackend>> {
+                Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+            }
+        }
+
+        let vm = VmBuilder::new()
+            .vsock(|vsock| {
+                vsock
+                    .unix_connect(5000, "/tmp/supervisor.sock")
+                    .unix_listen(5001, "/tmp/events.sock")
+                    .custom(6000, Arc::new(RejectService))
+                    .inet_hijack(true)
+                    .tcp_listen_remap(8080, 18080)
+            })
+            .build()
+            .expect("typed vsock configuration should build");
+
+        assert_eq!(
+            vm.vsock_unix_ipc_port_map
+                .as_ref()
+                .and_then(|routes| routes.get(&5000)),
+            Some(&(PathBuf::from("/tmp/supervisor.sock"), false))
+        );
+        assert_eq!(
+            vm.vsock_unix_ipc_port_map
+                .as_ref()
+                .and_then(|routes| routes.get(&5001)),
+            Some(&(PathBuf::from("/tmp/events.sock"), true))
+        );
+        assert!(vm
+            .vsock_custom_port_map
+            .as_ref()
+            .is_some_and(|routes| routes.contains_key(&6000)));
+        assert_eq!(
+            vm.vsock_host_port_map
+                .as_ref()
+                .and_then(|routes| routes.get(&8080)),
+            Some(&18080)
+        );
+        assert!(vm.compute_tsi_flags().contains(TsiFlags::HIJACK_INET));
     }
 
     #[cfg(all(
