@@ -552,9 +552,9 @@ impl VmBuilder {
                 sync_mode,
             };
 
-            vmr.add_block_device_with_writeback_preflush(
+            vmr.add_block_device_with_writeback_limit(
                 blk_config,
-                configured_disk.writeback_preflush_bytes,
+                configured_disk.writeback_limit_bytes,
             )
             .map_err(|e| Error::Config(ConfigError::Block(e.to_string())))?;
         }
@@ -918,7 +918,7 @@ mod tests {
                     .cache(CacheMode::Unsafe)
                     .direct_io(true)
                     .sync(SyncMode::None)
-                    .writeback_preflush_bytes(128 * 1024 * 1024)
+                    .writeback_limit_bytes(128 * 1024 * 1024)
             })
             .disk(|d| d.path("/b.raw"));
 
@@ -927,7 +927,7 @@ mod tests {
         assert!(builder.disk.configs[0].config.direct_io);
         assert_eq!(builder.disk.configs[0].config.sync, SyncMode::None);
         assert_eq!(
-            builder.disk.configs[0].writeback_preflush_bytes,
+            builder.disk.configs[0].writeback_limit_bytes,
             Some(128 * 1024 * 1024)
         );
 
@@ -935,6 +935,6 @@ mod tests {
         assert_eq!(builder.disk.configs[1].config.cache, CacheMode::Writeback);
         assert!(!builder.disk.configs[1].config.direct_io);
         assert_eq!(builder.disk.configs[1].config.sync, SyncMode::Full);
-        assert_eq!(builder.disk.configs[1].writeback_preflush_bytes, None);
+        assert_eq!(builder.disk.configs[1].writeback_limit_bytes, None);
     }
 }

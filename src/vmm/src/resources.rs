@@ -479,18 +479,15 @@ impl VmResources {
         self.block.insert(config, self.metrics.clone())
     }
 
-    /// Adds a block device with optional rolling writeback and per-device hard backpressure.
+    /// Adds a block device with an optional per-device hard dirty-data budget.
     #[cfg(feature = "blk")]
-    pub fn add_block_device_with_writeback_preflush(
+    pub fn add_block_device_with_writeback_limit(
         &mut self,
         config: BlockDeviceConfig,
-        writeback_preflush_bytes: Option<u64>,
+        writeback_limit_bytes: Option<u64>,
     ) -> Result<BlockConfigError> {
-        self.block.insert_with_writeback_preflush(
-            config,
-            writeback_preflush_bytes,
-            self.metrics.clone(),
-        )
+        self.block
+            .insert_with_writeback_limit(config, writeback_limit_bytes, self.metrics.clone())
     }
 
     /// Sets a vsock device to be attached when the VM starts.

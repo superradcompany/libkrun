@@ -331,7 +331,7 @@ pub struct DiskBuilder {
     current_cache: CacheMode,
     current_direct_io: bool,
     current_sync: SyncMode,
-    current_writeback_preflush_bytes: Option<u64>,
+    current_writeback_limit_bytes: Option<u64>,
 }
 
 /// Configuration for a single block device.
@@ -354,7 +354,7 @@ pub struct DiskConfig {
 #[derive(Debug, Clone)]
 pub(crate) struct ConfiguredDisk {
     pub(crate) config: DiskConfig,
-    pub(crate) writeback_preflush_bytes: Option<u64>,
+    pub(crate) writeback_limit_bytes: Option<u64>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -946,7 +946,7 @@ impl DiskBuilder {
             current_cache: CacheMode::Writeback,
             current_direct_io: false,
             current_sync: SyncMode::Full,
-            current_writeback_preflush_bytes: None,
+            current_writeback_limit_bytes: None,
         }
     }
 
@@ -982,14 +982,14 @@ impl DiskBuilder {
                     direct_io: self.current_direct_io,
                     sync: self.current_sync,
                 },
-                writeback_preflush_bytes: self.current_writeback_preflush_bytes,
+                writeback_limit_bytes: self.current_writeback_limit_bytes,
             });
             self.current_read_only = false;
             self.current_format = DiskImageFormat::Raw;
             self.current_cache = CacheMode::Writeback;
             self.current_direct_io = false;
             self.current_sync = SyncMode::Full;
-            self.current_writeback_preflush_bytes = None;
+            self.current_writeback_limit_bytes = None;
         }
 
         self.current_path = Some(path.as_ref().to_path_buf());
@@ -1020,17 +1020,21 @@ impl DiskBuilder {
         self
     }
 
-    /// Start rolling host writeback after this many buffered bytes have been written.
+    /// Limit outstanding buffered host dirty data to this many bytes.
     ///
-    /// This Linux-only optimization is valid for writable raw disks using writeback caching,
-    /// buffered I/O and an active sync mode. The minimum active threshold is 64 MiB; a value of
-    /// zero disables the optimization. Invalid combinations fail explicitly when the VM is built.
-    /// The configured value is the soft threshold for asynchronous range writeback. Twice that
-    /// value is a VMM-enforced per-device hard watermark: the block worker synchronously drains its
-    /// accumulated range before accepting more dirtying writes. Guest flushes still perform the
-    /// existing full durability sync.
-    pub fn writeback_preflush_bytes(mut self, bytes: u64) -> Self {
-        self.current_writeback_preflush_bytes = (bytes > 0).then_some(bytes);
+    /// This Linux-only policy is valid for writable raw disks using writeback caching, buffered
+    /// I/O and an active sync mode. The minimum active budget is 128 MiB; zero disables the policy.
+    /// Libkrun derives smaller internal batches, retires their data and allocation metadata on a
+    /// background helper, and applies backpressure before this per-device, page-aligned dirty-data
+    /// budget can be exceeded. Guest flushes still perform the existing full durability sync.
+    ///
+    /// While this policy is active, host hole punching is not exposed to the guest: discard and
+    /// write-zeroes-with-unmap are unavailable, while ordinary write-zeroes requests use accounted
+    /// data writes. On supporting Linux kernels and filesystems, writes also request best-effort
+    /// cache pruning; that hint is an optimization, not a bound on clean page-cache residency.
+    /// Invalid combinations fail explicitly when the VM is built.
+    pub fn writeback_limit_bytes(mut self, bytes: u64) -> Self {
+        self.current_writeback_limit_bytes = (bytes > 0).then_some(bytes);
         self
     }
 
@@ -1047,7 +1051,7 @@ impl DiskBuilder {
                     direct_io: self.current_direct_io,
                     sync: self.current_sync,
                 },
-                writeback_preflush_bytes: self.current_writeback_preflush_bytes,
+                writeback_limit_bytes: self.current_writeback_limit_bytes,
             });
         }
         self

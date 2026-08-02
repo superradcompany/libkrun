@@ -46,7 +46,9 @@ pub enum RequestError {
     DiscardingToZero(io::Error),
     FlushingToDisk(io::Error),
     InvalidDataLength,
+    InvalidMutationRange(io::Error),
     ReadingFromDescriptor(io::Error),
+    UnsupportedMutation,
     WritingToDescriptor(io::Error),
     WritingZeroes(io::Error),
     UnknownRequest,
@@ -832,6 +834,11 @@ impl BlockWorker {
                     Err(RequestError::InvalidDataLength)
                 } else {
                     let offset = sector_offset(request_header.sector)?;
+                    // Validate the complete descriptor payload before allowing the first backing
+                    // write. Bounded mode must never partially apply an out-of-capacity request.
+                    self.disk
+                        .validate_mutation_range(offset, data_len as u64)
+                        .map_err(RequestError::InvalidMutationRange)?;
                     let len = reader
                         .read_to_at(&self.disk, data_len, offset)
                         .map_err(RequestError::ReadingFromDescriptor)?;
@@ -861,14 +868,21 @@ impl BlockWorker {
                 }
             }
             VIRTIO_BLK_T_DISCARD => {
+                if self.disk.has_writeback_limit() {
+                    // Bounded writeback deliberately does not advertise DISCARD. Reject a guest
+                    // that sends it anyway rather than admitting unaccounted metadata mutation.
+                    return Err(RequestError::UnsupportedMutation);
+                }
                 let discard_write_data: DiscardWriteData = reader
                     .read_obj()
                     .map_err(RequestError::ReadingFromDescriptor)?;
+                let offset = sector_offset(discard_write_data.sector)?;
+                let length = sector_count_bytes(discard_write_data.num_sectors)?;
                 self.disk
-                    .discard_to_any(
-                        sector_offset(discard_write_data.sector)?,
-                        sector_count_bytes(discard_write_data.num_sectors)?,
-                    )
+                    .validate_mutation_range(offset, length)
+                    .map_err(RequestError::InvalidMutationRange)?;
+                self.disk
+                    .discard_to_any(offset, length)
                     .map_err(RequestError::Discarding)?;
                 Ok(0)
             }
@@ -877,19 +891,23 @@ impl BlockWorker {
                     .read_obj()
                     .map_err(RequestError::ReadingFromDescriptor)?;
                 let unmap = (discard_write_data.flags & VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP) != 0;
+                if self.disk.has_writeback_limit() && unmap {
+                    // The bounded device advertises write_zeroes_may_unmap=0. Fail closed if a
+                    // non-conforming guest still requests a hole-punching zero operation.
+                    return Err(RequestError::UnsupportedMutation);
+                }
+                let offset = sector_offset(discard_write_data.sector)?;
+                let length = sector_count_bytes(discard_write_data.num_sectors)?;
+                self.disk
+                    .validate_mutation_range(offset, length)
+                    .map_err(RequestError::InvalidMutationRange)?;
                 if unmap {
                     self.disk
-                        .discard_to_zero(
-                            sector_offset(discard_write_data.sector)?,
-                            sector_count_bytes(discard_write_data.num_sectors)?,
-                        )
+                        .discard_to_zero(offset, length)
                         .map_err(RequestError::DiscardingToZero)?;
                 } else {
                     self.disk
-                        .write_zeroes(
-                            sector_offset(discard_write_data.sector)?,
-                            sector_count_bytes(discard_write_data.num_sectors)?,
-                        )
+                        .write_zeroes(offset, length)
                         .map_err(RequestError::WritingZeroes)?;
                 }
                 Ok(0)

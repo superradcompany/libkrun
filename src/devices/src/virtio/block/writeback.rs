@@ -1,15 +1,41 @@
 // Copyright 2026 The Microsandbox Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::VecDeque;
+#[cfg(target_os = "linux")]
 use std::fs::File;
 use std::io;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 
+use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use log::warn;
 
-pub(crate) const MINIMUM_RANGE_BYTES: u64 = 64 * 1024 * 1024;
-const HARD_LIMIT_MULTIPLIER: u64 = 2;
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Smallest supported per-device hard writeback budget.
+pub(crate) const MINIMUM_WRITEBACK_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
+
+const MINIMUM_BATCH_BYTES: u64 = 32 * 1024 * 1024;
+const MAXIMUM_BATCH_BYTES: u64 = 256 * 1024 * 1024;
+const BATCH_BUDGET_DIVISOR: u64 = 4;
+/// Maximum exact disjoint ranges retained in one generation before it is submitted early.
+///
+/// This bounds both controller metadata and the number of `sync_file_range` calls in one job
+/// independently of the caller-supplied hard byte budget. At 4 KiB per page, 8192 extents cover
+/// the full 32 MiB minimum batch while limiting one job's range vector to roughly 128 KiB.
+const MAX_EXTENTS_PER_GENERATION: usize = 8192;
+const MAX_QUEUED_BATCHES: usize = 64;
+const WORKER_THREAD_NAME: &str = "virtio-blk-writeback";
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DirtyRange {
@@ -17,226 +43,1016 @@ struct DirtyRange {
     end: u64,
 }
 
-impl DirtyRange {
-    fn new(offset: u64, length: u64) -> Option<Self> {
-        if length == 0 {
-            return None;
-        }
-
-        Some(Self {
-            start: offset,
-            end: offset.saturating_add(length),
-        })
-    }
-
-    fn merge(self, other: Self) -> Self {
-        Self {
-            start: self.start.min(other.start),
-            end: self.end.max(other.end),
-        }
-    }
-
-    fn len(self) -> u64 {
-        self.end.saturating_sub(self.start)
-    }
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ExtentSet {
+    bytes: u64,
+    ranges: Vec<DirtyRange>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WritebackAction {
-    Advisory(DirtyRange),
-    Drain(DirtyRange),
+enum GenerationStatus {
+    InFlight,
+    Failed,
 }
 
 #[derive(Debug)]
-struct WritebackWindow {
-    trigger_bytes: u64,
-    hard_limit_bytes: u64,
-    batch_logical_bytes: u64,
-    batch_range: Option<DirtyRange>,
-    outstanding_logical_bytes: u64,
-    outstanding_range: Option<DirtyRange>,
+struct SharedHealth {
+    healthy: AtomicBool,
 }
 
-impl WritebackWindow {
-    fn new(trigger_bytes: u64) -> Self {
-        Self {
-            trigger_bytes,
-            hard_limit_bytes: trigger_bytes.saturating_mul(HARD_LIMIT_MULTIPLIER),
-            batch_logical_bytes: 0,
-            batch_range: None,
-            outstanding_logical_bytes: 0,
-            outstanding_range: None,
-        }
-    }
+#[derive(Debug)]
+struct Generation {
+    id: u64,
+    extents: ExtentSet,
+    status: GenerationStatus,
+}
 
-    fn prepare_write(&self, length: u64) -> Option<DirtyRange> {
-        let projected_bytes = self.outstanding_logical_bytes.saturating_add(length);
-        (projected_bytes > self.hard_limit_bytes)
-            .then_some(self.outstanding_range)
-            .flatten()
-    }
+#[derive(Debug)]
+struct WritebackJob {
+    generation: u64,
+    ranges: Vec<DirtyRange>,
+}
 
-    fn record_write(&mut self, offset: u64, length: u64) -> Option<WritebackAction> {
-        let range = DirtyRange::new(offset, length)?;
+#[derive(Debug)]
+struct WritebackCompletion {
+    generation: u64,
+    result: Result<(), WritebackFailure>,
+}
 
-        self.batch_logical_bytes = self.batch_logical_bytes.saturating_add(length);
-        self.batch_range = Some(
-            self.batch_range
-                .map_or(range, |existing| existing.merge(range)),
-        );
+#[derive(Clone, Debug)]
+struct WritebackFailure {
+    error: Arc<io::Error>,
+}
 
-        self.outstanding_logical_bytes = self.outstanding_logical_bytes.saturating_add(length);
-        self.outstanding_range = Some(
-            self.outstanding_range
-                .map_or(range, |existing| existing.merge(range)),
-        );
+#[derive(Clone, Debug)]
+struct LatchedError {
+    kind: io::ErrorKind,
+    raw_os_error: Option<i32>,
+    message: String,
+}
 
-        if self.outstanding_logical_bytes >= self.hard_limit_bytes {
-            return self.outstanding_range.map(WritebackAction::Drain);
-        }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingReservation {
+    id: u64,
+    offset: u64,
+    length: u64,
+    range: DirtyRange,
+}
 
-        let batch_range = self.batch_range?;
-        if self.batch_logical_bytes >= self.trigger_bytes
-            && batch_range.len() >= MINIMUM_RANGE_BYTES
-        {
-            return Some(WritebackAction::Advisory(batch_range));
-        }
+/// A single write admitted by the writeback budget.
+///
+/// The token is deliberately owned and does not borrow the controller, so callers can release
+/// interior mutability before performing the backing-file mutation.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct WritebackReservation {
+    id: u64,
+    offset: u64,
+    length: u64,
+}
 
-        None
-    }
+/// What the backing mutation did after a [`WritebackReservation`] was issued.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WritebackOutcome {
+    /// The mutation succeeded and dirtied exactly this prefix of the reservation.
+    Written(u64),
+    /// The mutation failed and may have dirtied any part of the reservation.
+    Failed,
+}
 
-    fn complete_advisory(&mut self) {
-        self.batch_logical_bytes = 0;
-        self.batch_range = None;
-    }
+trait WritebackBackend: Send + Sync + 'static {
+    fn writeback(&self, ranges: &[DirtyRange]) -> io::Result<()>;
+    fn sync_data(&self) -> io::Result<()>;
+}
 
-    fn complete_drain(&mut self) {
-        self.complete_advisory();
-        self.outstanding_logical_bytes = 0;
-        self.outstanding_range = None;
-    }
-
-    fn complete_flush(&mut self) {
-        self.complete_drain();
-    }
+#[cfg(target_os = "linux")]
+struct SyncFileRangeBackend {
+    file: Arc<File>,
 }
 
 /// Immutable inputs used to create a fresh controller when a block device is reactivated.
+#[cfg(target_os = "linux")]
 #[derive(Clone)]
 pub(crate) struct BufferedWritebackConfig {
     file: Arc<File>,
-    trigger_bytes: u64,
+    hard_budget_bytes: u64,
+    page_size: u64,
+    health: Arc<SharedHealth>,
 }
 
-impl BufferedWritebackConfig {
-    pub(crate) fn new(file: Arc<File>, trigger_bytes: u64) -> Self {
-        Self {
-            file,
-            trigger_bytes,
-        }
-    }
-
-    pub(crate) fn controller(&self) -> BufferedWritebackController {
-        BufferedWritebackController {
-            file: Arc::clone(&self.file),
-            window: WritebackWindow::new(self.trigger_bytes),
-        }
-    }
-}
-
-/// Applies rolling advisory writeback and hard backpressure to one buffered raw-file block device.
+/// Bounds buffered dirty data and moves range writeback off the virtio block worker.
 ///
-/// The configured threshold starts asynchronous range writeback. Twice that threshold is the hard
-/// logical-byte watermark: the device worker synchronously drains the accumulated range before it
-/// accepts more dirtying writes. The hard drain constrains host page-cache exposure even when the
-/// guest never issues `FLUSH`.
-///
-/// Neither operation acknowledges guest durability. Guest `FLUSH` completion still depends on the
-/// existing full Imago sync after every earlier write has been processed by the block worker.
+/// The configured value is the single hard budget. A smaller batch target is derived internally
+/// to provide completion jitter headroom. Credits represent unique page-aligned extents and are
+/// released only after the background worker completes exact range writeback followed by a
+/// same-inode data-and-allocation-metadata barrier. Guest `FLUSH` remains governed by the existing
+/// full backing-image sync.
 pub(crate) struct BufferedWritebackController {
-    file: Arc<File>,
-    window: WritebackWindow,
+    hard_budget_bytes: u64,
+    batch_bytes: u64,
+    page_size: u64,
+    tracked: ExtentSet,
+    current_generation: u64,
+    current_extents: ExtentSet,
+    submitted: VecDeque<Generation>,
+    next_reservation: u64,
+    pending: Option<PendingReservation>,
+    latched_error: Option<LatchedError>,
+    health: Arc<SharedHealth>,
+    job_sender: Sender<WritebackJob>,
+    completion_receiver: Receiver<WritebackCompletion>,
+    shutdown_sender: Sender<()>,
+    worker: Option<JoinHandle<()>>,
 }
 
-impl BufferedWritebackController {
-    pub(crate) fn hard_limit_bytes(&self) -> u64 {
-        self.window.hard_limit_bytes
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl DirtyRange {
+    fn for_write(offset: u64, length: u64, page_size: u64) -> io::Result<Option<Self>> {
+        if length == 0 {
+            return Ok(None);
+        }
+
+        let end = offset.checked_add(length).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "writeback range overflow")
+        })?;
+        let start = offset - offset % page_size;
+        let end = align_up(end, page_size).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "writeback page-aligned range overflow",
+            )
+        })?;
+        Ok(Some(Self { start, end }))
     }
 
-    pub(crate) fn prepare_write(&mut self, length: u64) -> io::Result<()> {
-        if length > self.window.hard_limit_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "buffered block write exceeds the hard writeback watermark",
-            ));
+    fn len(self) -> u64 {
+        self.end - self.start
+    }
+
+    fn intersection_len(self, other: Self) -> u64 {
+        self.end
+            .min(other.end)
+            .saturating_sub(self.start.max(other.start))
+    }
+}
+
+impl ExtentSet {
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    fn additional_bytes(&self, range: DirtyRange) -> u64 {
+        let first = self
+            .ranges
+            .partition_point(|existing| existing.end <= range.start);
+        let covered = self.ranges[first..]
+            .iter()
+            .take_while(|existing| existing.start < range.end)
+            .map(|existing| existing.intersection_len(range))
+            .sum::<u64>();
+        range.len() - covered
+    }
+
+    fn extent_count_after_insert(&self, mut range: DirtyRange) -> usize {
+        let first = self
+            .ranges
+            .partition_point(|existing| existing.end < range.start);
+        let mut last = first;
+
+        while let Some(existing) = self.ranges.get(last).copied() {
+            if existing.start > range.end {
+                break;
+            }
+            range.end = range.end.max(existing.end);
+            last += 1;
         }
 
-        if let Some(range) = self.window.prepare_write(length) {
-            self.drain(range)?;
-            self.window.complete_drain();
+        self.ranges.len() - (last - first) + 1
+    }
+
+    fn insert(&mut self, mut range: DirtyRange) -> u64 {
+        let first = self
+            .ranges
+            .partition_point(|existing| existing.end < range.start);
+        let mut last = first;
+        let mut removed_bytes = 0;
+
+        while let Some(existing) = self.ranges.get(last).copied() {
+            if existing.start > range.end {
+                break;
+            }
+            range.start = range.start.min(existing.start);
+            range.end = range.end.max(existing.end);
+            removed_bytes += existing.len();
+            last += 1;
         }
+
+        let added_bytes = range.len() - removed_bytes;
+        self.ranges.splice(first..last, [range]);
+        self.bytes += added_bytes;
+        added_bytes
+    }
+
+    fn remove(&mut self, range: DirtyRange) -> u64 {
+        let first = self
+            .ranges
+            .partition_point(|existing| existing.end <= range.start);
+        let mut last = first;
+        let mut removed_bytes = 0;
+        let mut replacements = Vec::with_capacity(2);
+
+        while let Some(existing) = self.ranges.get(last).copied() {
+            if existing.start >= range.end {
+                break;
+            }
+
+            removed_bytes += existing.intersection_len(range);
+            if existing.start < range.start {
+                replacements.push(DirtyRange {
+                    start: existing.start,
+                    end: range.start,
+                });
+            }
+            if existing.end > range.end {
+                replacements.push(DirtyRange {
+                    start: range.end,
+                    end: existing.end,
+                });
+            }
+            last += 1;
+        }
+
+        self.ranges.splice(first..last, replacements);
+        self.bytes -= removed_bytes;
+        removed_bytes
+    }
+}
+
+impl SharedHealth {
+    fn new() -> Self {
+        Self {
+            healthy: AtomicBool::new(true),
+        }
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+    }
+
+    fn mark_permanent_failure(&self) {
+        self.healthy.store(false, Ordering::Release);
+    }
+
+    fn mark_full_sync_success(&self) -> bool {
+        // A later success on the same file description does not prove that bytes associated with
+        // an earlier reported writeback error were recovered; errseq_t has already advanced.
+        self.is_healthy()
+    }
+}
+
+impl LatchedError {
+    fn capture(error: &io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+            message: error.to_string(),
+        }
+    }
+
+    fn to_io_error(&self) -> io::Error {
+        match self.raw_os_error {
+            Some(code) => io::Error::new(self.kind, format!("{} (os error {code})", self.message)),
+            None => io::Error::new(self.kind, self.message.clone()),
+        }
+    }
+}
+
+impl WritebackReservation {
+    /// Number of bytes the caller may pass to the backing mutation.
+    pub(crate) fn len(&self) -> u64 {
+        self.length
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl WritebackBackend for SyncFileRangeBackend {
+    fn writeback(&self, ranges: &[DirtyRange]) -> io::Result<()> {
+        let flags = libc::SYNC_FILE_RANGE_WRITE;
+
+        for range in ranges {
+            let offset = libc::off64_t::try_from(range.start).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "writeback range offset exceeds sync_file_range limits",
+                )
+            })?;
+            let length = libc::off64_t::try_from(range.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "writeback range length exceeds sync_file_range limits",
+                )
+            })?;
+
+            // Safe: the backend owns a live descriptor for the exact backing inode. Ranges are
+            // validated, page-aligned integers and the flag is a Linux-defined constant. Do not
+            // use either WAIT flag here: file_fdatawait_range advances the file description's
+            // writeback-error cursor and could hide EIO/ENOSPC from the authoritative fdatasync.
+            let result =
+                unsafe { libc::sync_file_range(self.file.as_raw_fd(), offset, length, flags) };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
         Ok(())
     }
 
-    pub(crate) fn record_write(&mut self, offset: u64, length: u64) -> io::Result<()> {
-        match self.window.record_write(offset, length) {
-            Some(WritebackAction::Advisory(range)) => {
-                match self.sync_range(range, libc::SYNC_FILE_RANGE_WRITE) {
-                    Ok(()) => self.window.complete_advisory(),
-                    Err(error) => {
-                        // Keep the range and counters intact. A later write retries the advisory
-                        // operation, while the hard watermark still prevents unbounded dirtying.
-                        warn!(
-                            "Buffered block advisory writeback failed; retaining hard backpressure: {error}"
-                        );
-                    }
-                }
-                Ok(())
-            }
-            Some(WritebackAction::Drain(range)) => {
-                self.drain(range)?;
-                self.window.complete_drain();
-                Ok(())
-            }
-            None => Ok(()),
-        }
+    fn sync_data(&self) -> io::Result<()> {
+        // Unlike sync_file_range, fdatasync also orders the allocation and copy-on-write metadata
+        // needed to retrieve the written bytes. Credits are not reusable until this succeeds.
+        self.file.sync_data()
     }
+}
 
-    pub(crate) fn complete_flush(&mut self) {
-        self.window.complete_flush();
-    }
-
-    fn drain(&self, range: DirtyRange) -> io::Result<()> {
-        let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
-            | libc::SYNC_FILE_RANGE_WRITE
-            | libc::SYNC_FILE_RANGE_WAIT_AFTER;
-        self.sync_range(range, flags).map_err(|error| {
-            warn!("Buffered block hard writeback drain failed; blocking further writes: {error}");
-            error
+#[cfg(target_os = "linux")]
+impl BufferedWritebackConfig {
+    pub(crate) fn new(file: Arc<File>, hard_budget_bytes: u64) -> io::Result<Self> {
+        let page_size = host_page_size()?;
+        validate_policy(hard_budget_bytes, page_size)?;
+        Ok(Self {
+            file,
+            hard_budget_bytes,
+            page_size,
+            health: Arc::new(SharedHealth::new()),
         })
     }
 
-    fn sync_range(&self, range: DirtyRange, flags: libc::c_uint) -> io::Result<()> {
-        let offset = libc::off64_t::try_from(range.start).map_err(|_| {
+    pub(crate) fn controller(&self) -> io::Result<BufferedWritebackController> {
+        if !self.health.is_healthy() {
+            return Err(io::Error::other(
+                "buffered writeback is permanently failed for this backing file",
+            ));
+        }
+
+        BufferedWritebackController::spawn_with_health(
+            Arc::new(SyncFileRangeBackend {
+                file: Arc::clone(&self.file),
+            }),
+            self.hard_budget_bytes,
+            self.page_size,
+            Arc::clone(&self.health),
+        )
+    }
+
+    /// Records a successful guest-visible full backing-file sync.
+    ///
+    /// Returns `false` when a permanent range-kick or controller failure must remain latched.
+    pub(crate) fn record_full_sync_success(&self) -> bool {
+        self.health.mark_full_sync_success()
+    }
+
+    /// Keeps future activations failed closed after a guest-visible full sync fails.
+    pub(crate) fn record_full_sync_failure(&self, error: &io::Error) {
+        warn!("Buffered block backing-file sync failed permanently: {error}");
+        self.health.mark_permanent_failure();
+    }
+}
+
+impl BufferedWritebackController {
+    #[cfg(test)]
+    fn spawn(
+        backend: Arc<dyn WritebackBackend>,
+        hard_budget_bytes: u64,
+        page_size: u64,
+    ) -> io::Result<Self> {
+        Self::spawn_with_health(
+            backend,
+            hard_budget_bytes,
+            page_size,
+            Arc::new(SharedHealth::new()),
+        )
+    }
+
+    fn spawn_with_health(
+        backend: Arc<dyn WritebackBackend>,
+        hard_budget_bytes: u64,
+        page_size: u64,
+        health: Arc<SharedHealth>,
+    ) -> io::Result<Self> {
+        validate_policy(hard_budget_bytes, page_size)?;
+        let batch_bytes = derive_batch_bytes(hard_budget_bytes, page_size);
+        let queue_capacity = queue_capacity(hard_budget_bytes, batch_bytes);
+        let (job_sender, job_receiver) = bounded(queue_capacity);
+        let (completion_sender, completion_receiver) = bounded(queue_capacity + 1);
+        let (shutdown_sender, shutdown_receiver) = bounded(1);
+        let worker = thread::Builder::new()
+            .name(WORKER_THREAD_NAME.to_string())
+            .spawn(move || {
+                run_worker(backend, job_receiver, completion_sender, shutdown_receiver)
+            })?;
+
+        Ok(Self {
+            hard_budget_bytes,
+            batch_bytes,
+            page_size,
+            tracked: ExtentSet::default(),
+            current_generation: 0,
+            current_extents: ExtentSet::default(),
+            submitted: VecDeque::new(),
+            next_reservation: 0,
+            pending: None,
+            latched_error: None,
+            health,
+            job_sender,
+            completion_receiver,
+            shutdown_sender,
+            worker: Some(worker),
+        })
+    }
+
+    /// Reserves budget for a prefix of a buffered backing mutation.
+    pub(crate) fn plan_write(
+        &mut self,
+        offset: u64,
+        requested_bytes: u64,
+    ) -> io::Result<WritebackReservation> {
+        if requested_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot reserve an empty buffered write",
+            ));
+        }
+        offset.checked_add(requested_bytes).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "buffered write range overflow")
+        })?;
+        if self.pending.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "a buffered write reservation is already pending",
+            ));
+        }
+
+        loop {
+            self.reap_completions_while_latching();
+            self.check_error()?;
+
+            if let Some((length, range)) = self.plannable_prefix(offset, requested_bytes)? {
+                let id = self.next_reservation;
+                self.next_reservation = self
+                    .next_reservation
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("writeback reservation id exhausted"))?;
+                self.pending = Some(PendingReservation {
+                    id,
+                    offset,
+                    length,
+                    range,
+                });
+                return Ok(WritebackReservation { id, offset, length });
+            }
+
+            if !self.current_extents.is_empty() {
+                if let Err(error) = self.submit_current_generation() {
+                    self.latch_error(&error);
+                    return Err(self
+                        .latched_error
+                        .as_ref()
+                        .expect("submission failure must latch an error")
+                        .to_io_error());
+                }
+                continue;
+            }
+            if !self.has_in_flight_generations() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "writeback budget cannot admit one page",
+                ));
+            }
+            self.wait_for_completion()?;
+        }
+    }
+
+    /// Finalizes a reservation after the backing mutation returns.
+    pub(crate) fn finish_write(
+        &mut self,
+        reservation: WritebackReservation,
+        outcome: WritebackOutcome,
+    ) -> io::Result<()> {
+        let pending = self.pending.take().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "writeback range offset exceeds sync_file_range limits",
+                "buffered write reservation is not pending",
             )
         })?;
-        let length = libc::off64_t::try_from(range.len()).map_err(|_| {
-            io::Error::new(
+        if pending.id != reservation.id
+            || pending.offset != reservation.offset
+            || pending.length != reservation.length
+        {
+            self.pending = Some(pending);
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "writeback range length exceeds sync_file_range limits",
+                "buffered write reservation does not match the pending plan",
+            ));
+        }
+
+        let committed_length = match outcome {
+            WritebackOutcome::Written(length) if length <= pending.length => length,
+            WritebackOutcome::Written(_) => {
+                self.pending = Some(pending);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "buffered write exceeded its reservation",
+                ));
+            }
+            WritebackOutcome::Failed => pending.length,
+        };
+
+        self.reap_completions_while_latching();
+        if committed_length != 0 {
+            let range = if committed_length == pending.length {
+                pending.range
+            } else {
+                DirtyRange::for_write(pending.offset, committed_length, self.page_size)?
+                    .expect("non-empty committed write must have a range")
+            };
+            if let Err(error) = self.commit_range(range) {
+                self.latch_error(&error);
+            }
+        }
+
+        if self.current_extents.bytes >= self.batch_bytes {
+            if let Err(error) = self.submit_current_generation() {
+                self.latch_error(&error);
+            }
+        }
+        self.check_error()
+    }
+
+    /// Makes the background worker idle before the guest-visible full sync.
+    pub(crate) fn quiesce(&mut self) -> io::Result<()> {
+        if self.pending.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "cannot quiesce with a buffered write reservation pending",
+            ));
+        }
+
+        self.reap_completions_while_latching();
+        if !self.current_extents.is_empty() {
+            if let Err(error) = self.submit_current_generation() {
+                self.latch_error(&error);
+            }
+        }
+        while self.has_in_flight_generations() {
+            if let Err(error) = self.wait_for_completion_while_latching() {
+                self.mark_in_flight_failed();
+                debug_assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            }
+        }
+        self.check_error()
+    }
+
+    /// Resets accounting after the existing full backing-image sync succeeds.
+    pub(crate) fn reset_after_flush(&mut self) -> bool {
+        if self.pending.is_some() || self.has_in_flight_generations() {
+            let error = io::Error::other(
+                "cannot reset writeback accounting before the controller is quiescent",
+            );
+            self.latch_error(&error);
+            return false;
+        }
+        self.tracked = ExtentSet::default();
+        self.current_extents = ExtentSet::default();
+        self.submitted.clear();
+        if self.latched_error.is_some() {
+            false
+        } else {
+            self.health.mark_full_sync_success()
+        }
+    }
+
+    fn plannable_prefix(
+        &self,
+        offset: u64,
+        requested_bytes: u64,
+    ) -> io::Result<Option<(u64, DirtyRange)>> {
+        let first_page = DirtyRange::for_write(offset, 1, self.page_size)?
+            .expect("non-empty requested write must have a range");
+        if self.current_extents.extent_count_after_insert(first_page) > MAX_EXTENTS_PER_GENERATION {
+            // Extending a range from a fixed start can only merge more existing extents. Refuse
+            // the first new disjoint page so the caller submits this underfilled generation.
+            return Ok(None);
+        }
+
+        let capped_length = requested_bytes.min(self.batch_bytes);
+        let mut low = 0;
+        let mut high = capped_length;
+
+        while low < high {
+            let candidate = low + (high - low).div_ceil(2);
+            let range = DirtyRange::for_write(offset, candidate, self.page_size)?
+                .expect("positive candidate must have a range");
+            let fits_batch = self
+                .current_extents
+                .bytes
+                .checked_add(self.current_extents.additional_bytes(range))
+                .is_some_and(|bytes| bytes <= self.batch_bytes);
+            let fits_hard = self
+                .tracked
+                .bytes
+                .checked_add(self.tracked.additional_bytes(range))
+                .is_some_and(|bytes| bytes <= self.hard_budget_bytes);
+            if fits_batch && fits_hard {
+                low = candidate;
+            } else {
+                high = candidate - 1;
+            }
+        }
+
+        if low == 0 {
+            Ok(None)
+        } else {
+            let range = DirtyRange::for_write(offset, low, self.page_size)?
+                .expect("positive planned write must have a range");
+            Ok(Some((low, range)))
+        }
+    }
+
+    fn commit_range(&mut self, range: DirtyRange) -> io::Result<()> {
+        let projected_batch = self
+            .current_extents
+            .bytes
+            .checked_add(self.current_extents.additional_bytes(range));
+        let projected_hard = self
+            .tracked
+            .bytes
+            .checked_add(self.tracked.additional_bytes(range));
+        if projected_batch.is_none_or(|bytes| bytes > self.batch_bytes)
+            || projected_hard.is_none_or(|bytes| bytes > self.hard_budget_bytes)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "completed buffered write exceeded its reservation",
+            ));
+        }
+
+        // Keep submitted extents immutable and bounded. Completion subtracts all newer ownership
+        // before releasing credits, so an older job can never release a rewritten page.
+        self.current_extents.insert(range);
+        self.tracked.insert(range);
+        Ok(())
+    }
+
+    fn submit_current_generation(&mut self) -> io::Result<()> {
+        if self.current_extents.is_empty() {
+            return Ok(());
+        }
+
+        let next_generation = self
+            .current_generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("writeback generation id exhausted"))?;
+        let job = WritebackJob {
+            generation: self.current_generation,
+            ranges: self.current_extents.ranges.clone(),
+        };
+        self.job_sender.send(job).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "writeback worker stopped accepting jobs",
             )
         })?;
 
-        // Safe: the controller owns a live descriptor for the exact backing inode reopened by
-        // Imago, and the remaining arguments are validated integers plus Linux-defined flags.
-        let result = unsafe { libc::sync_file_range(self.file.as_raw_fd(), offset, length, flags) };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+        self.submitted.push_back(Generation {
+            id: self.current_generation,
+            extents: std::mem::take(&mut self.current_extents),
+            status: GenerationStatus::InFlight,
+        });
+        self.current_generation = next_generation;
+        Ok(())
+    }
+
+    fn reap_completions(&mut self) -> io::Result<()> {
+        loop {
+            match self.completion_receiver.try_recv() {
+                Ok(completion) => self.apply_completion(completion)?,
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Disconnected) if self.has_in_flight_generations() => {
+                    let error = io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "writeback worker completion channel disconnected",
+                    );
+                    self.latch_error(&error);
+                    return Err(error);
+                }
+                Err(TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+    }
+
+    fn reap_completions_while_latching(&mut self) {
+        let _ = self.reap_completions();
+    }
+
+    fn wait_for_completion(&mut self) -> io::Result<()> {
+        let completion = match self.completion_receiver.recv() {
+            Ok(completion) => completion,
+            Err(_) => {
+                let error = io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "writeback worker completion channel disconnected",
+                );
+                self.latch_error(&error);
+                return Err(error);
+            }
+        };
+        // Receiving any completion is forward progress. A range error is already latched by
+        // apply_completion, but quiesce must continue waiting for the remaining queued jobs.
+        let _ = self.apply_completion(completion);
+        Ok(())
+    }
+
+    fn wait_for_completion_while_latching(&mut self) -> io::Result<()> {
+        self.wait_for_completion()
+    }
+
+    fn apply_completion(&mut self, completion: WritebackCompletion) -> io::Result<()> {
+        let Some(position) = self
+            .submitted
+            .iter()
+            .position(|generation| generation.id == completion.generation)
+        else {
+            let error = io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "writeback worker completed unknown generation {}",
+                    completion.generation
+                ),
+            );
+            self.latch_error(&error);
+            return Err(error);
+        };
+        if self.submitted[position].status != GenerationStatus::InFlight {
+            let error = io::Error::new(
+                io::ErrorKind::InvalidData,
+                "writeback worker completed a generation more than once",
+            );
+            self.latch_error(&error);
+            return Err(error);
+        }
+
+        match completion.result {
+            Ok(()) => {
+                let generation = self
+                    .submitted
+                    .remove(position)
+                    .expect("located generation must still exist");
+                let mut releasable = generation.extents;
+                for newer_generation in &self.submitted {
+                    for range in &newer_generation.extents.ranges {
+                        releasable.remove(*range);
+                    }
+                }
+                for range in &self.current_extents.ranges {
+                    releasable.remove(*range);
+                }
+                for range in releasable.ranges {
+                    self.tracked.remove(range);
+                }
+                Ok(())
+            }
+            Err(failure) => {
+                self.submitted[position].status = GenerationStatus::Failed;
+                let error = failure.error;
+                let error = io::Error::new(
+                    error.kind(),
+                    format!(
+                        "writeback generation {} failed: {error}",
+                        completion.generation
+                    ),
+                );
+                self.latch_error(&error);
+                Err(error)
+            }
+        }
+    }
+
+    fn has_in_flight_generations(&self) -> bool {
+        self.submitted
+            .iter()
+            .any(|generation| generation.status == GenerationStatus::InFlight)
+    }
+
+    fn mark_in_flight_failed(&mut self) {
+        for generation in &mut self.submitted {
+            if generation.status == GenerationStatus::InFlight {
+                generation.status = GenerationStatus::Failed;
+            }
+        }
+    }
+
+    fn latch_error(&mut self, error: &io::Error) {
+        // The config retains this state after the controller is dropped, so reset/reactivation
+        // cannot erase a reported writeback error after its errseq_t cursor has advanced.
+        self.health.mark_permanent_failure();
+        if self.latched_error.is_none() {
+            warn!("Buffered block writeback failed closed: {error}");
+            self.latched_error = Some(LatchedError::capture(error));
+        }
+    }
+
+    fn check_error(&self) -> io::Result<()> {
+        match &self.latched_error {
+            Some(error) => Err(error.to_io_error()),
+            None if !self.health.is_healthy() => Err(io::Error::other(
+                "buffered writeback is permanently failed for this backing file",
+            )),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for BufferedWritebackController {
+    fn drop(&mut self) {
+        if let Err(error) = self.quiesce() {
+            warn!("Buffered block writeback did not quiesce during drop: {error}");
+        }
+        let _ = self.shutdown_sender.try_send(());
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                warn!("Buffered block writeback worker panicked");
+            }
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+fn align_down(value: u64, alignment: u64) -> u64 {
+    value - value % alignment
+}
+
+fn align_up(value: u64, alignment: u64) -> Option<u64> {
+    value
+        .checked_add(alignment - 1)
+        .map(|rounded| align_down(rounded, alignment))
+}
+
+#[cfg(target_os = "linux")]
+fn host_page_size() -> io::Result<u64> {
+    // Safe: sysconf has no pointer arguments or caller-owned memory requirements.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(page_size as u64)
+    }
+}
+
+fn validate_policy(hard_budget_bytes: u64, page_size: u64) -> io::Result<()> {
+    if !page_size.is_power_of_two() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "writeback page size must be a non-zero power of two",
+        ));
+    }
+    if page_size > MINIMUM_BATCH_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "writeback page size exceeds the minimum batch size",
+        ));
+    }
+    if hard_budget_bytes < MINIMUM_WRITEBACK_BUDGET_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "writeback hard budget must be at least {MINIMUM_WRITEBACK_BUDGET_BYTES} bytes"
+            ),
+        ));
+    }
+    if align_down(hard_budget_bytes / 2, page_size) < page_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "writeback hard budget is too small for one batch",
+        ));
+    }
+    Ok(())
+}
+
+fn derive_batch_bytes(hard_budget_bytes: u64, page_size: u64) -> u64 {
+    let quarter_budget = align_down(hard_budget_bytes / BATCH_BUDGET_DIVISOR, page_size);
+    let target = quarter_budget.clamp(MINIMUM_BATCH_BYTES, MAXIMUM_BATCH_BYTES);
+    align_down(target, page_size).min(align_down(hard_budget_bytes / 2, page_size))
+}
+
+fn queue_capacity(hard_budget_bytes: u64, batch_bytes: u64) -> usize {
+    let batches = hard_budget_bytes.div_ceil(batch_bytes);
+    usize::try_from(batches)
+        .unwrap_or(MAX_QUEUED_BATCHES)
+        .clamp(1, MAX_QUEUED_BATCHES)
+}
+
+fn run_worker(
+    backend: Arc<dyn WritebackBackend>,
+    job_receiver: Receiver<WritebackJob>,
+    completion_sender: Sender<WritebackCompletion>,
+    shutdown_receiver: Receiver<()>,
+) {
+    // The completion channel is one slot larger than the job channel. Limit one coalesced group to
+    // that same size so the worker can always publish every result without deadlocking against a
+    // producer blocked on the bounded job queue.
+    let max_jobs_per_barrier = job_receiver
+        .capacity()
+        .unwrap_or(MAX_QUEUED_BATCHES)
+        .saturating_add(1);
+
+    loop {
+        let first_job = crossbeam_channel::select_biased! {
+            recv(shutdown_receiver) -> _ => return,
+            recv(job_receiver) -> job => {
+                let Ok(job) = job else {
+                    return;
+                };
+                job
+            }
+        };
+
+        let mut generations = Vec::with_capacity(max_jobs_per_barrier);
+        let mut next_job = first_job;
+        let mut first_range_error = None;
+        let mut jobs_disconnected = false;
+
+        loop {
+            if let Err(error) = backend.writeback(&next_job.ranges) {
+                first_range_error.get_or_insert((next_job.generation, error));
+            }
+            generations.push(next_job.generation);
+
+            if generations.len() == max_jobs_per_barrier {
+                break;
+            }
+            match job_receiver.try_recv() {
+                Ok(job) => next_job = job,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    jobs_disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        // sync_file_range does not guarantee allocation or COW metadata durability. One fdatasync
+        // covers every generation drained above and always runs, even after a failed range kick.
+        // The barrier cannot prove a nonzero kick result harmless, so that failure remains
+        // permanent and prevents every coalesced generation from releasing credit.
+        let barrier_error = backend.sync_data().err();
+        let group_failure = match (first_range_error, barrier_error) {
+            (Some((generation, range_error)), barrier_error) => {
+                if let Some(barrier_error) = barrier_error {
+                    warn!(
+                        "Range writeback kick for generation {generation} failed: {range_error}; \
+                         the containment data barrier also failed: {barrier_error}"
+                    );
+                } else {
+                    warn!(
+                        "Range writeback kick for generation {generation} failed closed after the \
+                         containment data barrier: {range_error}"
+                    );
+                }
+                Some(WritebackFailure {
+                    error: Arc::new(range_error),
+                })
+            }
+            (None, Some(barrier_error)) => Some(WritebackFailure {
+                error: Arc::new(barrier_error),
+            }),
+            (None, None) => None,
+        };
+
+        for generation in generations {
+            let completion = WritebackCompletion {
+                generation,
+                result: match &group_failure {
+                    None => Ok(()),
+                    Some(failure) => Err(failure.clone()),
+                },
+            };
+            crossbeam_channel::select_biased! {
+                recv(shutdown_receiver) -> _ => return,
+                send(completion_sender, completion) -> result => {
+                    if result.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        if jobs_disconnected {
+            return;
         }
     }
 }
@@ -247,170 +1063,846 @@ impl BufferedWritebackController {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::OpenOptions;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::FileExt;
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+
+    #[cfg(target_os = "linux")]
+    use utils::tempfile::TempFile;
 
     use super::*;
 
-    #[test]
-    fn dirty_range_merges_out_of_order_writes() {
-        let first = DirtyRange::new(128, 64).unwrap();
-        let second = DirtyRange::new(32, 48).unwrap();
-        assert_eq!(
-            first.merge(second),
-            DirtyRange {
-                start: 32,
-                end: 192
+    const TEST_PAGE_SIZE: u64 = 4096;
+
+    #[derive(Default)]
+    struct FakeBackend {
+        calls: Mutex<Vec<Vec<DirtyRange>>>,
+        barrier_calls: Mutex<usize>,
+        barrier_failures: Mutex<VecDeque<io::ErrorKind>>,
+    }
+
+    impl WritebackBackend for FakeBackend {
+        fn writeback(&self, ranges: &[DirtyRange]) -> io::Result<()> {
+            self.calls.lock().unwrap().push(ranges.to_vec());
+            Ok(())
+        }
+
+        fn sync_data(&self) -> io::Result<()> {
+            *self.barrier_calls.lock().unwrap() += 1;
+            match self.barrier_failures.lock().unwrap().pop_front() {
+                Some(kind) => Err(io::Error::new(kind, "injected data-barrier failure")),
+                None => Ok(()),
             }
-        );
+        }
+    }
+
+    impl FakeBackend {
+        fn fail_next_barrier(&self, kind: io::ErrorKind) {
+            self.barrier_failures.lock().unwrap().push_back(kind);
+        }
+
+        fn barrier_calls(&self) -> usize {
+            *self.barrier_calls.lock().unwrap()
+        }
+    }
+
+    #[derive(Default)]
+    struct GatedBackend {
+        changed: Condvar,
+        state: Mutex<GatedState>,
+    }
+
+    #[derive(Default)]
+    struct GatedState {
+        calls: Vec<Vec<DirtyRange>>,
+        permits: usize,
+    }
+
+    impl WritebackBackend for GatedBackend {
+        fn writeback(&self, ranges: &[DirtyRange]) -> io::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(ranges.to_vec());
+            self.changed.notify_all();
+            while state.permits == 0 {
+                state = self.changed.wait(state).unwrap();
+            }
+            state.permits -= 1;
+            Ok(())
+        }
+
+        fn sync_data(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl GatedBackend {
+        fn allow(&self, jobs: usize) {
+            let mut state = self.state.lock().unwrap();
+            state.permits += jobs;
+            self.changed.notify_all();
+        }
+
+        fn wait_for_calls(&self, calls: usize) {
+            let mut state = self.state.lock().unwrap();
+            while state.calls.len() < calls {
+                let (new_state, timeout) = self
+                    .changed
+                    .wait_timeout(state, Duration::from_secs(5))
+                    .unwrap();
+                assert!(
+                    !timeout.timed_out(),
+                    "writeback worker did not receive a job"
+                );
+                state = new_state;
+            }
+        }
+
+        fn calls(&self) -> Vec<Vec<DirtyRange>> {
+            self.state.lock().unwrap().calls.clone()
+        }
+    }
+
+    #[derive(Default)]
+    struct BarrierGatedBackend {
+        changed: Condvar,
+        state: Mutex<BarrierGatedState>,
+    }
+
+    #[derive(Default)]
+    struct BarrierGatedState {
+        calls: Vec<Vec<DirtyRange>>,
+        writeback_permits: usize,
+        writeback_failures: VecDeque<io::ErrorKind>,
+        barrier_calls: usize,
+        barrier_permits: usize,
+        barrier_failures: VecDeque<io::ErrorKind>,
+    }
+
+    impl WritebackBackend for BarrierGatedBackend {
+        fn writeback(&self, ranges: &[DirtyRange]) -> io::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(ranges.to_vec());
+            self.changed.notify_all();
+            while state.writeback_permits == 0 {
+                state = self.changed.wait(state).unwrap();
+            }
+            state.writeback_permits -= 1;
+            match state.writeback_failures.pop_front() {
+                Some(kind) => Err(io::Error::new(kind, "injected writeback failure")),
+                None => Ok(()),
+            }
+        }
+
+        fn sync_data(&self) -> io::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.barrier_calls += 1;
+            self.changed.notify_all();
+            while state.barrier_permits == 0 {
+                state = self.changed.wait(state).unwrap();
+            }
+            state.barrier_permits -= 1;
+            match state.barrier_failures.pop_front() {
+                Some(kind) => Err(io::Error::new(kind, "injected data-barrier failure")),
+                None => Ok(()),
+            }
+        }
+    }
+
+    impl BarrierGatedBackend {
+        fn allow_writebacks(&self, jobs: usize) {
+            let mut state = self.state.lock().unwrap();
+            state.writeback_permits += jobs;
+            self.changed.notify_all();
+        }
+
+        fn allow_barriers(&self, barriers: usize) {
+            let mut state = self.state.lock().unwrap();
+            state.barrier_permits += barriers;
+            self.changed.notify_all();
+        }
+
+        fn fail_next_barrier(&self, kind: io::ErrorKind) {
+            self.state.lock().unwrap().barrier_failures.push_back(kind);
+        }
+
+        fn fail_next_writeback(&self, kind: io::ErrorKind) {
+            self.state
+                .lock()
+                .unwrap()
+                .writeback_failures
+                .push_back(kind);
+        }
+
+        fn wait_for_writebacks(&self, calls: usize) {
+            let mut state = self.state.lock().unwrap();
+            while state.calls.len() < calls {
+                let (new_state, timeout) = self
+                    .changed
+                    .wait_timeout(state, Duration::from_secs(5))
+                    .unwrap();
+                assert!(
+                    !timeout.timed_out(),
+                    "writeback worker did not process the expected ranges"
+                );
+                state = new_state;
+            }
+        }
+
+        fn wait_for_barriers(&self, calls: usize) {
+            let mut state = self.state.lock().unwrap();
+            while state.barrier_calls < calls {
+                let (new_state, timeout) = self
+                    .changed
+                    .wait_timeout(state, Duration::from_secs(5))
+                    .unwrap();
+                assert!(
+                    !timeout.timed_out(),
+                    "writeback worker did not reach the expected data barrier"
+                );
+                state = new_state;
+            }
+        }
+
+        fn calls(&self) -> Vec<Vec<DirtyRange>> {
+            self.state.lock().unwrap().calls.clone()
+        }
+
+        fn barrier_calls(&self) -> usize {
+            self.state.lock().unwrap().barrier_calls
+        }
+    }
+
+    struct PanicBackend;
+
+    impl WritebackBackend for PanicBackend {
+        fn writeback(&self, _ranges: &[DirtyRange]) -> io::Result<()> {
+            panic!("injected writeback worker panic");
+        }
+
+        fn sync_data(&self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
-    fn rolling_window_rearms_without_a_guest_flush() {
-        let trigger = MINIMUM_RANGE_BYTES;
-        let mut window = WritebackWindow::new(trigger);
-
+    fn batch_policy_keeps_quarter_budget_jitter_headroom() {
         assert_eq!(
-            window.record_write(0, trigger),
-            Some(WritebackAction::Advisory(DirtyRange {
-                start: 0,
-                end: trigger,
-            }))
+            derive_batch_bytes(MINIMUM_WRITEBACK_BUDGET_BYTES, TEST_PAGE_SIZE),
+            MINIMUM_BATCH_BYTES
         );
-        window.complete_advisory();
-
         assert_eq!(
-            window.record_write(trigger, trigger),
-            Some(WritebackAction::Drain(DirtyRange {
-                start: 0,
-                end: trigger * 2,
-            }))
+            derive_batch_bytes(512 * 1024 * 1024, TEST_PAGE_SIZE),
+            128 * 1024 * 1024
         );
-        window.complete_drain();
-
         assert_eq!(
-            window.record_write(trigger * 2, trigger),
-            Some(WritebackAction::Advisory(DirtyRange {
-                start: trigger * 2,
-                end: trigger * 3,
-            }))
+            derive_batch_bytes(8 * 1024 * 1024 * 1024, TEST_PAGE_SIZE),
+            MAXIMUM_BATCH_BYTES
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn projected_hard_limit_drains_before_another_write() {
-        let trigger = MINIMUM_RANGE_BYTES;
-        let mut window = WritebackWindow::new(trigger);
-        assert!(matches!(
-            window.record_write(0, trigger),
-            Some(WritebackAction::Advisory(_))
-        ));
-        window.complete_advisory();
-
-        assert_eq!(
-            window.prepare_write(trigger + 1),
-            Some(DirtyRange {
-                start: 0,
-                end: trigger,
-            })
-        );
-    }
-
-    #[test]
-    fn successful_guest_flush_resets_both_watermarks() {
-        let trigger = MINIMUM_RANGE_BYTES;
-        let mut window = WritebackWindow::new(trigger);
-        assert!(window.record_write(0, trigger).is_some());
-
-        window.complete_flush();
-
-        assert_eq!(window.batch_logical_bytes, 0);
-        assert_eq!(window.batch_range, None);
-        assert_eq!(window.outstanding_logical_bytes, 0);
-        assert_eq!(window.outstanding_range, None);
-        assert_eq!(window.prepare_write(trigger * 2), None);
-    }
-
-    #[test]
-    fn empty_write_does_not_change_the_window() {
-        let mut window = WritebackWindow::new(MINIMUM_RANGE_BYTES);
-        assert_eq!(window.record_write(1024, 0), None);
-        assert_eq!(window.batch_range, None);
-        assert_eq!(window.outstanding_range, None);
-    }
-
-    #[test]
-    fn oversized_request_cannot_bypass_the_hard_watermark() {
-        let path = temporary_file_path("oversized");
-        let file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)
+    fn linux_backend_writes_back_and_syncs_a_regular_file() {
+        let backing = TempFile::new().unwrap();
+        backing.as_file().set_len(TEST_PAGE_SIZE * 2).unwrap();
+        backing
+            .as_file()
+            .write_all_at(&vec![0xa5; TEST_PAGE_SIZE as usize], 0)
             .unwrap();
-        let mut controller = BufferedWritebackController {
-            file: Arc::new(file),
-            window: WritebackWindow::new(MINIMUM_RANGE_BYTES),
+
+        let backend = SyncFileRangeBackend {
+            file: Arc::new(backing.as_file().try_clone().unwrap()),
         };
-
-        let error = controller
-            .prepare_write(MINIMUM_RANGE_BYTES * HARD_LIMIT_MULTIPLIER + 1)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-
-        drop(controller);
-        std::fs::remove_file(path).unwrap();
+        backend
+            .writeback(&[DirtyRange {
+                start: 0,
+                end: TEST_PAGE_SIZE,
+            }])
+            .unwrap();
+        backend.sync_data().unwrap();
     }
 
     #[test]
-    fn regular_file_supports_advisory_and_hard_writeback() {
-        let path = temporary_file_path("regular");
-        let file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        file.set_len(MINIMUM_RANGE_BYTES * 2).unwrap();
+    fn extent_set_preserves_holes_and_unique_bytes() {
+        let mut set = ExtentSet::default();
+        set.insert(DirtyRange {
+            start: 0,
+            end: 4096,
+        });
+        set.insert(DirtyRange {
+            start: 8192,
+            end: 12288,
+        });
+        set.insert(DirtyRange {
+            start: 0,
+            end: 4096,
+        });
 
-        let mut controller = BufferedWritebackController {
-            file: Arc::new(file),
-            window: WritebackWindow::new(MINIMUM_RANGE_BYTES),
-        };
-        controller.record_write(0, MINIMUM_RANGE_BYTES).unwrap();
+        assert_eq!(set.bytes, 8192);
+        assert_eq!(set.ranges.len(), 2);
+    }
+
+    #[test]
+    fn extent_removal_splits_without_collapsing_the_gap() {
+        let mut set = ExtentSet::default();
+        set.insert(DirtyRange {
+            start: 0,
+            end: 16384,
+        });
+        assert_eq!(
+            set.remove(DirtyRange {
+                start: 4096,
+                end: 12288
+            }),
+            8192
+        );
+        assert_eq!(
+            set.ranges,
+            vec![
+                DirtyRange {
+                    start: 0,
+                    end: 4096
+                },
+                DirtyRange {
+                    start: 12288,
+                    end: 16384
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extent_set_matches_a_page_bitmap_under_mixed_updates() {
+        const PAGE_COUNT: usize = 31;
+
+        let mut set = ExtentSet::default();
+        let mut pages = [false; PAGE_COUNT];
+        let mut seed = 0x1234_5678_u64;
+
+        for _ in 0..1000 {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let start = (seed as usize) % PAGE_COUNT;
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let end = (start + 1 + (seed as usize % (PAGE_COUNT - start))).min(PAGE_COUNT);
+            let range = DirtyRange {
+                start: start as u64 * TEST_PAGE_SIZE,
+                end: end as u64 * TEST_PAGE_SIZE,
+            };
+
+            if seed & 1 == 0 {
+                set.insert(range);
+                pages[start..end].fill(true);
+            } else {
+                set.remove(range);
+                pages[start..end].fill(false);
+            }
+
+            let expected_bytes =
+                pages.iter().filter(|dirty| **dirty).count() as u64 * TEST_PAGE_SIZE;
+            assert_eq!(set.bytes, expected_bytes);
+            assert_eq!(set.ranges, bitmap_ranges(&pages));
+            assert!(set.ranges.len() as u64 <= set.bytes / TEST_PAGE_SIZE);
+        }
+    }
+
+    #[test]
+    fn planner_caps_a_large_request_at_the_soft_batch() {
+        let backend = Arc::new(FakeBackend::default());
+        let mut controller = BufferedWritebackController::spawn(
+            backend,
+            MINIMUM_WRITEBACK_BUDGET_BYTES,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+        let reservation = controller
+            .plan_write(0, MINIMUM_WRITEBACK_BUDGET_BYTES)
+            .unwrap();
+        assert_eq!(reservation.len(), MINIMUM_BATCH_BYTES);
         controller
-            .record_write(MINIMUM_RANGE_BYTES, MINIMUM_RANGE_BYTES)
+            .finish_write(reservation, WritebackOutcome::Written(MINIMUM_BATCH_BYTES))
             .unwrap();
-        assert_eq!(controller.window.outstanding_range, None);
-
-        drop(controller);
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn unsupported_file_cannot_bypass_the_hard_watermark() {
-        let unsupported = OpenOptions::new().write(true).open("/dev/null").unwrap();
-        let mut controller = BufferedWritebackController {
-            file: Arc::new(unsupported),
-            window: WritebackWindow::new(MINIMUM_RANGE_BYTES),
-        };
-
-        // The advisory failure is tolerated, but the accumulated range remains accounted.
-        controller.record_write(0, MINIMUM_RANGE_BYTES).unwrap();
-        assert!(controller
-            .record_write(MINIMUM_RANGE_BYTES, MINIMUM_RANGE_BYTES)
-            .is_err());
-        assert!(controller.prepare_write(1).is_err());
+    fn planner_accounts_for_page_alignment_at_the_batch_edge() {
+        let backend = Arc::new(FakeBackend::default());
+        let mut controller = BufferedWritebackController::spawn(
+            backend,
+            MINIMUM_WRITEBACK_BUDGET_BYTES,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+        let reservation = controller
+            .plan_write(512, MINIMUM_WRITEBACK_BUDGET_BYTES)
+            .unwrap();
+        assert_eq!(reservation.len(), MINIMUM_BATCH_BYTES - 512);
+        controller
+            .finish_write(
+                reservation,
+                WritebackOutcome::Written(MINIMUM_BATCH_BYTES - 512),
+            )
+            .unwrap();
+        assert_eq!(controller.tracked.bytes, MINIMUM_BATCH_BYTES);
     }
 
-    fn temporary_file_path(label: &str) -> std::path::PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "libkrun-writeback-{label}-{}-{nonce}",
-            std::process::id()
-        ))
+    #[test]
+    fn planner_allows_only_one_pending_reservation() {
+        let backend = Arc::new(FakeBackend::default());
+        let mut controller = BufferedWritebackController::spawn(
+            backend,
+            MINIMUM_WRITEBACK_BUDGET_BYTES,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+        let reservation = controller.plan_write(0, 512).unwrap();
+        assert_eq!(
+            controller.plan_write(512, 512).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        controller
+            .finish_write(reservation, WritebackOutcome::Failed)
+            .unwrap();
+    }
+
+    #[test]
+    fn planner_submits_underfilled_generation_at_extent_limit() {
+        let backend = Arc::new(GatedBackend::default());
+        let mut controller = BufferedWritebackController::spawn(
+            backend.clone(),
+            MINIMUM_WRITEBACK_BUDGET_BYTES * 2,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+
+        // Populate a maximally fragmented generation without allocating or dirtying a large file.
+        for page in 0..MAX_EXTENTS_PER_GENERATION as u64 {
+            let range = DirtyRange {
+                start: page * TEST_PAGE_SIZE * 2,
+                end: page * TEST_PAGE_SIZE * 2 + TEST_PAGE_SIZE,
+            };
+            controller.current_extents.insert(range);
+            controller.tracked.insert(range);
+        }
+        assert!(controller.current_extents.bytes < controller.batch_bytes);
+
+        let next_offset = MAX_EXTENTS_PER_GENERATION as u64 * TEST_PAGE_SIZE * 2;
+        let reservation = controller.plan_write(next_offset, 512).unwrap();
+        backend.wait_for_calls(1);
+        controller
+            .finish_write(reservation, WritebackOutcome::Written(512))
+            .unwrap();
+
+        backend.allow(2);
+        controller.quiesce().unwrap();
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].len(), MAX_EXTENTS_PER_GENERATION);
+        assert_eq!(calls[1].len(), 1);
+    }
+
+    #[test]
+    fn failed_mutation_conservatively_commits_the_full_reservation() {
+        let backend = Arc::new(FakeBackend::default());
+        let mut controller = BufferedWritebackController::spawn(
+            backend,
+            MINIMUM_WRITEBACK_BUDGET_BYTES,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+        let reservation = controller.plan_write(512, 512).unwrap();
+        controller
+            .finish_write(reservation, WritebackOutcome::Failed)
+            .unwrap();
+        assert_eq!(controller.tracked.bytes, TEST_PAGE_SIZE);
+    }
+
+    #[test]
+    fn successful_partial_write_commits_only_the_actual_prefix() {
+        let backend = Arc::new(FakeBackend::default());
+        let mut controller = BufferedWritebackController::spawn(
+            backend,
+            MINIMUM_WRITEBACK_BUDGET_BYTES,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+        let reservation = controller.plan_write(0, 8192).unwrap();
+        controller
+            .finish_write(reservation, WritebackOutcome::Written(4096))
+            .unwrap();
+        assert_eq!(controller.tracked.bytes, 4096);
+    }
+
+    #[test]
+    fn quiesce_sends_exact_disjoint_ranges() {
+        let backend = Arc::new(FakeBackend::default());
+        let mut controller = BufferedWritebackController::spawn(
+            backend.clone(),
+            MINIMUM_WRITEBACK_BUDGET_BYTES,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+        for offset in [0, 8192] {
+            let reservation = controller.plan_write(offset, 512).unwrap();
+            controller
+                .finish_write(reservation, WritebackOutcome::Written(512))
+                .unwrap();
+        }
+        controller.quiesce().unwrap();
+
+        assert_eq!(
+            backend.calls.lock().unwrap().as_slice(),
+            &[vec![
+                DirtyRange {
+                    start: 0,
+                    end: 4096
+                },
+                DirtyRange {
+                    start: 8192,
+                    end: 12288
+                },
+            ]]
+        );
+        assert_eq!(controller.tracked.bytes, 0);
+        assert_eq!(backend.barrier_calls(), 1);
+    }
+
+    #[test]
+    fn queued_generations_share_one_barrier_before_releasing_credit() {
+        let backend = Arc::new(BarrierGatedBackend::default());
+        let mut controller = BufferedWritebackController::spawn(
+            backend.clone(),
+            MINIMUM_WRITEBACK_BUDGET_BYTES,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+
+        submit_small_generation(&mut controller, 0);
+        backend.wait_for_writebacks(1);
+        submit_small_generation(&mut controller, TEST_PAGE_SIZE * 2);
+
+        backend.allow_writebacks(2);
+        backend.wait_for_writebacks(2);
+        backend.wait_for_barriers(1);
+
+        assert_eq!(backend.barrier_calls(), 1);
+        assert_eq!(backend.calls().len(), 2);
+        assert_eq!(controller.tracked.bytes, TEST_PAGE_SIZE * 2);
+        assert!(controller
+            .submitted
+            .iter()
+            .all(|generation| generation.status == GenerationStatus::InFlight));
+        assert_eq!(
+            controller.completion_receiver.try_recv().unwrap_err(),
+            TryRecvError::Empty
+        );
+
+        backend.allow_barriers(1);
+        controller.quiesce().unwrap();
+        assert_eq!(controller.tracked.bytes, 0);
+        assert!(controller.submitted.is_empty());
+        assert!(controller.health.is_healthy());
+    }
+
+    #[test]
+    fn barrier_failure_fails_every_coalesced_generation() {
+        let backend = Arc::new(BarrierGatedBackend::default());
+        backend.fail_next_barrier(io::ErrorKind::Other);
+        let mut controller = BufferedWritebackController::spawn(
+            backend.clone(),
+            MINIMUM_WRITEBACK_BUDGET_BYTES,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+
+        submit_small_generation(&mut controller, 0);
+        backend.wait_for_writebacks(1);
+        submit_small_generation(&mut controller, TEST_PAGE_SIZE * 2);
+
+        backend.allow_writebacks(2);
+        backend.wait_for_writebacks(2);
+        backend.wait_for_barriers(1);
+        backend.allow_barriers(1);
+
+        assert_eq!(
+            controller.quiesce().unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+        assert_eq!(controller.tracked.bytes, TEST_PAGE_SIZE * 2);
+        assert_eq!(controller.submitted.len(), 2);
+        assert!(controller
+            .submitted
+            .iter()
+            .all(|generation| generation.status == GenerationStatus::Failed));
+        assert!(controller.latched_error.is_some());
+        assert!(!controller.health.is_healthy());
+    }
+
+    #[test]
+    fn successful_data_barrier_does_not_hide_a_range_kick_failure() {
+        let backend = Arc::new(BarrierGatedBackend::default());
+        backend.fail_next_writeback(io::ErrorKind::Other);
+        let mut controller = BufferedWritebackController::spawn(
+            backend.clone(),
+            MINIMUM_WRITEBACK_BUDGET_BYTES,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+
+        submit_small_generation(&mut controller, 0);
+        backend.wait_for_writebacks(1);
+        submit_small_generation(&mut controller, TEST_PAGE_SIZE * 2);
+
+        backend.allow_writebacks(2);
+        backend.wait_for_writebacks(2);
+        backend.wait_for_barriers(1);
+        assert_eq!(controller.tracked.bytes, TEST_PAGE_SIZE * 2);
+        assert_eq!(
+            controller.completion_receiver.try_recv().unwrap_err(),
+            TryRecvError::Empty
+        );
+        backend.allow_barriers(1);
+
+        assert_eq!(
+            controller.quiesce().unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+
+        assert_eq!(backend.barrier_calls(), 1);
+        assert_eq!(controller.tracked.bytes, TEST_PAGE_SIZE * 2);
+        assert_eq!(controller.submitted.len(), 2);
+        assert!(controller
+            .submitted
+            .iter()
+            .all(|generation| generation.status == GenerationStatus::Failed));
+        assert!(controller.latched_error.is_some());
+        assert!(!controller.health.is_healthy());
+
+        // A later full sync cannot prove a failed range-kick path safe.
+        assert!(!controller.reset_after_flush());
+        assert!(controller.latched_error.is_some());
+        assert!(!controller.health.is_healthy());
+    }
+
+    #[test]
+    fn newer_generation_keeps_rewritten_page_charged() {
+        let backend = Arc::new(GatedBackend::default());
+        let mut controller = BufferedWritebackController::spawn(
+            backend.clone(),
+            MINIMUM_WRITEBACK_BUDGET_BYTES,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+
+        let first = controller.plan_write(0, MINIMUM_BATCH_BYTES).unwrap();
+        controller
+            .finish_write(first, WritebackOutcome::Written(MINIMUM_BATCH_BYTES))
+            .unwrap();
+        backend.wait_for_calls(1);
+
+        let rewrite = controller.plan_write(0, TEST_PAGE_SIZE).unwrap();
+        controller
+            .finish_write(rewrite, WritebackOutcome::Written(TEST_PAGE_SIZE))
+            .unwrap();
+        assert_eq!(controller.tracked.bytes, MINIMUM_BATCH_BYTES);
+        assert_eq!(controller.submitted[0].extents.bytes, MINIMUM_BATCH_BYTES);
+        assert_eq!(controller.current_extents.bytes, TEST_PAGE_SIZE);
+
+        backend.allow(2);
+        controller.quiesce().unwrap();
+        assert_eq!(controller.tracked.bytes, 0);
+        assert_eq!(
+            backend.calls(),
+            vec![
+                vec![DirtyRange {
+                    start: 0,
+                    end: MINIMUM_BATCH_BYTES,
+                }],
+                vec![DirtyRange {
+                    start: 0,
+                    end: TEST_PAGE_SIZE,
+                }],
+            ]
+        );
+    }
+
+    #[test]
+    fn worker_error_latches_without_releasing_credits() {
+        let backend = Arc::new(FakeBackend::default());
+        backend.fail_next_barrier(io::ErrorKind::Other);
+        let mut controller = BufferedWritebackController::spawn(
+            backend,
+            MINIMUM_WRITEBACK_BUDGET_BYTES,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+        let reservation = controller.plan_write(0, 512).unwrap();
+        controller
+            .finish_write(reservation, WritebackOutcome::Written(512))
+            .unwrap();
+
+        assert_eq!(
+            controller.quiesce().unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+        assert_eq!(controller.tracked.bytes, TEST_PAGE_SIZE);
+        assert!(controller.latched_error.is_some());
+        assert_eq!(
+            controller
+                .plan_write(TEST_PAGE_SIZE, 512)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Other
+        );
+
+        // A later sync cannot prove that bytes behind an already-reported barrier error survived.
+        assert!(!controller.reset_after_flush());
+        assert_eq!(controller.tracked.bytes, 0);
+        assert!(controller.latched_error.is_some());
+        assert!(!controller.health.is_healthy());
+    }
+
+    #[test]
+    fn unsupported_backend_error_survives_full_sync_reset() {
+        let backend = Arc::new(FakeBackend::default());
+        backend.fail_next_barrier(io::ErrorKind::Unsupported);
+        let mut controller = BufferedWritebackController::spawn(
+            backend,
+            MINIMUM_WRITEBACK_BUDGET_BYTES,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+        let reservation = controller.plan_write(0, 512).unwrap();
+        controller
+            .finish_write(reservation, WritebackOutcome::Written(512))
+            .unwrap();
+
+        assert_eq!(
+            controller.quiesce().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(controller.latched_error.is_some());
+
+        assert!(!controller.reset_after_flush());
+        assert!(controller.latched_error.is_some());
+        assert_eq!(
+            controller
+                .plan_write(TEST_PAGE_SIZE, 512)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn full_sync_reset_does_not_revive_a_dead_worker() {
+        let mut controller = BufferedWritebackController::spawn(
+            Arc::new(PanicBackend),
+            MINIMUM_WRITEBACK_BUDGET_BYTES,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+        let reservation = controller.plan_write(0, 512).unwrap();
+        controller
+            .finish_write(reservation, WritebackOutcome::Written(512))
+            .unwrap();
+
+        assert_eq!(
+            controller.quiesce().unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(controller.latched_error.is_some());
+
+        assert!(!controller.reset_after_flush());
+        assert_eq!(controller.tracked.bytes, 0);
+        assert!(controller.latched_error.is_some());
+        assert_eq!(
+            controller
+                .plan_write(TEST_PAGE_SIZE, 512)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn reset_after_flush_does_not_clear_a_reported_writeback_error() {
+        let backend = Arc::new(FakeBackend::default());
+        let mut controller = BufferedWritebackController::spawn(
+            backend,
+            MINIMUM_WRITEBACK_BUDGET_BYTES,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+        controller.latched_error = Some(LatchedError::capture(&io::Error::other("failed")));
+        controller.health.mark_permanent_failure();
+        assert!(!controller.reset_after_flush());
+        assert!(controller.latched_error.is_some());
+    }
+
+    #[test]
+    fn shared_full_sync_failure_stops_the_live_controller() {
+        let backend = Arc::new(FakeBackend::default());
+        let mut controller = BufferedWritebackController::spawn(
+            backend,
+            MINIMUM_WRITEBACK_BUDGET_BYTES,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+
+        controller.health.mark_permanent_failure();
+        assert_eq!(
+            controller.plan_write(0, 512).unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+        assert!(!controller.reset_after_flush());
+    }
+
+    #[test]
+    fn reset_before_quiesce_fails_permanently_without_clearing_reservation() {
+        let backend = Arc::new(FakeBackend::default());
+        let mut controller = BufferedWritebackController::spawn(
+            backend,
+            MINIMUM_WRITEBACK_BUDGET_BYTES,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+        let reservation = controller.plan_write(0, 512).unwrap();
+
+        assert!(!controller.reset_after_flush());
+        assert!(controller.pending.is_some());
+        assert!(controller.latched_error.is_some());
+        assert!(controller
+            .finish_write(reservation, WritebackOutcome::Written(0))
+            .is_err());
+    }
+
+    fn submit_small_generation(controller: &mut BufferedWritebackController, offset: u64) {
+        let reservation = controller.plan_write(offset, 512).unwrap();
+        controller
+            .finish_write(reservation, WritebackOutcome::Written(512))
+            .unwrap();
+        controller.submit_current_generation().unwrap();
+    }
+
+    fn bitmap_ranges(pages: &[bool]) -> Vec<DirtyRange> {
+        let mut ranges = Vec::new();
+        let mut page = 0;
+        while page < pages.len() {
+            if !pages[page] {
+                page += 1;
+                continue;
+            }
+
+            let start = page;
+            while page < pages.len() && pages[page] {
+                page += 1;
+            }
+            ranges.push(DirtyRange {
+                start: start as u64 * TEST_PAGE_SIZE,
+                end: page as u64 * TEST_PAGE_SIZE,
+            });
+        }
+        ranges
     }
 }

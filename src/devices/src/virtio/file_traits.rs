@@ -510,14 +510,18 @@ impl FileReadWriteAtVolatile for DiskProperties {
             .try_into()
             .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
 
+        // Keep the invariant local to the backing-write boundary as well as the virtio request
+        // parser: a bounded mutation is accepted in full or rejected before its first writev.
+        self.validate_mutation_range(offset, full_length_u64)?;
+
         let mut chunk_offset = offset;
         while !iovec.is_empty() {
-            let chunk_length = self.buffered_write_chunk_bytes(iovec.len());
+            let plan = self.plan_buffered_mutation(chunk_offset, iovec.len())?;
+            let chunk_length = plan.len();
             let (chunk, remainder) = iovec.split_at(chunk_length);
 
-            self.prepare_buffered_write(chunk_offset, chunk_length)?;
-            self.file.lock().unwrap().writev(chunk, chunk_offset)?;
-            self.record_buffered_write(chunk_offset, chunk_length)?;
+            let operation_result = self.file.lock().unwrap().writev(chunk, chunk_offset);
+            self.finish_buffered_mutation(plan, operation_result)?;
 
             iovec = remainder;
             if !iovec.is_empty() {

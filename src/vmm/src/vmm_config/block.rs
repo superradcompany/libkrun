@@ -62,33 +62,33 @@ impl BlockBuilder {
     }
 
     pub fn create_block(config: BlockDeviceConfig, metrics: MetricsWriter) -> Result<Block> {
-        Self::create_block_with_writeback_preflush(config, None, metrics)
+        Self::create_block_with_writeback_limit(config, None, metrics)
     }
 
-    /// Inserts a block device with an optional advisory writeback threshold.
-    pub fn insert_with_writeback_preflush(
+    /// Inserts a block device with an optional hard buffered dirty-data budget.
+    pub fn insert_with_writeback_limit(
         &mut self,
         config: BlockDeviceConfig,
-        writeback_preflush_bytes: Option<u64>,
+        writeback_limit_bytes: Option<u64>,
         metrics: MetricsWriter,
     ) -> Result<()> {
-        let block_dev = Arc::new(Mutex::new(Self::create_block_with_writeback_preflush(
+        let block_dev = Arc::new(Mutex::new(Self::create_block_with_writeback_limit(
             config,
-            writeback_preflush_bytes,
+            writeback_limit_bytes,
             metrics,
         )?));
         self.list.push_back(block_dev);
         Ok(())
     }
 
-    /// Creates a block device with an optional advisory writeback threshold.
-    pub fn create_block_with_writeback_preflush(
+    /// Creates a block device with an optional hard buffered dirty-data budget.
+    pub fn create_block_with_writeback_limit(
         config: BlockDeviceConfig,
-        writeback_preflush_bytes: Option<u64>,
+        writeback_limit_bytes: Option<u64>,
         metrics: MetricsWriter,
     ) -> Result<Block> {
         let device_metrics = metrics.register_block_device(config.block_id.clone());
-        devices::virtio::Block::new_with_writeback_preflush(
+        devices::virtio::Block::new_with_writeback_limit(
             config.block_id,
             None,
             config.cache_type,
@@ -97,7 +97,7 @@ impl BlockBuilder {
             config.is_disk_read_only,
             config.direct_io,
             config.sync_mode,
-            writeback_preflush_bytes,
+            writeback_limit_bytes,
             device_metrics,
         )
         .map_err(BlockConfigError::CreateBlockDevice)

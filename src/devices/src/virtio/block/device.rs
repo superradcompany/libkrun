@@ -5,6 +5,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+#[cfg(target_os = "linux")]
+use std::cell::RefCell;
 use std::cmp;
 use std::convert::From;
 use std::fs::{File, OpenOptions};
@@ -40,7 +42,10 @@ use super::windows::{
 };
 use super::worker::BlockWorker;
 #[cfg(target_os = "linux")]
-use super::writeback::{BufferedWritebackConfig, BufferedWritebackController, MINIMUM_RANGE_BYTES};
+use super::writeback::{
+    BufferedWritebackConfig, BufferedWritebackController, WritebackOutcome, WritebackReservation,
+    MINIMUM_WRITEBACK_BUDGET_BYTES,
+};
 use super::{
     super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice, TYPE_BLOCK},
     Error, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
@@ -50,6 +55,9 @@ use crate::virtio::{
     block::{ImageType, SyncMode},
     ActivateError, InterruptTransport,
 };
+
+#[cfg(target_os = "linux")]
+const EXPLICIT_ZERO_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Configuration options for disk caching.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -81,13 +89,37 @@ pub(crate) struct DiskProperties {
     cache_type: CacheType,
     pub(crate) file: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
     #[cfg(target_os = "linux")]
-    writeback_controller: Option<Mutex<BufferedWritebackController>>,
+    // One block worker owns each DiskProperties instance. RefCell preserves the `&self` volatile
+    // I/O trait while avoiding mutex atomics on every guest write; this must be revisited before
+    // increasing NUM_QUEUES or sharing one DiskProperties between workers.
+    writeback_controller: Option<RefCell<BufferedWritebackController>>,
+    #[cfg(target_os = "linux")]
+    // Keep the shared configuration handle so teardown sync results survive the per-activation
+    // controller and can fail a later activation closed.
+    writeback_config: Option<BufferedWritebackConfig>,
+    #[cfg(target_os = "linux")]
+    // Bounded mode must account real dirty data, so WRITE_ZEROES reuses this buffer instead of
+    // invoking a filesystem hole-punch or metadata-only zeroing operation.
+    explicit_zero_buffer: Option<Box<[u8]>>,
     #[cfg(windows)]
     windows_raw_file: Option<Arc<WindowsRawFile>>,
     #[cfg(windows)]
     pub(crate) windows_formatted_io_runtime: tokio::runtime::Runtime,
     nsectors: u64,
     image_id: Vec<u8>,
+}
+
+/// An exact mutation chunk paired with an optional Linux writeback reservation.
+pub(crate) struct BufferedMutationPlan {
+    length: u64,
+    #[cfg(target_os = "linux")]
+    reservation: Option<WritebackReservation>,
+}
+
+impl BufferedMutationPlan {
+    pub(crate) fn len(&self) -> u64 {
+        self.length
+    }
 }
 
 impl DiskProperties {
@@ -114,6 +146,10 @@ impl DiskProperties {
             file: disk_image,
             #[cfg(target_os = "linux")]
             writeback_controller: None,
+            #[cfg(target_os = "linux")]
+            writeback_config: None,
+            #[cfg(target_os = "linux")]
+            explicit_zero_buffer: None,
             #[cfg(windows)]
             windows_raw_file: None,
             #[cfg(windows)]
@@ -172,83 +208,209 @@ impl DiskProperties {
     }
 
     pub(crate) fn flush_to_disk(&self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        let quiesce_error = self
+            .writeback_controller
+            .as_ref()
+            .and_then(|controller| controller.borrow_mut().quiesce().err());
+
         #[cfg(windows)]
         if let Some(raw_file) = &self.windows_raw_file {
             raw_file.flush()?;
         }
 
-        let diskfile = self.file.lock().unwrap();
-        diskfile.flush()?;
-        diskfile.sync()?;
+        // The full Imago flush remains the guest-visible durability fence, so run it even after
+        // the background controller fails. A successful later sync cannot erase a writeback error
+        // already reported through the file description; that controller remains failed closed.
+        let sync_result = {
+            let diskfile = self.file.lock().unwrap();
+            diskfile.flush().and_then(|_| diskfile.sync())
+        };
 
         #[cfg(target_os = "linux")]
-        if let Some(controller) = &self.writeback_controller {
-            controller.lock().unwrap().complete_flush();
-        }
+        match &sync_result {
+            Ok(()) => {
+                let config_healthy = self
+                    .writeback_config
+                    .as_ref()
+                    .is_none_or(BufferedWritebackConfig::record_full_sync_success);
+                let controller_healthy = self
+                    .writeback_controller
+                    .as_ref()
+                    .is_none_or(|controller| controller.borrow_mut().reset_after_flush());
 
-        Ok(())
-    }
-
-    pub(crate) fn buffered_write_chunk_bytes(&self, requested: u64) -> u64 {
-        #[cfg(target_os = "linux")]
-        if let Some(controller) = &self.writeback_controller {
-            // Never let one large guest request bypass the hard watermark before the controller
-            // gets a chance to account for it and apply backpressure.
-            return requested.min(controller.lock().unwrap().hard_limit_bytes());
-        }
-
-        requested
-    }
-
-    pub(crate) fn prepare_buffered_write(&self, offset: u64, length: u64) -> io::Result<()> {
-        let length = Self::clamp_buffered_write_length(self.nsectors, offset, length);
-
-        #[cfg(target_os = "linux")]
-        if length != 0 {
-            if let Some(controller) = &self.writeback_controller {
-                controller.lock().unwrap().prepare_write(length)?;
+                if let Some(error) = quiesce_error {
+                    warn!(
+                        "Buffered writeback remains permanently failed after the full disk sync: \
+                         {error}"
+                    );
+                    return Err(error);
+                }
+                if !config_healthy || !controller_healthy {
+                    return Err(io::Error::other(
+                        "buffered writeback remains permanently failed after the full disk sync",
+                    ));
+                }
+            }
+            Err(error) => {
+                if let Some(config) = &self.writeback_config {
+                    config.record_full_sync_failure(error);
+                }
             }
         }
 
-        #[cfg(not(target_os = "linux"))]
-        let _ = length;
-
-        Ok(())
+        sync_result
     }
 
-    pub(crate) fn record_buffered_write(&self, offset: u64, length: u64) -> io::Result<()> {
-        // Imago accepts writes beyond the virtual capacity and clips writes crossing the end. Only
-        // account for bytes the guest-visible raw disk could actually have dirtied, so an invalid
-        // request cannot amplify the advisory sync range.
-        let length = Self::clamp_buffered_write_length(self.nsectors, offset, length);
-        if length == 0 {
-            return Ok(());
-        }
+    pub(crate) fn plan_buffered_mutation(
+        &self,
+        offset: u64,
+        requested: u64,
+    ) -> io::Result<BufferedMutationPlan> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = offset;
 
         #[cfg(target_os = "linux")]
-        if let Some(controller) = &self.writeback_controller {
-            controller.lock().unwrap().record_write(offset, length)?;
+        {
+            if requested != 0 {
+                if let Some(controller) = &self.writeback_controller {
+                    let reservation = controller.borrow_mut().plan_write(offset, requested)?;
+                    return Ok(BufferedMutationPlan {
+                        length: reservation.len(),
+                        reservation: Some(reservation),
+                    });
+                }
+            }
+        }
+
+        Ok(BufferedMutationPlan {
+            length: requested,
+            #[cfg(target_os = "linux")]
+            reservation: None,
+        })
+    }
+
+    pub(crate) fn finish_buffered_mutation(
+        &self,
+        plan: BufferedMutationPlan,
+        operation_result: io::Result<()>,
+    ) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        let accounting_result = match plan.reservation {
+            Some(reservation) => {
+                let outcome = if operation_result.is_ok() {
+                    WritebackOutcome::Written(plan.length)
+                } else {
+                    // Imago may have completed a prefix before returning an error. Charge the
+                    // entire reservation conservatively so repeated failing writes cannot bypass
+                    // the hard budget.
+                    WritebackOutcome::Failed
+                };
+                self.writeback_controller
+                    .as_ref()
+                    .expect("reservation requires an active writeback controller")
+                    .borrow_mut()
+                    .finish_write(reservation, outcome)
+            }
+            None => Ok(()),
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let accounting_result: io::Result<()> = {
+            let _ = plan;
+            Ok(())
+        };
+
+        match operation_result {
+            Ok(()) => accounting_result,
+            Err(operation_error) => {
+                if let Err(accounting_error) = accounting_result {
+                    warn!(
+                        "Buffered mutation failed and writeback accounting also failed: {accounting_error}"
+                    );
+                }
+                Err(operation_error)
+            }
+        }
+    }
+
+    pub(crate) fn has_writeback_limit(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.writeback_config.is_some()
         }
 
         #[cfg(not(target_os = "linux"))]
-        let _ = (offset, length);
+        {
+            false
+        }
+    }
 
+    /// Rejects a complete bounded mutation before any prefix can reach the backing image.
+    ///
+    /// Legacy disks retain Imago's existing range behavior. Bounded mode is stricter because
+    /// truncating a request at the visible edge would violate its all-or-error range contract and
+    /// let controller accounting describe a different mutation from the one the guest submitted.
+    pub(crate) fn validate_mutation_range(&self, offset: u64, length: u64) -> io::Result<()> {
+        if self.has_writeback_limit() {
+            Self::validate_range_against_capacity(self.nsectors, offset, length)?;
+        }
         Ok(())
     }
 
-    fn clamp_buffered_write_length(nsectors: u64, offset: u64, length: u64) -> u64 {
-        let visible_size = nsectors.saturating_mul(SECTOR_SIZE);
-        length.min(visible_size.saturating_sub(offset))
+    fn validate_range_against_capacity(nsectors: u64, offset: u64, length: u64) -> io::Result<()> {
+        let visible_size = nsectors.checked_mul(SECTOR_SIZE).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "visible block capacity overflow",
+            )
+        })?;
+        let end = offset.checked_add(length).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "block mutation range overflow")
+        })?;
+        if end > visible_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "block mutation extends beyond visible capacity",
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
-    fn set_writeback_config(&mut self, config: Option<&BufferedWritebackConfig>) {
-        self.writeback_controller = config
+    fn set_writeback_config(&mut self, config: Option<&BufferedWritebackConfig>) -> io::Result<()> {
+        // Retain the shared health handle before any fallible setup. If controller recovery or
+        // buffer allocation fails, DiskProperties::drop can still report its final sync result.
+        self.writeback_config = config.cloned();
+        let controller = config
             .map(BufferedWritebackConfig::controller)
-            .map(Mutex::new);
+            .transpose()?
+            .map(RefCell::new);
+        let explicit_zero_buffer = if config.is_some() {
+            let mut buffer = Vec::new();
+            buffer
+                .try_reserve_exact(EXPLICIT_ZERO_BUFFER_BYTES)
+                .map_err(io::Error::other)?;
+            buffer.resize(EXPLICIT_ZERO_BUFFER_BYTES, 0);
+            Some(buffer.into_boxed_slice())
+        } else {
+            None
+        };
+
+        self.explicit_zero_buffer = explicit_zero_buffer;
+        self.writeback_controller = controller;
+        Ok(())
     }
 
     pub(crate) fn discard_to_any(&self, offset: u64, length: u64) -> io::Result<()> {
+        if self.has_writeback_limit() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "discard is disabled by the bounded writeback policy",
+            ));
+        }
+        self.validate_mutation_range(offset, length)?;
+
         #[cfg(windows)]
         if let Some(raw_file) = &self.windows_raw_file {
             return raw_file.discard_to_any(offset, length);
@@ -259,41 +421,75 @@ impl DiskProperties {
     }
 
     pub(crate) fn discard_to_zero(&self, offset: u64, length: u64) -> io::Result<()> {
+        if self.has_writeback_limit() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "unmapping zero writes are disabled by the bounded writeback policy",
+            ));
+        }
+        self.validate_mutation_range(offset, length)?;
+
         #[cfg(windows)]
         if let Some(raw_file) = &self.windows_raw_file {
             return raw_file.discard_to_zero(offset, length);
         }
 
-        self.run_buffered_mutation(offset, length, |chunk_offset, chunk_length| {
+        self.run_buffered_mutation(offset, length, None, |chunk_offset, chunk_length| {
             let mut diskfile = self.file.lock().unwrap();
             diskfile.discard_to_zero(chunk_offset, chunk_length)
         })
     }
 
     pub(crate) fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        self.validate_mutation_range(offset, length)?;
+
+        #[cfg(target_os = "linux")]
+        if let Some(zero_buffer) = &self.explicit_zero_buffer {
+            return self.run_buffered_mutation(
+                offset,
+                length,
+                Some(zero_buffer.len() as u64),
+                |chunk_offset, chunk_length| {
+                    let chunk_length = usize::try_from(chunk_length)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+                    let diskfile = self.file.lock().unwrap();
+                    diskfile.write(&zero_buffer[..chunk_length], chunk_offset)
+                },
+            );
+        }
+
         #[cfg(windows)]
         if let Some(raw_file) = &self.windows_raw_file {
             return raw_file.write_zeroes(offset, length);
         }
 
-        self.run_buffered_mutation(offset, length, |chunk_offset, chunk_length| {
+        self.run_buffered_mutation(offset, length, None, |chunk_offset, chunk_length| {
             let diskfile = self.file.lock().unwrap();
             diskfile.write_zeroes(chunk_offset, chunk_length)
         })
     }
 
-    fn run_buffered_mutation<F>(&self, offset: u64, length: u64, mut operation: F) -> io::Result<()>
+    fn run_buffered_mutation<F>(
+        &self,
+        offset: u64,
+        length: u64,
+        maximum_chunk: Option<u64>,
+        mut operation: F,
+    ) -> io::Result<()>
     where
         F: FnMut(u64, u64) -> io::Result<()>,
     {
+        self.validate_mutation_range(offset, length)?;
+
         let mut chunk_offset = offset;
         let mut remaining = length;
 
         while remaining != 0 {
-            let chunk_length = self.buffered_write_chunk_bytes(remaining);
-            self.prepare_buffered_write(chunk_offset, chunk_length)?;
-            operation(chunk_offset, chunk_length)?;
-            self.record_buffered_write(chunk_offset, chunk_length)?;
+            let requested = maximum_chunk.map_or(remaining, |maximum| remaining.min(maximum));
+            let plan = self.plan_buffered_mutation(chunk_offset, requested)?;
+            let chunk_length = plan.len();
+            let operation_result = operation(chunk_offset, chunk_length);
+            self.finish_buffered_mutation(plan, operation_result)?;
 
             remaining -= chunk_length;
             if remaining != 0 {
@@ -502,7 +698,7 @@ impl Block {
         sync_mode: SyncMode,
         metrics: BlockMetricsWriter,
     ) -> io::Result<Block> {
-        Self::new_with_writeback_preflush(
+        Self::new_with_writeback_limit(
             id,
             partuuid,
             cache_type,
@@ -516,16 +712,15 @@ impl Block {
         )
     }
 
-    /// Create a virtio block device with an optional buffered-writeback preflush threshold.
+    /// Create a virtio block device with an optional hard buffered-writeback budget.
     ///
-    /// Preflush is supported on Linux for writable raw disks using writeback caching, buffered I/O
-    /// and an active sync mode. The configured soft threshold starts rolling asynchronous range
-    /// writeback. Twice that threshold is a per-device hard watermark where the block worker
-    /// synchronously drains accumulated writes before accepting more, even without a guest flush.
-    /// Neither action replaces the full sync that completes a guest flush. A zero threshold
-    /// disables the option.
+    /// Bounded writeback is supported on Linux for writable raw disks using writeback caching,
+    /// buffered I/O and an active sync mode. The configured value is the per-device hard budget;
+    /// libkrun derives smaller background batches and releases their credits only after completed
+    /// range writeback. This does not replace the full sync that completes a guest flush. A zero
+    /// value disables the policy.
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_writeback_preflush(
+    pub fn new_with_writeback_limit(
         id: String,
         partuuid: Option<String>,
         cache_type: CacheType,
@@ -534,11 +729,11 @@ impl Block {
         is_disk_read_only: bool,
         direct_io: bool,
         sync_mode: SyncMode,
-        writeback_preflush_bytes: Option<u64>,
+        writeback_limit_bytes: Option<u64>,
         metrics: BlockMetricsWriter,
     ) -> io::Result<Block> {
         // Keep zero equivalent to the builder's disabled state for callers of this lower-level API.
-        let writeback_preflush_bytes = writeback_preflush_bytes.filter(|bytes| *bytes != 0);
+        let writeback_limit_bytes = writeback_limit_bytes.filter(|bytes| *bytes != 0);
 
         if matches!(disk_image_format, ImageType::Vmdk) && !is_disk_read_only {
             return Err(io::Error::new(
@@ -547,29 +742,21 @@ impl Block {
             ));
         }
 
-        if let Some(_trigger_bytes) = writeback_preflush_bytes {
+        if let Some(_hard_budget_bytes) = writeback_limit_bytes {
             #[cfg(target_os = "linux")]
-            if _trigger_bytes < MINIMUM_RANGE_BYTES {
+            if _hard_budget_bytes < MINIMUM_WRITEBACK_BUDGET_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
-                        "writeback preflush threshold must be at least {MINIMUM_RANGE_BYTES} bytes"
+                        "writeback hard budget must be at least {MINIMUM_WRITEBACK_BUDGET_BYTES} bytes"
                     ),
-                ));
-            }
-
-            #[cfg(target_os = "linux")]
-            if _trigger_bytes.checked_mul(2).is_none() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "writeback preflush threshold is too large to derive its hard watermark",
                 ));
             }
 
             #[cfg(not(target_os = "linux"))]
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "writeback preflush is only supported on Linux hosts",
+                "bounded writeback is only supported on Linux hosts",
             ));
 
             #[cfg(target_os = "linux")]
@@ -581,7 +768,7 @@ impl Block {
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "writeback preflush requires a writable raw disk with writeback caching, buffered I/O and an active sync mode",
+                    "bounded writeback requires a writable raw disk with writeback caching, buffered I/O and an active sync mode",
                 ));
             }
         }
@@ -617,11 +804,11 @@ impl Block {
         };
 
         #[cfg(target_os = "linux")]
-        let writeback_config = match writeback_preflush_bytes {
-            Some(trigger_bytes) => Some(BufferedWritebackConfig::new(
+        let writeback_config = match writeback_limit_bytes {
+            Some(hard_budget_bytes) => Some(BufferedWritebackConfig::new(
                 Arc::new(disk_image.try_clone()?),
-                trigger_bytes,
-            )),
+                hard_budget_bytes,
+            )?),
             None => None,
         };
 
@@ -640,6 +827,13 @@ impl Block {
             .write(!is_disk_read_only)
             .filename(&imago_path)
             .direct(direct_io);
+
+        // Ask Imago to keep completed buffered writes from lingering in the host page cache when
+        // the hard writeback budget is active. Linux treats RWF_DONTCACHE as a best-effort cache
+        // pressure hint, so correctness and containment continue to come from the controller's
+        // reservation accounting and sync barriers rather than this optimization.
+        #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+        let file_opts = file_opts.write_dontcache(writeback_config.is_some());
 
         #[cfg(target_os = "macos")]
         let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
@@ -678,12 +872,6 @@ impl Block {
         let disk_properties = {
             let disk_properties =
                 DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
-            #[cfg(target_os = "linux")]
-            let disk_properties = {
-                let mut disk_properties = disk_properties;
-                disk_properties.set_writeback_config(writeback_config.as_ref());
-                disk_properties
-            };
             #[cfg(windows)]
             {
                 let mut disk_properties = disk_properties;
@@ -696,11 +884,22 @@ impl Block {
             }
         };
 
+        #[cfg(target_os = "linux")]
+        let bounded_writeback_enabled = writeback_config.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let bounded_writeback_enabled = false;
+
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)
-            | (1u64 << VIRTIO_BLK_F_DISCARD)
             | (1u64 << VIRTIO_BLK_F_WRITE_ZEROES)
             | (1u64 << VIRTIO_RING_F_EVENT_IDX);
+
+        // DISCARD and WRITE_ZEROES|UNMAP can create metadata-only holes that are invisible to
+        // sync_file_range() accounting. Keep ordinary WRITE_ZEROES, but force it through explicit
+        // zero-data writes while the hard writeback budget is active.
+        if !bounded_writeback_enabled {
+            avail_features |= 1u64 << VIRTIO_BLK_F_DISCARD;
+        }
 
         if sync_mode != SyncMode::None {
             avail_features |= 1u64 << VIRTIO_BLK_F_FLUSH;
@@ -715,12 +914,20 @@ impl Block {
             size_max: 0,
             // QUEUE_SIZE - 2
             seg_max: 254,
-            max_discard_sectors: u32::MAX,
-            max_discard_seg: 1,
-            discard_sector_alignment: discard_alignment as u32 / 512,
+            max_discard_sectors: if bounded_writeback_enabled {
+                0
+            } else {
+                u32::MAX
+            },
+            max_discard_seg: u32::from(!bounded_writeback_enabled),
+            discard_sector_alignment: if bounded_writeback_enabled {
+                0
+            } else {
+                discard_alignment as u32 / 512
+            },
             max_write_zeroes_sectors: u32::MAX,
             max_write_zeroes_seg: 1,
-            write_zeroes_may_unmap: 1,
+            write_zeroes_may_unmap: u8::from(!bounded_writeback_enabled),
             ..Default::default()
         };
 
@@ -758,6 +965,28 @@ impl Block {
     /// Specifies if this block device is read only.
     pub fn is_read_only(&self) -> bool {
         self.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0
+    }
+
+    fn stop_worker(&mut self) {
+        if let Some(worker) = self.worker_thread.take() {
+            if let Err(error) = self.worker_stopfd.write(1) {
+                error!("error signaling block worker to stop: {error}");
+            }
+            if let Err(error) = worker.join() {
+                error!("error waiting for block worker thread: {error:?}");
+            }
+        }
+    }
+}
+
+impl Drop for Block {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if self.writeback_config.is_some() {
+            // Dropping a JoinHandle detaches it. A detached bounded-writeback worker would retain
+            // DiskProperties indefinitely, skipping its final sync and shared health update.
+            self.stop_worker();
+        }
     }
 }
 
@@ -832,12 +1061,6 @@ impl VirtioDevice for Block {
                     self.cache_type,
                 )
                 .map_err(|_| ActivateError::BadActivate)?;
-                #[cfg(target_os = "linux")]
-                let disk = {
-                    let mut disk = disk;
-                    disk.set_writeback_config(self.writeback_config.as_ref());
-                    disk
-                };
                 #[cfg(windows)]
                 {
                     let mut disk = disk;
@@ -849,6 +1072,17 @@ impl VirtioDevice for Block {
                     disk
                 }
             }
+        };
+
+        #[cfg(target_os = "linux")]
+        let disk = {
+            let mut disk = disk;
+            disk.set_writeback_config(self.writeback_config.as_ref())
+                .map_err(|error| {
+                    error!("Cannot start bounded block writeback: {error}");
+                    ActivateError::BadActivate
+                })?;
+            disk
         };
 
         let worker = BlockWorker::new(
@@ -866,12 +1100,7 @@ impl VirtioDevice for Block {
     }
 
     fn reset(&mut self) -> bool {
-        if let Some(worker) = self.worker_thread.take() {
-            let _ = self.worker_stopfd.write(1);
-            if let Err(e) = worker.join() {
-                error!("error waiting for worker thread: {e:?}");
-            }
-        }
+        self.stop_worker();
         self.device_state = DeviceState::Inactive;
         true
     }
@@ -884,6 +1113,8 @@ impl VirtioDevice for Block {
 #[cfg(test)]
 mod tests {
     use utils::metrics::MetricsWriter;
+    #[cfg(target_os = "linux")]
+    use utils::tempfile::TempFile;
 
     use super::*;
 
@@ -911,8 +1142,8 @@ mod tests {
     }
 
     #[test]
-    fn zero_writeback_preflush_threshold_disables_the_option() {
-        let result = Block::new_with_writeback_preflush(
+    fn zero_writeback_limit_disables_the_policy() {
+        let result = Block::new_with_writeback_limit(
             "raw".to_string(),
             None,
             CacheType::Unsafe,
@@ -933,26 +1164,79 @@ mod tests {
     }
 
     #[test]
-    fn buffered_write_accounting_is_clamped_to_visible_capacity() {
+    fn bounded_mutation_range_requires_full_visible_capacity() {
         let nsectors = 8;
-        assert_eq!(
-            DiskProperties::clamp_buffered_write_length(nsectors, 512, 4096),
-            3584
-        );
-        assert_eq!(
-            DiskProperties::clamp_buffered_write_length(nsectors, 4096, 512),
-            0
-        );
-        assert_eq!(
-            DiskProperties::clamp_buffered_write_length(nsectors, u64::MAX, u64::MAX),
-            0
-        );
+        assert!(DiskProperties::validate_range_against_capacity(nsectors, 512, 3584).is_ok());
+
+        let crossing_end =
+            DiskProperties::validate_range_against_capacity(nsectors, 512, 4096).unwrap_err();
+        assert_eq!(crossing_end.kind(), io::ErrorKind::InvalidInput);
+        assert!(crossing_end.to_string().contains("visible capacity"));
+
+        let past_end =
+            DiskProperties::validate_range_against_capacity(nsectors, 4096, 512).unwrap_err();
+        assert_eq!(past_end.kind(), io::ErrorKind::InvalidInput);
+
+        let overflow =
+            DiskProperties::validate_range_against_capacity(nsectors, u64::MAX, 1).unwrap_err();
+        assert_eq!(overflow.kind(), io::ErrorKind::InvalidInput);
+        assert!(overflow.to_string().contains("range overflow"));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn writeback_preflush_rejects_too_small_threshold() {
-        let result = Block::new_with_writeback_preflush(
+    fn bounded_writeback_advertises_only_accountable_zeroing() {
+        let backing = TempFile::new().unwrap();
+        backing.as_file().set_len(4 * 1024 * 1024).unwrap();
+        let block = Block::new_with_writeback_limit(
+            "bounded".to_string(),
+            None,
+            CacheType::Writeback,
+            backing.as_path().to_string_lossy().into_owned(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            Some(MINIMUM_WRITEBACK_BUDGET_BYTES),
+            MetricsWriter::default().register_block_device("bounded".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(block.avail_features & (1u64 << VIRTIO_BLK_F_DISCARD), 0);
+        assert_ne!(
+            block.avail_features & (1u64 << VIRTIO_BLK_F_WRITE_ZEROES),
+            0
+        );
+        let max_discard_sectors = block.config.max_discard_sectors;
+        let max_discard_seg = block.config.max_discard_seg;
+        let discard_sector_alignment = block.config.discard_sector_alignment;
+        let write_zeroes_may_unmap = block.config.write_zeroes_may_unmap;
+        assert_eq!(max_discard_sectors, 0);
+        assert_eq!(max_discard_seg, 0);
+        assert_eq!(discard_sector_alignment, 0);
+        assert_eq!(write_zeroes_may_unmap, 0);
+
+        let legacy = Block::new(
+            "legacy".to_string(),
+            None,
+            CacheType::Writeback,
+            backing.as_path().to_string_lossy().into_owned(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            MetricsWriter::default().register_block_device("legacy".to_string()),
+        )
+        .unwrap();
+        let legacy_may_unmap = legacy.config.write_zeroes_may_unmap;
+        assert_ne!(legacy.avail_features & (1u64 << VIRTIO_BLK_F_DISCARD), 0);
+        assert_eq!(legacy_may_unmap, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_writeback_rejects_too_small_budget() {
+        let result = Block::new_with_writeback_limit(
             "raw".to_string(),
             None,
             CacheType::Writeback,
@@ -961,12 +1245,12 @@ mod tests {
             false,
             false,
             SyncMode::Full,
-            Some(MINIMUM_RANGE_BYTES - 1),
+            Some(MINIMUM_WRITEBACK_BUDGET_BYTES - 1),
             MetricsWriter::default().register_block_device("raw".to_string()),
         );
 
         let error = match result {
-            Ok(_) => panic!("too-small preflush threshold should fail"),
+            Ok(_) => panic!("too-small writeback budget should fail"),
             Err(error) => error,
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
@@ -975,32 +1259,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn writeback_preflush_rejects_threshold_without_a_hard_watermark() {
-        let result = Block::new_with_writeback_preflush(
-            "raw".to_string(),
-            None,
-            CacheType::Writeback,
-            "missing.raw".to_string(),
-            ImageType::Raw,
-            false,
-            false,
-            SyncMode::Full,
-            Some(u64::MAX),
-            MetricsWriter::default().register_block_device("raw".to_string()),
-        );
-
-        let error = match result {
-            Ok(_) => panic!("overflowing hard watermark should fail"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains("too large"));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn writeback_preflush_rejects_incompatible_disk_settings() {
-        let result = Block::new_with_writeback_preflush(
+    fn bounded_writeback_rejects_incompatible_disk_settings() {
+        let result = Block::new_with_writeback_limit(
             "raw".to_string(),
             None,
             CacheType::Writeback,
@@ -1014,7 +1274,7 @@ mod tests {
         );
 
         let error = match result {
-            Ok(_) => panic!("preflush with direct I/O should fail"),
+            Ok(_) => panic!("bounded writeback with direct I/O should fail"),
             Err(error) => error,
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
@@ -1023,8 +1283,8 @@ mod tests {
 
     #[cfg(not(target_os = "linux"))]
     #[test]
-    fn writeback_preflush_is_rejected_on_unsupported_hosts() {
-        let result = Block::new_with_writeback_preflush(
+    fn bounded_writeback_is_rejected_on_unsupported_hosts() {
+        let result = Block::new_with_writeback_limit(
             "raw".to_string(),
             None,
             CacheType::Writeback,
@@ -1038,7 +1298,7 @@ mod tests {
         );
 
         let error = match result {
-            Ok(_) => panic!("preflush should fail on unsupported hosts"),
+            Ok(_) => panic!("bounded writeback should fail on unsupported hosts"),
             Err(error) => error,
         };
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
