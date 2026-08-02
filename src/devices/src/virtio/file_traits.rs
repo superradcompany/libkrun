@@ -504,13 +504,28 @@ impl FileReadWriteAtVolatile for DiskProperties {
                 IoSlice::new(slice)
             })
             .collect::<Vec<_>>();
-        let iovec = IoVector::from(buffers);
+        let mut iovec = IoVector::from(buffers);
         let full_length_u64 = iovec.len();
         let full_length = full_length_u64
             .try_into()
             .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-        self.file.lock().unwrap().writev(iovec, offset)?;
-        self.record_buffered_write(offset, full_length_u64);
+
+        let mut chunk_offset = offset;
+        while !iovec.is_empty() {
+            let chunk_length = self.buffered_write_chunk_bytes(iovec.len());
+            let (chunk, remainder) = iovec.split_at(chunk_length);
+
+            self.prepare_buffered_write(chunk_offset, chunk_length)?;
+            self.file.lock().unwrap().writev(chunk, chunk_offset)?;
+            self.record_buffered_write(chunk_offset, chunk_length)?;
+
+            iovec = remainder;
+            if !iovec.is_empty() {
+                chunk_offset = chunk_offset.checked_add(chunk_length).ok_or_else(|| {
+                    Error::new(ErrorKind::InvalidInput, "block write range overflow")
+                })?;
+            }
+        }
         Ok(full_length)
     }
 }

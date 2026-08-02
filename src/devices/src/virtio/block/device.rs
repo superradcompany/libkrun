@@ -189,22 +189,51 @@ impl DiskProperties {
         Ok(())
     }
 
-    pub(crate) fn record_buffered_write(&self, offset: u64, length: u64) {
+    pub(crate) fn buffered_write_chunk_bytes(&self, requested: u64) -> u64 {
+        #[cfg(target_os = "linux")]
+        if let Some(controller) = &self.writeback_controller {
+            // Never let one large guest request bypass the hard watermark before the controller
+            // gets a chance to account for it and apply backpressure.
+            return requested.min(controller.lock().unwrap().hard_limit_bytes());
+        }
+
+        requested
+    }
+
+    pub(crate) fn prepare_buffered_write(&self, offset: u64, length: u64) -> io::Result<()> {
+        let length = Self::clamp_buffered_write_length(self.nsectors, offset, length);
+
+        #[cfg(target_os = "linux")]
+        if length != 0 {
+            if let Some(controller) = &self.writeback_controller {
+                controller.lock().unwrap().prepare_write(length)?;
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        let _ = length;
+
+        Ok(())
+    }
+
+    pub(crate) fn record_buffered_write(&self, offset: u64, length: u64) -> io::Result<()> {
         // Imago accepts writes beyond the virtual capacity and clips writes crossing the end. Only
         // account for bytes the guest-visible raw disk could actually have dirtied, so an invalid
         // request cannot amplify the advisory sync range.
         let length = Self::clamp_buffered_write_length(self.nsectors, offset, length);
         if length == 0 {
-            return;
+            return Ok(());
         }
 
         #[cfg(target_os = "linux")]
         if let Some(controller) = &self.writeback_controller {
-            controller.lock().unwrap().record_write(offset, length);
+            controller.lock().unwrap().record_write(offset, length)?;
         }
 
         #[cfg(not(target_os = "linux"))]
         let _ = (offset, length);
+
+        Ok(())
     }
 
     fn clamp_buffered_write_length(nsectors: u64, offset: u64, length: u64) -> u64 {
@@ -235,10 +264,10 @@ impl DiskProperties {
             return raw_file.discard_to_zero(offset, length);
         }
 
-        let mut diskfile = self.file.lock().unwrap();
-        // Raw discard and zero-range operations use filesystem allocation primitives rather than
-        // the buffered data-write path, so they intentionally do not advance the preflush window.
-        diskfile.discard_to_zero(offset, length)
+        self.run_buffered_mutation(offset, length, |chunk_offset, chunk_length| {
+            let mut diskfile = self.file.lock().unwrap();
+            diskfile.discard_to_zero(chunk_offset, chunk_length)
+        })
     }
 
     pub(crate) fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
@@ -247,9 +276,34 @@ impl DiskProperties {
             return raw_file.write_zeroes(offset, length);
         }
 
-        let diskfile = self.file.lock().unwrap();
-        // See `discard_to_zero`: advisory page-cache writeback tracks ordinary buffered writes.
-        diskfile.write_zeroes(offset, length)
+        self.run_buffered_mutation(offset, length, |chunk_offset, chunk_length| {
+            let diskfile = self.file.lock().unwrap();
+            diskfile.write_zeroes(chunk_offset, chunk_length)
+        })
+    }
+
+    fn run_buffered_mutation<F>(&self, offset: u64, length: u64, mut operation: F) -> io::Result<()>
+    where
+        F: FnMut(u64, u64) -> io::Result<()>,
+    {
+        let mut chunk_offset = offset;
+        let mut remaining = length;
+
+        while remaining != 0 {
+            let chunk_length = self.buffered_write_chunk_bytes(remaining);
+            self.prepare_buffered_write(chunk_offset, chunk_length)?;
+            operation(chunk_offset, chunk_length)?;
+            self.record_buffered_write(chunk_offset, chunk_length)?;
+
+            remaining -= chunk_length;
+            if remaining != 0 {
+                chunk_offset = chunk_offset.checked_add(chunk_length).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "block mutation range overflow")
+                })?;
+            }
+        }
+
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -465,9 +519,11 @@ impl Block {
     /// Create a virtio block device with an optional buffered-writeback preflush threshold.
     ///
     /// Preflush is supported on Linux for writable raw disks using writeback caching, buffered I/O
-    /// and an active sync mode. It starts at most one advisory background writeback range between
-    /// successful guest flushes, but does not replace the full sync that completes a guest flush or
-    /// provide a dirty-memory containment boundary. A zero threshold disables the option.
+    /// and an active sync mode. The configured soft threshold starts rolling asynchronous range
+    /// writeback. Twice that threshold is a per-device hard watermark where the block worker
+    /// synchronously drains accumulated writes before accepting more, even without a guest flush.
+    /// Neither action replaces the full sync that completes a guest flush. A zero threshold
+    /// disables the option.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_writeback_preflush(
         id: String,
@@ -499,6 +555,14 @@ impl Block {
                     format!(
                         "writeback preflush threshold must be at least {MINIMUM_RANGE_BYTES} bytes"
                     ),
+                ));
+            }
+
+            #[cfg(target_os = "linux")]
+            if _trigger_bytes.checked_mul(2).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "writeback preflush threshold is too large to derive its hard watermark",
                 ));
             }
 
@@ -907,6 +971,30 @@ mod tests {
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("at least"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writeback_preflush_rejects_threshold_without_a_hard_watermark() {
+        let result = Block::new_with_writeback_preflush(
+            "raw".to_string(),
+            None,
+            CacheType::Writeback,
+            "missing.raw".to_string(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            Some(u64::MAX),
+            MetricsWriter::default().register_block_device("raw".to_string()),
+        );
+
+        let error = match result {
+            Ok(_) => panic!("overflowing hard watermark should fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("too large"));
     }
 
     #[cfg(target_os = "linux")]

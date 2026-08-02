@@ -479,7 +479,7 @@ impl VmResources {
         self.block.insert(config, self.metrics.clone())
     }
 
-    /// Adds a block device with an optional one-shot writeback threshold between guest flushes.
+    /// Adds a block device with optional rolling writeback and per-device hard backpressure.
     #[cfg(feature = "blk")]
     pub fn add_block_device_with_writeback_preflush(
         &mut self,

@@ -1020,14 +1020,15 @@ impl DiskBuilder {
         self
     }
 
-    /// Start one advisory host writeback range after this many buffered bytes have been written.
+    /// Start rolling host writeback after this many buffered bytes have been written.
     ///
     /// This Linux-only optimization is valid for writable raw disks using writeback caching,
     /// buffered I/O and an active sync mode. The minimum active threshold is 64 MiB; a value of
     /// zero disables the optimization. Invalid combinations fail explicitly when the VM is built.
-    /// The advisory writeback is issued at most once between successful guest flushes; it is not a
-    /// dirty-memory limit. Hosts running untrusted workloads must enforce memory and dirty-page
-    /// containment independently, for example with cgroups and Linux writeback policy.
+    /// The configured value is the soft threshold for asynchronous range writeback. Twice that
+    /// value is a VMM-enforced per-device hard watermark: the block worker synchronously drains its
+    /// accumulated range before accepting more dirtying writes. Guest flushes still perform the
+    /// existing full durability sync.
     pub fn writeback_preflush_bytes(mut self, bytes: u64) -> Self {
         self.current_writeback_preflush_bytes = (bytes > 0).then_some(bytes);
         self
