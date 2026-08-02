@@ -6,10 +6,12 @@ use super::{
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::socket::{
-    accept, bind, connect, listen, recv, send, shutdown, socket, AddressFamily, Backlog, MsgFlags,
-    Shutdown, SockFlag, SockType, UnixAddr,
+    accept, bind, connect, getsockopt, listen, recv, send, shutdown, socket, sockopt,
+    AddressFamily, Backlog, MsgFlags, Shutdown, SockFlag, SockType, UnixAddr,
 };
 use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::io;
 use std::num::Wrapping;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -23,6 +25,7 @@ use super::muxer::{push_packet, MuxerRx};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
 use super::proxy::{NewProxyType, Proxy, ProxyError, ProxyStatus, ProxyUpdate};
+use super::{VsockShutdown, VsockStreamBackend};
 use utils::epoll::EventSet;
 
 use vm_memory::GuestMemoryMmap;
@@ -30,7 +33,7 @@ use vm_memory::GuestMemoryMmap;
 pub struct UnixProxy {
     id: u64,
     cid: u64,
-    fd: OwnedFd,
+    endpoint: StreamEndpoint,
     pub status: ProxyStatus,
     mem: GuestMemoryMmap,
     queue: Arc<Mutex<VirtQueue>>,
@@ -45,6 +48,61 @@ pub struct UnixProxy {
     last_tx_cnt_sent: Wrapping<u32>,
     push_cnt: Wrapping<u32>,
     rx_cnt: Wrapping<u32>,
+    pending_write: VecDeque<u8>,
+}
+
+enum StreamEndpoint {
+    Unix(OwnedFd),
+    Custom(Box<dyn VsockStreamBackend>),
+}
+
+impl StreamEndpoint {
+    fn is_custom(&self) -> bool {
+        matches!(self, Self::Custom(_))
+    }
+
+    fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Unix(fd) => recv(fd.as_raw_fd(), buf, MsgFlags::MSG_DONTWAIT)
+                .map_err(|err| io::Error::from_raw_os_error(err as i32)),
+            Self::Custom(backend) => backend.read(buf),
+        }
+    }
+
+    fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Unix(fd) => {
+                #[cfg(target_os = "macos")]
+                let flags = MsgFlags::empty();
+                #[cfg(target_os = "linux")]
+                let flags = MsgFlags::MSG_NOSIGNAL;
+                send(fd.as_raw_fd(), buf, flags)
+                    .map_err(|err| io::Error::from_raw_os_error(err as i32))
+            }
+            Self::Custom(backend) => backend.write(buf),
+        }
+    }
+
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        match self {
+            Self::Unix(fd) => shutdown(fd.as_raw_fd(), how)
+                .map_err(|err| io::Error::from_raw_os_error(err as i32)),
+            Self::Custom(backend) => backend.shutdown(match how {
+                Shutdown::Read => VsockShutdown::Read,
+                Shutdown::Write => VsockShutdown::Write,
+                Shutdown::Both => VsockShutdown::Both,
+            }),
+        }
+    }
+}
+
+impl AsRawFd for StreamEndpoint {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            Self::Unix(fd) => fd.as_raw_fd(),
+            Self::Custom(backend) => backend.poll_fd(),
+        }
+    }
 }
 
 fn proxy_fd_create(id: u64) -> Result<OwnedFd, ProxyError> {
@@ -107,7 +165,7 @@ impl UnixProxy {
             local_port,
             peer_port: 0,
             control_port,
-            fd,
+            endpoint: StreamEndpoint::Unix(fd),
             status: ProxyStatus::Idle,
             mem,
             queue,
@@ -119,7 +177,41 @@ impl UnixProxy {
             last_tx_cnt_sent: Wrapping(0),
             push_cnt: Wrapping(0),
             rx_cnt: Wrapping(0),
+            pending_write: VecDeque::new(),
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_custom(
+        id: u64,
+        cid: u64,
+        local_port: u32,
+        peer_port: u32,
+        backend: Box<dyn VsockStreamBackend>,
+        mem: GuestMemoryMmap,
+        queue: Arc<Mutex<VirtQueue>>,
+        rxq: Arc<Mutex<MuxerRxQ>>,
+    ) -> Self {
+        UnixProxy {
+            id,
+            cid,
+            local_port,
+            peer_port,
+            control_port: 0,
+            endpoint: StreamEndpoint::Custom(backend),
+            status: ProxyStatus::Connected,
+            mem,
+            queue,
+            rxq,
+            peer_buf_alloc: 0,
+            peer_fwd_cnt: Wrapping(0),
+            path: PathBuf::new(),
+            tx_cnt: Wrapping(0),
+            last_tx_cnt_sent: Wrapping(0),
+            push_cnt: Wrapping(0),
+            rx_cnt: Wrapping(0),
+            pending_write: VecDeque::new(),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -134,13 +226,22 @@ impl UnixProxy {
         rxq: Arc<Mutex<MuxerRxQ>>,
     ) -> Self {
         debug!("new_reverse: id={id} local_port={local_port} peer_port={peer_port}");
+        // Accepted sockets are not guaranteed to inherit O_NONBLOCK. Keeping
+        // them nonblocking prevents a slow peer from stalling the muxer.
+        if let Ok(flags) = fcntl(&fd, FcntlArg::F_GETFL) {
+            if let Some(flags) = OFlag::from_bits(flags) {
+                if let Err(err) = fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)) {
+                    warn!("failed to make reverse Unix vsock nonblocking: {err}");
+                }
+            }
+        }
         UnixProxy {
             id,
             cid,
             local_port,
             peer_port,
             control_port: 0,
-            fd,
+            endpoint: StreamEndpoint::Unix(fd),
             status: ProxyStatus::ReverseInit,
             mem,
             queue,
@@ -152,22 +253,62 @@ impl UnixProxy {
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
             path: Default::default(),
+            pending_write: VecDeque::new(),
         }
     }
 
     fn switch_to_connected(&mut self) {
         self.status = ProxyStatus::Connected;
-        match fcntl(&self.fd, FcntlArg::F_GETFL) {
-            Ok(flags) => match OFlag::from_bits(flags) {
-                Some(flags) => {
-                    if let Err(e) = fcntl(&self.fd, FcntlArg::F_SETFL(flags & !OFlag::O_NONBLOCK)) {
-                        warn!("error switching to blocking: id={}, err={}", self.id, e);
-                    }
-                }
-                None => error!("invalid fd flags id={}", self.id),
+    }
+
+    /// Connect a typed AF_VSOCK route without emitting TSI control packets.
+    pub fn connect_vsock(&mut self) -> Result<ProxyUpdate, i32> {
+        let addr = UnixAddr::new(&self.path).map_err(|_| -libc::EINVAL)?;
+        let mut update = ProxyUpdate::default();
+
+        match connect(self.endpoint.as_raw_fd(), &addr) {
+            Ok(()) => self.switch_to_connected(),
+            Err(Errno::EINPROGRESS) => self.status = ProxyStatus::Connecting,
+            Err(err) => {
+                #[cfg(target_os = "macos")]
+                return Err(-linux_errno_raw(err as i32));
+                #[cfg(target_os = "linux")]
+                return Err(-(err as i32));
+            }
+        }
+
+        update.polling = Some((
+            self.id,
+            self.endpoint.as_raw_fd(),
+            if self.status == ProxyStatus::Connecting {
+                EventSet::IN | EventSet::OUT
+            } else {
+                EventSet::IN
             },
-            Err(e) => error!("couldn't obtain fd flags id={}, err={}", self.id, e),
+        ));
+        Ok(update)
+    }
+
+    /// Record peer flow-control state while a nonblocking route connect is pending.
+    pub fn prepare_vsock_connect(&mut self, pkt: &VsockPacket) {
+        self.peer_buf_alloc = pkt.buf_alloc();
+        self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
+        self.local_port = pkt.dst_port();
+        self.peer_port = pkt.src_port();
+    }
+
+    /// Confirm a completed route connection to the guest.
+    pub fn confirm_vsock_connect(&mut self, pkt: &VsockPacket) {
+        self.prepare_vsock_connect(pkt);
+        self.push_vsock_connect_response();
+    }
+
+    fn push_vsock_connect_response(&self) {
+        let rx = MuxerRx::OpResponse {
+            local_port: self.local_port,
+            peer_port: self.peer_port,
         };
+        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
     }
 
     fn push_connect_rsp(&self, result: i32) {
@@ -219,12 +360,14 @@ impl UnixProxy {
                 return RecvPkt::WaitForCredit;
             }
 
-            match recv(
-                self.fd.as_raw_fd(),
-                &mut buf[..max_len],
-                MsgFlags::MSG_DONTWAIT,
-            ) {
+            match self.endpoint.read(&mut buf[..max_len]) {
                 Ok(cnt) => {
+                    if cnt > max_len {
+                        warn!(
+                            "vsock backend returned invalid read length: count={cnt}, capacity={max_len}"
+                        );
+                        return RecvPkt::Error;
+                    }
                     debug!("recv cnt={cnt}");
                     if cnt > 0 {
                         debug!("recv rx_cnt={}", self.rx_cnt);
@@ -233,6 +376,7 @@ impl UnixProxy {
                         RecvPkt::Close
                     }
                 }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => RecvPkt::Error,
                 Err(e) => {
                     debug!("recv_pkt: recv error: {e:?}");
                     RecvPkt::Error
@@ -294,6 +438,36 @@ impl UnixProxy {
         (have_used, wait_credit)
     }
 
+    fn flush_pending_write(&mut self) -> io::Result<()> {
+        while !self.pending_write.is_empty() {
+            let (front, back) = self.pending_write.as_slices();
+            let buf = if front.is_empty() { back } else { front };
+            match self.endpoint.write(buf) {
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+                Ok(written) => {
+                    if written > buf.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "vsock backend returned a write length larger than its input",
+                        ));
+                    }
+                    self.pending_write.drain(..written);
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    fn connected_poll_events(&self) -> EventSet {
+        if self.endpoint.is_custom() || self.pending_write.is_empty() {
+            EventSet::IN
+        } else {
+            EventSet::IN | EventSet::OUT
+        }
+    }
+
     fn init_data_pkt(&self, pkt: &mut VsockPacket) {
         debug!(
             "init_data_pkt: id={}, local_port={}, peer_port={}",
@@ -323,9 +497,21 @@ impl Proxy for UnixProxy {
     fn connect(&mut self, _pkt: &VsockPacket, _req: TsiConnectReq) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
-        let addr = UnixAddr::new(&self.path).unwrap();
+        let addr = match UnixAddr::new(&self.path) {
+            Ok(addr) => addr,
+            Err(err) => {
+                warn!(
+                    "invalid Unix socket path for vsock route {:?}: {err}",
+                    self.path
+                );
+                self.push_connect_rsp(-libc::EINVAL);
+                update.signal_queue = true;
+                update.remove_proxy = ProxyRemoval::Immediate;
+                return update;
+            }
+        };
 
-        let result = match connect(self.fd.as_raw_fd(), &addr) {
+        let result = match connect(self.endpoint.as_raw_fd(), &addr) {
             Ok(()) => {
                 debug!("connect: Connected");
                 self.switch_to_connected();
@@ -347,10 +533,14 @@ impl Proxy for UnixProxy {
         };
 
         if self.status == ProxyStatus::Connecting {
-            update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::IN | EventSet::OUT));
+            update.polling = Some((
+                self.id,
+                self.endpoint.as_raw_fd(),
+                EventSet::IN | EventSet::OUT,
+            ));
         } else {
             if self.status == ProxyStatus::Connected {
-                update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::IN));
+                update.polling = Some((self.id, self.endpoint.as_raw_fd(), EventSet::IN));
             }
             self.push_connect_rsp(result);
         }
@@ -367,18 +557,7 @@ impl Proxy for UnixProxy {
             self.peer_port,
         );
 
-        self.peer_buf_alloc = pkt.buf_alloc();
-        self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
-
-        self.local_port = pkt.dst_port();
-        self.peer_port = pkt.src_port();
-
-        // This response goes to the connection.
-        let rx = MuxerRx::OpResponse {
-            local_port: pkt.dst_port(),
-            peer_port: pkt.src_port(),
-        };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        self.confirm_vsock_connect(pkt);
 
         None
     }
@@ -391,29 +570,23 @@ impl Proxy for UnixProxy {
         let mut update = ProxyUpdate::default();
 
         let ret = if let Some(buf) = pkt.buf() {
-            #[cfg(target_os = "macos")]
-            let flags = MsgFlags::empty();
-
-            #[cfg(target_os = "linux")]
-            let flags = MsgFlags::MSG_NOSIGNAL;
-
-            match send(self.fd.as_raw_fd(), buf, flags) {
-                Ok(sent) => {
-                    if sent != buf.len() {
-                        error!("couldn't set everything: buf={}, sent={}", buf.len(), sent);
-                    }
-                    self.tx_cnt += Wrapping(sent as u32);
-                    sent as i32
-                }
-                Err(err) => {
-                    #[cfg(target_os = "macos")]
-                    let errno = -linux_errno_raw(err as i32);
-
-                    #[cfg(target_os = "linux")]
-                    let errno = -(err as i32);
-                    errno
-                }
+            // Credit is returned when bytes enter this bounded proxy queue;
+            // readiness drives later partial flushes without blocking a VMM thread.
+            self.pending_write.extend(buf);
+            self.tx_cnt += Wrapping(buf.len() as u32);
+            if let Err(err) = self.flush_pending_write() {
+                warn!("vsock backend write failed: {err}");
+                self.push_reset();
+                self.status = ProxyStatus::Closed;
+                update.signal_queue = true;
+                update.remove_proxy = ProxyRemoval::Deferred;
             }
+            update.polling = Some((
+                self.id,
+                self.endpoint.as_raw_fd(),
+                self.connected_poll_events(),
+            ));
+            buf.len() as i32
         } else {
             -libc::EINVAL
         };
@@ -472,7 +645,11 @@ impl Proxy for UnixProxy {
         self.status = ProxyStatus::Connected;
 
         ProxyUpdate {
-            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::IN)),
+            polling: Some((
+                self.id,
+                self.endpoint.as_raw_fd(),
+                self.connected_poll_events(),
+            )),
             ..Default::default()
         }
     }
@@ -505,7 +682,11 @@ impl Proxy for UnixProxy {
         self.switch_to_connected();
 
         ProxyUpdate {
-            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::IN)),
+            polling: Some((
+                self.id,
+                self.endpoint.as_raw_fd(),
+                self.connected_poll_events(),
+            )),
             ..Default::default()
         }
     }
@@ -526,7 +707,7 @@ impl Proxy for UnixProxy {
             Shutdown::Write
         };
 
-        if let Err(e) = shutdown(self.fd.as_raw_fd(), how) {
+        if let Err(e) = self.endpoint.shutdown(how) {
             warn!("error sending shutdown to socket: {e}");
         }
     }
@@ -550,14 +731,10 @@ impl Proxy for UnixProxy {
         if evset.contains(EventSet::HANG_UP) {
             debug!("process_event: HANG_UP");
 
-            if self.status == ProxyStatus::Connecting {
-                self.push_connect_rsp(-libc::ECONNREFUSED);
-            } else {
-                self.push_reset();
-            }
+            self.push_reset();
 
             self.status = ProxyStatus::Closed;
-            update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::empty()));
+            update.polling = Some((self.id, self.endpoint.as_raw_fd(), EventSet::empty()));
             update.signal_queue = true;
             update.remove_proxy = ProxyRemoval::Deferred;
 
@@ -567,6 +744,16 @@ impl Proxy for UnixProxy {
         if evset.contains(EventSet::IN) {
             debug!("process_event: IN");
             if self.status == ProxyStatus::Connected {
+                if !self.pending_write.is_empty() {
+                    if let Err(err) = self.flush_pending_write() {
+                        warn!("vsock backend write failed: {err}");
+                        self.push_reset();
+                        self.status = ProxyStatus::Closed;
+                        update.signal_queue = true;
+                        update.remove_proxy = ProxyRemoval::Deferred;
+                        return update;
+                    }
+                }
                 let (signal_queue, wait_credit) = self.recv_pkt();
                 update.signal_queue = signal_queue;
 
@@ -588,11 +775,13 @@ impl Proxy for UnixProxy {
 
                     self.push_reset();
                     update.signal_queue = true;
-                    update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));
+                    update.polling =
+                        Some((self.id(), self.endpoint.as_raw_fd(), EventSet::empty()));
                     return update;
                 } else if self.status == ProxyStatus::WaitingCreditUpdate {
                     debug!("process_event: WaitingCreditUpdate");
-                    update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::empty()));
+                    update.polling =
+                        Some((self.id(), self.endpoint.as_raw_fd(), EventSet::empty()));
                 }
             } else {
                 debug!("EventSet::IN while not connected: {:?}", self.status);
@@ -602,12 +791,51 @@ impl Proxy for UnixProxy {
         if evset.contains(EventSet::OUT) {
             debug!("process_event: OUT");
             if self.status == ProxyStatus::Connecting {
+                let connect_error = match &self.endpoint {
+                    StreamEndpoint::Unix(fd) => {
+                        getsockopt(fd, sockopt::SocketError).unwrap_or(libc::EIO)
+                    }
+                    StreamEndpoint::Custom(_) => 0,
+                };
+                if connect_error != 0 {
+                    warn!("Unix vsock connect failed asynchronously: errno {connect_error}");
+                    self.push_reset();
+                    self.status = ProxyStatus::Closed;
+                    update.signal_queue = true;
+                    update.remove_proxy = ProxyRemoval::Deferred;
+                    update.polling =
+                        Some((self.id(), self.endpoint.as_raw_fd(), EventSet::empty()));
+                    return update;
+                }
                 self.switch_to_connected();
-                self.push_connect_rsp(0);
+                self.push_vsock_connect_response();
                 update.signal_queue = true;
-                update.polling = Some((self.id(), self.fd.as_raw_fd(), EventSet::IN));
+                if let Err(err) = self.flush_pending_write() {
+                    warn!("vsock backend write failed after connect: {err}");
+                    self.push_reset();
+                    self.status = ProxyStatus::Closed;
+                    update.remove_proxy = ProxyRemoval::Deferred;
+                }
+                update.polling = Some((
+                    self.id(),
+                    self.endpoint.as_raw_fd(),
+                    self.connected_poll_events(),
+                ));
+            } else if self.status == ProxyStatus::Connected {
+                if let Err(err) = self.flush_pending_write() {
+                    warn!("vsock backend write failed: {err}");
+                    self.push_reset();
+                    self.status = ProxyStatus::Closed;
+                    update.signal_queue = true;
+                    update.remove_proxy = ProxyRemoval::Deferred;
+                }
+                update.polling = Some((
+                    self.id(),
+                    self.endpoint.as_raw_fd(),
+                    self.connected_poll_events(),
+                ));
             } else {
-                error!("EventSet::OUT while not connecting");
+                error!("EventSet::OUT in unexpected state: {:?}", self.status);
             }
         }
 
@@ -617,7 +845,7 @@ impl Proxy for UnixProxy {
 
 impl AsRawFd for UnixProxy {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        self.endpoint.as_raw_fd()
     }
 }
 
@@ -719,5 +947,96 @@ impl Proxy for UnixAcceptorProxy {
 impl AsRawFd for UnixAcceptorProxy {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use utils::eventfd::{EventFd, EFD_NONBLOCK};
+    use vm_memory::GuestAddress;
+
+    use super::*;
+
+    struct TestStreamState {
+        blocked: AtomicBool,
+        written: Mutex<Vec<u8>>,
+        shutdown: Mutex<Option<VsockShutdown>>,
+    }
+
+    struct TestStream {
+        event: EventFd,
+        state: Arc<TestStreamState>,
+    }
+
+    impl VsockStreamBackend for TestStream {
+        fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+
+        fn write(&self, buf: &[u8]) -> io::Result<usize> {
+            let mut written = self.state.written.lock().unwrap();
+            if self.state.blocked.load(Ordering::Relaxed) && written.len() >= 2 {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            let count = if self.state.blocked.load(Ordering::Relaxed) {
+                buf.len().min(2)
+            } else {
+                buf.len()
+            };
+            written.extend_from_slice(&buf[..count]);
+            Ok(count)
+        }
+
+        fn shutdown(&self, how: VsockShutdown) -> io::Result<()> {
+            *self.state.shutdown.lock().unwrap() = Some(how);
+            Ok(())
+        }
+
+        fn poll_fd(&self) -> RawFd {
+            self.event.as_raw_fd()
+        }
+    }
+
+    #[test]
+    fn custom_stream_buffers_partial_writes_without_losing_bytes() {
+        let state = Arc::new(TestStreamState {
+            blocked: AtomicBool::new(true),
+            written: Mutex::new(Vec::new()),
+            shutdown: Mutex::new(None),
+        });
+        let backend = TestStream {
+            event: EventFd::new(EFD_NONBLOCK).unwrap(),
+            state: Arc::clone(&state),
+        };
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut proxy = UnixProxy::new_custom(
+            1,
+            3,
+            5000,
+            4000,
+            Box::new(backend),
+            mem,
+            Arc::new(Mutex::new(VirtQueue::new(256))),
+            Arc::new(Mutex::new(MuxerRxQ::new())),
+        );
+
+        proxy.pending_write.extend(b"hello");
+        proxy.flush_pending_write().unwrap();
+        assert_eq!(&*state.written.lock().unwrap(), b"he");
+        assert_eq!(proxy.pending_write.len(), 3);
+
+        state.blocked.store(false, Ordering::Relaxed);
+        proxy.flush_pending_write().unwrap();
+        assert_eq!(&*state.written.lock().unwrap(), b"hello");
+        assert!(proxy.pending_write.is_empty());
+
+        proxy.endpoint.shutdown(Shutdown::Both).unwrap();
+        assert_eq!(*state.shutdown.lock().unwrap(), Some(VsockShutdown::Both));
     }
 }

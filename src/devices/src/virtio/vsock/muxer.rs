@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -8,7 +8,7 @@ use super::defs;
 use super::defs::uapi;
 use super::muxer_rxq::{rx_to_pkt, MuxerRxQ};
 use super::muxer_thread::MuxerThread;
-use super::packet::{TsiConnectReq, TsiGetnameRsp, VsockPacket};
+use super::packet::{TsiGetnameRsp, VsockPacket};
 use super::proxy::{Proxy, ProxyRemoval, ProxyUpdate};
 use super::reaper::ReaperThread;
 #[cfg(target_os = "macos")]
@@ -16,8 +16,8 @@ use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
 use super::tsi_stream::TsiStreamProxy;
 use super::unix::UnixProxy;
-use super::TsiFlags;
 use super::VsockError;
+use super::{TsiFlags, VsockConnectRequest, VsockPortBackend};
 use crossbeam_channel::{unbounded, Sender};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
@@ -107,6 +107,7 @@ pub struct VsockMuxer {
     proxy_map: ProxyMap,
     reaper_sender: Option<Sender<u64>>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+    custom_port_map: Option<HashMap<u32, Arc<dyn VsockPortBackend>>>,
     tsi_flags: TsiFlags,
 }
 
@@ -115,6 +116,7 @@ impl VsockMuxer {
         cid: u64,
         host_port_map: Option<HashMap<u16, u16>>,
         unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+        custom_port_map: Option<HashMap<u32, Arc<dyn VsockPortBackend>>>,
         tsi_flags: TsiFlags,
     ) -> Self {
         VsockMuxer {
@@ -128,6 +130,7 @@ impl VsockMuxer {
             proxy_map: Arc::new(RwLock::new(HashMap::new())),
             reaper_sender: None,
             unix_ipc_port_map,
+            custom_port_map,
             tsi_flags,
         }
     }
@@ -539,47 +542,194 @@ impl VsockMuxer {
     fn process_op_request(&mut self, pkt: &VsockPacket) {
         debug!("OP_REQUEST");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        let mut proxy_map = self.proxy_map.write().unwrap();
 
-        if let Some(proxy) = proxy_map.get(&id) {
+        if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
             if let Some(update) = proxy.lock().unwrap().confirm_connect(pkt) {
                 self.process_proxy_update(id, update);
             }
-        } else if let Some(ref mut ipc_map) = &mut self.unix_ipc_port_map {
-            if let Some((path, listen)) = ipc_map.get(&pkt.dst_port()) {
-                let mem = self.mem.as_ref().unwrap();
-                let queue = self.queue.as_ref().unwrap();
-                if *listen {
-                    warn!("Attempting to connect a socket that is listening, sending rst");
-                    let rx = MuxerRx::Reset {
+            return;
+        }
+
+        let Some(mem) = self.mem.as_ref() else {
+            warn!("vsock connection request without guest memory");
+            return;
+        };
+        let Some(queue) = self.queue.as_ref() else {
+            warn!("vsock connection request without receive queue");
+            return;
+        };
+
+        if let Some(service) = self
+            .custom_port_map
+            .as_ref()
+            .and_then(|routes| routes.get(&pkt.dst_port()))
+            .cloned()
+        {
+            let request = VsockConnectRequest {
+                guest_cid: pkt.src_cid(),
+                guest_port: pkt.src_port(),
+                host_port: pkt.dst_port(),
+            };
+            match service.connect(request) {
+                Ok(backend) => {
+                    let proxy = UnixProxy::new_custom(
+                        id,
+                        self.cid,
+                        pkt.dst_port(),
+                        pkt.src_port(),
+                        backend,
+                        mem.clone(),
+                        queue.clone(),
+                        self.rxq.clone(),
+                    );
+                    let poll_fd = proxy.as_raw_fd();
+                    if poll_fd < 0 {
+                        warn!(
+                            "custom vsock service for port {} returned an invalid poll fd",
+                            pkt.dst_port()
+                        );
+                        push_packet(
+                            self.cid,
+                            MuxerRx::Reset {
+                                local_port: pkt.dst_port(),
+                                peer_port: pkt.src_port(),
+                            },
+                            &self.rxq,
+                            queue,
+                            mem,
+                        );
+                        return;
+                    }
+                    self.proxy_map
+                        .write()
+                        .unwrap()
+                        .insert(id, Mutex::new(Box::new(proxy)));
+                    if let Err(err) = self.epoll.ctl(
+                        ControlOperation::Add,
+                        poll_fd,
+                        &EpollEvent::new(EventSet::IN, id),
+                    ) {
+                        self.proxy_map.write().unwrap().remove(&id);
+                        warn!(
+                            "custom vsock service for port {} returned an unusable poll fd: {err}",
+                            pkt.dst_port()
+                        );
+                        push_packet(
+                            self.cid,
+                            MuxerRx::Reset {
+                                local_port: pkt.dst_port(),
+                                peer_port: pkt.src_port(),
+                            },
+                            &self.rxq,
+                            queue,
+                            mem,
+                        );
+                        return;
+                    }
+                    if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
+                        proxy.lock().unwrap().confirm_connect(pkt);
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "custom vsock service rejected port {}: {err}",
+                        pkt.dst_port()
+                    );
+                    push_packet(
+                        self.cid,
+                        MuxerRx::Reset {
+                            local_port: pkt.dst_port(),
+                            peer_port: pkt.src_port(),
+                        },
+                        &self.rxq,
+                        queue,
+                        mem,
+                    );
+                }
+            }
+            return;
+        }
+
+        if let Some((path, listen)) = self
+            .unix_ipc_port_map
+            .as_ref()
+            .and_then(|routes| routes.get(&pkt.dst_port()))
+        {
+            if *listen {
+                warn!("attempting to connect a vsock port configured for Unix listen mode");
+                push_packet(
+                    self.cid,
+                    MuxerRx::Reset {
                         local_port: pkt.dst_port(),
                         peer_port: pkt.src_port(),
-                    };
-                    push_packet(self.cid, rx, &self.rxq, queue, mem);
+                    },
+                    &self.rxq,
+                    queue,
+                    mem,
+                );
+                return;
+            }
+
+            let mut unix = match UnixProxy::new(
+                id,
+                self.cid,
+                pkt.dst_port(),
+                pkt.src_port(),
+                mem.clone(),
+                queue.clone(),
+                self.rxq.clone(),
+                path.to_path_buf(),
+            ) {
+                Ok(proxy) => proxy,
+                Err(err) => {
+                    warn!(
+                        "failed to create Unix proxy for host port {}: {err}",
+                        pkt.dst_port()
+                    );
+                    push_packet(
+                        self.cid,
+                        MuxerRx::Reset {
+                            local_port: pkt.dst_port(),
+                            peer_port: pkt.src_port(),
+                        },
+                        &self.rxq,
+                        queue,
+                        mem,
+                    );
                     return;
                 }
-                let rxq = self.rxq.clone();
-
-                let mut unix = UnixProxy::new(
-                    id,
-                    self.cid,
-                    pkt.dst_port(),
-                    pkt.src_port(),
-                    mem.clone(),
-                    queue.clone(),
-                    rxq,
-                    path.to_path_buf(),
-                )
-                .unwrap();
-                let tsi = TsiConnectReq {
-                    peer_port: 0,
-                    addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
-                };
-                let update = unix.connect(pkt, tsi);
-                unix.confirm_connect(pkt);
-                proxy_map.insert(id, Mutex::new(Box::new(unix)));
-                self.process_proxy_update(id, update);
+            };
+            let update = match unix.connect_vsock() {
+                Ok(update) => update,
+                Err(errno) => {
+                    warn!(
+                        "failed to connect Unix route for host port {}: errno {}",
+                        pkt.dst_port(),
+                        errno
+                    );
+                    push_packet(
+                        self.cid,
+                        MuxerRx::Reset {
+                            local_port: pkt.dst_port(),
+                            peer_port: pkt.src_port(),
+                        },
+                        &self.rxq,
+                        queue,
+                        mem,
+                    );
+                    return;
+                }
+            };
+            if unix.status == super::proxy::ProxyStatus::Connected {
+                unix.confirm_vsock_connect(pkt);
+            } else {
+                unix.prepare_vsock_connect(pkt);
             }
+            self.proxy_map
+                .write()
+                .unwrap()
+                .insert(id, Mutex::new(Box::new(unix)));
+            self.process_proxy_update(id, update);
         }
     }
 

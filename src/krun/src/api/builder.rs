@@ -1,5 +1,7 @@
 //! VM Builder for creating and configuring microVMs using nested builders.
 
+#[cfg(not(target_os = "windows"))]
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
 
@@ -23,6 +25,8 @@ use super::builders::FsConfig;
 use super::builders::{ConsoleBuilder, ExecBuilder, KernelBuilder, MachineBuilder};
 #[cfg(feature = "net")]
 use super::builders::{NetBuilder, NetConfig};
+#[cfg(not(target_os = "windows"))]
+use super::builders::{VsockBuilder, VsockRoute};
 
 use super::error::{BuildError, ConfigError, Error, Result};
 use super::vm::Vm;
@@ -63,6 +67,8 @@ use vmm::vmm_config::net::NetworkInterfaceConfig;
 /// ```
 pub struct VmBuilder {
     machine: MachineBuilder,
+    #[cfg(not(target_os = "windows"))]
+    vsock: VsockBuilder,
     kernel: KernelBuilder,
     #[cfg_attr(feature = "tee", allow(dead_code))]
     #[cfg(not(feature = "tee"))]
@@ -91,6 +97,8 @@ impl VmBuilder {
     pub fn new() -> Self {
         Self {
             machine: MachineBuilder::new(),
+            #[cfg(not(target_os = "windows"))]
+            vsock: VsockBuilder::new(),
             kernel: KernelBuilder::new(),
             #[cfg(not(feature = "tee"))]
             fs: FsBuilder::new(),
@@ -120,6 +128,16 @@ impl VmBuilder {
     /// ```
     pub fn machine(mut self, f: impl FnOnce(MachineBuilder) -> MachineBuilder) -> Self {
         self.machine = f(self.machine);
+        self
+    }
+
+    /// Configure host services exposed through virtio-vsock.
+    ///
+    /// Routes imply device attachment; [`MachineBuilder::vsock`] remains an
+    /// independent force-attach request for guests that manage vsock directly.
+    #[cfg(not(target_os = "windows"))]
+    pub fn vsock(mut self, f: impl FnOnce(VsockBuilder) -> VsockBuilder) -> Self {
+        self.vsock = f(self.vsock);
         self
     }
 
@@ -344,6 +362,95 @@ impl VmBuilder {
             return Err(Error::Config(ConfigError::InvalidMemorySize(0)));
         }
 
+        #[cfg(target_os = "windows")]
+        if self.machine.vsock || self.machine.enable_inet_hijack {
+            return Err(Error::Config(ConfigError::Vsock(
+                "virtio-vsock is not supported on Windows".to_string(),
+            )));
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        let (vsock_unix_ipc_port_map, vsock_custom_port_map, vsock_host_port_map, has_vsock_routes) = {
+            let mut occupied_ports = HashSet::new();
+            let mut unix_routes = HashMap::new();
+            let mut custom_routes = HashMap::new();
+
+            for route in self.vsock.routes {
+                let (port, path) = match &route {
+                    VsockRoute::UnixConnect { port, path }
+                    | VsockRoute::UnixListen { port, path } => (*port, Some(path)),
+                    VsockRoute::Custom { port, .. } => (*port, None),
+                };
+
+                if port == 0 {
+                    return Err(Error::Config(ConfigError::Vsock(
+                        "route port must be non-zero".to_string(),
+                    )));
+                }
+                if !occupied_ports.insert(port) {
+                    return Err(Error::Config(ConfigError::Vsock(format!(
+                        "duplicate route for host port {port}"
+                    ))));
+                }
+                if path.is_some_and(|path| path.as_os_str().is_empty()) {
+                    return Err(Error::Config(ConfigError::Vsock(format!(
+                        "Unix socket path for host port {port} is empty"
+                    ))));
+                }
+
+                match route {
+                    VsockRoute::UnixConnect { port, path } => {
+                        unix_routes.insert(port, (path, false));
+                    }
+                    VsockRoute::UnixListen { port, path } => {
+                        unix_routes.insert(port, (path, true));
+                    }
+                    VsockRoute::Custom { port, backend } => {
+                        custom_routes.insert(port, backend);
+                    }
+                }
+            }
+
+            let enable_inet_hijack =
+                self.machine.enable_inet_hijack || self.vsock.enable_inet_hijack;
+            if !self.vsock.tcp_listen_remaps.is_empty() && !enable_inet_hijack {
+                return Err(Error::Config(ConfigError::Vsock(
+                    "TCP listen remaps require TSI INET hijack".to_string(),
+                )));
+            }
+
+            #[cfg(feature = "net")]
+            if !self.vsock.tcp_listen_remaps.is_empty() && !self.net.configs.is_empty() {
+                return Err(Error::Config(ConfigError::Vsock(
+                    "TCP listen remaps cannot be used with a virtio-net device because TSI INET hijack is inactive".to_string(),
+                )));
+            }
+
+            let mut host_map = HashMap::new();
+            for (guest_port, host_port) in self.vsock.tcp_listen_remaps {
+                if guest_port == 0 || host_port == 0 {
+                    return Err(Error::Config(ConfigError::Vsock(
+                        "TCP listen remap ports must be non-zero".to_string(),
+                    )));
+                }
+                if host_map.insert(guest_port, host_port).is_some() {
+                    return Err(Error::Config(ConfigError::Vsock(format!(
+                        "duplicate TCP listen remap for guest port {guest_port}"
+                    ))));
+                }
+            }
+
+            let has_routes = !unix_routes.is_empty() || !custom_routes.is_empty();
+            (
+                (!unix_routes.is_empty()).then_some(unix_routes),
+                (!custom_routes.is_empty()).then_some(custom_routes),
+                (!host_map.is_empty()).then_some(host_map),
+                has_routes,
+            )
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let enable_inet_hijack = self.machine.enable_inet_hijack || self.vsock.enable_inet_hijack;
         if let Some(affinity) = &self.machine.vcpu_affinity {
             let expected = self.machine.max_vcpus.unwrap_or(self.machine.vcpus) as usize;
             if affinity.len() != expected {
@@ -419,7 +526,14 @@ impl VmBuilder {
         }
         vmr.nested_enabled = self.machine.nested_virt;
         vmr.split_irqchip = self.machine.split_irqchip;
-        vmr.request_vsock = self.machine.vsock;
+        #[cfg(not(target_os = "windows"))]
+        {
+            vmr.request_vsock = self.machine.vsock || has_vsock_routes;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            vmr.request_vsock = self.machine.vsock;
+        }
         vmr.enable_balloon = self.machine.balloon;
         vmr.balloon_stats_interval = self.machine.balloon_stats_interval;
         vmr.enable_rng = self.machine.rng;
@@ -629,9 +743,14 @@ impl VmBuilder {
             self.exit_observers,
             exit_evt,
             exit_code,
-            self.machine.enable_inet_hijack,
-            self.machine.vsock_unix_ipc_port_map,
-            self.machine.vsock_host_port_map,
+            #[cfg(not(target_os = "windows"))]
+            enable_inet_hijack,
+            #[cfg(not(target_os = "windows"))]
+            vsock_unix_ipc_port_map,
+            #[cfg(not(target_os = "windows"))]
+            vsock_custom_port_map,
+            #[cfg(not(target_os = "windows"))]
+            vsock_host_port_map,
         ))
     }
 }
@@ -776,6 +895,42 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn build_rejects_duplicate_vsock_routes() {
+        let err = match VmBuilder::new()
+            .vsock(|vsock| {
+                vsock
+                    .unix_connect(5000, "/tmp/a.sock")
+                    .unix_listen(5000, "/tmp/b.sock")
+            })
+            .build()
+        {
+            Ok(_) => panic!("duplicate routes must fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, Error::Config(ConfigError::Vsock(message)) if message.contains("duplicate route"))
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn build_rejects_tcp_remap_without_inet_hijack() {
+        let err = match VmBuilder::new()
+            .vsock(|vsock| vsock.tcp_listen_remap(8080, 18080))
+            .build()
+        {
+            Ok(_) => panic!("inactive TSI remap must fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, Error::Config(ConfigError::Vsock(message)) if message.contains("require TSI INET"))
+        );
+    }
+
     #[test]
     fn validate_cmdline_env_rejects_uncarryable_values() {
         // Ordinary env, including spaces in the value (quoted on the cmdline), is fine.
@@ -847,7 +1002,7 @@ mod tests {
         match err {
             Error::Config(ConfigError::InvalidHostCpuGroup(1)) => {}
             other => panic!("unexpected error: {other:?}"),
-    }
+        }
     }
 
     #[cfg(feature = "blk")]
