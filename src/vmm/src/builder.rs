@@ -914,6 +914,22 @@ const X86_IOAPIC_REDTBL_RW_BITS: u64 = !X86_IOAPIC_REDTBL_RO_BITS;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 const X86_IOAPIC_VECTOR_MASK: u64 = 0xff;
 
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+fn x86_mmio_irq_max(_split_irqchip: bool) -> u32 {
+    // WHP always uses the userspace IOAPIC, so the KVM-specific split setting must not constrain
+    // the Windows allocator.
+    X86_IOAPIC_NUM_PINS as u32 - 1
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+fn x86_mmio_irq_max(split_irqchip: bool) -> u32 {
+    if split_irqchip {
+        arch::IRQ_MAX_SPLIT
+    } else {
+        arch::IRQ_MAX
+    }
+}
+
 #[cfg(target_os = "windows")]
 impl devices::BusDevice for WhpIrqChip {
     fn read(&mut self, _vcpuid: u64, offset: u64, data: &mut [u8]) {
@@ -981,6 +997,11 @@ impl IrqChipT for WhpIrqChip {
 
         #[cfg(target_arch = "aarch64")]
         0
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn num_pins(&self) -> usize {
+        X86_IOAPIC_NUM_PINS
     }
 
     fn set_irq(
@@ -1439,14 +1460,8 @@ pub fn build_microvm(
     // is emulated in userspace with X86_IOAPIC_NUM_PINS redirection entries; the usable ceiling is
     // pin NUM_PINS-1, not the legacy in-kernel IRQ_MAX. This lifts the virtio MMIO IRQ count from 11
     // (IRQ_BASE..=IRQ_MAX) to NUM_PINS-IRQ_BASE, enough for a guest with several virtiofs mounts.
-    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-    let irq_max = X86_IOAPIC_NUM_PINS as u32 - 1;
-    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
-    let irq_max = if vm_resources.split_irqchip {
-        arch::IRQ_MAX_SPLIT
-    } else {
-        arch::IRQ_MAX
-    };
+    #[cfg(target_arch = "x86_64")]
+    let irq_max = x86_mmio_irq_max(vm_resources.split_irqchip);
     #[cfg(not(target_arch = "x86_64"))]
     let irq_max = arch::IRQ_MAX;
     #[allow(unused_mut)]
@@ -4092,6 +4107,41 @@ pub mod tests {
     use super::*;
     #[cfg(not(target_os = "windows"))]
     use crate::vmm_config::kernel_bundle::KernelBundle;
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+    fn linux_irqchip_selection_remains_explicit() {
+        assert_eq!(x86_mmio_irq_max(false), arch::IRQ_MAX);
+        assert_eq!(x86_mmio_irq_max(true), arch::IRQ_MAX_SPLIT);
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    fn windows_uses_the_whp_ioapic_capacity() {
+        assert_eq!(x86_mmio_irq_max(false), 63);
+        assert_eq!(x86_mmio_irq_max(true), 63);
+        assert_eq!(X86_IOAPIC_NUM_PINS - arch::IRQ_BASE as usize, 59);
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    fn windows_ioapic_programs_its_last_pin() {
+        let mut ioapic = WhpIoApicState::new();
+
+        ioapic.ioregsel = X86_IOAPIC_VER;
+        assert_eq!(
+            ioapic.read_selected_register() >> X86_IOAPIC_VER_ENTRIES_SHIFT,
+            63
+        );
+
+        ioapic.ioregsel = 0x8e;
+        ioapic.write_selected_register(0x45);
+        ioapic.ioregsel = 0x8f;
+        ioapic.write_selected_register(0);
+        let route = ioapic.route_for_irq(63).unwrap();
+        assert_eq!(route.vector, 0x45);
+        assert!(ioapic.route_for_irq(64).is_none());
+    }
 
     #[test]
     #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]

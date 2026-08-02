@@ -80,7 +80,7 @@ pub struct IoApicEntryInfo {
     trig_mode: u8,
     _dest_idx: u16,
     _dest_mode: u8,
-    _delivery_mode: u8,
+    delivery_mode: u8,
     _vector: u8,
 
     addr: u32,
@@ -100,7 +100,6 @@ pub struct IoApic {
     irr: [u64; IRR_WORDS],
     ioredtbl: [u64; IOAPIC_NUM_PINS],
     version: u8,
-    irq_eoi: [i32; IOAPIC_NUM_PINS],
     irq_routes: Vec<kvm_irq_routing_entry>,
     irq_sender: crossbeam_channel::Sender<WorkerMessage>,
 }
@@ -128,7 +127,6 @@ impl IoApic {
             irr: [0; IRR_WORDS],
             ioredtbl: [1 << IOAPIC_LVT_MASKED_SHIFT; IOAPIC_NUM_PINS],
             version: 0x20,
-            irq_eoi: [0; IOAPIC_NUM_PINS],
             irq_routes: Vec::with_capacity(IOAPIC_NUM_PINS),
             irq_sender: _irq_sender,
         };
@@ -181,16 +179,12 @@ impl IoApic {
         let trig_mode = ((entry >> IOAPIC_LVT_TRIGGER_MODE_SHIFT) & 1) as u8;
         let dest_mode = ((entry >> IOAPIC_LVT_DEST_MODE_SHIFT) & 1) as u8;
 
-        if delivery_mode as u64 == IOAPIC_DM_EXTINT {
-            panic!("ioapic: libkrun does not have PIC support");
-        }
-
         IoApicEntryInfo {
             masked: ((entry >> IOAPIC_LVT_MASKED_SHIFT) & 1) as u8,
             trig_mode,
             _dest_idx: dest_idx,
             _dest_mode: dest_mode,
-            _delivery_mode: delivery_mode,
+            delivery_mode,
             _vector: vector,
 
             addr: ((APIC_DEFAULT_ADDRESS as u64)
@@ -230,7 +224,7 @@ impl IoApic {
         for i in 0..IOAPIC_NUM_PINS {
             let info = self.parse_entry(&self.ioredtbl[i]);
 
-            if info.masked == 0 {
+            if info.masked == 0 && info.delivery_mode as u64 != IOAPIC_DM_EXTINT {
                 let msg = MsiMessage {
                     address: info.addr as u64,
                     data: info.data as u64,
@@ -241,14 +235,21 @@ impl IoApic {
         }
 
         let (response_sender, response_receiver) = unbounded();
-        self.irq_sender
+        if self
+            .irq_sender
             .send(WorkerMessage::GsiRoute(
-                response_sender.clone(),
+                response_sender,
                 self.irq_routes.clone(),
             ))
-            .unwrap();
-        if !response_receiver.recv().unwrap() {
-            error!("unable to set GSI Routes for IO APIC");
+            .is_err()
+        {
+            error!("unable to send GSI routes to the IRQ worker");
+            return;
+        }
+        match response_receiver.recv() {
+            Ok(true) => {}
+            Ok(false) => error!("unable to set GSI routes for IO APIC"),
+            Err(_) => error!("IRQ worker stopped while setting GSI routes"),
         }
     }
 
@@ -264,6 +265,47 @@ impl IoApic {
         self.irr[word] &= !(1u64 << bit);
     }
 
+    fn selected_redirection_entry(&self) -> Option<(usize, bool)> {
+        let register = usize::from(self.ioregsel).checked_sub(IOAPIC_REG_REDTBL_BASE as usize)?;
+        let index = register >> 1;
+        (index < IOAPIC_NUM_PINS).then_some((index, register & 1 != 0))
+    }
+
+    fn end_of_interrupt(&mut self, vector: u8) {
+        let mut cleared_remote_irr = false;
+        for entry in &mut self.ioredtbl {
+            if (*entry & IOAPIC_VECTOR_MASK) as u8 == vector && *entry & IOAPIC_LVT_REMOTE_IRR != 0
+            {
+                *entry &= !IOAPIC_LVT_REMOTE_IRR;
+                cleared_remote_irr = true;
+            }
+        }
+
+        // A level-triggered line may still be asserted after EOI. Service it again only when an
+        // entry actually transitioned, which avoids unnecessary worker traffic for stray EOIs.
+        if cleared_remote_irr {
+            self.service();
+        }
+    }
+
+    fn send_irq_line(&self, virq: usize, active: bool) {
+        let (response_sender, response_receiver) = unbounded();
+        if self
+            .irq_sender
+            .send(WorkerMessage::IrqLine(response_sender, virq as u32, active))
+            .is_err()
+        {
+            error!("IRQ worker stopped before IRQ {virq} could be set to {active}");
+            return;
+        }
+
+        match response_receiver.recv() {
+            Ok(true) => {}
+            Ok(false) => error!("unable to set IRQ {virq} to {active}"),
+            Err(_) => error!("IRQ worker stopped while setting IRQ {virq} to {active}"),
+        }
+    }
+
     fn service(&mut self) {
         for i in 0..IOAPIC_NUM_PINS {
             if self.irr_is_set(i) {
@@ -271,7 +313,7 @@ impl IoApic {
 
                 let entry = self.ioredtbl[i];
                 let info = self.parse_entry(&entry);
-                if info.masked == 0 {
+                if info.masked == 0 && info.delivery_mode as u64 != IOAPIC_DM_EXTINT {
                     if info.trig_mode as u64 == IOAPIC_TRIGGER_EDGE {
                         self.irr_clear(i);
                     } else {
@@ -283,49 +325,11 @@ impl IoApic {
                         continue;
                     }
 
-                    let (response_sender, response_receiver) = unbounded();
                     if info.trig_mode as u64 == IOAPIC_TRIGGER_EDGE {
-                        self.irq_sender
-                            .send(WorkerMessage::IrqLine(
-                                response_sender.clone(),
-                                i as u32,
-                                true,
-                            ))
-                            .unwrap();
-                        if !response_receiver.recv().unwrap() {
-                            error!(
-                                "unable to set IRQ LINE for IRQ {} with active set to {}",
-                                i, true
-                            );
-                        }
-
-                        self.irq_sender
-                            .send(WorkerMessage::IrqLine(
-                                response_sender.clone(),
-                                i as u32,
-                                false,
-                            ))
-                            .unwrap();
-                        if !response_receiver.recv().unwrap() {
-                            error!(
-                                "unable to set IRQ LINE for IRQ {} with active set to {}",
-                                i, false
-                            );
-                        }
+                        self.send_irq_line(i, true);
+                        self.send_irq_line(i, false);
                     } else {
-                        self.irq_sender
-                            .send(WorkerMessage::IrqLine(
-                                response_sender.clone(),
-                                i as u32,
-                                true,
-                            ))
-                            .unwrap();
-                        if !response_receiver.recv().unwrap() {
-                            error!(
-                                "unable to set IRQ LINE for IRQ {} with active set to {}",
-                                i, true
-                            );
-                        }
+                        self.send_irq_line(i, true);
                     }
                 }
             }
@@ -340,6 +344,10 @@ impl IrqChipT for IoApic {
 
     fn get_mmio_size(&self) -> u64 {
         0x1000
+    }
+
+    fn num_pins(&self) -> usize {
+        IOAPIC_NUM_PINS
     }
 
     fn set_irq(
@@ -388,34 +396,26 @@ impl BusDevice for IoApic {
                             | ((IOAPIC_NUM_PINS as u32 - 1) << IOAPIC_VER_ENTRIES_SHIFT)
                     }
                     _ => {
-                        let Some(reg_index) =
-                            (self.ioregsel as u64).checked_sub(IOAPIC_REG_REDTBL_BASE)
-                        else {
+                        let Some((index, high)) = self.selected_redirection_entry() else {
                             debug!("ioapic: read: invalid ioregsel {}", self.ioregsel);
                             data.fill(0);
                             return;
                         };
-                        let index = reg_index >> 1;
                         debug!("ioapic: read: ioredtbl register {index}");
-                        let mut val = 0u32;
 
-                        // we can only read from this register in 32-bit chunks.
-                        // Therefore, we need to check if we are reading the
-                        // upper 32 bits or the lower
-                        if index < IOAPIC_NUM_PINS as u64 {
-                            if self.ioregsel & 1 > 0 {
-                                // read upper 32 bits
-                                val = (self.ioredtbl[index as usize] >> 32) as u32;
-                            } else {
-                                // read lower 32 bits
-                                val = (self.ioredtbl[index as usize] & 0xffff_ffffu64) as u32;
-                            }
+                        if high {
+                            (self.ioredtbl[index] >> 32) as u32
+                        } else {
+                            (self.ioredtbl[index] & 0xffff_ffffu64) as u32
                         }
-                        val
                     }
                 }
             }
-            _ => unreachable!(),
+            _ => {
+                debug!("ioapic: read: unsupported offset {offset:#x}");
+                data.fill(0);
+                return;
+            }
         };
 
         // turn the value into native endian byte order and put that value into `data`
@@ -451,45 +451,44 @@ impl BusDevice for IoApic {
                     // NOTE: these are read-only registers, so they should never be written to
                     IO_APIC_VER | IO_APIC_ARB => debug!("ioapic: write: IOAPIC VERSION"),
                     _ => {
-                        let Some(reg_index) =
-                            (self.ioregsel as u64).checked_sub(IOAPIC_REG_REDTBL_BASE)
-                        else {
+                        let Some((index, high)) = self.selected_redirection_entry() else {
                             debug!("ioapic: write: invalid ioregsel {}", self.ioregsel);
                             return;
                         };
-
-                        let index = reg_index >> 1;
                         debug!("ioapic: write: ioredtbl register {index}");
-                        if index >= IOAPIC_NUM_PINS as u64 {
-                            warn!("ioapic: write: virq out of pin range {index}");
-                            return;
-                        }
-
-                        let ro_bits = self.ioredtbl[index as usize] & IOAPIC_RO_BITS;
+                        let ro_bits = self.ioredtbl[index] & IOAPIC_RO_BITS;
                         // check if we are writing to the upper 32-bits of the
                         // register or the lower 32-bits
-                        if self.ioregsel & 1 > 0 {
-                            self.ioredtbl[index as usize] &= 0xffff_ffff;
-                            self.ioredtbl[index as usize] |= (val as u64) << 32;
+                        if high {
+                            self.ioredtbl[index] &= 0xffff_ffff;
+                            self.ioredtbl[index] |= (val as u64) << 32;
                         } else {
-                            self.ioredtbl[index as usize] &= !0xffff_ffff;
-                            self.ioredtbl[index as usize] |= val as u64;
+                            self.ioredtbl[index] &= !0xffff_ffff;
+                            self.ioredtbl[index] |= val as u64;
                         }
 
                         // restore RO bits
-                        self.ioredtbl[index as usize] &= IOAPIC_RW_BITS;
-                        self.ioredtbl[index as usize] |= ro_bits;
-                        self.irq_eoi[index as usize] = 0;
+                        self.ioredtbl[index] &= IOAPIC_RW_BITS;
+                        self.ioredtbl[index] |= ro_bits;
+
+                        // ExtINT requires a legacy PIC, which libkrun does not emulate. Keep the
+                        // entry masked instead of allowing guest-controlled state to panic the VMM.
+                        let delivery_mode =
+                            (self.ioredtbl[index] >> IOAPIC_LVT_DELIV_MODE_SHIFT) & IOAPIC_DM_MASK;
+                        if delivery_mode == IOAPIC_DM_EXTINT {
+                            warn!("ioapic: masking unsupported ExtINT route for pin {index}");
+                            self.ioredtbl[index] |= 1 << IOAPIC_LVT_MASKED_SHIFT;
+                        }
 
                         // if the trigger mode is EDGE, clear IRR bit
-                        self.fix_edge_remote_irr(index as usize);
+                        self.fix_edge_remote_irr(index);
                         self.update_routes();
                         self.service();
                     }
                 }
             }
-            IO_EOI => todo!(),
-            _ => unreachable!(),
+            IO_EOI => self.end_of_interrupt((val as u64 & IOAPIC_VECTOR_MASK) as u8),
+            _ => debug!("ioapic: write: ignoring unsupported offset {offset:#x}"),
         }
     }
 }
@@ -506,7 +505,6 @@ mod tests {
             irr: [0; IRR_WORDS],
             ioredtbl: [1 << IOAPIC_LVT_MASKED_SHIFT; IOAPIC_NUM_PINS],
             version: 0x20,
-            irq_eoi: [0; IOAPIC_NUM_PINS],
             irq_routes: Vec::new(),
             irq_sender,
         }
@@ -525,5 +523,53 @@ mod tests {
             ioapic.irr_clear(pin);
             assert!(!ioapic.irr_is_set(pin));
         }
+    }
+
+    #[test]
+    fn last_pin_is_addressable_through_ioregsel() {
+        let mut ioapic = test_ioapic();
+
+        ioapic.ioregsel = 0xfe;
+        assert_eq!(ioapic.selected_redirection_entry(), Some((119, false)));
+        ioapic.ioregsel = 0xff;
+        assert_eq!(ioapic.selected_redirection_entry(), Some((119, true)));
+        assert_eq!(IOAPIC_NUM_PINS, 120);
+    }
+
+    #[test]
+    fn unsupported_mmio_accesses_and_eoi_do_not_panic() {
+        let mut ioapic = test_ioapic();
+        let mut data = [0xff; 4];
+
+        ioapic.read(0, 0x20, &mut data);
+        assert_eq!(data, [0; 4]);
+        ioapic.write(0, 0x20, &[0; 4]);
+        ioapic.write(0, IO_EOI, &[0; 4]);
+    }
+
+    #[test]
+    fn eoi_clears_remote_irr_for_the_matching_vector() {
+        let mut ioapic = test_ioapic();
+        ioapic.ioredtbl[0] = 0x31 | IOAPIC_LVT_REMOTE_IRR;
+        ioapic.ioredtbl[1] = 0x32 | IOAPIC_LVT_REMOTE_IRR;
+
+        ioapic.write(0, IO_EOI, &0x31u32.to_ne_bytes());
+
+        assert_eq!(ioapic.ioredtbl[0] & IOAPIC_LVT_REMOTE_IRR, 0);
+        assert_ne!(ioapic.ioredtbl[1] & IOAPIC_LVT_REMOTE_IRR, 0);
+    }
+
+    #[test]
+    fn extint_routes_are_safely_masked() {
+        let mut ioapic = test_ioapic();
+        ioapic.ioregsel = IOAPIC_REG_REDTBL_BASE as u8;
+
+        ioapic.write(
+            0,
+            IO_WIN,
+            &((IOAPIC_DM_EXTINT as u32) << IOAPIC_LVT_DELIV_MODE_SHIFT).to_ne_bytes(),
+        );
+
+        assert_ne!(ioapic.ioredtbl[0] & (1 << IOAPIC_LVT_MASKED_SHIFT), 0);
     }
 }
