@@ -454,7 +454,8 @@ pub trait DynFileSystem: Send + Sync {
             Sender<WorkerMessage>,
         >,
     ) -> io::Result<()> {
-        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+        // Dynamic backends return guest-facing errors, so keep this in the Linux namespace.
+        Err(io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
 
     /// Remove a DAX mapping.
@@ -468,7 +469,8 @@ pub trait DynFileSystem: Send + Sync {
             Sender<WorkerMessage>,
         >,
     ) -> io::Result<()> {
-        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+        // `reply_error` serializes this value directly into the Linux FUSE ABI.
+        Err(io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
 
     /// Perform an ioctl on a file.
@@ -958,5 +960,62 @@ impl FileSystem for DynFileSystemAdapter {
 
     fn notify_reply(&self) -> io::Result<()> {
         self.0.notify_reply()
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    struct DefaultFileSystem;
+    struct DefaultDynFileSystem;
+
+    impl FileSystem for DefaultFileSystem {
+        type Inode = u64;
+        type Handle = u64;
+    }
+
+    impl DynFileSystem for DefaultDynFileSystem {}
+
+    fn context() -> Context {
+        Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        }
+    }
+
+    fn assert_linux_enosys(error: io::Error) {
+        assert_eq!(error.raw_os_error(), Some(LINUX_ENOSYS));
+    }
+
+    #[test]
+    fn dax_defaults_return_linux_enosys() {
+        let map_sender: Option<Sender<WorkerMessage>> = None;
+
+        assert_linux_enosys(
+            DefaultFileSystem
+                .setupmapping(context(), 0, 0, 0, 0, 0, 0, 0, 0, &map_sender)
+                .unwrap_err(),
+        );
+        assert_linux_enosys(
+            DefaultFileSystem
+                .removemapping(context(), Vec::new(), 0, 0, &map_sender)
+                .unwrap_err(),
+        );
+        assert_linux_enosys(
+            DefaultDynFileSystem
+                .setupmapping(context(), 0, 0, 0, 0, 0, 0, 0, 0, &map_sender)
+                .unwrap_err(),
+        );
+        assert_linux_enosys(
+            DefaultDynFileSystem
+                .removemapping(context(), Vec::new(), 0, 0, &map_sender)
+                .unwrap_err(),
+        );
     }
 }

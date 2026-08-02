@@ -1159,7 +1159,8 @@ pub trait FileSystem {
             Sender<WorkerMessage>,
         >,
     ) -> io::Result<()> {
-        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+        // Trait defaults are guest-facing FUSE errors, so use the Linux ABI value directly.
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
     }
 
     fn removemapping(
@@ -1172,7 +1173,8 @@ pub trait FileSystem {
             Sender<WorkerMessage>,
         >,
     ) -> io::Result<()> {
-        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+        // Avoid leaking the host errno namespace through the FUSE reply header.
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
     }
 
     #[allow(clippy::too_many_arguments)]

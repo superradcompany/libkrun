@@ -24,6 +24,27 @@ jobs:
       - name: Unit tests
         run: cargo test
 
+  unit-tests-windows-x86_64:
+    name: Unit tests (Windows x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build-env
+
+      - name: Windows errno translation tests
+        run: cargo test --locked --manifest-path src/devices/Cargo.toml virtio::linux_errno::tests
+
+      - name: Windows DAX default error test
+        run: cargo test --locked --manifest-path src/devices/Cargo.toml virtio::fs::dyn_filesystem::tests
+
+      - name: Windows passthrough error test
+        run: cargo test --locked --manifest-path src/devices/Cargo.toml read_translates_zero_copy_win32_errors
+
+      - name: Windows device Clippy
+        run: cargo clippy --locked --manifest-path src/devices/Cargo.toml -- -D warnings
+
   # Disabled: requires self-hosted aarch64 runner (not available on forks)
   # unit-tests-linux-aarch64:
   #   name: Unit tests (Linux aarch64)
@@ -39,4 +60,3 @@ jobs:
   #
   #     - name: Unit tests
   #       run: cargo test
-
