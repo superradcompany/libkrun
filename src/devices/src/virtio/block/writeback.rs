@@ -1,7 +1,6 @@
 // Copyright 2026 The Microsandbox Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::env;
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -9,12 +8,7 @@ use std::sync::Arc;
 
 use log::warn;
 
-// Starting one advisory writeback before a guest durability barrier can bound host dirty memory,
-// but the measured 12 GiB policy reduced sequential-write throughput. Keep this mechanism opt-in
-// through an internal environment override until the host runtime selects a workload-aware policy;
-// zero, an invalid value and an unset variable all preserve the existing writeback behavior.
-const MINIMUM_RANGE_BYTES: u64 = 64 * 1024 * 1024;
-const TRIGGER_ENV: &str = "KRUN_BLOCK_WRITEBACK_PREFLUSH_BYTES";
+pub(crate) const MINIMUM_RANGE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DirtyRange {
@@ -107,14 +101,11 @@ pub(crate) struct BufferedWritebackConfig {
 }
 
 impl BufferedWritebackConfig {
-    pub(crate) fn from_environment(file: Arc<File>) -> Option<Self> {
-        let value = env::var(TRIGGER_ENV).ok();
-        let trigger_bytes = parse_trigger_bytes(value.as_deref())?;
-
-        Some(Self {
+    pub(crate) fn new(file: Arc<File>, trigger_bytes: u64) -> Self {
+        Self {
             file,
             trigger_bytes,
-        })
+        }
     }
 
     pub(crate) fn controller(&self) -> BufferedWritebackController {
@@ -186,14 +177,6 @@ impl BufferedWritebackController {
 }
 
 //--------------------------------------------------------------------------------------------------
-// Functions
-//--------------------------------------------------------------------------------------------------
-
-fn parse_trigger_bytes(value: Option<&str>) -> Option<u64> {
-    value?.parse().ok().filter(|bytes| *bytes > 0)
-}
-
-//--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
 
@@ -261,15 +244,6 @@ mod tests {
         let mut window = WritebackWindow::new(1);
         assert_eq!(window.record_write(1024, 0), None);
         assert_eq!(window.pending_range(), None);
-    }
-
-    #[test]
-    fn preflush_requires_an_explicit_positive_threshold() {
-        assert_eq!(parse_trigger_bytes(None), None);
-        assert_eq!(parse_trigger_bytes(Some("")), None);
-        assert_eq!(parse_trigger_bytes(Some("invalid")), None);
-        assert_eq!(parse_trigger_bytes(Some("0")), None);
-        assert_eq!(parse_trigger_bytes(Some("128")), Some(128));
     }
 
     #[test]

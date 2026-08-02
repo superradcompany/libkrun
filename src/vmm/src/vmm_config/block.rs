@@ -34,6 +34,8 @@ pub struct BlockDeviceConfig {
     pub is_disk_read_only: bool,
     pub direct_io: bool,
     pub sync_mode: SyncMode,
+    /// Optional host dirty-data threshold for advisory writeback before a guest flush.
+    pub writeback_preflush_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,7 +65,7 @@ impl BlockBuilder {
 
     pub fn create_block(config: BlockDeviceConfig, metrics: MetricsWriter) -> Result<Block> {
         let device_metrics = metrics.register_block_device(config.block_id.clone());
-        devices::virtio::Block::new(
+        devices::virtio::Block::new_with_writeback_preflush(
             config.block_id,
             None,
             config.cache_type,
@@ -72,6 +74,7 @@ impl BlockBuilder {
             config.is_disk_read_only,
             config.direct_io,
             config.sync_mode,
+            config.writeback_preflush_bytes,
             device_metrics,
         )
         .map_err(BlockConfigError::CreateBlockDevice)

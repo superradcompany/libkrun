@@ -549,6 +549,7 @@ impl VmBuilder {
                 is_disk_read_only: config.read_only,
                 direct_io: config.direct_io,
                 sync_mode,
+                writeback_preflush_bytes: config.writeback_preflush_bytes,
             };
 
             vmr.add_block_device(blk_config)
@@ -911,6 +912,7 @@ mod tests {
                     .cache(CacheMode::Unsafe)
                     .direct_io(true)
                     .sync(SyncMode::None)
+                    .writeback_preflush_bytes(128 * 1024 * 1024)
             })
             .disk(|d| d.path("/b.raw"));
 
@@ -918,10 +920,15 @@ mod tests {
         assert_eq!(builder.disk.configs[0].cache, CacheMode::Unsafe);
         assert!(builder.disk.configs[0].direct_io);
         assert_eq!(builder.disk.configs[0].sync, SyncMode::None);
+        assert_eq!(
+            builder.disk.configs[0].writeback_preflush_bytes,
+            Some(128 * 1024 * 1024)
+        );
 
         assert!(!builder.disk.configs[1].read_only);
         assert_eq!(builder.disk.configs[1].cache, CacheMode::Writeback);
         assert!(!builder.disk.configs[1].direct_io);
         assert_eq!(builder.disk.configs[1].sync, SyncMode::Full);
+        assert_eq!(builder.disk.configs[1].writeback_preflush_bytes, None);
     }
 }

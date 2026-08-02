@@ -40,7 +40,7 @@ use super::windows::{
 };
 use super::worker::BlockWorker;
 #[cfg(target_os = "linux")]
-use super::writeback::{BufferedWritebackConfig, BufferedWritebackController};
+use super::writeback::{BufferedWritebackConfig, BufferedWritebackController, MINIMUM_RANGE_BYTES};
 use super::{
     super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice, TYPE_BLOCK},
     Error, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
@@ -432,11 +432,81 @@ impl Block {
         sync_mode: SyncMode,
         metrics: BlockMetricsWriter,
     ) -> io::Result<Block> {
+        Self::new_with_writeback_preflush(
+            id,
+            partuuid,
+            cache_type,
+            disk_image_path,
+            disk_image_format,
+            is_disk_read_only,
+            direct_io,
+            sync_mode,
+            None,
+            metrics,
+        )
+    }
+
+    /// Create a virtio block device with an optional buffered-writeback preflush threshold.
+    ///
+    /// Preflush is supported on Linux for writable raw disks using writeback caching, buffered I/O
+    /// and an active sync mode. It starts advisory background writeback but does not replace the
+    /// full sync that completes a guest flush.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_writeback_preflush(
+        id: String,
+        partuuid: Option<String>,
+        cache_type: CacheType,
+        disk_image_path: String,
+        disk_image_format: ImageType,
+        is_disk_read_only: bool,
+        direct_io: bool,
+        sync_mode: SyncMode,
+        writeback_preflush_bytes: Option<u64>,
+        metrics: BlockMetricsWriter,
+    ) -> io::Result<Block> {
         if matches!(disk_image_format, ImageType::Vmdk) && !is_disk_read_only {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "VMDK write support is not available; configure the disk as read-only",
             ));
+        }
+
+        if let Some(trigger_bytes) = writeback_preflush_bytes {
+            if trigger_bytes == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "writeback preflush threshold must be greater than zero",
+                ));
+            }
+
+            #[cfg(target_os = "linux")]
+            if trigger_bytes < MINIMUM_RANGE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "writeback preflush threshold must be at least {MINIMUM_RANGE_BYTES} bytes"
+                    ),
+                ));
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "writeback preflush is only supported on Linux hosts",
+            ));
+
+            #[cfg(target_os = "linux")]
+            if !matches!(disk_image_format, ImageType::Raw)
+                || is_disk_read_only
+                || direct_io
+                || cache_type != CacheType::Writeback
+                || sync_mode == SyncMode::None
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "writeback preflush requires a writable raw disk with writeback caching, buffered I/O and an active sync mode",
+                ));
+            }
         }
 
         let disk_image = OpenOptions::new()
@@ -470,15 +540,12 @@ impl Block {
         };
 
         #[cfg(target_os = "linux")]
-        let writeback_config = if matches!(disk_image_format, ImageType::Raw)
-            && !is_disk_read_only
-            && !direct_io
-            && cache_type == CacheType::Writeback
-            && sync_mode != SyncMode::None
-        {
-            BufferedWritebackConfig::from_environment(Arc::new(disk_image.try_clone()?))
-        } else {
-            None
+        let writeback_config = match writeback_preflush_bytes {
+            Some(trigger_bytes) => Some(BufferedWritebackConfig::new(
+                Arc::new(disk_image.try_clone()?),
+                trigger_bytes,
+            )),
+            None => None,
         };
 
         // Keep Imago on its established open path. When advisory writeback is active, procfs
@@ -764,5 +831,98 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         assert!(error.to_string().contains("VMDK write support"));
+    }
+
+    #[test]
+    fn zero_writeback_preflush_threshold_is_rejected() {
+        let result = Block::new_with_writeback_preflush(
+            "raw".to_string(),
+            None,
+            CacheType::Writeback,
+            "missing.raw".to_string(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            Some(0),
+            MetricsWriter::default().register_block_device("raw".to_string()),
+        );
+
+        let error = match result {
+            Ok(_) => panic!("zero preflush threshold should fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writeback_preflush_rejects_too_small_threshold() {
+        let result = Block::new_with_writeback_preflush(
+            "raw".to_string(),
+            None,
+            CacheType::Writeback,
+            "missing.raw".to_string(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            Some(MINIMUM_RANGE_BYTES - 1),
+            MetricsWriter::default().register_block_device("raw".to_string()),
+        );
+
+        let error = match result {
+            Ok(_) => panic!("too-small preflush threshold should fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("at least"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writeback_preflush_rejects_incompatible_disk_settings() {
+        let result = Block::new_with_writeback_preflush(
+            "raw".to_string(),
+            None,
+            CacheType::Writeback,
+            "missing.raw".to_string(),
+            ImageType::Raw,
+            false,
+            true,
+            SyncMode::Full,
+            Some(128 * 1024 * 1024),
+            MetricsWriter::default().register_block_device("raw".to_string()),
+        );
+
+        let error = match result {
+            Ok(_) => panic!("preflush with direct I/O should fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("buffered I/O"));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn writeback_preflush_is_rejected_on_unsupported_hosts() {
+        let result = Block::new_with_writeback_preflush(
+            "raw".to_string(),
+            None,
+            CacheType::Writeback,
+            "missing.raw".to_string(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            Some(128 * 1024 * 1024),
+            MetricsWriter::default().register_block_device("raw".to_string()),
+        );
+
+        let error = match result {
+            Ok(_) => panic!("preflush should fail on unsupported hosts"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 }

@@ -331,6 +331,7 @@ pub struct DiskBuilder {
     current_cache: CacheMode,
     current_direct_io: bool,
     current_sync: SyncMode,
+    current_writeback_preflush_bytes: Option<u64>,
 }
 
 /// Configuration for a single block device.
@@ -346,6 +347,8 @@ pub struct DiskConfig {
     pub cache: CacheMode,
     pub direct_io: bool,
     pub sync: SyncMode,
+    /// Host dirty-data threshold that starts advisory writeback before a guest flush.
+    pub writeback_preflush_bytes: Option<u64>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -937,6 +940,7 @@ impl DiskBuilder {
             current_cache: CacheMode::Writeback,
             current_direct_io: false,
             current_sync: SyncMode::Full,
+            current_writeback_preflush_bytes: None,
         }
     }
 
@@ -970,12 +974,14 @@ impl DiskBuilder {
                 cache: self.current_cache,
                 direct_io: self.current_direct_io,
                 sync: self.current_sync,
+                writeback_preflush_bytes: self.current_writeback_preflush_bytes,
             });
             self.current_read_only = false;
             self.current_format = DiskImageFormat::Raw;
             self.current_cache = CacheMode::Writeback;
             self.current_direct_io = false;
             self.current_sync = SyncMode::Full;
+            self.current_writeback_preflush_bytes = None;
         }
 
         self.current_path = Some(path.as_ref().to_path_buf());
@@ -1006,6 +1012,16 @@ impl DiskBuilder {
         self
     }
 
+    /// Start advisory host writeback after this many buffered bytes have been written.
+    ///
+    /// This Linux-only optimization is valid for writable raw disks using writeback caching,
+    /// buffered I/O and an active sync mode. The minimum active threshold is 64 MiB; a value of
+    /// zero disables the optimization. Invalid combinations fail explicitly when the VM is built.
+    pub fn writeback_preflush_bytes(mut self, bytes: u64) -> Self {
+        self.current_writeback_preflush_bytes = (bytes > 0).then_some(bytes);
+        self
+    }
+
     /// Finalize the builder (called internally).
     pub(crate) fn finalize(mut self) -> Self {
         if let Some(path) = self.current_path.take() {
@@ -1017,6 +1033,7 @@ impl DiskBuilder {
                 cache: self.current_cache,
                 direct_io: self.current_direct_io,
                 sync: self.current_sync,
+                writeback_preflush_bytes: self.current_writeback_preflush_bytes,
             });
         }
         self
