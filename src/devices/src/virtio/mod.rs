@@ -28,16 +28,13 @@ pub mod fs;
 pub mod gpu;
 #[cfg(feature = "input")]
 pub mod input;
-#[cfg(not(target_os = "windows"))]
+// linux_errno.rs is now compiled on Windows too: its match arms use symbolic
+// libc:: constants, so `libc::ENOSYS => LINUX_ENOSYS` correctly translates the
+// Windows CRT value (40) to the Linux value (38). Arms for errnos absent from
+// the Windows CRT are cfg-gated inside the module. This replaces the old
+// Windows inline stub that passed the host errno through untranslated, which
+// mistranslated ENOSYS(40) into Linux ELOOP(40) and broke guest statx().
 pub mod linux_errno;
-#[cfg(target_os = "windows")]
-pub mod linux_errno {
-    pub const LINUX_ERANGE: i32 = 34;
-
-    pub fn linux_error(error: std::io::Error) -> std::io::Error {
-        std::io::Error::from_raw_os_error(error.raw_os_error().unwrap_or(5))
-    }
-}
 // The CPU capacity module is compiled under every feature: TEE builds never
 // instantiate the device (extra capacity is rejected at config time), but the
 // vCPU run loops still reference its enforcement types unconditionally.

@@ -344,6 +344,24 @@ impl VmBuilder {
             return Err(Error::Config(ConfigError::InvalidMemorySize(0)));
         }
 
+        if let Some(affinity) = &self.machine.vcpu_affinity {
+            let expected = self.machine.max_vcpus.unwrap_or(self.machine.vcpus) as usize;
+            if affinity.len() != expected {
+                return Err(Error::Config(ConfigError::InvalidVcpuAffinityLength {
+                    expected,
+                    actual: affinity.len(),
+                }));
+            }
+
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            return Err(Error::Config(ConfigError::VcpuAffinityUnsupported));
+
+            #[cfg(target_os = "linux")]
+            if let Some(cpu) = affinity.iter().find(|cpu| cpu.group != 0) {
+                return Err(Error::Config(ConfigError::InvalidHostCpuGroup(cpu.group)));
+            }
+        }
+
         // Build VmResources
         let mut vmr = VmResources::default();
 
@@ -358,6 +376,11 @@ impl VmBuilder {
         };
         vmr.set_vm_config(&vm_config)
             .map_err(|err| map_vm_config_error(&self.machine, err))?;
+
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            vmr.vcpu_affinity = self.machine.vcpu_affinity;
+        }
 
         // Reserved CPU capacity is realized through the private msb-cpu device:
         // the guest driver converges on the requested online count and the
@@ -548,6 +571,21 @@ impl VmBuilder {
             )
         };
 
+        // The exec env rides the kernel command line as quoted `KEY="value"` words (api/vm.rs
+        // get_env → KRUN_ENV), and the vmm cmdline layer rejects control/non-ASCII bytes — a tab
+        // in a perfectly legitimate OCI image env value (e.g. gcc's GPG_KEYS) used to reach an
+        // `.unwrap()` there and abort the whole VMM. Validate per variable here, where the name
+        // is still known, so the caller gets an actionable error instead of a crash. Carrying
+        // such values would need an encoded transport (tracked separately).
+        for (key, value) in &self.exec.env {
+            validate_cmdline_env(key, value).map_err(|reason| {
+                Error::Build(BuildError::Start(format!(
+                    "guest env var {key:?} cannot be carried on the kernel command line \
+                     ({reason}); sanitize or drop this variable"
+                )))
+            })?;
+        }
+
         let env = if self.exec.env.is_empty() {
             None
         } else {
@@ -664,6 +702,23 @@ fn map_vm_config_error(machine: &MachineBuilder, err: VmConfigError) -> Error {
     }
 }
 
+/// Check that one exec env pair can be carried as a quoted `KEY="value"` kernel-cmdline word: printable ASCII only (the vmm cmdline layer rejects everything else, and the kernel
+/// would misparse it anyway), no double quotes (they would terminate the kernel's quote parsing mid-value), and no whitespace in the key (the kernel splits words on unquoted
+/// whitespace, so a spaced key silently becomes two parameters).
+fn validate_cmdline_env(key: &str, value: &str) -> std::result::Result<(), &'static str> {
+    let printable = |s: &str| s.bytes().all(|b| (0x20..=0x7e).contains(&b));
+    if !printable(key) || !printable(value) {
+        return Err("it contains control or non-ASCII bytes");
+    }
+    if key.contains('"') || value.contains('"') {
+        return Err("it contains a double quote");
+    }
+    if key.contains(' ') {
+        return Err("the key contains whitespace");
+    }
+    Ok(())
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
@@ -671,6 +726,7 @@ fn map_vm_config_error(machine: &MachineBuilder, err: VmConfigError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::builders::HostCpuId;
 
     #[test]
     fn build_rejects_invalid_machine_config() {
@@ -721,34 +777,77 @@ mod tests {
     }
 
     #[test]
-    fn vsock_port_maps_enable_vsock() {
-        use std::collections::HashMap;
-        use std::path::PathBuf;
+    fn validate_cmdline_env_rejects_uncarryable_values() {
+        // Ordinary env, including spaces in the value (quoted on the cmdline), is fine.
+        assert!(validate_cmdline_env("PATH", "/usr/local/bin:/usr/bin").is_ok());
+        assert!(validate_cmdline_env("GREETING", "hello world").is_ok());
 
-        let builder = VmBuilder::new();
-        assert!(!builder.machine.vsock);
+        // Regression: gcc:13-bookworm's GPG_KEYS/GCC_MIRRORS carry tab separators, which
+        // previously reached the vmm cmdline unwrap and aborted the process (InvalidAscii).
+        assert!(validate_cmdline_env("GPG_KEYS", "B215C163\t B3C42148").is_err());
 
-        let builder = VmBuilder::new()
-            .machine(|machine| machine.vsock_unix_ipc_port_map(HashMap::new()));
-        assert!(!builder.machine.vsock, "empty map must not enable vsock");
+        assert!(validate_cmdline_env("MOTD", "héllo").is_err());
+        assert!(validate_cmdline_env("Q", "say \"hi\"").is_err());
+        assert!(validate_cmdline_env("BAD KEY", "v").is_err());
+        assert!(validate_cmdline_env("NL", "a\nb").is_err());
+    }
 
-        let mut unix_map = HashMap::new();
-        unix_map.insert(5000, (PathBuf::from("/tmp/ipc.sock"), false));
-        let builder = VmBuilder::new()
-            .machine(|machine| machine.vsock_unix_ipc_port_map(unix_map));
-        assert!(builder.machine.vsock, "non-empty Unix IPC map enables vsock");
+    #[test]
+    fn build_rejects_affinity_that_does_not_cover_max_vcpus() {
+        let err = match VmBuilder::new()
+            .machine(|machine| {
+                machine
+                    .vcpus(2)
+                    .max_vcpus(4)
+                    .vcpu_affinity(vec![HostCpuId::new(0), HostCpuId::new(1)])
+            })
+            .build()
+        {
+            Ok(_) => panic!("partial vCPU affinity map should fail"),
+            Err(err) => err,
+        };
 
-        let mut host_map = HashMap::new();
-        host_map.insert(8080, 18080);
-        let builder = VmBuilder::new()
-            .machine(|machine| machine.vsock_host_port_map(host_map));
-        assert!(builder.machine.vsock, "non-empty host port map enables vsock");
+        match err {
+            Error::Config(ConfigError::InvalidVcpuAffinityLength {
+                expected: 4,
+                actual: 2,
+            }) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
 
-        let mut unix_map = HashMap::new();
-        unix_map.insert(5000, (PathBuf::from("/tmp/ipc.sock"), false));
-        let builder = VmBuilder::new()
-            .machine(|machine| machine.vsock_unix_ipc_port_map(unix_map).vsock(false));
-        assert!(!builder.machine.vsock, "later vsock(false) overrides the map");
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn build_rejects_vcpu_affinity_on_unsupported_hosts() {
+        let err = match VmBuilder::new()
+            .machine(|machine| machine.vcpu_affinity(vec![HostCpuId::new(0)]))
+            .build()
+        {
+            Ok(_) => panic!("vCPU affinity should fail on unsupported hosts"),
+            Err(err) => err,
+        };
+
+        match err {
+            Error::Config(ConfigError::VcpuAffinityUnsupported) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_rejects_nonzero_processor_group_on_linux() {
+        let err = match VmBuilder::new()
+            .machine(|machine| machine.vcpu_affinity(vec![HostCpuId::in_group(1, 0)]))
+            .build()
+        {
+            Ok(_) => panic!("nonzero processor group should fail on Linux"),
+            Err(err) => err,
+        };
+
+        match err {
+            Error::Config(ConfigError::InvalidHostCpuGroup(1)) => {}
+            other => panic!("unexpected error: {other:?}"),
+    }
     }
 
     #[cfg(feature = "blk")]

@@ -884,7 +884,7 @@ const X86_IOAPIC_BASE: u64 = 0xfec0_0000;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 const X86_IOAPIC_SIZE: u64 = 0x1000;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-const X86_IOAPIC_NUM_PINS: usize = 24;
+const X86_IOAPIC_NUM_PINS: usize = 64;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 const X86_IOAPIC_REG_SEL: u64 = 0x00;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
@@ -913,6 +913,22 @@ const X86_IOAPIC_REDTBL_RO_BITS: u64 = (1 << 12) | (1 << 14);
 const X86_IOAPIC_REDTBL_RW_BITS: u64 = !X86_IOAPIC_REDTBL_RO_BITS;
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 const X86_IOAPIC_VECTOR_MASK: u64 = 0xff;
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+fn x86_mmio_irq_max(_split_irqchip: bool) -> u32 {
+    // WHP always uses the userspace IOAPIC, so the KVM-specific split setting must not constrain
+    // the Windows allocator.
+    X86_IOAPIC_NUM_PINS as u32 - 1
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+fn x86_mmio_irq_max(split_irqchip: bool) -> u32 {
+    if split_irqchip {
+        arch::IRQ_MAX_SPLIT
+    } else {
+        arch::IRQ_MAX
+    }
+}
 
 #[cfg(target_os = "windows")]
 impl devices::BusDevice for WhpIrqChip {
@@ -981,6 +997,11 @@ impl IrqChipT for WhpIrqChip {
 
         #[cfg(target_arch = "aarch64")]
         0
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn num_pins(&self) -> usize {
+        X86_IOAPIC_NUM_PINS
     }
 
     fn set_irq(
@@ -1143,24 +1164,25 @@ pub fn build_microvm(
     #[allow(unused_mut)]
     let mut kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
     if let Some(cmdline) = payload_config.kernel_cmdline {
-        kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
+        kernel_cmdline.insert_str(cmdline.as_str())?;
     } else if let Some(cmdline) = &vm_resources.kernel_cmdline.prolog {
-        kernel_cmdline.insert_str(cmdline).unwrap();
+        kernel_cmdline.insert_str(cmdline)?;
     } else {
-        kernel_cmdline.insert_str(DEFAULT_KERNEL_CMDLINE).unwrap();
+        kernel_cmdline.insert_str(DEFAULT_KERNEL_CMDLINE)?;
     }
 
+    // The krun_env segment carries caller-controlled guest env; a non-cmdline-safe byte in it
+    // (e.g. a tab in an OCI image env value) must surface as a StartMicrovmError, not a panic —
+    // the API layer validates per variable, this is the backstop.
     if let Some(cmdline) = &vm_resources.kernel_cmdline.krun_env {
-        kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
+        kernel_cmdline.insert_str(cmdline.as_str())?;
     }
 
     // When extra CPU capacity is reserved, every possible vCPU is described to the guest
     // (MPTABLE/FDT), so cap the number brought online at boot to the requested count. The
     // remaining CPUs stay offline until the guest's msb-cpu driver onlines them.
     if vcpu_config.max_vcpu_count > vcpu_config.vcpu_count {
-        kernel_cmdline
-            .insert_str(format!(" maxcpus={}", vcpu_config.vcpu_count))
-            .unwrap();
+        kernel_cmdline.insert_str(format!(" maxcpus={}", vcpu_config.vcpu_count))?;
     }
 
     // Hotplugged virtio-mem blocks must come online automatically: without this,
@@ -1170,9 +1192,7 @@ pub fn build_microvm(
     // reliable.
     #[cfg(not(feature = "tee"))]
     if vm_resources.mem_device.is_some() {
-        kernel_cmdline
-            .insert_str(" memhp_default_state=online_movable")
-            .unwrap();
+        kernel_cmdline.insert_str(" memhp_default_state=online_movable")?;
     }
     trace.mark("kernel_cmdline.ready");
 
@@ -1188,7 +1208,7 @@ pub fn build_microvm(
             format!("console={kernel_console}").as_str(),
         );
         kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
-        kernel_cmdline.insert_str(cmdline).unwrap();
+        kernel_cmdline.insert_str(cmdline)?;
     }
 
     // The WHP partition is sized to the full possible topology: reserved
@@ -1392,10 +1412,10 @@ pub fn build_microvm(
                     .replace("console=hvc0", "console=ttyS0,115200n8")
                     .replace("console=ttyAMA0", "console=ttyS0,115200n8");
                 kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
-                kernel_cmdline.insert_str(cmdline.as_str()).unwrap();
+                kernel_cmdline.insert_str(cmdline.as_str())?;
             } else {
                 #[cfg(target_arch = "aarch64")]
-                kernel_cmdline.insert("console", "ttyAMA0").unwrap();
+                kernel_cmdline.insert("console", "ttyAMA0")?;
                 #[cfg(target_arch = "x86_64")]
                 kernel_cmdline.insert("console", "ttyS0,115200n8").unwrap();
             }
@@ -1435,12 +1455,13 @@ pub fn build_microvm(
     // Instantiate the MMIO device manager.
     // 'mmio_base' address has to be an address which is protected by the kernel
     // and is architectural specific.
+    //
+    // Use the WhpIrqChip IOAPIC's full pin range. WHP has no in-kernel irqchip, so the guest IOAPIC
+    // is emulated in userspace with X86_IOAPIC_NUM_PINS redirection entries; the usable ceiling is
+    // pin NUM_PINS-1, not the legacy in-kernel IRQ_MAX. This lifts the virtio MMIO IRQ count from 11
+    // (IRQ_BASE..=IRQ_MAX) to NUM_PINS-IRQ_BASE, enough for a guest with several virtiofs mounts.
     #[cfg(target_arch = "x86_64")]
-    let irq_max = if vm_resources.split_irqchip {
-        arch::IRQ_MAX_SPLIT
-    } else {
-        arch::IRQ_MAX
-    };
+    let irq_max = x86_mmio_irq_max(vm_resources.split_irqchip);
     #[cfg(not(target_arch = "x86_64"))]
     let irq_max = arch::IRQ_MAX;
     #[allow(unused_mut)]
@@ -1866,7 +1887,7 @@ pub fn build_microvm(
     }
 
     if let Some(s) = &vm_resources.kernel_cmdline.epilog {
-        vmm.kernel_cmdline.insert_str(s).unwrap();
+        vmm.kernel_cmdline.insert_str(s)?;
     };
 
     // Write the kernel command line to guest memory. This is x86_64 specific, since on
@@ -1915,6 +1936,14 @@ pub fn build_microvm(
         }
 
         println!("Starting TEE/microVM.");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    if let Some(affinity) = &vm_resources.vcpu_affinity {
+        // The public builder validates an exact map for the full possible topology.
+        for (vcpu, host_cpu) in vcpus.iter_mut().zip(affinity.iter().copied()) {
+            vcpu.set_host_cpu(host_cpu);
+        }
     }
 
     vmm.start_vcpus(vcpus)
@@ -2077,6 +2106,43 @@ fn load_elf64_kernel(
 }
 
 #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+fn decode_image_bz2_kernel(data: &[u8]) -> std::result::Result<Vec<u8>, StartMicrovmError> {
+    const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+
+    let mut decoder_error = None;
+    let mut decoded_non_elf = false;
+
+    // An Image prefix can contain bytes that resemble a BZIP2 header, so keep looking until a
+    // candidate both decompresses successfully and contains the expected ELF payload.
+    for (magic, window) in data.windows(3).enumerate() {
+        if window != b"BZh" {
+            continue;
+        }
+
+        let mut kernel_data = Vec::new();
+        let mut bz2 = bzip2::read::BzDecoder::new(&data[magic..]);
+        match bz2.read_to_end(&mut kernel_data) {
+            Ok(_) if kernel_data.starts_with(ELF_MAGIC) => {
+                debug!("Found BZIP2 kernel payload in Image file at: 0x{magic:x}");
+                return Ok(kernel_data);
+            }
+            Ok(_) => decoded_non_elf = true,
+            Err(err) => decoder_error = Some(err),
+        }
+    }
+
+    if decoded_non_elf {
+        Err(StartMicrovmError::ImageBz2LoadKernel(
+            ElfLoadError::InvalidMagic,
+        ))
+    } else if let Some(err) = decoder_error {
+        Err(StartMicrovmError::ImageBz2Decoder(err))
+    } else {
+        Err(StartMicrovmError::ImageBz2Invalid)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 fn read_elf_u16(data: &[u8], offset: usize) -> std::result::Result<u16, ElfLoadError> {
     let bytes = data
         .get(offset..offset + 2)
@@ -2158,21 +2224,9 @@ fn load_external_kernel(
         KernelFormat::ImageBz2 => {
             let data: Vec<u8> = std::fs::read(external_kernel.path.clone())
                 .map_err(StartMicrovmError::ImageBz2OpenKernel)?;
-            if let Some(magic) = data
-                .windows(4)
-                .position(|window| window == [b'B', b'Z', b'h'])
-            {
-                debug!("Found BZIP2 header on Image file at: 0x{magic:x}");
-                let (_, compressed) = data.split_at(magic);
-                let mut kernel_data: Vec<u8> = Vec::new();
-                let mut bz2 = bzip2::read::BzDecoder::new(compressed);
-                bz2.read_to_end(&mut kernel_data)
-                    .map_err(StartMicrovmError::ImageBz2Decoder)?;
-                load_elf64_kernel(guest_mem, &kernel_data)
-                    .map_err(StartMicrovmError::ImageBz2LoadKernel)?
-            } else {
-                return Err(StartMicrovmError::ImageBz2Invalid);
-            }
+            let kernel_data = decode_image_bz2_kernel(&data)?;
+            load_elf64_kernel(guest_mem, &kernel_data)
+                .map_err(StartMicrovmError::ImageBz2LoadKernel)?
         }
         #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
         KernelFormat::ImageGz => {
@@ -4053,6 +4107,58 @@ pub mod tests {
     use super::*;
     #[cfg(not(target_os = "windows"))]
     use crate::vmm_config::kernel_bundle::KernelBundle;
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+    fn linux_irqchip_selection_remains_explicit() {
+        assert_eq!(x86_mmio_irq_max(false), arch::IRQ_MAX);
+        assert_eq!(x86_mmio_irq_max(true), arch::IRQ_MAX_SPLIT);
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    fn windows_uses_the_whp_ioapic_capacity() {
+        assert_eq!(x86_mmio_irq_max(false), 63);
+        assert_eq!(x86_mmio_irq_max(true), 63);
+        assert_eq!(X86_IOAPIC_NUM_PINS - arch::IRQ_BASE as usize, 59);
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    fn windows_ioapic_programs_its_last_pin() {
+        let mut ioapic = WhpIoApicState::new();
+
+        ioapic.ioregsel = X86_IOAPIC_VER;
+        assert_eq!(
+            ioapic.read_selected_register() >> X86_IOAPIC_VER_ENTRIES_SHIFT,
+            63
+        );
+
+        ioapic.ioregsel = 0x8e;
+        ioapic.write_selected_register(0x45);
+        ioapic.ioregsel = 0x8f;
+        ioapic.write_selected_register(0);
+        let route = ioapic.route_for_irq(63).unwrap();
+        assert_eq!(route.vector, 0x45);
+        assert!(ioapic.route_for_irq(64).is_none());
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+    fn image_bz2_skips_false_header_candidates() {
+        use std::io::Write;
+
+        const KERNEL_DATA: &[u8] = b"\x7fELFminimal-kernel";
+
+        let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        encoder.write_all(KERNEL_DATA).unwrap();
+        let compressed_kernel = encoder.finish().unwrap();
+
+        let mut image = b"Image-prefix-BZh0-not-a-stream".to_vec();
+        image.extend_from_slice(&compressed_kernel);
+
+        assert_eq!(decode_image_bz2_kernel(&image).unwrap(), KERNEL_DATA);
+    }
 
     #[cfg(not(target_os = "windows"))]
     fn default_guest_memory(

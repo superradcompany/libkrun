@@ -923,7 +923,10 @@ impl FileSystem for PassthroughFs {
             HandleKind::Directory(_) => return Err(linux_error(LINUX_EISDIR)),
         };
 
+        // Zero-copy reads can surface Win32 file errors; normalize them before the server writes
+        // the raw value into the Linux FUSE reply header.
         w.write_from(&file, size as usize, offset)
+            .map_err(host_error)
     }
 
     fn write<R: io::Read + ZeroCopyReader>(
@@ -1611,6 +1614,8 @@ mod tests {
         bytes: Vec<u8>,
     }
 
+    struct FailingZeroCopyWriter;
+
     struct SourceReader {
         bytes: Vec<u8>,
         pos: usize,
@@ -1652,6 +1657,23 @@ mod tests {
             file.seek(SeekFrom::Start(offset))?;
             let mut take = file.take(count as u64);
             take.read_to_end(&mut self.bytes)
+        }
+    }
+
+    impl Write for FailingZeroCopyWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ZeroCopyWriter for FailingZeroCopyWriter {
+        fn write_from(&mut self, _file: &File, _count: usize, _offset: u64) -> io::Result<usize> {
+            // Model a Windows file failure returned by the server's zero-copy adapter.
+            Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32))
         }
     }
 
@@ -1732,6 +1754,40 @@ mod tests {
 
         assert_eq!(read, 5);
         assert_eq!(writer.bytes, b"from ");
+        fs.release(context(), entry.inode, 0, handle, false, false, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn read_translates_zero_copy_win32_errors() {
+        let temp = TempDir::new();
+        fs::write(temp.path.join("denied.txt"), b"content").unwrap();
+
+        let fs = PassthroughFs::new(Config {
+            root_dir: temp.path.to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        let name = CStr::from_bytes_with_nul(b"denied.txt\0").unwrap();
+        let entry = fs.lookup(context(), fuse::ROOT_ID, name).unwrap();
+        let (handle, _) = fs.open(context(), entry.inode, false, 0).unwrap();
+        let handle = handle.unwrap();
+
+        expect_linux_error(
+            fs.read(
+                context(),
+                entry.inode,
+                handle,
+                FailingZeroCopyWriter,
+                7,
+                0,
+                None,
+                0,
+            ),
+            LINUX_EACCES,
+        );
         fs.release(context(), entry.inode, 0, handle, false, false, None)
             .unwrap();
     }

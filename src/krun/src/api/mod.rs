@@ -47,7 +47,7 @@ pub use builders::DiskImageFormat;
 pub use builders::FsBuilder;
 #[cfg(feature = "net")]
 pub use builders::NetBuilder;
-pub use builders::{ConsoleBuilder, ExecBuilder, KernelBuilder, MachineBuilder};
+pub use builders::{ConsoleBuilder, ExecBuilder, HostCpuId, KernelBuilder, MachineBuilder};
 pub use error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use exit_handle::ExitHandle;
 pub use metrics::{

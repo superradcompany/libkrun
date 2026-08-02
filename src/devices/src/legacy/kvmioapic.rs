@@ -3,6 +3,8 @@
 
 use std::io;
 
+use arch::x86_64::layout::KVM_IOAPIC_NUM_PINS;
+
 use crate::bus::BusDevice;
 use crate::legacy::irqchip::IrqChipT;
 use crate::Error as DeviceError;
@@ -35,6 +37,10 @@ impl IrqChipT for KvmIoapic {
 
     fn get_mmio_size(&self) -> u64 {
         0
+    }
+
+    fn num_pins(&self) -> usize {
+        KVM_IOAPIC_NUM_PINS
     }
 
     fn set_irq(

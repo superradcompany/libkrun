@@ -42,6 +42,15 @@ pub enum ConfigError {
     /// Reserving capacity above the initial resources is not supported on this platform.
     MaxCapacityUnsupported,
 
+    /// The vCPU affinity map does not cover the full possible topology.
+    InvalidVcpuAffinityLength { expected: usize, actual: usize },
+
+    /// vCPU affinity is not supported on the current host platform.
+    VcpuAffinityUnsupported,
+
+    /// The selected host processor group is not supported on the current platform.
+    InvalidHostCpuGroup(u16),
+
     /// Missing kernel configuration.
     MissingKernel,
 
@@ -124,6 +133,16 @@ impl fmt::Display for ConfigError {
                 f,
                 "reserving CPU or memory capacity above the initial resources is not supported on this platform"
             ),
+            ConfigError::InvalidVcpuAffinityLength { expected, actual } => write!(
+                f,
+                "invalid vCPU affinity map length: expected {expected}, got {actual}"
+            ),
+            ConfigError::VcpuAffinityUnsupported => {
+                write!(f, "vCPU affinity is not supported on this host platform")
+            }
+            ConfigError::InvalidHostCpuGroup(group) => {
+                write!(f, "host processor group {group} is not supported")
+            }
             ConfigError::MissingKernel => write!(f, "missing kernel configuration"),
             ConfigError::InvalidKernelBundle(s) => write!(f, "invalid kernel bundle: {}", s),
             ConfigError::Network(s) => write!(f, "network: {}", s),
