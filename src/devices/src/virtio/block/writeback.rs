@@ -9,12 +9,10 @@ use std::sync::Arc;
 
 use log::warn;
 
-// Heavy sequential writers in the measured guest issued about 16 GiB between durability
-// barriers. Starting one advisory writeback near the end of that interval leaves the final fsync
-// responsible for durability while giving Linux time to drain dirty pages on an otherwise-idle
-// device. The environment override is intentionally internal and exists for controlled host
-// tuning; zero disables advisory writeback without changing the guest-visible cache contract.
-const DEFAULT_TRIGGER_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+// Starting one advisory writeback before a guest durability barrier can bound host dirty memory,
+// but the measured 12 GiB policy reduced sequential-write throughput. Keep this mechanism opt-in
+// through an internal environment override until the host runtime selects a workload-aware policy;
+// zero, an invalid value and an unset variable all preserve the existing writeback behavior.
 const MINIMUM_RANGE_BYTES: u64 = 64 * 1024 * 1024;
 const TRIGGER_ENV: &str = "KRUN_BLOCK_WRITEBACK_PREFLUSH_BYTES";
 
@@ -89,6 +87,7 @@ impl WritebackWindow {
         Some(dirty_range)
     }
 
+    #[cfg(test)]
     fn pending_range(&self) -> Option<DirtyRange> {
         self.dirty_range
     }
@@ -109,13 +108,8 @@ pub(crate) struct BufferedWritebackConfig {
 
 impl BufferedWritebackConfig {
     pub(crate) fn from_environment(file: Arc<File>) -> Option<Self> {
-        let trigger_bytes = env::var(TRIGGER_ENV)
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(DEFAULT_TRIGGER_BYTES);
-        if trigger_bytes == 0 {
-            return None;
-        }
+        let value = env::var(TRIGGER_ENV).ok();
+        let trigger_bytes = parse_trigger_bytes(value.as_deref())?;
 
         Some(Self {
             file,
@@ -192,6 +186,14 @@ impl BufferedWritebackController {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+fn parse_trigger_bytes(value: Option<&str>) -> Option<u64> {
+    value?.parse().ok().filter(|bytes| *bytes > 0)
+}
+
+//--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
 
@@ -259,6 +261,15 @@ mod tests {
         let mut window = WritebackWindow::new(1);
         assert_eq!(window.record_write(1024, 0), None);
         assert_eq!(window.pending_range(), None);
+    }
+
+    #[test]
+    fn preflush_requires_an_explicit_positive_threshold() {
+        assert_eq!(parse_trigger_bytes(None), None);
+        assert_eq!(parse_trigger_bytes(Some("")), None);
+        assert_eq!(parse_trigger_bytes(Some("invalid")), None);
+        assert_eq!(parse_trigger_bytes(Some("0")), None);
+        assert_eq!(parse_trigger_bytes(Some("128")), Some(128));
     }
 
     #[test]
