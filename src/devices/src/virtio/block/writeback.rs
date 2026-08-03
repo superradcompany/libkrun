@@ -21,16 +21,15 @@ use log::warn;
 /// Smallest supported per-device hard writeback budget.
 pub(crate) const MINIMUM_WRITEBACK_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 
-const MINIMUM_BATCH_BYTES: u64 = 32 * 1024 * 1024;
-const MAXIMUM_BATCH_BYTES: u64 = 256 * 1024 * 1024;
-const BATCH_BUDGET_DIVISOR: u64 = 4;
+const MINIMUM_RETIREMENT_BYTES: u64 = 32 * 1024 * 1024;
 /// Maximum exact disjoint ranges retained in one generation before it is submitted early.
 ///
 /// This bounds both controller metadata and the number of `sync_file_range` calls in one job
 /// independently of the caller-supplied hard byte budget. At 4 KiB per page, 8192 extents cover
-/// the full 32 MiB minimum batch while limiting one job's range vector to roughly 128 KiB.
+/// a 32 MiB minimally fragmented retirement while limiting one job's range vector to roughly
+/// 128 KiB.
 const MAX_EXTENTS_PER_GENERATION: usize = 8192;
-const MAX_QUEUED_BATCHES: usize = 64;
+const MAX_QUEUED_GENERATIONS: usize = 64;
 const WORKER_THREAD_NAME: &str = "virtio-blk-writeback";
 
 //--------------------------------------------------------------------------------------------------
@@ -141,15 +140,14 @@ pub(crate) struct BufferedWritebackConfig {
 
 /// Bounds buffered dirty data and moves range writeback off the virtio block worker.
 ///
-/// The configured value is the single hard budget. A smaller batch target is derived internally
-/// to provide completion jitter headroom. Credits represent unique page-aligned extents and are
-/// released only after the background worker completes exact range writeback. This bounds dirty
-/// file data without turning each internal batch into a durability boundary. Guest `FLUSH`
-/// remains governed by the existing full backing-image sync, including the data-retrieval metadata
-/// required by the host filesystem.
+/// The configured value is the single hard budget. Credits represent unique page-aligned extents
+/// and are released only after the background worker completes exact range writeback. Hot rewrites
+/// remain inside their already-reserved finite window; retirement starts only when a new unique page
+/// cannot fit or metadata fragmentation reaches its explicit bound. Guest `FLUSH` remains governed
+/// by the existing full backing-image sync, including the data-retrieval metadata required by the
+/// host filesystem.
 pub(crate) struct BufferedWritebackController {
     hard_budget_bytes: u64,
-    batch_bytes: u64,
     page_size: u64,
     tracked: ExtentSet,
     current_generation: u64,
@@ -449,8 +447,7 @@ impl BufferedWritebackController {
         health: Arc<SharedHealth>,
     ) -> io::Result<Self> {
         validate_policy(hard_budget_bytes, page_size)?;
-        let batch_bytes = derive_batch_bytes(hard_budget_bytes, page_size);
-        let queue_capacity = queue_capacity(hard_budget_bytes, batch_bytes);
+        let queue_capacity = queue_capacity(hard_budget_bytes);
         let (job_sender, job_receiver) = bounded(queue_capacity);
         let (completion_sender, completion_receiver) = bounded(queue_capacity + 1);
         let (shutdown_sender, shutdown_receiver) = bounded(1);
@@ -462,7 +459,6 @@ impl BufferedWritebackController {
 
         Ok(Self {
             hard_budget_bytes,
-            batch_bytes,
             page_size,
             tracked: ExtentSet::default(),
             current_generation: 0,
@@ -589,11 +585,6 @@ impl BufferedWritebackController {
             }
         }
 
-        if self.current_extents.bytes >= self.batch_bytes {
-            if let Err(error) = self.submit_current_generation() {
-                self.latch_error(&error);
-            }
-        }
         self.check_error()
     }
 
@@ -653,7 +644,7 @@ impl BufferedWritebackController {
             return Ok(None);
         }
 
-        let capped_length = requested_bytes.min(self.batch_bytes);
+        let capped_length = requested_bytes.min(self.hard_budget_bytes);
         let mut low = 0;
         let mut high = capped_length;
 
@@ -661,17 +652,17 @@ impl BufferedWritebackController {
             let candidate = low + (high - low).div_ceil(2);
             let range = DirtyRange::for_write(offset, candidate, self.page_size)?
                 .expect("positive candidate must have a range");
-            let fits_batch = self
+            let fits_generation = self
                 .current_extents
                 .bytes
                 .checked_add(self.current_extents.additional_bytes(range))
-                .is_some_and(|bytes| bytes <= self.batch_bytes);
+                .is_some_and(|bytes| bytes <= self.hard_budget_bytes);
             let fits_hard = self
                 .tracked
                 .bytes
                 .checked_add(self.tracked.additional_bytes(range))
                 .is_some_and(|bytes| bytes <= self.hard_budget_bytes);
-            if fits_batch && fits_hard {
+            if fits_generation && fits_hard {
                 low = candidate;
             } else {
                 high = candidate - 1;
@@ -688,7 +679,7 @@ impl BufferedWritebackController {
     }
 
     fn commit_range(&mut self, range: DirtyRange) -> io::Result<()> {
-        let projected_batch = self
+        let projected_generation = self
             .current_extents
             .bytes
             .checked_add(self.current_extents.additional_bytes(range));
@@ -696,7 +687,7 @@ impl BufferedWritebackController {
             .tracked
             .bytes
             .checked_add(self.tracked.additional_bytes(range));
-        if projected_batch.is_none_or(|bytes| bytes > self.batch_bytes)
+        if projected_generation.is_none_or(|bytes| bytes > self.hard_budget_bytes)
             || projected_hard.is_none_or(|bytes| bytes > self.hard_budget_bytes)
         {
             return Err(io::Error::new(
@@ -927,10 +918,10 @@ fn validate_policy(hard_budget_bytes: u64, page_size: u64) -> io::Result<()> {
             "writeback page size must be a non-zero power of two",
         ));
     }
-    if page_size > MINIMUM_BATCH_BYTES {
+    if page_size > MINIMUM_WRITEBACK_BUDGET_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "writeback page size exceeds the minimum batch size",
+            "writeback page size exceeds the minimum hard budget",
         ));
     }
     if hard_budget_bytes < MINIMUM_WRITEBACK_BUDGET_BYTES {
@@ -941,26 +932,14 @@ fn validate_policy(hard_budget_bytes: u64, page_size: u64) -> io::Result<()> {
             ),
         ));
     }
-    if align_down(hard_budget_bytes / 2, page_size) < page_size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "writeback hard budget is too small for one batch",
-        ));
-    }
     Ok(())
 }
 
-fn derive_batch_bytes(hard_budget_bytes: u64, page_size: u64) -> u64 {
-    let quarter_budget = align_down(hard_budget_bytes / BATCH_BUDGET_DIVISOR, page_size);
-    let target = quarter_budget.clamp(MINIMUM_BATCH_BYTES, MAXIMUM_BATCH_BYTES);
-    align_down(target, page_size).min(align_down(hard_budget_bytes / 2, page_size))
-}
-
-fn queue_capacity(hard_budget_bytes: u64, batch_bytes: u64) -> usize {
-    let batches = hard_budget_bytes.div_ceil(batch_bytes);
-    usize::try_from(batches)
-        .unwrap_or(MAX_QUEUED_BATCHES)
-        .clamp(1, MAX_QUEUED_BATCHES)
+fn queue_capacity(hard_budget_bytes: u64) -> usize {
+    let generations = hard_budget_bytes.div_ceil(MINIMUM_RETIREMENT_BYTES);
+    usize::try_from(generations)
+        .unwrap_or(MAX_QUEUED_GENERATIONS)
+        .clamp(1, MAX_QUEUED_GENERATIONS)
 }
 
 fn run_worker(
@@ -974,7 +953,7 @@ fn run_worker(
     // producer blocked on the bounded job queue.
     let max_jobs_per_group = job_receiver
         .capacity()
-        .unwrap_or(MAX_QUEUED_BATCHES)
+        .unwrap_or(MAX_QUEUED_GENERATIONS)
         .saturating_add(1);
 
     loop {
@@ -1281,19 +1260,10 @@ mod tests {
     }
 
     #[test]
-    fn batch_policy_keeps_quarter_budget_jitter_headroom() {
-        assert_eq!(
-            derive_batch_bytes(MINIMUM_WRITEBACK_BUDGET_BYTES, TEST_PAGE_SIZE),
-            MINIMUM_BATCH_BYTES
-        );
-        assert_eq!(
-            derive_batch_bytes(512 * 1024 * 1024, TEST_PAGE_SIZE),
-            128 * 1024 * 1024
-        );
-        assert_eq!(
-            derive_batch_bytes(8 * 1024 * 1024 * 1024, TEST_PAGE_SIZE),
-            MAXIMUM_BATCH_BYTES
-        );
+    fn queue_capacity_scales_with_the_finite_hard_window() {
+        assert_eq!(queue_capacity(MINIMUM_WRITEBACK_BUDGET_BYTES), 4);
+        assert_eq!(queue_capacity(512 * 1024 * 1024), 16);
+        assert_eq!(queue_capacity(8 * 1024 * 1024 * 1024), 64);
     }
 
     #[cfg(target_os = "linux")]
@@ -1407,7 +1377,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_caps_a_large_request_at_the_soft_batch() {
+    fn planner_caps_a_large_request_at_the_hard_budget() {
         let backend = Arc::new(FakeBackend::default());
         let mut controller = BufferedWritebackController::spawn(
             backend,
@@ -1418,14 +1388,17 @@ mod tests {
         let reservation = controller
             .plan_write(0, MINIMUM_WRITEBACK_BUDGET_BYTES)
             .unwrap();
-        assert_eq!(reservation.len(), MINIMUM_BATCH_BYTES);
+        assert_eq!(reservation.len(), MINIMUM_WRITEBACK_BUDGET_BYTES);
         controller
-            .finish_write(reservation, WritebackOutcome::Written(MINIMUM_BATCH_BYTES))
+            .finish_write(
+                reservation,
+                WritebackOutcome::Written(MINIMUM_WRITEBACK_BUDGET_BYTES),
+            )
             .unwrap();
     }
 
     #[test]
-    fn planner_accounts_for_page_alignment_at_the_batch_edge() {
+    fn planner_accounts_for_page_alignment_at_the_hard_edge() {
         let backend = Arc::new(FakeBackend::default());
         let mut controller = BufferedWritebackController::spawn(
             backend,
@@ -1436,14 +1409,54 @@ mod tests {
         let reservation = controller
             .plan_write(512, MINIMUM_WRITEBACK_BUDGET_BYTES)
             .unwrap();
-        assert_eq!(reservation.len(), MINIMUM_BATCH_BYTES - 512);
+        assert_eq!(reservation.len(), MINIMUM_WRITEBACK_BUDGET_BYTES - 512);
         controller
             .finish_write(
                 reservation,
-                WritebackOutcome::Written(MINIMUM_BATCH_BYTES - 512),
+                WritebackOutcome::Written(MINIMUM_WRITEBACK_BUDGET_BYTES - 512),
             )
             .unwrap();
-        assert_eq!(controller.tracked.bytes, MINIMUM_BATCH_BYTES);
+        assert_eq!(controller.tracked.bytes, MINIMUM_WRITEBACK_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn hard_pressure_starts_retirement_but_hot_rewrites_do_not() {
+        let backend = Arc::new(FakeBackend::default());
+        let mut controller = BufferedWritebackController::spawn(
+            backend.clone(),
+            MINIMUM_WRITEBACK_BUDGET_BYTES,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+
+        let initial = controller
+            .plan_write(0, MINIMUM_WRITEBACK_BUDGET_BYTES)
+            .unwrap();
+        controller
+            .finish_write(
+                initial,
+                WritebackOutcome::Written(MINIMUM_WRITEBACK_BUDGET_BYTES),
+            )
+            .unwrap();
+        assert!(backend.start_calls.lock().unwrap().is_empty());
+
+        let rewrite = controller.plan_write(0, TEST_PAGE_SIZE).unwrap();
+        controller
+            .finish_write(rewrite, WritebackOutcome::Written(TEST_PAGE_SIZE))
+            .unwrap();
+        assert!(backend.start_calls.lock().unwrap().is_empty());
+        assert_eq!(controller.tracked.bytes, MINIMUM_WRITEBACK_BUDGET_BYTES);
+
+        let next = controller
+            .plan_write(MINIMUM_WRITEBACK_BUDGET_BYTES, TEST_PAGE_SIZE)
+            .unwrap();
+        controller
+            .finish_write(next, WritebackOutcome::Written(TEST_PAGE_SIZE))
+            .unwrap();
+        controller.quiesce().unwrap();
+
+        assert_eq!(backend.start_calls.lock().unwrap().len(), 2);
+        assert_eq!(controller.tracked.bytes, 0);
     }
 
     #[test]
@@ -1484,7 +1497,7 @@ mod tests {
             controller.current_extents.insert(range);
             controller.tracked.insert(range);
         }
-        assert!(controller.current_extents.bytes < controller.batch_bytes);
+        assert!(controller.current_extents.bytes < controller.hard_budget_bytes);
 
         let next_offset = MAX_EXTENTS_PER_GENERATION as u64 * TEST_PAGE_SIZE * 2;
         let reservation = controller.plan_write(next_offset, 512).unwrap();
@@ -1695,18 +1708,22 @@ mod tests {
         )
         .unwrap();
 
-        let first = controller.plan_write(0, MINIMUM_BATCH_BYTES).unwrap();
+        let first = controller.plan_write(0, MINIMUM_RETIREMENT_BYTES).unwrap();
         controller
-            .finish_write(first, WritebackOutcome::Written(MINIMUM_BATCH_BYTES))
+            .finish_write(first, WritebackOutcome::Written(MINIMUM_RETIREMENT_BYTES))
             .unwrap();
+        controller.submit_current_generation().unwrap();
         backend.wait_for_calls(1);
 
         let rewrite = controller.plan_write(0, TEST_PAGE_SIZE).unwrap();
         controller
             .finish_write(rewrite, WritebackOutcome::Written(TEST_PAGE_SIZE))
             .unwrap();
-        assert_eq!(controller.tracked.bytes, MINIMUM_BATCH_BYTES);
-        assert_eq!(controller.submitted[0].extents.bytes, MINIMUM_BATCH_BYTES);
+        assert_eq!(controller.tracked.bytes, MINIMUM_RETIREMENT_BYTES);
+        assert_eq!(
+            controller.submitted[0].extents.bytes,
+            MINIMUM_RETIREMENT_BYTES
+        );
         assert_eq!(controller.current_extents.bytes, TEST_PAGE_SIZE);
 
         backend.allow(2);
@@ -1717,7 +1734,7 @@ mod tests {
             vec![
                 vec![DirtyRange {
                     start: 0,
-                    end: MINIMUM_BATCH_BYTES,
+                    end: MINIMUM_RETIREMENT_BYTES,
                 }],
                 vec![DirtyRange {
                     start: 0,
