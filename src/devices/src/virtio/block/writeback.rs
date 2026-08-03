@@ -120,8 +120,8 @@ pub(crate) enum WritebackOutcome {
 }
 
 trait WritebackBackend: Send + Sync + 'static {
-    fn writeback(&self, ranges: &[DirtyRange]) -> io::Result<()>;
-    fn sync_data(&self) -> io::Result<()>;
+    fn start_writeback(&self, ranges: &[DirtyRange]) -> io::Result<()>;
+    fn wait_writeback(&self, ranges: &[DirtyRange]) -> io::Result<()>;
 }
 
 #[cfg(target_os = "linux")]
@@ -143,9 +143,10 @@ pub(crate) struct BufferedWritebackConfig {
 ///
 /// The configured value is the single hard budget. A smaller batch target is derived internally
 /// to provide completion jitter headroom. Credits represent unique page-aligned extents and are
-/// released only after the background worker completes exact range writeback followed by a
-/// same-inode data-and-allocation-metadata barrier. Guest `FLUSH` remains governed by the existing
-/// full backing-image sync.
+/// released only after the background worker completes exact range writeback. This bounds dirty
+/// file data without turning each internal batch into a durability boundary. Guest `FLUSH`
+/// remains governed by the existing full backing-image sync, including the data-retrieval metadata
+/// required by the host filesystem.
 pub(crate) struct BufferedWritebackController {
     hard_budget_bytes: u64,
     batch_bytes: u64,
@@ -337,10 +338,8 @@ impl WritebackReservation {
 }
 
 #[cfg(target_os = "linux")]
-impl WritebackBackend for SyncFileRangeBackend {
-    fn writeback(&self, ranges: &[DirtyRange]) -> io::Result<()> {
-        let flags = libc::SYNC_FILE_RANGE_WRITE;
-
+impl SyncFileRangeBackend {
+    fn sync_ranges(&self, ranges: &[DirtyRange], flags: u32) -> io::Result<()> {
         for range in ranges {
             let offset = libc::off64_t::try_from(range.start).map_err(|_| {
                 io::Error::new(
@@ -356,9 +355,7 @@ impl WritebackBackend for SyncFileRangeBackend {
             })?;
 
             // Safe: the backend owns a live descriptor for the exact backing inode. Ranges are
-            // validated, page-aligned integers and the flag is a Linux-defined constant. Do not
-            // use either WAIT flag here: file_fdatawait_range advances the file description's
-            // writeback-error cursor and could hide EIO/ENOSPC from the authoritative fdatasync.
+            // validated, page-aligned integers and the flags are Linux-defined constants.
             let result =
                 unsafe { libc::sync_file_range(self.file.as_raw_fd(), offset, length, flags) };
             if result != 0 {
@@ -368,11 +365,21 @@ impl WritebackBackend for SyncFileRangeBackend {
 
         Ok(())
     }
+}
 
-    fn sync_data(&self) -> io::Result<()> {
-        // Unlike sync_file_range, fdatasync also orders the allocation and copy-on-write metadata
-        // needed to retrieve the written bytes. Credits are not reusable until this succeeds.
-        self.file.sync_data()
+#[cfg(target_os = "linux")]
+impl WritebackBackend for SyncFileRangeBackend {
+    fn start_writeback(&self, ranges: &[DirtyRange]) -> io::Result<()> {
+        self.sync_ranges(ranges, libc::SYNC_FILE_RANGE_WRITE)
+    }
+
+    fn wait_writeback(&self, ranges: &[DirtyRange]) -> io::Result<()> {
+        // The earlier WRITE kick submitted the generation's dirty pages. WAIT_AFTER proves that
+        // their page-cache writeback completed before their credit is reused, but deliberately
+        // does not make this internal containment batch a durability boundary. The Imago backing
+        // file was opened separately through /proc/self/fd, so advancing this descriptor's errseq
+        // cursor cannot consume an error that the guest-visible full sync still needs to report.
+        self.sync_ranges(ranges, libc::SYNC_FILE_RANGE_WAIT_AFTER)
     }
 }
 
@@ -965,7 +972,7 @@ fn run_worker(
     // The completion channel is one slot larger than the job channel. Limit one coalesced group to
     // that same size so the worker can always publish every result without deadlocking against a
     // producer blocked on the bounded job queue.
-    let max_jobs_per_barrier = job_receiver
+    let max_jobs_per_group = job_receiver
         .capacity()
         .unwrap_or(MAX_QUEUED_BATCHES)
         .saturating_add(1);
@@ -981,18 +988,18 @@ fn run_worker(
             }
         };
 
-        let mut generations = Vec::with_capacity(max_jobs_per_barrier);
+        let mut jobs = Vec::with_capacity(max_jobs_per_group);
         let mut next_job = first_job;
-        let mut first_range_error = None;
+        let mut first_error = None;
         let mut jobs_disconnected = false;
 
         loop {
-            if let Err(error) = backend.writeback(&next_job.ranges) {
-                first_range_error.get_or_insert((next_job.generation, error));
+            if let Err(error) = backend.start_writeback(&next_job.ranges) {
+                first_error.get_or_insert((next_job.generation, "start", error));
             }
-            generations.push(next_job.generation);
+            jobs.push(next_job);
 
-            if generations.len() == max_jobs_per_barrier {
+            if jobs.len() == max_jobs_per_group {
                 break;
             }
             match job_receiver.try_recv() {
@@ -1005,37 +1012,25 @@ fn run_worker(
             }
         }
 
-        // sync_file_range does not guarantee allocation or COW metadata durability. One fdatasync
-        // covers every generation drained above and always runs, even after a failed range kick.
-        // The barrier cannot prove a nonzero kick result harmless, so that failure remains
-        // permanent and prevents every coalesced generation from releasing credit.
-        let barrier_error = backend.sync_data().err();
-        let group_failure = match (first_range_error, barrier_error) {
-            (Some((generation, range_error)), barrier_error) => {
-                if let Some(barrier_error) = barrier_error {
-                    warn!(
-                        "Range writeback kick for generation {generation} failed: {range_error}; \
-                         the containment data barrier also failed: {barrier_error}"
-                    );
-                } else {
-                    warn!(
-                        "Range writeback kick for generation {generation} failed closed after the \
-                         containment data barrier: {range_error}"
-                    );
-                }
-                Some(WritebackFailure {
-                    error: Arc::new(range_error),
-                })
+        // Kick every queued generation before waiting so the host block layer can keep multiple
+        // ranges in flight. Completion waits return containment credit only after the associated
+        // page-cache writeback has finished; durability metadata remains the responsibility of the
+        // existing guest-visible full sync.
+        for job in &jobs {
+            if let Err(error) = backend.wait_writeback(&job.ranges) {
+                first_error.get_or_insert((job.generation, "completion", error));
             }
-            (None, Some(barrier_error)) => Some(WritebackFailure {
-                error: Arc::new(barrier_error),
-            }),
-            (None, None) => None,
-        };
+        }
+        let group_failure = first_error.map(|(generation, operation, error)| {
+            warn!("Range writeback {operation} for generation {generation} failed closed: {error}");
+            WritebackFailure {
+                error: Arc::new(error),
+            }
+        });
 
-        for generation in generations {
+        for job in jobs {
             let completion = WritebackCompletion {
-                generation,
+                generation: job.generation,
                 result: match &group_failure {
                     None => Ok(()),
                     Some(failure) => Err(failure.clone()),
@@ -1077,33 +1072,33 @@ mod tests {
 
     #[derive(Default)]
     struct FakeBackend {
-        calls: Mutex<Vec<Vec<DirtyRange>>>,
-        barrier_calls: Mutex<usize>,
-        barrier_failures: Mutex<VecDeque<io::ErrorKind>>,
+        start_calls: Mutex<Vec<Vec<DirtyRange>>>,
+        wait_calls: Mutex<Vec<Vec<DirtyRange>>>,
+        wait_failures: Mutex<VecDeque<io::ErrorKind>>,
     }
 
     impl WritebackBackend for FakeBackend {
-        fn writeback(&self, ranges: &[DirtyRange]) -> io::Result<()> {
-            self.calls.lock().unwrap().push(ranges.to_vec());
+        fn start_writeback(&self, ranges: &[DirtyRange]) -> io::Result<()> {
+            self.start_calls.lock().unwrap().push(ranges.to_vec());
             Ok(())
         }
 
-        fn sync_data(&self) -> io::Result<()> {
-            *self.barrier_calls.lock().unwrap() += 1;
-            match self.barrier_failures.lock().unwrap().pop_front() {
-                Some(kind) => Err(io::Error::new(kind, "injected data-barrier failure")),
+        fn wait_writeback(&self, ranges: &[DirtyRange]) -> io::Result<()> {
+            self.wait_calls.lock().unwrap().push(ranges.to_vec());
+            match self.wait_failures.lock().unwrap().pop_front() {
+                Some(kind) => Err(io::Error::new(kind, "injected completion-wait failure")),
                 None => Ok(()),
             }
         }
     }
 
     impl FakeBackend {
-        fn fail_next_barrier(&self, kind: io::ErrorKind) {
-            self.barrier_failures.lock().unwrap().push_back(kind);
+        fn fail_next_wait(&self, kind: io::ErrorKind) {
+            self.wait_failures.lock().unwrap().push_back(kind);
         }
 
-        fn barrier_calls(&self) -> usize {
-            *self.barrier_calls.lock().unwrap()
+        fn wait_calls(&self) -> usize {
+            self.wait_calls.lock().unwrap().len()
         }
     }
 
@@ -1120,7 +1115,7 @@ mod tests {
     }
 
     impl WritebackBackend for GatedBackend {
-        fn writeback(&self, ranges: &[DirtyRange]) -> io::Result<()> {
+        fn start_writeback(&self, ranges: &[DirtyRange]) -> io::Result<()> {
             let mut state = self.state.lock().unwrap();
             state.calls.push(ranges.to_vec());
             self.changed.notify_all();
@@ -1131,7 +1126,7 @@ mod tests {
             Ok(())
         }
 
-        fn sync_data(&self) -> io::Result<()> {
+        fn wait_writeback(&self, _ranges: &[DirtyRange]) -> io::Result<()> {
             Ok(())
         }
     }
@@ -1164,23 +1159,23 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct BarrierGatedBackend {
+    struct CompletionGatedBackend {
         changed: Condvar,
-        state: Mutex<BarrierGatedState>,
+        state: Mutex<CompletionGatedState>,
     }
 
     #[derive(Default)]
-    struct BarrierGatedState {
+    struct CompletionGatedState {
         calls: Vec<Vec<DirtyRange>>,
         writeback_permits: usize,
         writeback_failures: VecDeque<io::ErrorKind>,
-        barrier_calls: usize,
-        barrier_permits: usize,
-        barrier_failures: VecDeque<io::ErrorKind>,
+        wait_calls: usize,
+        wait_permits: usize,
+        wait_failures: VecDeque<io::ErrorKind>,
     }
 
-    impl WritebackBackend for BarrierGatedBackend {
-        fn writeback(&self, ranges: &[DirtyRange]) -> io::Result<()> {
+    impl WritebackBackend for CompletionGatedBackend {
+        fn start_writeback(&self, ranges: &[DirtyRange]) -> io::Result<()> {
             let mut state = self.state.lock().unwrap();
             state.calls.push(ranges.to_vec());
             self.changed.notify_all();
@@ -1194,36 +1189,36 @@ mod tests {
             }
         }
 
-        fn sync_data(&self) -> io::Result<()> {
+        fn wait_writeback(&self, _ranges: &[DirtyRange]) -> io::Result<()> {
             let mut state = self.state.lock().unwrap();
-            state.barrier_calls += 1;
+            state.wait_calls += 1;
             self.changed.notify_all();
-            while state.barrier_permits == 0 {
+            while state.wait_permits == 0 {
                 state = self.changed.wait(state).unwrap();
             }
-            state.barrier_permits -= 1;
-            match state.barrier_failures.pop_front() {
-                Some(kind) => Err(io::Error::new(kind, "injected data-barrier failure")),
+            state.wait_permits -= 1;
+            match state.wait_failures.pop_front() {
+                Some(kind) => Err(io::Error::new(kind, "injected completion-wait failure")),
                 None => Ok(()),
             }
         }
     }
 
-    impl BarrierGatedBackend {
+    impl CompletionGatedBackend {
         fn allow_writebacks(&self, jobs: usize) {
             let mut state = self.state.lock().unwrap();
             state.writeback_permits += jobs;
             self.changed.notify_all();
         }
 
-        fn allow_barriers(&self, barriers: usize) {
+        fn allow_waits(&self, waits: usize) {
             let mut state = self.state.lock().unwrap();
-            state.barrier_permits += barriers;
+            state.wait_permits += waits;
             self.changed.notify_all();
         }
 
-        fn fail_next_barrier(&self, kind: io::ErrorKind) {
-            self.state.lock().unwrap().barrier_failures.push_back(kind);
+        fn fail_next_wait(&self, kind: io::ErrorKind) {
+            self.state.lock().unwrap().wait_failures.push_back(kind);
         }
 
         fn fail_next_writeback(&self, kind: io::ErrorKind) {
@@ -1249,16 +1244,16 @@ mod tests {
             }
         }
 
-        fn wait_for_barriers(&self, calls: usize) {
+        fn wait_for_waits(&self, calls: usize) {
             let mut state = self.state.lock().unwrap();
-            while state.barrier_calls < calls {
+            while state.wait_calls < calls {
                 let (new_state, timeout) = self
                     .changed
                     .wait_timeout(state, Duration::from_secs(5))
                     .unwrap();
                 assert!(
                     !timeout.timed_out(),
-                    "writeback worker did not reach the expected data barrier"
+                    "writeback worker did not reach the expected completion wait"
                 );
                 state = new_state;
             }
@@ -1268,19 +1263,19 @@ mod tests {
             self.state.lock().unwrap().calls.clone()
         }
 
-        fn barrier_calls(&self) -> usize {
-            self.state.lock().unwrap().barrier_calls
+        fn wait_calls(&self) -> usize {
+            self.state.lock().unwrap().wait_calls
         }
     }
 
     struct PanicBackend;
 
     impl WritebackBackend for PanicBackend {
-        fn writeback(&self, _ranges: &[DirtyRange]) -> io::Result<()> {
+        fn start_writeback(&self, _ranges: &[DirtyRange]) -> io::Result<()> {
             panic!("injected writeback worker panic");
         }
 
-        fn sync_data(&self) -> io::Result<()> {
+        fn wait_writeback(&self, _ranges: &[DirtyRange]) -> io::Result<()> {
             Ok(())
         }
     }
@@ -1303,7 +1298,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_backend_writes_back_and_syncs_a_regular_file() {
+    fn linux_backend_starts_and_waits_for_regular_file_writeback() {
         let backing = TempFile::new().unwrap();
         backing.as_file().set_len(TEST_PAGE_SIZE * 2).unwrap();
         backing
@@ -1315,12 +1310,17 @@ mod tests {
             file: Arc::new(backing.as_file().try_clone().unwrap()),
         };
         backend
-            .writeback(&[DirtyRange {
+            .start_writeback(&[DirtyRange {
                 start: 0,
                 end: TEST_PAGE_SIZE,
             }])
             .unwrap();
-        backend.sync_data().unwrap();
+        backend
+            .wait_writeback(&[DirtyRange {
+                start: 0,
+                end: TEST_PAGE_SIZE,
+            }])
+            .unwrap();
     }
 
     #[test]
@@ -1551,7 +1551,7 @@ mod tests {
         controller.quiesce().unwrap();
 
         assert_eq!(
-            backend.calls.lock().unwrap().as_slice(),
+            backend.start_calls.lock().unwrap().as_slice(),
             &[vec![
                 DirtyRange {
                     start: 0,
@@ -1564,12 +1564,12 @@ mod tests {
             ]]
         );
         assert_eq!(controller.tracked.bytes, 0);
-        assert_eq!(backend.barrier_calls(), 1);
+        assert_eq!(backend.wait_calls(), 1);
     }
 
     #[test]
-    fn queued_generations_share_one_barrier_before_releasing_credit() {
-        let backend = Arc::new(BarrierGatedBackend::default());
+    fn queued_generations_wait_for_each_range_before_releasing_credit() {
+        let backend = Arc::new(CompletionGatedBackend::default());
         let mut controller = BufferedWritebackController::spawn(
             backend.clone(),
             MINIMUM_WRITEBACK_BUDGET_BYTES,
@@ -1583,9 +1583,9 @@ mod tests {
 
         backend.allow_writebacks(2);
         backend.wait_for_writebacks(2);
-        backend.wait_for_barriers(1);
+        backend.wait_for_waits(1);
 
-        assert_eq!(backend.barrier_calls(), 1);
+        assert_eq!(backend.wait_calls(), 1);
         assert_eq!(backend.calls().len(), 2);
         assert_eq!(controller.tracked.bytes, TEST_PAGE_SIZE * 2);
         assert!(controller
@@ -1597,17 +1597,18 @@ mod tests {
             TryRecvError::Empty
         );
 
-        backend.allow_barriers(1);
+        backend.allow_waits(2);
         controller.quiesce().unwrap();
+        assert_eq!(backend.wait_calls(), 2);
         assert_eq!(controller.tracked.bytes, 0);
         assert!(controller.submitted.is_empty());
         assert!(controller.health.is_healthy());
     }
 
     #[test]
-    fn barrier_failure_fails_every_coalesced_generation() {
-        let backend = Arc::new(BarrierGatedBackend::default());
-        backend.fail_next_barrier(io::ErrorKind::Other);
+    fn completion_failure_fails_every_coalesced_generation() {
+        let backend = Arc::new(CompletionGatedBackend::default());
+        backend.fail_next_wait(io::ErrorKind::Other);
         let mut controller = BufferedWritebackController::spawn(
             backend.clone(),
             MINIMUM_WRITEBACK_BUDGET_BYTES,
@@ -1621,8 +1622,8 @@ mod tests {
 
         backend.allow_writebacks(2);
         backend.wait_for_writebacks(2);
-        backend.wait_for_barriers(1);
-        backend.allow_barriers(1);
+        backend.wait_for_waits(1);
+        backend.allow_waits(2);
 
         assert_eq!(
             controller.quiesce().unwrap_err().kind(),
@@ -1639,8 +1640,8 @@ mod tests {
     }
 
     #[test]
-    fn successful_data_barrier_does_not_hide_a_range_kick_failure() {
-        let backend = Arc::new(BarrierGatedBackend::default());
+    fn successful_completion_wait_does_not_hide_a_range_kick_failure() {
+        let backend = Arc::new(CompletionGatedBackend::default());
         backend.fail_next_writeback(io::ErrorKind::Other);
         let mut controller = BufferedWritebackController::spawn(
             backend.clone(),
@@ -1655,20 +1656,20 @@ mod tests {
 
         backend.allow_writebacks(2);
         backend.wait_for_writebacks(2);
-        backend.wait_for_barriers(1);
+        backend.wait_for_waits(1);
         assert_eq!(controller.tracked.bytes, TEST_PAGE_SIZE * 2);
         assert_eq!(
             controller.completion_receiver.try_recv().unwrap_err(),
             TryRecvError::Empty
         );
-        backend.allow_barriers(1);
+        backend.allow_waits(2);
 
         assert_eq!(
             controller.quiesce().unwrap_err().kind(),
             io::ErrorKind::Other
         );
 
-        assert_eq!(backend.barrier_calls(), 1);
+        assert_eq!(backend.wait_calls(), 2);
         assert_eq!(controller.tracked.bytes, TEST_PAGE_SIZE * 2);
         assert_eq!(controller.submitted.len(), 2);
         assert!(controller
@@ -1729,7 +1730,7 @@ mod tests {
     #[test]
     fn worker_error_latches_without_releasing_credits() {
         let backend = Arc::new(FakeBackend::default());
-        backend.fail_next_barrier(io::ErrorKind::Other);
+        backend.fail_next_wait(io::ErrorKind::Other);
         let mut controller = BufferedWritebackController::spawn(
             backend,
             MINIMUM_WRITEBACK_BUDGET_BYTES,
@@ -1755,7 +1756,7 @@ mod tests {
             io::ErrorKind::Other
         );
 
-        // A later sync cannot prove that bytes behind an already-reported barrier error survived.
+        // A later sync cannot prove that bytes behind an already-reported completion error survived.
         assert!(!controller.reset_after_flush());
         assert_eq!(controller.tracked.bytes, 0);
         assert!(controller.latched_error.is_some());
@@ -1765,7 +1766,7 @@ mod tests {
     #[test]
     fn unsupported_backend_error_survives_full_sync_reset() {
         let backend = Arc::new(FakeBackend::default());
-        backend.fail_next_barrier(io::ErrorKind::Unsupported);
+        backend.fail_next_wait(io::ErrorKind::Unsupported);
         let mut controller = BufferedWritebackController::spawn(
             backend,
             MINIMUM_WRITEBACK_BUDGET_BYTES,
