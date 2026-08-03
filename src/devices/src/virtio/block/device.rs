@@ -828,12 +828,10 @@ impl Block {
             .filename(&imago_path)
             .direct(direct_io);
 
-        // Ask Imago to keep completed buffered writes from lingering in the host page cache when
-        // the hard writeback budget is active. Linux treats RWF_DONTCACHE as a best-effort cache
-        // pressure hint, so correctness and containment continue to come from the controller's
-        // reservation accounting and sync barriers rather than this optimization.
-        #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
-        let file_opts = file_opts.write_dontcache(writeback_config.is_some());
+        // Do not attach `RWF_DONTCACHE` to bounded writes. The controller already reserves every
+        // dirty page before mutation and returns that credit only after verified writeback, while
+        // the per-write hint would start eager writeback and collapse the finite cache window that
+        // the hard budget is intended to bound.
 
         #[cfg(target_os = "macos")]
         let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
