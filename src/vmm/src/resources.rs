@@ -473,6 +473,17 @@ impl VmResources {
         self.block.insert(config, self.metrics.clone())
     }
 
+    /// Adds a block device with an optional per-device hard dirty-data budget.
+    #[cfg(feature = "blk")]
+    pub fn add_block_device_with_writeback_limit(
+        &mut self,
+        config: BlockDeviceConfig,
+        writeback_limit_bytes: Option<u64>,
+    ) -> Result<BlockConfigError> {
+        self.block
+            .insert_with_writeback_limit(config, writeback_limit_bytes, self.metrics.clone())
+    }
+
     /// Sets a vsock device to be attached when the VM starts.
     pub fn set_vsock_device(&mut self, config: VsockDeviceConfig) -> Result<VsockConfigError> {
         self.vsock.insert(config)

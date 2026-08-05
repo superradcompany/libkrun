@@ -504,12 +504,32 @@ impl FileReadWriteAtVolatile for DiskProperties {
                 IoSlice::new(slice)
             })
             .collect::<Vec<_>>();
-        let iovec = IoVector::from(buffers);
-        let full_length = iovec
-            .len()
+        let mut iovec = IoVector::from(buffers);
+        let full_length_u64 = iovec.len();
+        let full_length = full_length_u64
             .try_into()
             .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-        self.file.lock().unwrap().writev(iovec, offset)?;
+
+        // Keep the invariant local to the backing-write boundary as well as the virtio request
+        // parser: a bounded mutation is accepted in full or rejected before its first writev.
+        self.validate_mutation_range(offset, full_length_u64)?;
+
+        let mut chunk_offset = offset;
+        while !iovec.is_empty() {
+            let plan = self.plan_buffered_mutation(chunk_offset, iovec.len())?;
+            let chunk_length = plan.len();
+            let (chunk, remainder) = iovec.split_at(chunk_length);
+
+            let operation_result = self.file.lock().unwrap().writev(chunk, chunk_offset);
+            self.finish_buffered_mutation(plan, operation_result)?;
+
+            iovec = remainder;
+            if !iovec.is_empty() {
+                chunk_offset = chunk_offset.checked_add(chunk_length).ok_or_else(|| {
+                    Error::new(ErrorKind::InvalidInput, "block write range overflow")
+                })?;
+            }
+        }
         Ok(full_length)
     }
 }

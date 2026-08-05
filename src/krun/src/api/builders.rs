@@ -368,7 +368,7 @@ pub enum SyncMode {
 #[cfg(feature = "blk")]
 #[derive(Debug, Clone)]
 pub struct DiskBuilder {
-    pub(crate) configs: Vec<DiskConfig>,
+    pub(crate) configs: Vec<ConfiguredDisk>,
     current_path: Option<PathBuf>,
     current_id: Option<String>,
     current_read_only: bool,
@@ -376,6 +376,7 @@ pub struct DiskBuilder {
     current_cache: CacheMode,
     current_direct_io: bool,
     current_sync: SyncMode,
+    current_writeback_limit_bytes: Option<u64>,
 }
 
 /// Configuration for a single block device.
@@ -391,6 +392,14 @@ pub struct DiskConfig {
     pub cache: CacheMode,
     pub direct_io: bool,
     pub sync: SyncMode,
+}
+
+/// Internal disk configuration paired with host-only tuning state.
+#[cfg(feature = "blk")]
+#[derive(Debug, Clone)]
+pub(crate) struct ConfiguredDisk {
+    pub(crate) config: DiskConfig,
+    pub(crate) writeback_limit_bytes: Option<u64>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1025,6 +1034,7 @@ impl DiskBuilder {
             current_cache: CacheMode::Writeback,
             current_direct_io: false,
             current_sync: SyncMode::Full,
+            current_writeback_limit_bytes: None,
         }
     }
 
@@ -1050,20 +1060,24 @@ impl DiskBuilder {
     pub fn path(mut self, path: impl AsRef<Path>) -> Self {
         // Finalize any pending config
         if let Some(pending_path) = self.current_path.take() {
-            self.configs.push(DiskConfig {
-                path: pending_path,
-                id: self.current_id.take(),
-                read_only: self.current_read_only,
-                format: self.current_format,
-                cache: self.current_cache,
-                direct_io: self.current_direct_io,
-                sync: self.current_sync,
+            self.configs.push(ConfiguredDisk {
+                config: DiskConfig {
+                    path: pending_path,
+                    id: self.current_id.take(),
+                    read_only: self.current_read_only,
+                    format: self.current_format,
+                    cache: self.current_cache,
+                    direct_io: self.current_direct_io,
+                    sync: self.current_sync,
+                },
+                writeback_limit_bytes: self.current_writeback_limit_bytes,
             });
             self.current_read_only = false;
             self.current_format = DiskImageFormat::Raw;
             self.current_cache = CacheMode::Writeback;
             self.current_direct_io = false;
             self.current_sync = SyncMode::Full;
+            self.current_writeback_limit_bytes = None;
         }
 
         self.current_path = Some(path.as_ref().to_path_buf());
@@ -1094,17 +1108,38 @@ impl DiskBuilder {
         self
     }
 
+    /// Limit outstanding buffered host dirty data to this many bytes.
+    ///
+    /// This Linux-only policy is valid for writable raw disks using writeback caching, buffered
+    /// I/O and an active sync mode. The minimum active budget is 128 MiB; zero disables the policy.
+    /// Libkrun derives smaller internal batches, retires their data and allocation metadata on a
+    /// background helper, and applies backpressure before this per-device, page-aligned dirty-data
+    /// budget can be exceeded. Guest flushes still perform the existing full durability sync.
+    ///
+    /// While this policy is active, host hole punching is not exposed to the guest: discard and
+    /// write-zeroes-with-unmap are unavailable, while ordinary write-zeroes requests use accounted
+    /// data writes. On supporting Linux kernels and filesystems, writes also request best-effort
+    /// cache pruning; that hint is an optimization, not a bound on clean page-cache residency.
+    /// Invalid combinations fail explicitly when the VM is built.
+    pub fn writeback_limit_bytes(mut self, bytes: u64) -> Self {
+        self.current_writeback_limit_bytes = (bytes > 0).then_some(bytes);
+        self
+    }
+
     /// Finalize the builder (called internally).
     pub(crate) fn finalize(mut self) -> Self {
         if let Some(path) = self.current_path.take() {
-            self.configs.push(DiskConfig {
-                path,
-                id: self.current_id.take(),
-                read_only: self.current_read_only,
-                format: self.current_format,
-                cache: self.current_cache,
-                direct_io: self.current_direct_io,
-                sync: self.current_sync,
+            self.configs.push(ConfiguredDisk {
+                config: DiskConfig {
+                    path,
+                    id: self.current_id.take(),
+                    read_only: self.current_read_only,
+                    format: self.current_format,
+                    cache: self.current_cache,
+                    direct_io: self.current_direct_io,
+                    sync: self.current_sync,
+                },
+                writeback_limit_bytes: self.current_writeback_limit_bytes,
             });
         }
         self

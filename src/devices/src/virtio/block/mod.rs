@@ -5,6 +5,8 @@ pub mod device;
 #[cfg(windows)]
 mod windows;
 mod worker;
+#[cfg(any(target_os = "linux", test))]
+mod writeback;
 
 pub use self::device::{Block, CacheType};
 
