@@ -1,6 +1,6 @@
 [package]
 name = "msb_krun_polly"
-version = "0.1.25"
+version = "0.1.26"
 authors = ["Amazon Firecracker team <firecracker-devel@amazon.com>"]
 edition = "2021"
 license = "Apache-2.0"
@@ -9,4 +9,4 @@ repository = "https://github.com/containers/libkrun"
 
 [dependencies]
 libc = ">=0.2.39"
-utils = { package = "msb_krun_utils", version = "0.1.25", path = "../utils" }
+utils = { package = "msb_krun_utils", version = "0.1.26", path = "../utils" }
