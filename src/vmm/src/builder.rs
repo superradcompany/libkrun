@@ -265,6 +265,12 @@ pub enum StartMicrovmError {
     RegisterFsSigwinch(kvm_ioctls::Error),
     /// Cannot initialize a MMIO Gpu device or add a device to the MMIO Bus.
     RegisterGpuDevice(device_manager::mmio::Error),
+    /// Cannot register the PCIe host bridge (ECAM) on the MMIO Bus.
+    #[cfg(feature = "pci")]
+    RegisterPciDevice(device_manager::mmio::Error),
+    /// Cannot open or attach a VFIO passthrough PCI device.
+    #[cfg(feature = "vfio")]
+    AttachVfioDevice(String),
     /// Cannot initialize a MMIO Input device or add a device to the MMIO Bus.
     RegisterInputDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Network Device or add a device to the MMIO Bus.
@@ -569,6 +575,19 @@ impl Display for StartMicrovmError {
                     f,
                     "Cannot initialize a MMIO Input Device or add a device to the MMIO Bus. {err_msg}"
                 )
+            }
+            #[cfg(feature = "pci")]
+            RegisterPciDevice(ref err) => {
+                let mut err_msg = format!("{err}");
+                err_msg = err_msg.replace('\"', "");
+                write!(
+                    f,
+                    "Cannot register the PCIe host bridge on the MMIO Bus. {err_msg}"
+                )
+            }
+            #[cfg(feature = "vfio")]
+            AttachVfioDevice(ref msg) => {
+                write!(f, "Cannot attach VFIO passthrough device. {msg}")
             }
             RegisterNetDevice(ref err) => {
                 let mut err_msg = format!("{err}");
@@ -1707,6 +1726,46 @@ pub fn build_microvm(
     #[cfg(not(target_os = "windows"))]
     for serial_tty in serial_ttys {
         setup_terminal_raw_mode(&mut vmm, Some(serial_tty), false);
+    }
+
+    // Register the PCIe host bridge (ECAM) so the guest enumerates the PCI bus.
+    #[cfg(all(target_arch = "aarch64", feature = "pci"))]
+    {
+        let _pci_bus = attach_pci_root(&mut vmm)?;
+        // Attach VFIO passthrough devices named in KRUN_VFIO_PCI (comma-separated BDFs).
+        //
+        // Exactly one device is supported today. Attaching N>1 would require, and
+        // currently silently breaks without, three pieces of per-device resource
+        // management (see buildlog "multi-device" follow-up, flagged for review):
+        //   1. a shared BAR allocator — `allocate_bars` restarts its cursors from
+        //      the aperture base per device, so a 2nd device's BARs collide;
+        //   2. per-device slot / requester-id / GSI base (indexing off the device
+        //      position — the extension point is `attach_vfio_device`'s hardcoded
+        //      slot 0 / devid / `default_msi_gsi_base`);
+        //   3. AGGREGATE GSI routing — `KVM_SET_GSI_ROUTING` replaces the *entire*
+        //      table, so each device's `build_routing` (SPIs + its own MSI vectors)
+        //      would clobber the others'. A central routing owner must emit SPIs +
+        //      every VFIO device's MSI routes on any change.
+        // Until those land, reject N>1 loudly rather than corrupt interrupts/BARs.
+        #[cfg(feature = "vfio")]
+        if let Ok(bdfs_env) = std::env::var("KRUN_VFIO_PCI") {
+            let bdfs: Vec<&str> = bdfs_env
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if bdfs.len() > 1 {
+                return Err(StartMicrovmError::AttachVfioDevice(format!(
+                    "KRUN_VFIO_PCI lists {} devices; only one passthrough device is \
+                     supported (multi-device needs shared BAR/GSI allocation and \
+                     aggregate GSI routing)",
+                    bdfs.len()
+                )));
+            }
+            for bdf in bdfs {
+                attach_vfio_device(&mut vmm, &_pci_bus, bdf, _sender.clone())?;
+            }
+        }
     }
 
     #[cfg(not(feature = "tee"))]
@@ -4013,6 +4072,272 @@ fn attach_rng_device(
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc.clone(), rng).map_err(RegisterRngDevice)?;
+
+    Ok(())
+}
+
+/// Creates the PCIe host bridge and registers its ECAM config window on the
+/// MMIO bus, so the guest kernel enumerates a (initially empty) PCI bus. VFIO
+/// devices are added to this same bus in a later step.
+#[cfg(all(target_arch = "aarch64", feature = "pci"))]
+fn attach_pci_root(
+    vmm: &mut Vmm,
+) -> std::result::Result<Arc<Mutex<devices::pci::PciBus>>, StartMicrovmError> {
+    // BAR relocation is unsupported: a VFIO BAR is mmap'd into a fixed KVM
+    // memslot at attach time (`register_mmio_memslot`), and `DeviceRelocation`
+    // has no path back to the VMM to re-register that memslot. Rather than
+    // silently accept a guest BAR move — which would leave the config register
+    // pointing at a new address while the memslot stays at the old one, breaking
+    // all BAR access — we return an error. `PciConfigMmio::config_space_write`
+    // then rolls the write back (`restore_bar_addr`) and warns, keeping config
+    // consistent with the mapping. In practice Linux re-assigns the GPU BARs to
+    // the same addresses we pre-allocated (both pack from the aperture base), so
+    // `move_bar` is never actually hit; this just makes the unsupported case
+    // fail safe instead of silently corrupting. (A real implementation would
+    // thread VMM memslot access through here — see buildlog follow-ups.)
+    struct UnsupportedRelocation;
+    impl devices::pci::DeviceRelocation for UnsupportedRelocation {
+        fn move_bar(
+            &self,
+            old_base: u64,
+            new_base: u64,
+            _len: u64,
+            _pci_dev: &mut dyn devices::pci::PciDevice,
+            _region_type: devices::pci::PciBarRegionType,
+        ) -> std::result::Result<(), std::io::Error> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("VFIO BAR relocation {old_base:#x}->{new_base:#x} not supported"),
+            ))
+        }
+    }
+
+    let pci_root = devices::pci::PciRoot::new(None);
+    let pci_bus = Arc::new(Mutex::new(devices::pci::PciBus::new(
+        pci_root,
+        Arc::new(UnsupportedRelocation),
+    )));
+    vmm.mmio_device_manager
+        .register_pci(pci_bus.clone())
+        .map_err(StartMicrovmError::RegisterPciDevice)?;
+
+    // Place a PCIe root port at 00:01.0 (secondary bus 1). Passed-through devices
+    // are attached behind it (bus 1) rather than directly on the root bus, because
+    // NVIDIA's RM requires the GPU to have an upstream PCIe port (on Linux,
+    // `pci_dev->bus->self != NULL`) or it fails osVerifySystemEnvironment.
+    let root_port = devices::pci::PciRootPort::new(PCI_SECONDARY_BUS);
+    pci_bus
+        .lock()
+        .unwrap()
+        .add_bridge(PCI_ROOT_PORT_SLOT, Arc::new(Mutex::new(root_port)));
+
+    Ok(pci_bus)
+}
+
+/// Bus-0 slot holding the PCIe root port that fronts passed-through devices.
+#[cfg(all(target_arch = "aarch64", feature = "pci"))]
+const PCI_ROOT_PORT_SLOT: u8 = 1;
+/// Secondary bus number assigned to the root port (where the GPU lives).
+#[cfg(all(target_arch = "aarch64", feature = "pci"))]
+const PCI_SECONDARY_BUS: u8 = 1;
+// The secondary bus must be addressable by the ECAM window, or its config space
+// falls outside the mapped region (see `PCIE_MAX_BUS`). Enforced at compile time.
+#[cfg(all(target_arch = "aarch64", feature = "pci"))]
+const _: () = assert!(PCI_SECONDARY_BUS <= arch::aarch64::layout::PCIE_MAX_BUS);
+
+/// Open a physical PCI device via VFIO and add it to the guest PCI bus. Config
+/// space passes through to the device; BARs are emulated (and mmap'd in a later
+/// step). The device is selected by BDF (e.g. "0002:01:00.0").
+#[cfg(all(target_arch = "aarch64", feature = "vfio"))]
+fn attach_vfio_device(
+    vmm: &mut Vmm,
+    pci_bus: &Arc<Mutex<devices::pci::PciBus>>,
+    bdf: &str,
+    irq_sender: Sender<WorkerMessage>,
+) -> std::result::Result<(), StartMicrovmError> {
+    let id = format!("vfio-{bdf}");
+    let mut device = devices::vfio_pci::VfioPciDevice::new(id, bdf)
+        .map_err(|e| StartMicrovmError::AttachVfioDevice(format!("{bdf}: {e}")))?;
+
+    // The 4 KiB page(s) holding the MSI-X table are left unmapped so guest
+    // accesses trap to the device's read_bar/write_bar (MSI-X emulation, step 9)
+    // instead of hitting the hardware table directly. Compute that window for
+    // the BAR that holds the table.
+    const PAGE: u64 = 4096;
+    let table_trap: Option<(u32, u64, u64)> = device.msix().map(|m| {
+        let (t_off, t_size) = m.table_range();
+        let start = t_off & !(PAGE - 1);
+        let end = (t_off + t_size).div_ceil(PAGE) * PAGE;
+        (m.table_bir, start, end)
+    });
+
+    // Guest address + length of the trapped MSI-X table page, captured below so
+    // it can be registered on the MMIO bus (step 9) once the device is shared.
+    let mut table_page_gpa: Option<(u64, u64)> = None;
+
+    // Step 6: mmap each mmappable BAR from the device fd and register it as a
+    // guest MMIO memslot at the allocated BAR address, so guest accesses reach
+    // the hardware directly — except the MSI-X table page, which is carved out
+    // and left to trap (step 9).
+    for region in device.mmio_regions() {
+        // Sub-ranges of this BAR to mmap as (region_offset, len). Normally the
+        // whole BAR; for the table BAR, the parts before and after the table page.
+        let ranges: Vec<(u64, u64)> = match table_trap {
+            Some((bir, start, end)) if bir == region.index => {
+                let end = end.min(region.length);
+                table_page_gpa = Some((region.start + start, end - start));
+                let mut v = Vec::new();
+                if start > 0 {
+                    v.push((0, start));
+                }
+                if end < region.length {
+                    v.push((end, region.length - end));
+                }
+                info!(
+                    "vfio: {bdf} BAR{} MSI-X table page [{:#x},{:#x}) trapped",
+                    region.index, start, end
+                );
+                v
+            }
+            _ => vec![(0, region.length)],
+        };
+
+        for (off, len) in ranges {
+            if len == 0 {
+                continue;
+            }
+            match device.vfio().mmap_region_range(region.index, off, len) {
+                Ok((host_addr, mlen)) => {
+                    vmm.register_mmio_memslot(region.start + off, host_addr as u64, mlen as u64)
+                        .map_err(|e| {
+                            StartMicrovmError::AttachVfioDevice(format!(
+                                "{bdf} BAR{}: {e}",
+                                region.index
+                            ))
+                        })?;
+                    info!(
+                        "vfio: {bdf} BAR{} mapped guest {:#x} len {:#x}",
+                        region.index,
+                        region.start + off,
+                        mlen
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "vfio: {bdf} BAR{} range {:#x}+{:#x} not mmappable ({e}); accesses will be trapped",
+                        region.index, off, len
+                    );
+                }
+            }
+        }
+    }
+
+    // Step 7: identity-map all guest RAM into the device's IOMMU (iova == gpa)
+    // so the GPU can DMA to/from guest memory.
+    {
+        use vm_memory::GuestMemoryRegion;
+        let gm = vmm.guest_memory();
+        for region in gm.iter() {
+            let gpa = region.start_addr().raw_value();
+            let host = gm.get_host_address(region.start_addr()).map_err(|e| {
+                StartMicrovmError::AttachVfioDevice(format!("{bdf} dma host addr: {e}"))
+            })? as u64;
+            let size = region.len();
+            device
+                .vfio()
+                .container()
+                .map_dma(host, gpa, size)
+                .map_err(|e| {
+                    StartMicrovmError::AttachVfioDevice(format!("{bdf} dma map: {e}"))
+                })?;
+        }
+        info!("vfio: {bdf} guest RAM identity-mapped into device IOMMU");
+    }
+
+    // Step 8: bind the VFIO group to KVM (KVM_DEV_VFIO) so KVM can coordinate
+    // interrupt routing and IOMMU coherence with the device.
+    {
+        let mut kvm_vfio = kvm_bindings::kvm_create_device {
+            type_: kvm_bindings::kvm_device_type_KVM_DEV_TYPE_VFIO,
+            fd: 0,
+            flags: 0,
+        };
+        let kvm_vfio_fd = vmm
+            .kvm_vm()
+            .fd()
+            .create_device(&mut kvm_vfio)
+            .map_err(|e| {
+                StartMicrovmError::AttachVfioDevice(format!("{bdf} kvm vfio device: {e}"))
+            })?;
+        let group_fd: i32 = device.vfio().group_as_raw_fd();
+        let attr = kvm_bindings::kvm_device_attr {
+            group: kvm_bindings::KVM_DEV_VFIO_GROUP,
+            attr: u64::from(kvm_bindings::KVM_DEV_VFIO_GROUP_ADD),
+            addr: &group_fd as *const i32 as u64,
+            flags: 0,
+        };
+        kvm_vfio_fd.set_device_attr(&attr).map_err(|e| {
+            StartMicrovmError::AttachVfioDevice(format!("{bdf} kvm vfio group add: {e}"))
+        })?;
+        // The KVM VFIO device fd must outlive the VM; leak it (closed at exit).
+        std::mem::forget(kvm_vfio_fd);
+        info!("vfio: {bdf} group bound to KVM");
+    }
+
+    // The GPU is attached behind the root port on the secondary bus, at slot 0.
+    let slot: u8 = 0;
+
+    // Step 9: set up MSI-X interrupt delivery. Create one eventfd (irqfd) per
+    // vector, assign a GSI range, and install the initial routing + irqfd
+    // bindings. The requester id (devid) is the guest BDF
+    // (bus = secondary bus, dev = slot, fn 0), matching the PCIe node's
+    // `msi-map` (identity rid→devid).
+    if device.msix().is_some() {
+        let table_size = device.msix().unwrap().table_size as usize;
+        let mut eventfds = Vec::with_capacity(table_size);
+        for _ in 0..table_size {
+            let evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(|e| {
+                StartMicrovmError::AttachVfioDevice(format!("{bdf} msix eventfd: {e}"))
+            })?;
+            eventfds.push(evt);
+        }
+        let gsi_base = devices::vfio_pci::VfioPciDevice::default_msi_gsi_base();
+        let devid = (u32::from(PCI_SECONDARY_BUS) << 8) | (u32::from(slot) << 3);
+        device.set_msix_runtime(gsi_base, devid, eventfds, irq_sender);
+        device.setup_msix_kvm(vmm.kvm_vm().fd()).map_err(|e| {
+            StartMicrovmError::AttachVfioDevice(format!("{bdf} msix kvm setup: {e}"))
+        })?;
+        info!(
+            "vfio: {bdf} MSI-X ready ({table_size} vectors, gsi {gsi_base}.., devid {devid:#x})"
+        );
+    }
+
+    let device_arc: Arc<Mutex<dyn devices::pci::PciDevice>> = Arc::new(Mutex::new(device));
+
+    // Register the MSI-X table page trap on the MMIO bus so the guest's table
+    // writes reach `write_bar` (they'd otherwise fall into the unmapped memslot
+    // gap and be dropped, leaving MSI routing with a null message).
+    if let Some((addr, len)) = table_page_gpa {
+        let trap = Arc::new(Mutex::new(devices::vfio_pci::VfioBarTrap::new(
+            device_arc.clone(),
+            addr,
+        )));
+        vmm.mmio_device_manager
+            .register_mmio_bar_trap(trap, addr, len)
+            .map_err(|e| {
+                StartMicrovmError::AttachVfioDevice(format!("{bdf} msix table trap: {e:?}"))
+            })?;
+        info!("vfio: {bdf} MSI-X table page trap at {addr:#x} len {len:#x}");
+    }
+
+    {
+        let mut bus = pci_bus.lock().unwrap();
+        bus.add_secondary_device(slot, device_arc);
+    }
+    info!(
+        "vfio: attached {bdf} at 0000:{:02x}:{slot:02x}.0 (behind root port)",
+        PCI_SECONDARY_BUS
+    );
 
     Ok(())
 }

@@ -118,6 +118,39 @@ impl MMIODeviceManager {
         Ok(())
     }
 
+    /// Register the PCIe ECAM config-access window on the MMIO bus. The guest
+    /// kernel reaches config space through this `PciConfigMmio`, which shares
+    /// the `PciBus` across vCPUs (the bus map is cloned per-vCPU, but each
+    /// device is an `Arc<Mutex<..>>`).
+    #[cfg(all(target_arch = "aarch64", feature = "pci"))]
+    pub fn register_pci(
+        &mut self,
+        pci_bus: Arc<Mutex<devices::pci::PciBus>>,
+    ) -> Result<()> {
+        use arch::aarch64::layout::{PCIE_ECAM_BASE, PCIE_ECAM_SIZE};
+
+        let cfg_mmio = devices::pci::PciConfigMmio::new(pci_bus);
+        self.bus
+            .insert(Arc::new(Mutex::new(cfg_mmio)), PCIE_ECAM_BASE, PCIE_ECAM_SIZE)
+            .map_err(Error::BusError)?;
+
+        Ok(())
+    }
+
+    /// Register a trap `BusDevice` over a carved-out BAR sub-region (the MSI-X
+    /// table page), so guest accesses that fault out of the memslot gap are
+    /// dispatched to the VFIO device's `read_bar`/`write_bar` (MSI-X emulation).
+    #[cfg(all(target_arch = "aarch64", feature = "vfio"))]
+    pub fn register_mmio_bar_trap(
+        &mut self,
+        trap: Arc<Mutex<dyn devices::BusDevice>>,
+        addr: u64,
+        size: u64,
+    ) -> Result<()> {
+        self.bus.insert(trap, addr, size).map_err(Error::BusError)?;
+        Ok(())
+    }
+
     /// Register an already created MMIO device to be used via MMIO transport.
     pub fn register_mmio_device(
         &mut self,

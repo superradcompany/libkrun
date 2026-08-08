@@ -15,6 +15,8 @@ net = []
 blk = []
 efi = ["blk", "net"]
 gpu = ["rutabaga_gfx", "thiserror", "zerocopy", "krun_display"]
+pci = ["thiserror"]
+vfio = ["pci", "dep:vfio-bindings", "dep:vmm-sys-util"]
 snd = ["pw", "thiserror"]
 input = ["zerocopy", "krun_input"]
 virgl_resource_map2 = []
@@ -53,6 +55,8 @@ capng = "0.2.3"
 caps = "0.5.5"
 kvm-bindings = { version = ">=0.11", features = ["fam-wrappers"] }
 kvm-ioctls = ">=0.21"
+vfio-bindings = { version = "=0.6.2", optional = true }
+vmm-sys-util = { version = ">=0.12", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 tokio = { version = "1", features = ["rt"] }
