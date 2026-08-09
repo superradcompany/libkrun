@@ -462,6 +462,10 @@ impl Proxy for TsiStreamProxy {
         self.id
     }
 
+    fn pollable(&self) -> RawFd {
+        self.as_raw_fd()
+    }
+
     fn status(&self) -> ProxyStatus {
         self.status
     }

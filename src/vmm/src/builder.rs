@@ -77,8 +77,8 @@ use devices::legacy::{KvmGicV2, KvmGicV3};
 #[cfg(target_os = "windows")]
 use devices::virtio::{port_io, PortDescription};
 #[cfg(not(target_os = "windows"))]
-use devices::virtio::{port_io, PortDescription, Vsock};
-use devices::virtio::{MmioTransport, VirtioDevice};
+use devices::virtio::{port_io, PortDescription};
+use devices::virtio::{MmioTransport, VirtioDevice, Vsock};
 
 #[cfg(feature = "tee")]
 use kbs_types::Tee;
@@ -1862,15 +1862,17 @@ pub fn build_microvm(
     #[cfg(feature = "blk")]
     trace.mark("block.ready");
 
-    #[cfg(not(target_os = "windows"))]
     if let Some(vsock) = vm_resources.vsock.get() {
-        attach_unixsock_vsock_device(&mut vmm, vsock, event_manager, intc.clone())?;
-        let tsi_flags = vm_resources.vsock.tsi_flags();
-        if tsi_flags.contains(TsiFlags::HIJACK_INET) {
-            vmm.kernel_cmdline.insert_str("tsi_hijack")?;
-        }
-        if tsi_flags.contains(TsiFlags::HIJACK_UNIX) {
-            vmm.kernel_cmdline.insert_str("tsi_hijack_unix")?;
+        attach_vsock_device(&mut vmm, vsock, event_manager, intc.clone())?;
+        #[cfg(not(target_os = "windows"))]
+        {
+            let tsi_flags = vm_resources.vsock.tsi_flags();
+            if tsi_flags.contains(TsiFlags::HIJACK_INET) {
+                vmm.kernel_cmdline.insert_str("tsi_hijack")?;
+            }
+            if tsi_flags.contains(TsiFlags::HIJACK_UNIX) {
+                vmm.kernel_cmdline.insert_str("tsi_hijack_unix")?;
+            }
         }
         trace.mark("vsock.ready");
     } else {
@@ -3864,23 +3866,22 @@ fn attach_net_devices(
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
-fn attach_unixsock_vsock_device(
+fn attach_vsock_device(
     vmm: &mut Vmm,
-    unix_vsock: &Arc<Mutex<Vsock>>,
+    vsock: &Arc<Mutex<Vsock>>,
     event_manager: &mut EventManager,
     intc: IrqChip,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
     event_manager
-        .add_subscriber(unix_vsock.clone())
+        .add_subscriber(vsock.clone())
         .map_err(RegisterEvent)?;
 
-    let id = String::from(unix_vsock.lock().unwrap().id());
+    let id = String::from(vsock.lock().unwrap().id());
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
-    attach_mmio_device(vmm, id, intc, unix_vsock.clone()).map_err(RegisterVsockDevice)?;
+    attach_mmio_device(vmm, id, intc, vsock.clone()).map_err(RegisterVsockDevice)?;
 
     Ok(())
 }

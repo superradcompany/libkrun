@@ -6,10 +6,21 @@
 // found in the THIRD-PARTY file.
 
 mod backend;
+mod custom_stream;
 mod device;
+#[cfg(unix)]
+mod dgram;
 mod event_handler;
+#[cfg(unix)]
+mod muxer;
+#[cfg(windows)]
+#[path = "muxer_windows.rs"]
 mod muxer;
 mod muxer_rxq;
+#[cfg(unix)]
+mod muxer_thread;
+#[cfg(windows)]
+#[path = "muxer_thread_windows.rs"]
 mod muxer_thread;
 #[allow(dead_code)]
 mod packet;
@@ -17,12 +28,17 @@ mod proxy;
 mod reaper;
 #[cfg(target_os = "macos")]
 mod timesync;
+#[cfg(unix)]
 mod tsi_dgram;
+#[cfg(unix)]
 mod tsi_stream;
+#[cfg(unix)]
 mod unix;
 
 pub use self::backend::{
-    VsockConnectRequest, VsockNotifier, VsockPortBackend, VsockShutdown, VsockStreamBackend,
+    VsockConnectRequest, VsockConnectState, VsockDatagramBackend, VsockDatagramPeer,
+    VsockDatagramPortBackend, VsockDatagramRead, VsockNotifier, VsockPollable, VsockPortBackend,
+    VsockShutdown, VsockStreamBackend,
 };
 pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
 pub use self::defs::TsiFlags;
@@ -80,23 +96,37 @@ mod defs {
     // Kernel side doesn't play nice with us supporting so many bytes
     //pub const CONN_TX_BUF_SIZE: usize = i32::MAX as usize;
     pub const CONN_TX_BUF_SIZE: usize = 8 * 1024 * 1024;
+    #[cfg(unix)]
     pub const SOCK_STREAM: u16 = 1;
+    #[cfg(unix)]
     pub const SOCK_DGRAM: u16 = 2;
 
     /// Misc
+    #[cfg(unix)]
     pub const TSI_PROXY_PORT: u32 = 620;
+    #[cfg(unix)]
     pub const TSI_PROXY_CREATE: u32 = 1024;
+    #[cfg(unix)]
     pub const TSI_CONNECT: u32 = 1025;
+    #[cfg(unix)]
     pub const TSI_GETNAME: u32 = 1026;
+    #[cfg(unix)]
     pub const TSI_SENDTO_ADDR: u32 = 1027;
+    #[cfg(unix)]
     pub const TSI_SENDTO_DATA: u32 = 1028;
+    #[cfg(unix)]
     pub const TSI_LISTEN: u32 = 1029;
+    #[cfg(unix)]
     pub const TSI_ACCEPT: u32 = 1030;
+    #[cfg(unix)]
     pub const TSI_PROXY_RELEASE: u32 = 1031;
 
     // Linux definitions that we need for cross-platform compatibility.
+    #[cfg(unix)]
     pub const LINUX_AF_UNIX: u16 = 1;
+    #[cfg(unix)]
     pub const LINUX_AF_INET: u16 = 2;
+    #[cfg(unix)]
     pub const LINUX_AF_INET6: u16 = 10;
 
     pub mod uapi {

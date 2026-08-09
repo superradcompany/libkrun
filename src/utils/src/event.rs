@@ -16,18 +16,20 @@ use bitflags::bitflags;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
 #[cfg(windows)]
-use std::os::windows::io::RawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 
 #[cfg(unix)]
 use crate::eventfd::{EventFd, EFD_NONBLOCK};
 
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
-    CloseHandle, FALSE, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, FALSE, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+    CreateEventW, GetCurrentProcess, ResetEvent, SetEvent, WaitForMultipleObjects,
+    WaitForSingleObject,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -98,10 +100,16 @@ pub struct WaitEvent {
 }
 
 /// Context that waits on registered event sources.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct WaitContext {
     sources: Vec<RegisteredSource>,
 }
+
+// Windows HANDLE values are process-wide opaque identifiers. WaitContext never
+// dereferences them, and callers synchronize mutation, so moving a context to
+// its dedicated event-loop thread is safe.
+#[cfg(windows)]
+unsafe impl Send for WaitContext {}
 
 #[derive(Clone, Copy, Debug)]
 struct RegisteredSource {
@@ -361,10 +369,32 @@ fn wait_platform(
         return Ok(0);
     }
 
-    let mut handles = Vec::with_capacity(sources.len());
+    // Wait on duplicated handles so callers can unregister and close their
+    // originals immediately after waking the control source. Windows leaves a
+    // wait undefined if one of its raw handles is closed concurrently.
+    let process = unsafe { GetCurrentProcess() };
+    let mut owned_handles = Vec::with_capacity(sources.len());
     for source in sources {
         match source.source.raw {
-            RawEventSource::WaitableHandle(handle) => handles.push(handle as HANDLE),
+            RawEventSource::WaitableHandle(handle) => {
+                let mut duplicate = std::ptr::null_mut();
+                let result = unsafe {
+                    DuplicateHandle(
+                        process,
+                        handle as HANDLE,
+                        process,
+                        &mut duplicate,
+                        0,
+                        FALSE,
+                        DUPLICATE_SAME_ACCESS,
+                    )
+                };
+                if result == FALSE {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: DuplicateHandle returned a new owned process handle.
+                owned_handles.push(unsafe { OwnedHandle::from_raw_handle(duplicate) });
+            }
             RawEventSource::CompletionHandle(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -373,6 +403,10 @@ fn wait_platform(
             }
         }
     }
+    let handles = owned_handles
+        .iter()
+        .map(|handle| handle.as_raw_handle() as HANDLE)
+        .collect::<Vec<_>>();
 
     let timeout = if timeout_ms < 0 {
         INFINITE_TIMEOUT

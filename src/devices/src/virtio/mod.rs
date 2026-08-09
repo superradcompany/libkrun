@@ -50,7 +50,9 @@ mod queue;
 pub mod rng;
 #[cfg(feature = "snd")]
 pub mod snd;
-#[cfg(not(target_os = "windows"))]
+// Preserve vsock for existing Unix TEE builds while enabling it for ordinary
+// Windows guests. Windows TEE combinations continue to omit the device.
+#[cfg(any(not(target_os = "windows"), not(feature = "tee")))]
 pub mod vsock;
 
 #[cfg(not(feature = "tee"))]
@@ -75,7 +77,7 @@ pub use self::queue::{Descriptor, DescriptorChain, Queue};
 pub use self::rng::*;
 #[cfg(feature = "snd")]
 pub use self::snd::Snd;
-#[cfg(not(target_os = "windows"))]
+#[cfg(any(not(target_os = "windows"), not(feature = "tee")))]
 pub use self::vsock::*;
 
 /// When the driver initializes the device, it lets the device know about the

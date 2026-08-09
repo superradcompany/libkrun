@@ -1,4 +1,8 @@
 use std::io;
+#[cfg(unix)]
+use std::os::fd::RawFd;
+#[cfg(windows)]
+use std::os::windows::io::RawHandle;
 use std::sync::Arc;
 
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
@@ -6,6 +10,14 @@ use utils::eventfd::{EventFd, EFD_NONBLOCK};
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
+
+/// Platform-native object that can be registered with libkrun's event loop.
+#[cfg(unix)]
+pub type VsockPollable = RawFd;
+
+/// Platform-native object that can be registered with libkrun's event loop.
+#[cfg(windows)]
+pub type VsockPollable = RawHandle;
 
 /// Metadata for a guest-initiated connection to a registered host port.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16,6 +28,35 @@ pub struct VsockConnectRequest {
     pub guest_port: u32,
     /// Host port on which the backend was registered.
     pub host_port: u32,
+}
+
+/// State of the host endpoint behind a guest stream connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VsockConnectState {
+    /// The nonblocking host connection is still being established.
+    Connecting,
+    /// The host endpoint is ready for stream traffic.
+    Connected,
+}
+
+/// Metadata identifying one guest datagram peer for a registered host port.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct VsockDatagramPeer {
+    /// CID of the guest sending datagrams.
+    pub guest_cid: u64,
+    /// Source port selected or bound by the guest.
+    pub guest_port: u32,
+    /// Host port on which the backend was registered.
+    pub host_port: u32,
+}
+
+/// Result of receiving one complete datagram from a host backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VsockDatagramRead {
+    /// Number of bytes written into the supplied buffer.
+    pub len: usize,
+    /// Whether the original message exceeded the supplied buffer.
+    pub truncated: bool,
 }
 
 /// Direction requested by a guest shutdown packet.
@@ -57,6 +98,15 @@ pub trait VsockPortBackend: Send + Sync {
 /// continues to own virtio-vsock framing, credit flow, shutdown, and reset
 /// handling around this stream.
 pub trait VsockStreamBackend: Send {
+    /// Report whether a nonblocking host connection has completed.
+    ///
+    /// In-process backends are ready immediately. Socket-backed implementations
+    /// can return [`VsockConnectState::Connecting`] until their poll fd becomes
+    /// writable and then surface the result of `SO_ERROR` here.
+    fn connect_state(&self) -> io::Result<VsockConnectState> {
+        Ok(VsockConnectState::Connected)
+    }
+
     /// Read bytes that should be delivered to the guest.
     fn read(&self, buf: &mut [u8]) -> io::Result<usize>;
 
@@ -65,6 +115,45 @@ pub trait VsockStreamBackend: Send {
 
     /// Apply a guest-requested half-close or full shutdown.
     fn shutdown(&self, how: VsockShutdown) -> io::Result<()>;
+
+    /// Return a pollable host object when the backend has one.
+    ///
+    /// Returning `None` keeps the existing notifier-driven behavior. Returning
+    /// a native object lets libkrun poll a real socket or handle directly.
+    fn pollable(&self) -> Option<VsockPollable> {
+        None
+    }
+}
+
+/// Factory for message-oriented services exposed on one host vsock port.
+///
+/// libkrun opens one endpoint for every `(guest CID, guest source port, host
+/// port)` tuple. This preserves connectionless guest semantics while giving a
+/// host Unix datagram backend a stable reply address for each guest peer.
+pub trait VsockDatagramPortBackend: Send + Sync {
+    /// Open the host endpoint associated with one guest datagram peer.
+    fn open_peer(
+        &self,
+        peer: VsockDatagramPeer,
+        notifier: VsockNotifier,
+    ) -> io::Result<Box<dyn VsockDatagramBackend>>;
+}
+
+/// One nonblocking message-oriented endpoint behind a guest datagram peer.
+pub trait VsockDatagramBackend: Send {
+    /// Atomically deliver one guest message to the host endpoint.
+    ///
+    /// Implementations must never report partial delivery. `WouldBlock` means
+    /// the best-effort datagram may be dropped by the device.
+    fn send(&self, payload: &[u8]) -> io::Result<()>;
+
+    /// Receive one complete host message for delivery to the guest peer.
+    fn receive(&self, buf: &mut [u8]) -> io::Result<VsockDatagramRead>;
+
+    /// Return a pollable host object, or `None` to use [`VsockNotifier`].
+    fn pollable(&self) -> Option<VsockPollable> {
+        None
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -72,7 +161,10 @@ pub trait VsockStreamBackend: Send {
 //--------------------------------------------------------------------------------------------------
 
 impl VsockNotifier {
-    pub(crate) fn new() -> io::Result<Self> {
+    /// Create an independent notifier suitable for backend tests or adapters.
+    ///
+    /// libkrun normally constructs the notifier passed to a route backend.
+    pub fn new() -> io::Result<Self> {
         Ok(Self {
             event: Arc::new(EventFd::new(EFD_NONBLOCK)?),
         })
@@ -83,8 +175,25 @@ impl VsockNotifier {
         self.event.write(1)
     }
 
+    #[cfg(any(unix, test))]
     pub(crate) fn event(&self) -> &EventFd {
         &self.event
+    }
+
+    pub(crate) fn pollable(&self) -> VsockPollable {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            self.event.as_raw_fd()
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+
+            self.event.as_raw_handle()
+        }
     }
 
     pub(crate) fn clear(&self) -> io::Result<()> {

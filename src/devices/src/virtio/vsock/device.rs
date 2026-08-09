@@ -20,8 +20,8 @@ use super::super::{
 use super::muxer::VsockMuxer;
 use super::packet::VsockPacket;
 use super::TsiFlags;
-use super::VsockPortBackend;
 use super::{defs, defs::uapi};
+use super::{VsockDatagramPortBackend, VsockPortBackend};
 use crate::virtio::InterruptTransport;
 
 pub(crate) const RXQ_INDEX: usize = 0;
@@ -34,7 +34,11 @@ pub(crate) const EVQ_INDEX: usize = 2;
 ///   them available.
 pub(crate) const AVAIL_FEATURES: u64 = (1 << uapi::VIRTIO_F_VERSION_1 as u64)
     | (1 << uapi::VIRTIO_F_IN_ORDER as u64)
-    | (1 << uapi::VIRTIO_VSOCK_F_DGRAM);
+    | if cfg!(unix) {
+        1 << uapi::VIRTIO_VSOCK_F_DGRAM
+    } else {
+        0
+    };
 
 pub struct Vsock {
     cid: u64,
@@ -56,6 +60,7 @@ impl Vsock {
         host_port_map: Option<HashMap<u16, u16>>,
         unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
         custom_port_map: Option<HashMap<u32, Arc<dyn VsockPortBackend>>>,
+        custom_dgram_port_map: Option<HashMap<u32, Arc<dyn VsockDatagramPortBackend>>>,
         tsi_flags: TsiFlags,
     ) -> super::Result<Vsock> {
         Ok(Vsock {
@@ -65,6 +70,7 @@ impl Vsock {
                 host_port_map,
                 unix_ipc_port_map,
                 custom_port_map,
+                custom_dgram_port_map,
                 tsi_flags,
             ),
             queue_rx: None,
@@ -98,6 +104,7 @@ impl Vsock {
         };
 
         let mut have_used = false;
+        let mut needs_backend_kick = false;
 
         debug!("process_rx before while");
         let queue_rx = self
@@ -115,6 +122,7 @@ impl Vsock {
                         // We are using a consuming iterator over the virtio buffers, so, if we can't
                         // fill in this buffer, we'll need to undo the last iterator step.
                         queue_rx.undo_pop();
+                        needs_backend_kick = true;
                         break;
                     }
                 }
@@ -129,6 +137,14 @@ impl Vsock {
             if let Err(e) = queue_rx.add_used(mem, head.index, used_len) {
                 error!("failed to add used elements to the queue: {e:?}");
             }
+        }
+
+        // Backends can need a retry when the guest has just supplied receive
+        // capacity. Drop the virtqueue lock before taking proxy locks so the
+        // muxer thread cannot deadlock in the opposite proxy -> queue order.
+        drop(queue_rx);
+        if needs_backend_kick {
+            self.muxer.kick_backends();
         }
 
         have_used

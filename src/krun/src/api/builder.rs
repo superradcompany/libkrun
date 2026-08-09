@@ -1,6 +1,5 @@
 //! VM Builder for creating and configuring microVMs using nested builders.
 
-#[cfg(not(target_os = "windows"))]
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
@@ -25,7 +24,6 @@ use super::builders::FsConfig;
 use super::builders::{ConsoleBuilder, ExecBuilder, KernelBuilder, MachineBuilder};
 #[cfg(feature = "net")]
 use super::builders::{NetBuilder, NetConfig};
-#[cfg(not(target_os = "windows"))]
 use super::builders::{VsockBuilder, VsockRoute};
 
 use super::error::{BuildError, ConfigError, Error, Result};
@@ -44,6 +42,17 @@ use devices::virtio::net::device::VirtioNetBackend;
 use std::os::fd::IntoRawFd;
 #[cfg(feature = "net")]
 use vmm::vmm_config::net::NetworkInterfaceConfig;
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(not(target_os = "windows"))]
+const VSOCK_TIMESYNC_PORT: u32 = 123;
+#[cfg(not(target_os = "windows"))]
+const TSI_CONTROL_PORT_START: u32 = 1024;
+#[cfg(not(target_os = "windows"))]
+const TSI_CONTROL_PORT_END: u32 = 1031;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -67,7 +76,6 @@ use vmm::vmm_config::net::NetworkInterfaceConfig;
 /// ```
 pub struct VmBuilder {
     machine: MachineBuilder,
-    #[cfg(not(target_os = "windows"))]
     vsock: VsockBuilder,
     kernel: KernelBuilder,
     #[cfg_attr(feature = "tee", allow(dead_code))]
@@ -97,7 +105,6 @@ impl VmBuilder {
     pub fn new() -> Self {
         Self {
             machine: MachineBuilder::new(),
-            #[cfg(not(target_os = "windows"))]
             vsock: VsockBuilder::new(),
             kernel: KernelBuilder::new(),
             #[cfg(not(feature = "tee"))]
@@ -134,7 +141,6 @@ impl VmBuilder {
     /// Configure host services exposed through virtio-vsock.
     ///
     /// A route or enabled TSI transport automatically attaches the device.
-    #[cfg(not(target_os = "windows"))]
     pub fn vsock(mut self, f: impl FnOnce(VsockBuilder) -> VsockBuilder) -> Self {
         self.vsock = f(self.vsock);
         self
@@ -364,31 +370,51 @@ impl VmBuilder {
         #[cfg(target_os = "windows")]
         if self.machine.enable_inet_hijack {
             return Err(Error::Config(ConfigError::Vsock(
-                "virtio-vsock is not supported on Windows".to_string(),
+                "TSI INET hijack is not supported on Windows".to_string(),
             )));
         }
 
         #[cfg(not(target_os = "windows"))]
-        let (vsock_unix_ipc_port_map, vsock_custom_port_map, vsock_host_port_map) = {
-            let mut occupied_ports = HashSet::new();
+        let (
+            vsock_unix_ipc_port_map,
+            vsock_custom_port_map,
+            vsock_custom_dgram_port_map,
+            vsock_host_port_map,
+        ) = {
+            let mut occupied_stream_ports = HashSet::new();
+            let mut occupied_dgram_ports = HashSet::new();
             let mut unix_routes = HashMap::new();
             let mut custom_routes = HashMap::new();
+            let mut custom_dgram_routes = HashMap::new();
 
             for route in self.vsock.routes {
                 let (port, path) = match &route {
                     VsockRoute::UnixConnect { port, path }
                     | VsockRoute::UnixListen { port, path } => (*port, Some(path)),
-                    VsockRoute::Custom { port, .. } => (*port, None),
+                    VsockRoute::Custom { port, .. } | VsockRoute::CustomDatagram { port, .. } => {
+                        (*port, None)
+                    }
                 };
 
-                if port == 0 {
+                if port == 0 || port == u32::MAX {
                     return Err(Error::Config(ConfigError::Vsock(
-                        "route port must be non-zero".to_string(),
+                        "route port must be between 1 and u32::MAX - 1".to_string(),
                     )));
                 }
+                if matches!(&route, VsockRoute::CustomDatagram { .. })
+                    && port == VSOCK_TIMESYNC_PORT
+                {
+                    return Err(Error::Config(ConfigError::Vsock(format!(
+                        "datagram route port {port} is reserved for guest time synchronization"
+                    ))));
+                }
+                let occupied_ports = match &route {
+                    VsockRoute::CustomDatagram { .. } => &mut occupied_dgram_ports,
+                    _ => &mut occupied_stream_ports,
+                };
                 if !occupied_ports.insert(port) {
                     return Err(Error::Config(ConfigError::Vsock(format!(
-                        "duplicate route for host port {port}"
+                        "duplicate route for host port and socket type: {port}"
                     ))));
                 }
                 if path.is_some_and(|path| path.as_os_str().is_empty()) {
@@ -407,11 +433,28 @@ impl VmBuilder {
                     VsockRoute::Custom { port, backend } => {
                         custom_routes.insert(port, backend);
                     }
+                    VsockRoute::CustomDatagram { port, backend } => {
+                        custom_dgram_routes.insert(port, backend);
+                    }
                 }
             }
 
             let enable_inet_hijack =
                 self.machine.enable_inet_hijack || self.vsock.enable_inet_hijack;
+            #[cfg(feature = "net")]
+            let tsi_inet_active = enable_inet_hijack && self.net.configs.is_empty();
+            #[cfg(not(feature = "net"))]
+            let tsi_inet_active = enable_inet_hijack;
+            if tsi_inet_active {
+                if let Some(port) = custom_dgram_routes
+                    .keys()
+                    .find(|port| (TSI_CONTROL_PORT_START..=TSI_CONTROL_PORT_END).contains(port))
+                {
+                    return Err(Error::Config(ConfigError::Vsock(format!(
+                        "datagram route port {port} conflicts with the active TSI control transport"
+                    ))));
+                }
+            }
             if !self.vsock.tcp_listen_remaps.is_empty() && !enable_inet_hijack {
                 return Err(Error::Config(ConfigError::Vsock(
                     "TCP listen remaps require TSI INET hijack".to_string(),
@@ -442,8 +485,30 @@ impl VmBuilder {
             (
                 (!unix_routes.is_empty()).then_some(unix_routes),
                 (!custom_routes.is_empty()).then_some(custom_routes),
+                (!custom_dgram_routes.is_empty()).then_some(custom_dgram_routes),
                 (!host_map.is_empty()).then_some(host_map),
             )
+        };
+
+        #[cfg(target_os = "windows")]
+        let vsock_custom_port_map = {
+            let mut occupied_ports = HashSet::new();
+            let mut custom_routes = HashMap::new();
+            for route in self.vsock.routes {
+                let VsockRoute::Custom { port, backend } = route;
+                if port == 0 || port == u32::MAX {
+                    return Err(Error::Config(ConfigError::Vsock(
+                        "route port must be between 1 and u32::MAX - 1".to_string(),
+                    )));
+                }
+                if !occupied_ports.insert(port) {
+                    return Err(Error::Config(ConfigError::Vsock(format!(
+                        "duplicate stream route for host port: {port}"
+                    ))));
+                }
+                custom_routes.insert(port, backend);
+            }
+            (!custom_routes.is_empty()).then_some(custom_routes)
         };
 
         #[cfg(not(target_os = "windows"))]
@@ -740,8 +805,9 @@ impl VmBuilder {
             enable_inet_hijack,
             #[cfg(not(target_os = "windows"))]
             vsock_unix_ipc_port_map,
-            #[cfg(not(target_os = "windows"))]
             vsock_custom_port_map,
+            #[cfg(not(target_os = "windows"))]
+            vsock_custom_dgram_port_map,
             #[cfg(not(target_os = "windows"))]
             vsock_host_port_map,
         ))
@@ -837,8 +903,30 @@ fn validate_cmdline_env(key: &str, value: &str) -> std::result::Result<(), &'sta
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_os = "windows"))]
+    use std::io;
+
+    #[cfg(not(target_os = "windows"))]
+    use devices::virtio::vsock::{
+        VsockDatagramBackend, VsockDatagramPeer, VsockDatagramPortBackend, VsockNotifier,
+    };
+
     use super::*;
     use crate::api::builders::HostCpuId;
+
+    #[cfg(not(target_os = "windows"))]
+    struct RejectDatagrams;
+
+    #[cfg(not(target_os = "windows"))]
+    impl VsockDatagramPortBackend for RejectDatagrams {
+        fn open_peer(
+            &self,
+            _peer: VsockDatagramPeer,
+            _notifier: VsockNotifier,
+        ) -> io::Result<Box<dyn VsockDatagramBackend>> {
+            Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+        }
+    }
 
     #[test]
     fn build_rejects_invalid_machine_config() {
@@ -905,6 +993,55 @@ mod tests {
 
         assert!(
             matches!(err, Error::Config(ConfigError::Vsock(message)) if message.contains("duplicate route"))
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn build_allows_stream_and_datagram_on_same_port() {
+        VmBuilder::new()
+            .vsock(|vsock| {
+                vsock
+                    .unix_connect(5000, "/tmp/stream.sock")
+                    .custom_dgram(5000, Arc::new(RejectDatagrams))
+            })
+            .build()
+            .expect("socket type disambiguates equal port numbers");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn build_rejects_reserved_timesync_datagram_port() {
+        let err = match VmBuilder::new()
+            .vsock(|vsock| vsock.custom_dgram(123, Arc::new(RejectDatagrams)))
+            .build()
+        {
+            Ok(_) => panic!("time synchronization owns datagram port 123"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, Error::Config(ConfigError::Vsock(message)) if message.contains("reserved"))
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn build_rejects_datagram_routes_over_active_tsi_control_ports() {
+        let err = match VmBuilder::new()
+            .vsock(|vsock| {
+                vsock
+                    .inet_hijack(true)
+                    .custom_dgram(1024, Arc::new(RejectDatagrams))
+            })
+            .build()
+        {
+            Ok(_) => panic!("active TSI owns its datagram control ports"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, Error::Config(ConfigError::Vsock(message)) if message.contains("active TSI"))
         );
     }
 

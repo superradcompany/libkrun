@@ -17,12 +17,12 @@ use crate::backends::fs::DynFileSystem;
 use std::os::fd::OwnedFd;
 #[cfg(not(target_os = "windows"))]
 use std::os::fd::RawFd;
-#[cfg(not(target_os = "windows"))]
 use std::sync::Arc;
 
 #[cfg(feature = "net")]
 use crate::backends::net::NetBackend;
 #[cfg(not(target_os = "windows"))]
+use crate::backends::vsock::VsockDatagramPortBackend;
 use crate::backends::vsock::VsockPortBackend;
 
 //--------------------------------------------------------------------------------------------------
@@ -79,28 +79,29 @@ pub struct MachineBuilder {
 ///         .custom(6000, Arc::new(my_service))
 /// });
 /// ```
-#[cfg(not(target_os = "windows"))]
 #[derive(Default)]
 pub struct VsockBuilder {
     pub(crate) routes: Vec<VsockRoute>,
+    #[cfg(not(target_os = "windows"))]
     pub(crate) tcp_listen_remaps: Vec<(u16, u16)>,
+    #[cfg(not(target_os = "windows"))]
     pub(crate) enable_inet_hijack: bool,
 }
 
 /// One typed host-side route for a guest vsock destination port.
-#[cfg(not(target_os = "windows"))]
 pub(crate) enum VsockRoute {
-    UnixConnect {
-        port: u32,
-        path: PathBuf,
-    },
-    UnixListen {
-        port: u32,
-        path: PathBuf,
-    },
+    #[cfg(not(target_os = "windows"))]
+    UnixConnect { port: u32, path: PathBuf },
+    #[cfg(not(target_os = "windows"))]
+    UnixListen { port: u32, path: PathBuf },
     Custom {
         port: u32,
         backend: Arc<dyn VsockPortBackend>,
+    },
+    #[cfg(not(target_os = "windows"))]
+    CustomDatagram {
+        port: u32,
+        backend: Arc<dyn VsockDatagramPortBackend>,
     },
 }
 
@@ -557,7 +558,6 @@ impl MachineBuilder {
 // Methods: Vsock Builder
 //--------------------------------------------------------------------------------------------------
 
-#[cfg(not(target_os = "windows"))]
 impl VsockBuilder {
     /// Create an empty vsock service builder.
     pub fn new() -> Self {
@@ -565,6 +565,7 @@ impl VsockBuilder {
     }
 
     /// Route guest connections to `port` into an existing host Unix socket.
+    #[cfg(not(target_os = "windows"))]
     pub fn unix_connect(mut self, port: u32, path: impl AsRef<Path>) -> Self {
         self.routes.push(VsockRoute::UnixConnect {
             port,
@@ -574,6 +575,7 @@ impl VsockBuilder {
     }
 
     /// Listen on a host Unix socket and inject accepted streams into guest `port`.
+    #[cfg(not(target_os = "windows"))]
     pub fn unix_listen(mut self, port: u32, path: impl AsRef<Path>) -> Self {
         self.routes.push(VsockRoute::UnixListen {
             port,
@@ -592,16 +594,26 @@ impl VsockBuilder {
         self
     }
 
+    /// Serve guest datagrams to `port` with a custom message-oriented backend.
+    #[cfg(not(target_os = "windows"))]
+    pub fn custom_dgram(mut self, port: u32, backend: Arc<dyn VsockDatagramPortBackend>) -> Self {
+        self.routes
+            .push(VsockRoute::CustomDatagram { port, backend });
+        self
+    }
+
     /// Remap a guest TCP listen port to a host port through TSI.
     ///
     /// This requires [`inet_hijack(true)`](Self::inet_hijack); validation
     /// rejects remaps that would otherwise be silently ignored.
+    #[cfg(not(target_os = "windows"))]
     pub fn tcp_listen_remap(mut self, guest_port: u16, host_port: u16) -> Self {
         self.tcp_listen_remaps.push((guest_port, host_port));
         self
     }
 
     /// Enable or disable TSI interception of guest INET sockets.
+    #[cfg(not(target_os = "windows"))]
     pub fn inet_hijack(mut self, enabled: bool) -> Self {
         self.enable_inet_hijack = enabled;
         self

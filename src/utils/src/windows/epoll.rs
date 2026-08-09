@@ -7,10 +7,18 @@ use std::collections::HashMap;
 use std::io;
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use bitflags::bitflags;
 
-use crate::event::{EventSource, WaitContext, WaitEvent};
+use crate::event::{EventNotifier, EventSource, WaitContext, WaitEvent};
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Internal token used to rebuild a blocking wait after a registration change.
+const CONTROL_TOKEN: u64 = u64::MAX;
 
 #[repr(i32)]
 pub enum ControlOperation {
@@ -43,7 +51,10 @@ pub struct EpollEvent {
 #[derive(Debug)]
 pub struct Epoll {
     context: Mutex<WaitContext>,
-    registrations: Mutex<HashMap<RawHandle, u64>>,
+    // Store opaque handle values as integers so the synchronized registry is
+    // safely movable with an event loop thread.
+    registrations: Mutex<HashMap<usize, u64>>,
+    control: EventNotifier,
 }
 
 impl EpollEvent {
@@ -79,9 +90,17 @@ impl std::fmt::Debug for EpollEvent {
 
 impl Epoll {
     pub fn new() -> io::Result<Self> {
+        let control = EventNotifier::new()?;
+        let mut context = WaitContext::new();
+        context.add(
+            control.event_source(CONTROL_TOKEN),
+            crate::event::EventSet::IN,
+        )?;
+
         Ok(Self {
-            context: Mutex::new(WaitContext::new()),
+            context: Mutex::new(context),
             registrations: Mutex::new(HashMap::new()),
+            control,
         })
     }
 
@@ -94,28 +113,45 @@ impl Epoll {
         let mut context = self.context.lock().unwrap();
         let mut registrations = self.registrations.lock().unwrap();
 
-        match operation {
+        let result = match operation {
             ControlOperation::Add => {
+                if event.data == CONTROL_TOKEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "event token is reserved for epoll control",
+                    ));
+                }
                 context.add(
                     EventSource::waitable_handle(handle, event.data),
                     event_set_to_wait_event_set(event.event_set()),
                 )?;
-                registrations.insert(handle, event.data);
+                registrations.insert(handle as usize, event.data);
                 Ok(())
             }
             ControlOperation::Modify => {
-                let token = registrations.get(&handle).copied().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "handle is not registered")
-                })?;
+                let token = registrations
+                    .get(&(handle as usize))
+                    .copied()
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "handle is not registered")
+                    })?;
                 context.modify(token, event_set_to_wait_event_set(event.event_set()))
             }
             ControlOperation::Delete => {
-                let token = registrations.remove(&handle).ok_or_else(|| {
+                let token = registrations.remove(&(handle as usize)).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "handle is not registered")
                 })?;
                 context.delete(token)
             }
+        };
+
+        // Wake any waiter so it can rebuild its handle snapshot. The context
+        // lock is intentionally still held here, preventing the waiter from
+        // draining this notification before the mutation is visible.
+        if result.is_ok() {
+            self.control.wake()?;
         }
+        result
     }
 
     pub fn wait(
@@ -124,19 +160,49 @@ impl Epoll {
         timeout: i32,
         events: &mut [EpollEvent],
     ) -> io::Result<usize> {
-        let mut wait_events = vec![WaitEvent::default(); max_events.min(events.len())];
-        let count = self
-            .context
-            .lock()
-            .unwrap()
-            .wait(timeout, &mut wait_events)?;
-
-        for (index, event) in wait_events.into_iter().take(count).enumerate() {
-            events[index] =
-                EpollEvent::new(wait_event_set_to_event_set(event.events()), event.token());
+        let output_capacity = max_events.min(events.len());
+        if output_capacity == 0 {
+            return Ok(0);
         }
 
-        Ok(count)
+        let deadline = (timeout >= 0).then(|| {
+            Instant::now()
+                .checked_add(Duration::from_millis(timeout as u64))
+                .unwrap_or_else(Instant::now)
+        });
+
+        loop {
+            // Drain and snapshot under the same lock used by ctl(). A control
+            // mutation after this point will signal the notifier contained in
+            // the snapshot and force another iteration.
+            let snapshot = {
+                let context = self.context.lock().unwrap();
+                self.control.drain()?;
+                context.clone()
+            };
+            let wait_timeout = remaining_timeout(timeout, deadline);
+            let mut wait_events = vec![WaitEvent::default(); output_capacity + 1];
+            let count = snapshot.wait(wait_timeout, &mut wait_events)?;
+
+            let mut written = 0;
+            let mut control_ready = false;
+            for event in wait_events.into_iter().take(count) {
+                if event.token() == CONTROL_TOKEN {
+                    control_ready = true;
+                    continue;
+                }
+                if written == output_capacity {
+                    break;
+                }
+                events[written] =
+                    EpollEvent::new(wait_event_set_to_event_set(event.events()), event.token());
+                written += 1;
+            }
+
+            if written > 0 || !control_ready || wait_timeout == 0 {
+                return Ok(written);
+            }
+        }
     }
 }
 
@@ -175,4 +241,79 @@ fn wait_event_set_to_event_set(events: crate::event::EventSet) -> EventSet {
         epoll_events |= EventSet::READ_HANG_UP;
     }
     epoll_events
+}
+
+fn remaining_timeout(timeout: i32, deadline: Option<Instant>) -> i32 {
+    let Some(deadline) = deadline else {
+        return timeout;
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return 0;
+    }
+
+    remaining.as_millis().clamp(1, i32::MAX as u128) as i32
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+
+    use crate::event::RawEventSource;
+
+    use super::*;
+
+    #[test]
+    fn registration_wakes_a_blocked_waiter_without_locking_ctl() {
+        let epoll = Arc::new(Epoll::new().unwrap());
+        let waiter_epoll = Arc::clone(&epoll);
+        let (wait_tx, wait_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let mut events = [EpollEvent::default(); 1];
+            let result = waiter_epoll
+                .wait(events.len(), -1, &mut events)
+                .map(|count| (count, events[0].data()));
+            wait_tx.send(result).unwrap();
+        });
+
+        // Give the waiter time to enter its infinite wait with only the
+        // internal control event registered.
+        thread::sleep(Duration::from_millis(20));
+
+        let notifier = EventNotifier::new().unwrap();
+        let handle = match notifier.event_source(7).raw() {
+            RawEventSource::WaitableHandle(handle) => handle as usize,
+            RawEventSource::CompletionHandle(_) => unreachable!(),
+        };
+        let ctl_epoll = Arc::clone(&epoll);
+        let (ctl_tx, ctl_rx) = mpsc::channel();
+        thread::spawn(move || {
+            ctl_tx
+                .send(ctl_epoll.ctl(
+                    ControlOperation::Add,
+                    handle as RawHandle,
+                    &EpollEvent::new(EventSet::IN, 7),
+                ))
+                .unwrap();
+        });
+
+        ctl_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("ctl must not block behind the wait thread")
+            .unwrap();
+        notifier.wake().unwrap();
+
+        let (count, token) = wait_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("registered event should wake the rebuilt wait set")
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(token, 7);
+        waiter.join().unwrap();
+    }
 }
