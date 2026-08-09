@@ -14,11 +14,24 @@ use devices::virtio::{Vsock, VsockError};
 
 type MutexVsock = Arc<Mutex<Vsock>>;
 
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(not(target_os = "windows"))]
+const VSOCK_TIMESYNC_PORT: u32 = 123;
+#[cfg(not(target_os = "windows"))]
+const TSI_CONTROL_PORT_START: u32 = 1024;
+#[cfg(not(target_os = "windows"))]
+const TSI_CONTROL_PORT_END: u32 = 1031;
+
 /// Errors associated with `NetworkInterfaceConfig`.
 #[derive(Debug)]
 pub enum VsockConfigError {
     /// Failed to create the vsock device.
     CreateVsockDevice(VsockError),
+    /// A custom datagram route overlaps a device-owned protocol port.
+    ReservedDatagramPort { port: u32, owner: &'static str },
 }
 
 impl fmt::Display for VsockConfigError {
@@ -26,6 +39,12 @@ impl fmt::Display for VsockConfigError {
         use self::VsockConfigError::*;
         match *self {
             CreateVsockDevice(ref e) => write!(f, "Cannot create vsock device: {e:?}"),
+            ReservedDatagramPort { port, owner } => {
+                write!(
+                    f,
+                    "Cannot route vsock datagram port {port}: reserved for {owner}"
+                )
+            }
         }
     }
 }
@@ -122,6 +141,27 @@ impl VsockBuilder {
     /// Creates a Vsock device from a VsockDeviceConfig.
     pub fn create_vsock(cfg: VsockDeviceConfig) -> Result<Vsock> {
         #[cfg(not(target_os = "windows"))]
+        if let Some(routes) = &cfg.custom_dgram_port_map {
+            if routes.contains_key(&VSOCK_TIMESYNC_PORT) {
+                return Err(VsockConfigError::ReservedDatagramPort {
+                    port: VSOCK_TIMESYNC_PORT,
+                    owner: "guest time synchronization",
+                });
+            }
+            if !cfg.tsi_flags.is_empty() {
+                if let Some(port) = routes
+                    .keys()
+                    .find(|port| (TSI_CONTROL_PORT_START..=TSI_CONTROL_PORT_END).contains(port))
+                {
+                    return Err(VsockConfigError::ReservedDatagramPort {
+                        port: *port,
+                        owner: "the active TSI control transport",
+                    });
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
         let custom_dgram_port_map = cfg.custom_dgram_port_map;
         #[cfg(target_os = "windows")]
         let custom_dgram_port_map = None;
@@ -140,8 +180,26 @@ impl VsockBuilder {
 
 #[cfg(all(test, not(target_os = "windows")))]
 pub(crate) mod tests {
+    use std::io;
+
+    use devices::virtio::vsock::{
+        VsockDatagramBackend, VsockDatagramPeer, VsockDatagramPortBackend, VsockNotifier,
+    };
+
     use super::*;
     use utils::tempfile::TempFile;
+
+    struct RejectDatagrams;
+
+    impl VsockDatagramPortBackend for RejectDatagrams {
+        fn open_peer(
+            &self,
+            _peer: VsockDatagramPeer,
+            _notifier: VsockNotifier,
+        ) -> io::Result<Box<dyn VsockDatagramBackend>> {
+            Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+        }
+    }
 
     // Placeholder for the path where a socket file will be created.
     // The socket file will be removed when the scope ends.
@@ -202,5 +260,23 @@ pub(crate) mod tests {
             io::Error::from_raw_os_error(0),
         ));
         let _ = format!("{err}{err:?}");
+    }
+
+    #[test]
+    fn create_vsock_rejects_reserved_datagram_ports() {
+        let tmp_sock_file = TempSockFile::new(TempFile::new().unwrap());
+        let mut config = default_config(&tmp_sock_file);
+        config.custom_dgram_port_map = Some(HashMap::from([(
+            VSOCK_TIMESYNC_PORT,
+            Arc::new(RejectDatagrams) as Arc<dyn VsockDatagramPortBackend>,
+        )]));
+
+        assert!(matches!(
+            VsockBuilder::create_vsock(config),
+            Err(VsockConfigError::ReservedDatagramPort {
+                port: VSOCK_TIMESYNC_PORT,
+                ..
+            })
+        ));
     }
 }

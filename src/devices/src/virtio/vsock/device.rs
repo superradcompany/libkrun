@@ -104,6 +104,7 @@ impl Vsock {
         };
 
         let mut have_used = false;
+        let mut needs_backend_kick = false;
 
         debug!("process_rx before while");
         let queue_rx = self
@@ -121,6 +122,7 @@ impl Vsock {
                         // We are using a consuming iterator over the virtio buffers, so, if we can't
                         // fill in this buffer, we'll need to undo the last iterator step.
                         queue_rx.undo_pop();
+                        needs_backend_kick = true;
                         break;
                     }
                 }
@@ -135,6 +137,14 @@ impl Vsock {
             if let Err(e) = queue_rx.add_used(mem, head.index, used_len) {
                 error!("failed to add used elements to the queue: {e:?}");
             }
+        }
+
+        // Backends can need a retry when the guest has just supplied receive
+        // capacity. Drop the virtqueue lock before taking proxy locks so the
+        // muxer thread cannot deadlock in the opposite proxy -> queue order.
+        drop(queue_rx);
+        if needs_backend_kick {
+            self.muxer.kick_backends();
         }
 
         have_used

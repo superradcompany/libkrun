@@ -84,6 +84,9 @@ impl MuxerThread {
         }
         match update.remove_proxy {
             ProxyRemoval::Keep => {}
+            ProxyRemoval::Immediate => {
+                self.proxy_map.write().unwrap().remove(&id);
+            }
             ProxyRemoval::Deferred => {
                 if self.reaper_sender.send(id).is_err() {
                     self.proxy_map.write().unwrap().remove(&id);

@@ -44,6 +44,17 @@ use std::os::fd::IntoRawFd;
 use vmm::vmm_config::net::NetworkInterfaceConfig;
 
 //--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(not(target_os = "windows"))]
+const VSOCK_TIMESYNC_PORT: u32 = 123;
+#[cfg(not(target_os = "windows"))]
+const TSI_CONTROL_PORT_START: u32 = 1024;
+#[cfg(not(target_os = "windows"))]
+const TSI_CONTROL_PORT_END: u32 = 1031;
+
+//--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
 
@@ -390,6 +401,13 @@ impl VmBuilder {
                         "route port must be between 1 and u32::MAX - 1".to_string(),
                     )));
                 }
+                if matches!(&route, VsockRoute::CustomDatagram { .. })
+                    && port == VSOCK_TIMESYNC_PORT
+                {
+                    return Err(Error::Config(ConfigError::Vsock(format!(
+                        "datagram route port {port} is reserved for guest time synchronization"
+                    ))));
+                }
                 let occupied_ports = match &route {
                     VsockRoute::CustomDatagram { .. } => &mut occupied_dgram_ports,
                     _ => &mut occupied_stream_ports,
@@ -423,6 +441,20 @@ impl VmBuilder {
 
             let enable_inet_hijack =
                 self.machine.enable_inet_hijack || self.vsock.enable_inet_hijack;
+            #[cfg(feature = "net")]
+            let tsi_inet_active = enable_inet_hijack && self.net.configs.is_empty();
+            #[cfg(not(feature = "net"))]
+            let tsi_inet_active = enable_inet_hijack;
+            if tsi_inet_active {
+                if let Some(port) = custom_dgram_routes
+                    .keys()
+                    .find(|port| (TSI_CONTROL_PORT_START..=TSI_CONTROL_PORT_END).contains(port))
+                {
+                    return Err(Error::Config(ConfigError::Vsock(format!(
+                        "datagram route port {port} conflicts with the active TSI control transport"
+                    ))));
+                }
+            }
             if !self.vsock.tcp_listen_remaps.is_empty() && !enable_inet_hijack {
                 return Err(Error::Config(ConfigError::Vsock(
                     "TCP listen remaps require TSI INET hijack".to_string(),
@@ -871,8 +903,30 @@ fn validate_cmdline_env(key: &str, value: &str) -> std::result::Result<(), &'sta
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_os = "windows"))]
+    use std::io;
+
+    #[cfg(not(target_os = "windows"))]
+    use devices::virtio::vsock::{
+        VsockDatagramBackend, VsockDatagramPeer, VsockDatagramPortBackend, VsockNotifier,
+    };
+
     use super::*;
     use crate::api::builders::HostCpuId;
+
+    #[cfg(not(target_os = "windows"))]
+    struct RejectDatagrams;
+
+    #[cfg(not(target_os = "windows"))]
+    impl VsockDatagramPortBackend for RejectDatagrams {
+        fn open_peer(
+            &self,
+            _peer: VsockDatagramPeer,
+            _notifier: VsockNotifier,
+        ) -> io::Result<Box<dyn VsockDatagramBackend>> {
+            Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+        }
+    }
 
     #[test]
     fn build_rejects_invalid_machine_config() {
@@ -945,24 +999,6 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn build_allows_stream_and_datagram_on_same_port() {
-        use std::io;
-
-        use devices::virtio::vsock::{
-            VsockDatagramBackend, VsockDatagramPeer, VsockDatagramPortBackend, VsockNotifier,
-        };
-
-        struct RejectDatagrams;
-
-        impl VsockDatagramPortBackend for RejectDatagrams {
-            fn open_peer(
-                &self,
-                _peer: VsockDatagramPeer,
-                _notifier: VsockNotifier,
-            ) -> io::Result<Box<dyn VsockDatagramBackend>> {
-                Err(io::Error::from(io::ErrorKind::ConnectionRefused))
-            }
-        }
-
         VmBuilder::new()
             .vsock(|vsock| {
                 vsock
@@ -971,6 +1007,42 @@ mod tests {
             })
             .build()
             .expect("socket type disambiguates equal port numbers");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn build_rejects_reserved_timesync_datagram_port() {
+        let err = match VmBuilder::new()
+            .vsock(|vsock| vsock.custom_dgram(123, Arc::new(RejectDatagrams)))
+            .build()
+        {
+            Ok(_) => panic!("time synchronization owns datagram port 123"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, Error::Config(ConfigError::Vsock(message)) if message.contains("reserved"))
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn build_rejects_datagram_routes_over_active_tsi_control_ports() {
+        let err = match VmBuilder::new()
+            .vsock(|vsock| {
+                vsock
+                    .inet_hijack(true)
+                    .custom_dgram(1024, Arc::new(RejectDatagrams))
+            })
+            .build()
+        {
+            Ok(_) => panic!("active TSI owns its datagram control ports"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, Error::Config(ConfigError::Vsock(message)) if message.contains("active TSI"))
+        );
     }
 
     #[cfg(not(target_os = "windows"))]

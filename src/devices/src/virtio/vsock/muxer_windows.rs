@@ -78,16 +78,26 @@ pub fn push_packet(
     mem: &GuestMemoryMmap,
 ) {
     let mut queue = queue_mutex.lock().unwrap();
+    let mut rxq = rxq_mutex.lock().unwrap();
+    if !rxq.is_empty() {
+        rxq.push(rx);
+        return;
+    }
+
     if let Some(head) = queue.pop(mem) {
         if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-            rx_to_pkt(cid, rx, &mut pkt);
-            if let Err(err) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len()) {
-                error!("failed to add used elements to the queue: {err:?}");
+            if rx_to_pkt(cid, rx, &mut pkt) {
+                if let Err(err) =
+                    queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
+                {
+                    error!("failed to add used elements to the queue: {err:?}");
+                }
+            } else {
+                queue.undo_pop();
             }
         }
     } else {
-        drop(queue);
-        rxq_mutex.lock().unwrap().push(rx);
+        rxq.push(rx);
     }
 }
 
@@ -150,15 +160,22 @@ impl VsockMuxer {
 
     pub(crate) fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> super::Result<()> {
         if self.rxq.lock().unwrap().is_empty() {
-            for proxy in self.proxy_map.read().unwrap().values() {
-                proxy.lock().unwrap().kick();
-            }
             return Err(super::VsockError::NoData);
         }
-        if let Some(rx) = self.rxq.lock().unwrap().pop() {
-            rx_to_pkt(self.cid, rx, pkt);
+        let mut rxq = self.rxq.lock().unwrap();
+        while let Some(rx) = rxq.pop() {
+            if rx_to_pkt(self.cid, rx, pkt) {
+                return Ok(());
+            }
         }
-        Ok(())
+        Err(super::VsockError::NoData)
+    }
+
+    /// Retry proxy work after the caller has released the guest RX queue.
+    pub(crate) fn kick_backends(&self) {
+        for proxy in self.proxy_map.read().unwrap().values() {
+            proxy.lock().unwrap().kick();
+        }
     }
 
     fn update_polling(&self, id: u64, pollable: VsockPollable, events: EventSet) {
@@ -180,6 +197,9 @@ impl VsockMuxer {
         }
         match update.remove_proxy {
             ProxyRemoval::Keep => {}
+            ProxyRemoval::Immediate => {
+                self.proxy_map.write().unwrap().remove(&id);
+            }
             ProxyRemoval::Deferred => {
                 if self
                     .reaper_sender
@@ -214,8 +234,14 @@ impl VsockMuxer {
 
     fn process_op_request(&self, pkt: &VsockPacket) {
         let id = ((pkt.src_port() as u64) << 32) | pkt.dst_port() as u64;
-        if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
-            if let Some(update) = proxy.lock().unwrap().confirm_connect(pkt) {
+        let existing = self
+            .proxy_map
+            .read()
+            .unwrap()
+            .get(&id)
+            .map(|proxy| proxy.lock().unwrap().confirm_connect(pkt));
+        if let Some(update) = existing {
+            if let Some(update) = update {
                 self.process_proxy_update(id, update);
             }
             return;

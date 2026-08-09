@@ -230,7 +230,8 @@ impl CustomStreamProxy {
         (have_used, wait_credit)
     }
 
-    fn flush_pending_write(&mut self) -> io::Result<()> {
+    fn flush_pending_write(&mut self) -> io::Result<usize> {
+        let mut total_written = 0;
         while !self.pending_write.is_empty() {
             let (front, back) = self.pending_write.as_slices();
             let buf = if front.is_empty() { back } else { front };
@@ -238,6 +239,8 @@ impl CustomStreamProxy {
                 Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
                 Ok(written) if written <= buf.len() => {
                     self.pending_write.drain(..written);
+                    self.tx_cnt += Wrapping(written as u32);
+                    total_written += written;
                 }
                 Ok(_) => {
                     return Err(io::Error::new(
@@ -245,11 +248,33 @@ impl CustomStreamProxy {
                         "vsock backend returned a write length larger than its input",
                     ));
                 }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(total_written),
                 Err(err) => return Err(err),
             }
         }
-        Ok(())
+        Ok(total_written)
+    }
+
+    /// Return stream credit only after the host backend has consumed bytes
+    /// from the bounded proxy queue.
+    fn maybe_push_credit_update(&mut self, update: &mut ProxyUpdate) {
+        if ((self.tx_cnt - self.last_tx_cnt_sent).0 as usize) < defs::CONN_TX_BUF_SIZE / 2 {
+            return;
+        }
+
+        self.last_tx_cnt_sent = self.tx_cnt;
+        push_packet(
+            self.cid,
+            MuxerRx::CreditUpdate {
+                local_port: self.local_port,
+                peer_port: self.peer_port,
+                fwd_cnt: self.tx_cnt.0,
+            },
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+        );
+        update.signal_queue = true;
     }
 
     fn init_data_pkt(&self, pkt: &mut VsockPacket) {
@@ -298,7 +323,12 @@ impl Proxy for CustomStreamProxy {
 
     fn confirm_connect(&mut self, pkt: &VsockPacket) -> Option<ProxyUpdate> {
         self.prepare_connect(pkt);
-        self.push_connect_response();
+        // A duplicate request can arrive while an asynchronous host connect is
+        // still pending. Do not acknowledge it until connect_state reports the
+        // backend is actually ready.
+        if self.status == ProxyStatus::Connected {
+            self.push_connect_response();
+        }
         None
     }
 
@@ -309,33 +339,40 @@ impl Proxy for CustomStreamProxy {
 
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
-        let Some(buf) = pkt.buf() else {
+        let Some(buf) = pkt.payload() else {
+            let err = io::Error::new(
+                io::ErrorKind::InvalidData,
+                "vsock packet payload does not match its declared length",
+            );
+            self.fail(&mut update, "invalid custom vsock packet", &err);
+            update.remove_proxy = ProxyRemoval::Immediate;
             return update;
         };
 
+        // Flush previously accepted bytes before checking the fixed receive
+        // window. This lets a backend that has become writable make room
+        // without ever allocating beyond the advertised credit.
+        if let Err(err) = self.flush_pending_write() {
+            self.fail(&mut update, "custom vsock backend write failed", &err);
+            return update;
+        }
+        if buf.len() > defs::CONN_TX_BUF_SIZE.saturating_sub(self.pending_write.len()) {
+            let err = io::Error::new(
+                io::ErrorKind::InvalidData,
+                "guest exceeded the custom vsock stream receive window",
+            );
+            self.fail(&mut update, "invalid custom vsock stream credit", &err);
+            update.remove_proxy = ProxyRemoval::Immediate;
+            return update;
+        }
+
         self.pending_write.extend(buf);
-        self.tx_cnt += Wrapping(buf.len() as u32);
         if let Err(err) = self.flush_pending_write() {
             self.fail(&mut update, "custom vsock backend write failed", &err);
             return update;
         }
         update.polling = Some((self.id, self.event_pollable(), self.connected_poll_events()));
-
-        if (self.tx_cnt - self.last_tx_cnt_sent).0 as usize >= defs::CONN_TX_BUF_SIZE / 2 {
-            self.last_tx_cnt_sent = self.tx_cnt;
-            push_packet(
-                self.cid,
-                MuxerRx::CreditUpdate {
-                    local_port: pkt.dst_port(),
-                    peer_port: pkt.src_port(),
-                    fwd_cnt: self.tx_cnt.0,
-                },
-                &self.rxq,
-                &self.queue,
-                &self.mem,
-            );
-            update.signal_queue = true;
-        }
+        self.maybe_push_credit_update(&mut update);
 
         update
     }
@@ -396,8 +433,10 @@ impl Proxy for CustomStreamProxy {
     }
 
     fn release(&mut self) -> ProxyUpdate {
+        self.status = ProxyStatus::Closed;
         ProxyUpdate {
-            remove_proxy: ProxyRemoval::Deferred,
+            polling: Some((self.id, self.event_pollable(), EventSet::empty())),
+            remove_proxy: ProxyRemoval::Immediate,
             ..Default::default()
         }
     }
@@ -441,6 +480,7 @@ impl Proxy for CustomStreamProxy {
                 self.fail(&mut update, "custom vsock backend write failed", &err);
                 return update;
             }
+            self.maybe_push_credit_update(&mut update);
         }
 
         if self.status == ProxyStatus::Connected && evset.contains(EventSet::IN) {
@@ -459,6 +499,7 @@ impl Proxy for CustomStreamProxy {
                 self.push_reset();
                 update.signal_queue = true;
                 update.polling = Some((self.id, self.event_pollable(), EventSet::empty()));
+                update.remove_proxy = ProxyRemoval::Immediate;
                 return update;
             }
         }
@@ -490,9 +531,11 @@ impl Proxy for CustomStreamProxy {
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use vm_memory::GuestAddress;
+    use vm_memory::{Bytes, GuestAddress};
 
+    use super::super::packet::VSOCK_PKT_HDR_SIZE;
     use super::*;
+    use crate::virtio::{Descriptor, DescriptorChain};
 
     struct TestStreamState {
         blocked: AtomicBool,
@@ -527,6 +570,56 @@ mod tests {
         }
     }
 
+    fn tx_packet(mem: &GuestMemoryMmap, declared_len: u32, descriptor: &[u8]) -> VsockPacket {
+        const DESC_TABLE: u64 = 0x1000;
+        const HEADER: u64 = 0x2000;
+        const PAYLOAD: u64 = 0x3000;
+
+        mem.write_obj(
+            Descriptor {
+                addr: HEADER,
+                len: VSOCK_PKT_HDR_SIZE as u32,
+                flags: 1,
+                next: 1,
+            },
+            GuestAddress(DESC_TABLE),
+        )
+        .unwrap();
+        mem.write_obj(
+            Descriptor {
+                addr: PAYLOAD,
+                len: descriptor.len() as u32,
+                flags: 0,
+                next: 0,
+            },
+            GuestAddress(DESC_TABLE + 16),
+        )
+        .unwrap();
+
+        let mut header = [0u8; VSOCK_PKT_HDR_SIZE];
+        header[24..28].copy_from_slice(&declared_len.to_le_bytes());
+        mem.write_slice(&header, GuestAddress(HEADER)).unwrap();
+        mem.write_slice(descriptor, GuestAddress(PAYLOAD)).unwrap();
+
+        let head = DescriptorChain::checked_new(mem, GuestAddress(DESC_TABLE), 2, 0).unwrap();
+        VsockPacket::from_tx_virtq_head(&head).unwrap()
+    }
+
+    fn test_proxy(state: Arc<TestStreamState>, mem: GuestMemoryMmap) -> CustomStreamProxy {
+        CustomStreamProxy::new(
+            1,
+            3,
+            5000,
+            4000,
+            Box::new(TestStream { state }),
+            VsockNotifier::new().unwrap(),
+            mem,
+            Arc::new(Mutex::new(VirtQueue::new(256))),
+            Arc::new(Mutex::new(MuxerRxQ::new())),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn buffers_partial_writes_without_losing_bytes() {
         let state = Arc::new(TestStreamState {
@@ -534,29 +627,53 @@ mod tests {
             written: Mutex::new(Vec::new()),
         });
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let mut proxy = CustomStreamProxy::new(
-            1,
-            3,
-            5000,
-            4000,
-            Box::new(TestStream {
-                state: Arc::clone(&state),
-            }),
-            VsockNotifier::new().unwrap(),
-            mem,
-            Arc::new(Mutex::new(VirtQueue::new(256))),
-            Arc::new(Mutex::new(MuxerRxQ::new())),
-        )
-        .unwrap();
+        let mut proxy = test_proxy(Arc::clone(&state), mem);
 
         proxy.pending_write.extend(b"hello");
         proxy.flush_pending_write().unwrap();
         assert_eq!(&*state.written.lock().unwrap(), b"he");
         assert_eq!(proxy.pending_write.len(), 3);
+        assert_eq!(proxy.tx_cnt.0, 2);
 
         state.blocked.store(false, Ordering::Relaxed);
         proxy.flush_pending_write().unwrap();
         assert_eq!(&*state.written.lock().unwrap(), b"hello");
         assert!(proxy.pending_write.is_empty());
+        assert_eq!(proxy.tx_cnt.0, 5);
+    }
+
+    #[test]
+    fn forwards_only_the_declared_packet_payload() {
+        let state = Arc::new(TestStreamState {
+            blocked: AtomicBool::new(false),
+            written: Mutex::new(Vec::new()),
+        });
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let pkt = tx_packet(&mem, 1, b"a-secret-tail");
+        let mut proxy = test_proxy(Arc::clone(&state), mem.clone());
+
+        let update = proxy.sendmsg(&pkt);
+
+        assert!(matches!(update.remove_proxy, ProxyRemoval::Keep));
+        assert_eq!(&*state.written.lock().unwrap(), b"a");
+        assert_eq!(proxy.tx_cnt.0, 1);
+    }
+
+    #[test]
+    fn rejects_writes_beyond_the_bounded_receive_window() {
+        let state = Arc::new(TestStreamState {
+            blocked: AtomicBool::new(true),
+            // The test backend returns WouldBlock after accepting two bytes.
+            written: Mutex::new(vec![0, 0]),
+        });
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let pkt = tx_packet(&mem, 1, b"x");
+        let mut proxy = test_proxy(state, mem.clone());
+        proxy.pending_write.resize(defs::CONN_TX_BUF_SIZE, 0);
+
+        let update = proxy.sendmsg(&pkt);
+
+        assert!(matches!(update.remove_proxy, ProxyRemoval::Immediate));
+        assert_eq!(proxy.pending_write.len(), defs::CONN_TX_BUF_SIZE);
     }
 }

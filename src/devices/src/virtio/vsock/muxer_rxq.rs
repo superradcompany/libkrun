@@ -92,7 +92,7 @@ impl MuxerRxQ {
     }
 }
 
-pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
+pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) -> bool {
     match rx {
         MuxerRx::Reset {
             local_port,
@@ -235,6 +235,15 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
             peer_port,
             data,
         } => {
+            let Some(capacity) = pkt.buf().map(|buf| buf.len()) else {
+                return false;
+            };
+            if data.len() > capacity {
+                // Virtio-vsock datagrams are atomic. A short guest buffer must
+                // drop the message rather than manufacture a truncated one.
+                return false;
+            }
+
             pkt.set_op(uapi::VSOCK_OP_RW)
                 .set_src_cid(uapi::VSOCK_HOST_CID)
                 .set_dst_cid(cid)
@@ -245,15 +254,11 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_buf_alloc(0)
                 .set_fwd_cnt(0);
 
-            let len = pkt
-                .buf_mut()
-                .map(|buf| {
-                    let len = data.len().min(buf.len());
-                    buf[..len].copy_from_slice(&data[..len]);
-                    len
-                })
-                .unwrap_or(0);
-            pkt.set_len(len as u32);
+            let buf = pkt.buf_mut().expect("datagram buffer was validated above");
+            buf[..data.len()].copy_from_slice(&data);
+            pkt.set_len(data.len() as u32);
         }
     }
+
+    true
 }

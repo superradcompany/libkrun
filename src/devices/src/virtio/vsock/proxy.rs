@@ -53,7 +53,6 @@ pub enum ProxyStatus {
 pub enum ProxyRemoval {
     #[default]
     Keep,
-    #[cfg(unix)]
     Immediate,
     Deferred,
 }

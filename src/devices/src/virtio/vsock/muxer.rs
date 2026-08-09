@@ -31,7 +31,25 @@ use vm_memory::GuestMemoryMmap;
 use crate::virtio::InterruptTransport;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Bound connectionless peer state per exposed host port. The least recently
+/// used peer is retired before a new peer is opened at the limit.
+const MAX_DGRAM_PEERS_PER_PORT: usize = 256;
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
 pub type ProxyMap = Arc<RwLock<HashMap<u64, Mutex<Box<dyn Proxy>>>>>;
+
+#[derive(Clone, Copy)]
+struct DgramPeerEntry {
+    id: u64,
+    last_used: u64,
+}
 
 /// A muxer RX queue item.
 #[derive(Debug)]
@@ -93,17 +111,26 @@ pub fn push_packet(
     mem: &GuestMemoryMmap,
 ) {
     let mut queue = queue_mutex.lock().unwrap();
+    let mut rxq = rxq_mutex.lock().unwrap();
+    if !rxq.is_empty() {
+        rxq.push(rx);
+        return;
+    }
+
     if let Some(head) = queue.pop(mem) {
         if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-            rx_to_pkt(cid, rx, &mut pkt);
-            if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len()) {
-                error!("failed to add used elements to the queue: {e:?}");
+            if rx_to_pkt(cid, rx, &mut pkt) {
+                if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
+                {
+                    error!("failed to add used elements to the queue: {e:?}");
+                }
+            } else {
+                queue.undo_pop();
             }
         }
     } else {
         error!("couldn't push pkt to queue, adding it to rxq");
-        drop(queue);
-        rxq_mutex.lock().unwrap().push(rx);
+        rxq.push(rx);
     }
 }
 
@@ -120,8 +147,9 @@ pub struct VsockMuxer {
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     custom_port_map: Option<HashMap<u32, Arc<dyn VsockPortBackend>>>,
     custom_dgram_port_map: Option<HashMap<u32, Arc<dyn VsockDatagramPortBackend>>>,
-    dgram_peer_map: Mutex<HashMap<(u32, u32), u64>>,
+    dgram_peer_map: Mutex<HashMap<(u32, u32), DgramPeerEntry>>,
     next_dgram_proxy_id: AtomicU64,
+    next_dgram_activity: AtomicU64,
     tsi_flags: TsiFlags,
 }
 
@@ -152,6 +180,7 @@ impl VsockMuxer {
             // port. Keeping those bits zero gives datagram event tokens a
             // disjoint namespace without changing the legacy stream ids.
             next_dgram_proxy_id: AtomicU64::new(1),
+            next_dgram_activity: AtomicU64::new(1),
             tsi_flags,
         }
     }
@@ -200,21 +229,23 @@ impl VsockMuxer {
     pub(crate) fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> super::Result<()> {
         debug!("recv_stream_pkt");
         if self.rxq.lock().unwrap().is_empty() {
-            // A custom backend notification may have arrived before the guest
-            // supplied an RX descriptor. Re-kick streams now that the guest is
-            // explicitly asking us to fill one, without exposing event fds to
-            // backend implementations.
-            for proxy in self.proxy_map.read().unwrap().values() {
-                proxy.lock().unwrap().kick();
-            }
             return Err(VsockError::NoData);
         }
 
-        if let Some(rx) = self.rxq.lock().unwrap().pop() {
-            rx_to_pkt(self.cid, rx, pkt);
+        let mut rxq = self.rxq.lock().unwrap();
+        while let Some(rx) = rxq.pop() {
+            if rx_to_pkt(self.cid, rx, pkt) {
+                return Ok(());
+            }
         }
+        Err(VsockError::NoData)
+    }
 
-        Ok(())
+    /// Retry proxy work after the caller has released the guest RX queue.
+    pub(crate) fn kick_backends(&self) {
+        for proxy in self.proxy_map.read().unwrap().values() {
+            proxy.lock().unwrap().kick();
+        }
     }
 
     fn push_packet(&self, rx: MuxerRx) {
@@ -234,18 +265,27 @@ impl VsockMuxer {
         };
 
         let mut queue = queue_mutex.lock().unwrap();
+        let mut rxq = self.rxq.lock().unwrap();
+        if !rxq.is_empty() {
+            rxq.push(rx);
+            return;
+        }
+
         if let Some(head) = queue.pop(mem) {
             if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-                rx_to_pkt(self.cid, rx, &mut pkt);
-                if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
-                {
-                    error!("failed to add used elements to the queue: {e:?}");
+                if rx_to_pkt(self.cid, rx, &mut pkt) {
+                    if let Err(e) =
+                        queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
+                    {
+                        error!("failed to add used elements to the queue: {e:?}");
+                    }
+                } else {
+                    queue.undo_pop();
                 }
             }
         } else {
             error!("couldn't push pkt to queue, adding it to rxq");
-            drop(queue);
-            self.rxq.lock().unwrap().push(rx);
+            rxq.push(rx);
         }
     }
 
@@ -270,7 +310,7 @@ impl VsockMuxer {
             ProxyRemoval::Keep => {}
             ProxyRemoval::Immediate => {
                 info!("immediately removing proxy: {id}");
-                self.proxy_map.write().unwrap().remove(&id);
+                self.remove_proxy(id);
             }
             ProxyRemoval::Deferred => {
                 info!("deferring proxy removal: {id}");
@@ -286,6 +326,42 @@ impl VsockMuxer {
             if let Some(interrupt) = &self.interrupt {
                 interrupt.signal_used_queue();
             }
+        }
+    }
+
+    /// Remove polling, proxy ownership, and any connectionless peer index as
+    /// one lifecycle operation.
+    fn remove_proxy(&self, id: u64) {
+        let proxy = self.proxy_map.write().unwrap().remove(&id);
+        if let Some(proxy) = proxy {
+            let pollable = proxy.lock().unwrap().pollable();
+            self.update_polling(id, pollable, EventSet::empty());
+        }
+        self.dgram_peer_map
+            .lock()
+            .unwrap()
+            .retain(|_, entry| entry.id != id);
+    }
+
+    fn evict_oldest_dgram_peer(&self, host_port: u32) {
+        let evicted = {
+            let mut peers = self.dgram_peer_map.lock().unwrap();
+            if peers.keys().filter(|(_, port)| *port == host_port).count()
+                < MAX_DGRAM_PEERS_PER_PORT
+            {
+                None
+            } else {
+                let oldest = peers
+                    .iter()
+                    .filter(|((_, port), _)| *port == host_port)
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(key, entry)| (*key, entry.id));
+                oldest.and_then(|(key, id)| peers.remove(&key).map(|_| id))
+            }
+        };
+
+        if let Some(id) = evicted {
+            self.remove_proxy(id);
         }
     }
 
@@ -520,10 +596,14 @@ impl VsockMuxer {
         debug!("DGRAM OP_RW");
         let id = ((pkt.src_port() as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
 
-        if let Some(proxy_lock) = self.proxy_map.read().unwrap().get(&id) {
+        let update = self
+            .proxy_map
+            .read()
+            .unwrap()
+            .get(&id)
+            .map(|proxy| proxy.lock().unwrap().sendmsg(pkt));
+        if let Some(update) = update {
             debug!("DGRAM allowing OP_RW for {}", pkt.src_port());
-            let mut proxy = proxy_lock.lock().unwrap();
-            let update = proxy.sendmsg(pkt);
             self.process_proxy_update(id, update);
         } else {
             debug!("DGRAM ignoring OP_RW for {}", pkt.src_port());
@@ -541,7 +621,15 @@ impl VsockMuxer {
         };
 
         let peer_key = (pkt.src_port(), pkt.dst_port());
-        if let Some(id) = self.dgram_peer_map.lock().unwrap().get(&peer_key).copied() {
+        let activity = self.next_dgram_activity.fetch_add(1, Ordering::Relaxed);
+        let existing = {
+            let mut peers = self.dgram_peer_map.lock().unwrap();
+            peers.get_mut(&peer_key).map(|entry| {
+                entry.last_used = activity;
+                entry.id
+            })
+        };
+        if let Some(id) = existing {
             let update = self
                 .proxy_map
                 .read()
@@ -554,6 +642,8 @@ impl VsockMuxer {
             }
             self.dgram_peer_map.lock().unwrap().remove(&peer_key);
         }
+
+        self.evict_oldest_dgram_peer(pkt.dst_port());
 
         let Some(mem) = self.mem.as_ref() else {
             warn!("vsock datagram without guest memory");
@@ -624,7 +714,13 @@ impl VsockMuxer {
             .write()
             .unwrap()
             .insert(id, Mutex::new(Box::new(proxy)));
-        self.dgram_peer_map.lock().unwrap().insert(peer_key, id);
+        self.dgram_peer_map.lock().unwrap().insert(
+            peer_key,
+            DgramPeerEntry {
+                id,
+                last_used: activity,
+            },
+        );
         self.process_proxy_update(id, update);
     }
 
@@ -682,8 +778,14 @@ impl VsockMuxer {
         debug!("OP_REQUEST");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
 
-        if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
-            if let Some(update) = proxy.lock().unwrap().confirm_connect(pkt) {
+        let existing = self
+            .proxy_map
+            .read()
+            .unwrap()
+            .get(&id)
+            .map(|proxy| proxy.lock().unwrap().confirm_connect(pkt));
+        if let Some(update) = existing {
+            if let Some(update) = update {
                 self.process_proxy_update(id, update);
             }
             return;
@@ -972,14 +1074,18 @@ impl VsockMuxer {
     fn process_stream_rw(&self, pkt: &VsockPacket) {
         debug!("OP_RW");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        if let Some(proxy_lock) = self.proxy_map.read().unwrap().get(&id) {
+        let update = self
+            .proxy_map
+            .read()
+            .unwrap()
+            .get(&id)
+            .map(|proxy| proxy.lock().unwrap().sendmsg(pkt));
+        if let Some(update) = update {
             debug!(
                 "allowing OP_RW: src={} dst={}",
                 pkt.src_port(),
                 pkt.dst_port()
             );
-            let mut proxy = proxy_lock.lock().unwrap();
-            let update = proxy.sendmsg(pkt);
             self.process_proxy_update(id, update);
         } else {
             debug!("invalid OP_RW for {}, sending reset", pkt.src_port());
@@ -1010,15 +1116,19 @@ impl VsockMuxer {
     fn process_stream_rst(&self, pkt: &VsockPacket) {
         debug!("OP_RST");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        if let Some(proxy_lock) = self.proxy_map.read().unwrap().get(&id) {
+        let update = self
+            .proxy_map
+            .read()
+            .unwrap()
+            .get(&id)
+            .map(|proxy| proxy.lock().unwrap().release());
+        if let Some(update) = update {
             debug!(
                 "allowing OP_RST: id={} src={} dst={}",
                 id,
                 pkt.src_port(),
                 pkt.dst_port()
             );
-            let mut proxy = proxy_lock.lock().unwrap();
-            let update = proxy.release();
             self.process_proxy_update(id, update);
         } else {
             debug!("invalid OP_RST for {}", pkt.src_port());
@@ -1048,5 +1158,48 @@ impl VsockMuxer {
             _ => warn!("stream: unhandled op={}", pkt.op()),
         }
         Ok(())
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn datagram_peer_limit_evicts_the_least_recently_used_peer_per_port() {
+        let muxer = VsockMuxer::new(3, None, None, None, None, TsiFlags::empty());
+        {
+            let mut peers = muxer.dgram_peer_map.lock().unwrap();
+            for source_port in 1..=MAX_DGRAM_PEERS_PER_PORT as u32 {
+                peers.insert(
+                    (source_port, 5000),
+                    DgramPeerEntry {
+                        id: source_port as u64,
+                        last_used: source_port as u64,
+                    },
+                );
+            }
+            peers.insert(
+                (1, 6000),
+                DgramPeerEntry {
+                    id: u32::MAX as u64,
+                    last_used: 0,
+                },
+            );
+        }
+
+        muxer.evict_oldest_dgram_peer(5000);
+
+        let peers = muxer.dgram_peer_map.lock().unwrap();
+        assert!(!peers.contains_key(&(1, 5000)));
+        assert_eq!(
+            peers.keys().filter(|(_, port)| *port == 5000).count(),
+            MAX_DGRAM_PEERS_PER_PORT - 1
+        );
+        assert!(peers.contains_key(&(1, 6000)));
     }
 }

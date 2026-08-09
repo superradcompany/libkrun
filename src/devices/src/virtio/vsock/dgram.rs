@@ -79,11 +79,15 @@ impl DatagramProxy {
         }
 
         let mut delivered = false;
+        let mut exhausted_batch = true;
         for _ in 0..MAX_RECEIVE_BATCH {
             let mut data = vec![0; defs::MAX_PKT_BUF_SIZE];
             let read = match self.backend.receive(&mut data) {
                 Ok(read) => read,
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    exhausted_batch = false;
+                    break;
+                }
                 Err(err) => return Err(err),
             };
 
@@ -114,6 +118,13 @@ impl DatagramProxy {
                 &self.mem,
             );
             delivered = true;
+        }
+
+        // Notifier-backed endpoints commonly signal only on an empty-to-ready
+        // transition. Preserve fairness without stranding a 33rd message after
+        // clearing that notification above.
+        if exhausted_batch && self.uses_notifier() {
+            self.notifier.notify()?;
         }
 
         Ok(delivered)
@@ -152,7 +163,10 @@ impl Proxy for DatagramProxy {
     fn getpeername(&mut self, _pkt: &VsockPacket) {}
 
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
-        let payload = pkt.buf().unwrap_or_default();
+        let Some(payload) = pkt.payload() else {
+            warn!("dropping custom vsock datagram with an invalid payload length");
+            return ProxyUpdate::default();
+        };
         match self.backend.send(payload) {
             Ok(()) => ProxyUpdate::default(),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -241,5 +255,73 @@ impl Proxy for DatagramProxy {
                 warn!("failed to kick custom vsock datagram backend: {err}");
             }
         }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use vm_memory::GuestAddress;
+
+    use super::super::backend::VsockDatagramRead;
+    use super::*;
+
+    struct QueueDatagrams {
+        messages: Mutex<VecDeque<Vec<u8>>>,
+    }
+
+    impl VsockDatagramBackend for QueueDatagrams {
+        fn send(&self, _payload: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn receive(&self, buf: &mut [u8]) -> io::Result<VsockDatagramRead> {
+            let Some(message) = self.messages.lock().unwrap().pop_front() else {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            };
+            let len = message.len().min(buf.len());
+            buf[..len].copy_from_slice(&message[..len]);
+            Ok(VsockDatagramRead {
+                len,
+                truncated: message.len() > buf.len(),
+            })
+        }
+    }
+
+    #[test]
+    fn notifier_rearms_after_a_full_receive_batch() {
+        let messages = (0..=MAX_RECEIVE_BATCH)
+            .map(|index| vec![index as u8])
+            .collect();
+        let notifier = VsockNotifier::new().unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let rxq = Arc::new(Mutex::new(MuxerRxQ::new()));
+        let proxy = DatagramProxy::new(
+            1,
+            3,
+            5000,
+            4000,
+            Box::new(QueueDatagrams {
+                messages: Mutex::new(messages),
+            }),
+            notifier.clone(),
+            mem,
+            Arc::new(Mutex::new(VirtQueue::new(256))),
+            Arc::clone(&rxq),
+        );
+
+        assert!(proxy.receive_batch().unwrap());
+        assert_eq!(rxq.lock().unwrap().len(), MAX_RECEIVE_BATCH);
+        // The full batch explicitly re-signals so the remaining datagram is
+        // observable even when the backend only signals empty-to-ready.
+        notifier.event().read().unwrap();
+
+        assert!(proxy.receive_batch().unwrap());
+        assert_eq!(rxq.lock().unwrap().len(), MAX_RECEIVE_BATCH + 1);
     }
 }

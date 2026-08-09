@@ -352,6 +352,16 @@ impl VsockPacket {
         })
     }
 
+    /// Return exactly the data length declared in the packet header rather
+    /// than the potentially larger backing descriptor.
+    pub(crate) fn payload(&self) -> Option<&[u8]> {
+        let len = self.len() as usize;
+        if len == 0 {
+            return Some(&[]);
+        }
+        self.buf()?.get(..len)
+    }
+
     /// Provides in-place, byte-slice, mutable access to the vsock packet data buffer.
     ///
     /// Note: control packets (e.g. connection request or reset) have no data buffer associated.
