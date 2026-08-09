@@ -20,7 +20,9 @@ use std::collections::VecDeque;
 use super::defs;
 use super::defs::uapi;
 use super::muxer::MuxerRx;
-use super::packet::{TsiAcceptRsp, TsiConnectRsp, TsiListenRsp, VsockPacket};
+use super::packet::VsockPacket;
+#[cfg(unix)]
+use super::packet::{TsiAcceptRsp, TsiConnectRsp, TsiListenRsp};
 
 /// The muxer RX queue.
 pub struct MuxerRxQ {
@@ -107,6 +109,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_buf_alloc(0)
                 .set_fwd_cnt(0);
         }
+        #[cfg(unix)]
         MuxerRx::ConnResponse {
             local_port,
             peer_port,
@@ -150,6 +153,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
 
             pkt.set_len(0);
         }
+        #[cfg(unix)]
         MuxerRx::GetnameResponse {
             local_port,
             peer_port,
@@ -193,6 +197,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
                 .set_fwd_cnt(fwd_cnt);
         }
+        #[cfg(unix)]
         MuxerRx::ListenResponse {
             local_port,
             peer_port,
@@ -208,6 +213,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
             pkt.write_listen_rsp(TsiListenRsp { result });
             pkt.set_len(pkt.buf().unwrap().len() as u32);
         }
+        #[cfg(unix)]
         MuxerRx::AcceptResponse {
             local_port,
             peer_port,
@@ -222,6 +228,32 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
 
             pkt.write_accept_rsp(TsiAcceptRsp { result });
             pkt.set_len(pkt.buf().unwrap().len() as u32);
+        }
+        #[cfg(unix)]
+        MuxerRx::Datagram {
+            local_port,
+            peer_port,
+            data,
+        } => {
+            pkt.set_op(uapi::VSOCK_OP_RW)
+                .set_src_cid(uapi::VSOCK_HOST_CID)
+                .set_dst_cid(cid)
+                .set_src_port(local_port)
+                .set_dst_port(peer_port)
+                .set_type(uapi::VSOCK_TYPE_DGRAM)
+                .set_flags(0)
+                .set_buf_alloc(0)
+                .set_fwd_cnt(0);
+
+            let len = pkt
+                .buf_mut()
+                .map(|buf| {
+                    let len = data.len().min(buf.len());
+                    buf[..len].copy_from_slice(&data[..len]);
+                    len
+                })
+                .unwrap_or(0);
+            pkt.set_len(len as u32);
         }
     }
 }

@@ -1,6 +1,5 @@
 //! VM handle for entering microVMs.
 
-#[cfg(not(target_os = "windows"))]
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -15,6 +14,7 @@ use std::ffi::CString;
 
 use crossbeam_channel::unbounded;
 #[cfg(not(target_os = "windows"))]
+use devices::virtio::vsock::VsockDatagramPortBackend;
 use devices::virtio::vsock::VsockPortBackend;
 use log::error;
 use polly::event_manager::EventManager;
@@ -25,7 +25,6 @@ use vmm::resources::VmResources;
 use vmm::vmm_config::kernel_bundle::InitrdBundle;
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 use vmm::vmm_config::kernel_cmdline::KernelCmdlineConfig;
-#[cfg(not(target_os = "windows"))]
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 
 use super::error::{BuildError, Error, Result, RuntimeError};
@@ -69,8 +68,9 @@ pub struct Vm {
     enable_inet_hijack: bool,
     #[cfg(not(target_os = "windows"))]
     vsock_unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
-    #[cfg(not(target_os = "windows"))]
     vsock_custom_port_map: Option<HashMap<u32, Arc<dyn VsockPortBackend>>>,
+    #[cfg(not(target_os = "windows"))]
+    vsock_custom_dgram_port_map: Option<HashMap<u32, Arc<dyn VsockDatagramPortBackend>>>,
     #[cfg(not(target_os = "windows"))]
     vsock_host_port_map: Option<HashMap<u16, u16>>,
     /// Keeps the libkrunfw library loaded so kernel memory pointers remain valid.
@@ -155,8 +155,9 @@ impl Vm {
         #[cfg(not(target_os = "windows"))] vsock_unix_ipc_port_map: Option<
             HashMap<u32, (PathBuf, bool)>,
         >,
-        #[cfg(not(target_os = "windows"))] vsock_custom_port_map: Option<
-            HashMap<u32, Arc<dyn VsockPortBackend>>,
+        vsock_custom_port_map: Option<HashMap<u32, Arc<dyn VsockPortBackend>>>,
+        #[cfg(not(target_os = "windows"))] vsock_custom_dgram_port_map: Option<
+            HashMap<u32, Arc<dyn VsockDatagramPortBackend>>,
         >,
         #[cfg(not(target_os = "windows"))] vsock_host_port_map: Option<HashMap<u16, u16>>,
     ) -> Self {
@@ -178,8 +179,9 @@ impl Vm {
             enable_inet_hijack,
             #[cfg(not(target_os = "windows"))]
             vsock_unix_ipc_port_map,
-            #[cfg(not(target_os = "windows"))]
             vsock_custom_port_map,
+            #[cfg(not(target_os = "windows"))]
+            vsock_custom_dgram_port_map,
             #[cfg(not(target_os = "windows"))]
             vsock_host_port_map,
             _krunfw_library: None,
@@ -415,6 +417,7 @@ impl Vm {
 
         if self.vsock_unix_ipc_port_map.is_none()
             && self.vsock_custom_port_map.is_none()
+            && self.vsock_custom_dgram_port_map.is_none()
             && tsi_flags.is_empty()
         {
             return Ok(());
@@ -426,6 +429,7 @@ impl Vm {
             host_port_map: self.vsock_host_port_map.take(),
             unix_ipc_port_map: self.vsock_unix_ipc_port_map.take(),
             custom_port_map: self.vsock_custom_port_map.take(),
+            custom_dgram_port_map: self.vsock_custom_dgram_port_map.take(),
             tsi_flags,
         };
 
@@ -438,8 +442,22 @@ impl Vm {
 
     #[cfg(target_os = "windows")]
     fn configure_vsock(&mut self) -> Result<()> {
-        // Unsupported requests are rejected by VmBuilder::build; keep VM
-        // startup free of placeholder devices on Windows.
+        if self.vsock_custom_port_map.is_none() {
+            return Ok(());
+        }
+
+        self.vmr
+            .set_vsock_device(VsockDeviceConfig {
+                vsock_id: "vsock0".to_string(),
+                guest_cid: 3,
+                host_port_map: None,
+                unix_ipc_port_map: None,
+                custom_port_map: self.vsock_custom_port_map.take(),
+                tsi_flags: vmm::resources::TsiFlags::empty(),
+            })
+            .map_err(|err| {
+                Error::Build(BuildError::DeviceRegistration(format!("vsock: {err:?}")))
+            })?;
         Ok(())
     }
 
@@ -668,6 +686,7 @@ mod tests {
             false,
             #[cfg(not(target_os = "windows"))]
             None,
+            None,
             #[cfg(not(target_os = "windows"))]
             None,
             #[cfg(not(target_os = "windows"))]
@@ -692,6 +711,7 @@ mod tests {
             EventFd::new(EFD_NONBLOCK).unwrap(),
             Arc::new(AtomicI32::new(i32::MAX)),
             enable_inet_hijack,
+            None,
             None,
             None,
             None,

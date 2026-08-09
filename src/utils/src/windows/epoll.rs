@@ -43,7 +43,9 @@ pub struct EpollEvent {
 #[derive(Debug)]
 pub struct Epoll {
     context: Mutex<WaitContext>,
-    registrations: Mutex<HashMap<RawHandle, u64>>,
+    // Store opaque handle values as integers so the synchronized registry is
+    // safely movable with an event loop thread.
+    registrations: Mutex<HashMap<usize, u64>>,
 }
 
 impl EpollEvent {
@@ -100,17 +102,20 @@ impl Epoll {
                     EventSource::waitable_handle(handle, event.data),
                     event_set_to_wait_event_set(event.event_set()),
                 )?;
-                registrations.insert(handle, event.data);
+                registrations.insert(handle as usize, event.data);
                 Ok(())
             }
             ControlOperation::Modify => {
-                let token = registrations.get(&handle).copied().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "handle is not registered")
-                })?;
+                let token = registrations
+                    .get(&(handle as usize))
+                    .copied()
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "handle is not registered")
+                    })?;
                 context.modify(token, event_set_to_wait_event_set(event.event_set()))
             }
             ControlOperation::Delete => {
-                let token = registrations.remove(&handle).ok_or_else(|| {
+                let token = registrations.remove(&(handle as usize)).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "handle is not registered")
                 })?;
                 context.delete(token)

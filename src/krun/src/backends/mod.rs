@@ -32,7 +32,6 @@ pub mod fs;
 #[cfg(feature = "net")]
 pub mod net;
 
-#[cfg(not(target_os = "windows"))]
 pub mod vsock;
 
 //--------------------------------------------------------------------------------------------------

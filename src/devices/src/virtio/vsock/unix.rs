@@ -25,7 +25,6 @@ use super::muxer::{push_packet, MuxerRx};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
 use super::proxy::{NewProxyType, Proxy, ProxyError, ProxyStatus, ProxyUpdate};
-use super::{VsockNotifier, VsockShutdown, VsockStreamBackend};
 use utils::epoll::EventSet;
 
 use vm_memory::GuestMemoryMmap;
@@ -53,22 +52,13 @@ pub struct UnixProxy {
 
 enum StreamEndpoint {
     Unix(OwnedFd),
-    Custom {
-        backend: Box<dyn VsockStreamBackend>,
-        notifier: VsockNotifier,
-    },
 }
 
 impl StreamEndpoint {
-    fn is_custom(&self) -> bool {
-        matches!(self, Self::Custom { .. })
-    }
-
     fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Unix(fd) => recv(fd.as_raw_fd(), buf, MsgFlags::MSG_DONTWAIT)
                 .map_err(|err| io::Error::from_raw_os_error(err as i32)),
-            Self::Custom { backend, .. } => backend.read(buf),
         }
     }
 
@@ -82,7 +72,6 @@ impl StreamEndpoint {
                 send(fd.as_raw_fd(), buf, flags)
                     .map_err(|err| io::Error::from_raw_os_error(err as i32))
             }
-            Self::Custom { backend, .. } => backend.write(buf),
         }
     }
 
@@ -90,11 +79,6 @@ impl StreamEndpoint {
         match self {
             Self::Unix(fd) => shutdown(fd.as_raw_fd(), how)
                 .map_err(|err| io::Error::from_raw_os_error(err as i32)),
-            Self::Custom { backend, .. } => backend.shutdown(match how {
-                Shutdown::Read => VsockShutdown::Read,
-                Shutdown::Write => VsockShutdown::Write,
-                Shutdown::Both => VsockShutdown::Both,
-            }),
         }
     }
 }
@@ -103,7 +87,6 @@ impl AsRawFd for StreamEndpoint {
     fn as_raw_fd(&self) -> RawFd {
         match self {
             Self::Unix(fd) => fd.as_raw_fd(),
-            Self::Custom { notifier, .. } => notifier.event().as_raw_fd(),
         }
     }
 }
@@ -182,40 +165,6 @@ impl UnixProxy {
             rx_cnt: Wrapping(0),
             pending_write: VecDeque::new(),
         })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_custom(
-        id: u64,
-        cid: u64,
-        local_port: u32,
-        peer_port: u32,
-        backend: Box<dyn VsockStreamBackend>,
-        notifier: VsockNotifier,
-        mem: GuestMemoryMmap,
-        queue: Arc<Mutex<VirtQueue>>,
-        rxq: Arc<Mutex<MuxerRxQ>>,
-    ) -> Self {
-        UnixProxy {
-            id,
-            cid,
-            local_port,
-            peer_port,
-            control_port: 0,
-            endpoint: StreamEndpoint::Custom { backend, notifier },
-            status: ProxyStatus::Connected,
-            mem,
-            queue,
-            rxq,
-            peer_buf_alloc: 0,
-            peer_fwd_cnt: Wrapping(0),
-            path: PathBuf::new(),
-            tx_cnt: Wrapping(0),
-            last_tx_cnt_sent: Wrapping(0),
-            push_cnt: Wrapping(0),
-            rx_cnt: Wrapping(0),
-            pending_write: VecDeque::new(),
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -465,18 +414,10 @@ impl UnixProxy {
     }
 
     fn connected_poll_events(&self) -> EventSet {
-        if self.endpoint.is_custom() || self.pending_write.is_empty() {
+        if self.pending_write.is_empty() {
             EventSet::IN
         } else {
             EventSet::IN | EventSet::OUT
-        }
-    }
-
-    fn clear_custom_notification(&self) {
-        if let StreamEndpoint::Custom { notifier, .. } = &self.endpoint {
-            if let Err(err) = notifier.clear() {
-                warn!("failed to clear custom vsock notification: {err}");
-            }
         }
     }
 
@@ -500,6 +441,10 @@ impl UnixProxy {
 impl Proxy for UnixProxy {
     fn id(&self) -> u64 {
         self.id
+    }
+
+    fn pollable(&self) -> RawFd {
+        self.as_raw_fd()
     }
 
     fn status(&self) -> ProxyStatus {
@@ -757,7 +702,6 @@ impl Proxy for UnixProxy {
         if evset.contains(EventSet::IN) {
             debug!("process_event: IN");
             if self.status == ProxyStatus::Connected {
-                self.clear_custom_notification();
                 if !self.pending_write.is_empty() {
                     if let Err(err) = self.flush_pending_write() {
                         warn!("vsock backend write failed: {err}");
@@ -809,7 +753,6 @@ impl Proxy for UnixProxy {
                     StreamEndpoint::Unix(fd) => {
                         getsockopt(fd, sockopt::SocketError).unwrap_or(libc::EIO)
                     }
-                    StreamEndpoint::Custom { .. } => 0,
                 };
                 if connect_error != 0 {
                     warn!("Unix vsock connect failed asynchronously: errno {connect_error}");
@@ -855,14 +798,6 @@ impl Proxy for UnixProxy {
 
         update
     }
-
-    fn kick(&self) {
-        if let StreamEndpoint::Custom { notifier, .. } = &self.endpoint {
-            if let Err(err) = notifier.notify() {
-                warn!("failed to kick custom vsock backend: {err}");
-            }
-        }
-    }
 }
 
 impl AsRawFd for UnixProxy {
@@ -900,6 +835,9 @@ impl UnixAcceptorProxy {
 impl Proxy for UnixAcceptorProxy {
     fn id(&self) -> u64 {
         self.id
+    }
+    fn pollable(&self) -> RawFd {
+        self.as_raw_fd()
     }
     fn status(&self) -> ProxyStatus {
         ProxyStatus::WaitingOnAccept
@@ -969,90 +907,5 @@ impl Proxy for UnixAcceptorProxy {
 impl AsRawFd for UnixAcceptorProxy {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
-    }
-}
-
-//--------------------------------------------------------------------------------------------------
-// Tests
-//--------------------------------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use vm_memory::GuestAddress;
-
-    use super::*;
-
-    struct TestStreamState {
-        blocked: AtomicBool,
-        written: Mutex<Vec<u8>>,
-        shutdown: Mutex<Option<VsockShutdown>>,
-    }
-
-    struct TestStream {
-        state: Arc<TestStreamState>,
-    }
-
-    impl VsockStreamBackend for TestStream {
-        fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
-            Err(io::Error::from(io::ErrorKind::WouldBlock))
-        }
-
-        fn write(&self, buf: &[u8]) -> io::Result<usize> {
-            let mut written = self.state.written.lock().unwrap();
-            if self.state.blocked.load(Ordering::Relaxed) && written.len() >= 2 {
-                return Err(io::Error::from(io::ErrorKind::WouldBlock));
-            }
-            let count = if self.state.blocked.load(Ordering::Relaxed) {
-                buf.len().min(2)
-            } else {
-                buf.len()
-            };
-            written.extend_from_slice(&buf[..count]);
-            Ok(count)
-        }
-
-        fn shutdown(&self, how: VsockShutdown) -> io::Result<()> {
-            *self.state.shutdown.lock().unwrap() = Some(how);
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn custom_stream_buffers_partial_writes_without_losing_bytes() {
-        let state = Arc::new(TestStreamState {
-            blocked: AtomicBool::new(true),
-            written: Mutex::new(Vec::new()),
-            shutdown: Mutex::new(None),
-        });
-        let backend = TestStream {
-            state: Arc::clone(&state),
-        };
-        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let mut proxy = UnixProxy::new_custom(
-            1,
-            3,
-            5000,
-            4000,
-            Box::new(backend),
-            VsockNotifier::new().unwrap(),
-            mem,
-            Arc::new(Mutex::new(VirtQueue::new(256))),
-            Arc::new(Mutex::new(MuxerRxQ::new())),
-        );
-
-        proxy.pending_write.extend(b"hello");
-        proxy.flush_pending_write().unwrap();
-        assert_eq!(&*state.written.lock().unwrap(), b"he");
-        assert_eq!(proxy.pending_write.len(), 3);
-
-        state.blocked.store(false, Ordering::Relaxed);
-        proxy.flush_pending_write().unwrap();
-        assert_eq!(&*state.written.lock().unwrap(), b"hello");
-        assert!(proxy.pending_write.is_empty());
-
-        proxy.endpoint.shutdown(Shutdown::Both).unwrap();
-        assert_eq!(*state.shutdown.lock().unwrap(), Some(VsockShutdown::Both));
     }
 }

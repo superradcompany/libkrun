@@ -47,7 +47,6 @@ pub use builders::DiskImageFormat;
 pub use builders::FsBuilder;
 #[cfg(feature = "net")]
 pub use builders::NetBuilder;
-#[cfg(not(target_os = "windows"))]
 pub use builders::VsockBuilder;
 pub use builders::{ConsoleBuilder, ExecBuilder, HostCpuId, KernelBuilder, MachineBuilder};
 pub use error::{BuildError, ConfigError, Error, Result, RuntimeError};

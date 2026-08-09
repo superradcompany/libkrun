@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::super::Queue as VirtQueue;
+use super::custom_stream::CustomStreamProxy;
 use super::defs;
 use super::defs::uapi;
+use super::dgram::DatagramProxy;
 use super::muxer_rxq::{rx_to_pkt, MuxerRxQ};
 use super::muxer_thread::MuxerThread;
 use super::packet::{TsiGetnameRsp, VsockPacket};
@@ -17,7 +20,10 @@ use super::tsi_dgram::TsiDgramProxy;
 use super::tsi_stream::TsiStreamProxy;
 use super::unix::UnixProxy;
 use super::VsockError;
-use super::{TsiFlags, VsockConnectRequest, VsockNotifier, VsockPortBackend};
+use super::{
+    TsiFlags, VsockConnectRequest, VsockDatagramPeer, VsockDatagramPortBackend, VsockNotifier,
+    VsockPortBackend,
+};
 use crossbeam_channel::{unbounded, Sender};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
@@ -72,6 +78,11 @@ pub enum MuxerRx {
         peer_port: u32,
         result: i32,
     },
+    Datagram {
+        local_port: u32,
+        peer_port: u32,
+        data: Vec<u8>,
+    },
 }
 
 pub fn push_packet(
@@ -108,6 +119,9 @@ pub struct VsockMuxer {
     reaper_sender: Option<Sender<u64>>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     custom_port_map: Option<HashMap<u32, Arc<dyn VsockPortBackend>>>,
+    custom_dgram_port_map: Option<HashMap<u32, Arc<dyn VsockDatagramPortBackend>>>,
+    dgram_peer_map: Mutex<HashMap<(u32, u32), u64>>,
+    next_dgram_proxy_id: AtomicU64,
     tsi_flags: TsiFlags,
 }
 
@@ -117,6 +131,7 @@ impl VsockMuxer {
         host_port_map: Option<HashMap<u16, u16>>,
         unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
         custom_port_map: Option<HashMap<u32, Arc<dyn VsockPortBackend>>>,
+        custom_dgram_port_map: Option<HashMap<u32, Arc<dyn VsockDatagramPortBackend>>>,
         tsi_flags: TsiFlags,
     ) -> Self {
         VsockMuxer {
@@ -131,6 +146,12 @@ impl VsockMuxer {
             reaper_sender: None,
             unix_ipc_port_map,
             custom_port_map,
+            custom_dgram_port_map,
+            dgram_peer_map: Mutex::new(HashMap::new()),
+            // Direct stream proxy ids use the low 32 bits for a non-zero host
+            // port. Keeping those bits zero gives datagram event tokens a
+            // disjoint namespace without changing the legacy stream ids.
+            next_dgram_proxy_id: AtomicU64::new(1),
             tsi_flags,
         }
     }
@@ -509,6 +530,104 @@ impl VsockMuxer {
         }
     }
 
+    fn process_custom_dgram(&self, pkt: &VsockPacket) {
+        let Some(service) = self
+            .custom_dgram_port_map
+            .as_ref()
+            .and_then(|routes| routes.get(&pkt.dst_port()))
+            .cloned()
+        else {
+            return;
+        };
+
+        let peer_key = (pkt.src_port(), pkt.dst_port());
+        if let Some(id) = self.dgram_peer_map.lock().unwrap().get(&peer_key).copied() {
+            let update = self
+                .proxy_map
+                .read()
+                .unwrap()
+                .get(&id)
+                .map(|proxy| proxy.lock().unwrap().sendmsg(pkt));
+            if let Some(update) = update {
+                self.process_proxy_update(id, update);
+                return;
+            }
+            self.dgram_peer_map.lock().unwrap().remove(&peer_key);
+        }
+
+        let Some(mem) = self.mem.as_ref() else {
+            warn!("vsock datagram without guest memory");
+            return;
+        };
+        let Some(queue) = self.queue.as_ref() else {
+            warn!("vsock datagram without receive queue");
+            return;
+        };
+
+        let notifier = match VsockNotifier::new() {
+            Ok(notifier) => notifier,
+            Err(err) => {
+                warn!("failed to create custom vsock datagram notifier: {err}");
+                return;
+            }
+        };
+        let peer = VsockDatagramPeer {
+            guest_cid: pkt.src_cid(),
+            guest_port: pkt.src_port(),
+            host_port: pkt.dst_port(),
+        };
+        let backend = match service.open_peer(peer, notifier.clone()) {
+            Ok(backend) => backend,
+            Err(err) => {
+                warn!(
+                    "custom vsock datagram service rejected port {}: {err}",
+                    pkt.dst_port()
+                );
+                return;
+            }
+        };
+
+        let id = self.next_dgram_proxy_id.fetch_add(1, Ordering::Relaxed) << 32;
+        let mut proxy = DatagramProxy::new(
+            id,
+            self.cid,
+            pkt.dst_port(),
+            pkt.src_port(),
+            backend,
+            notifier,
+            mem.clone(),
+            queue.clone(),
+            self.rxq.clone(),
+        );
+        let poll_fd = proxy.as_raw_fd();
+        if poll_fd < 0 {
+            warn!(
+                "custom vsock datagram service for port {} returned an invalid poll fd",
+                pkt.dst_port()
+            );
+            return;
+        }
+        if let Err(err) = self.epoll.ctl(
+            ControlOperation::Add,
+            poll_fd,
+            &EpollEvent::new(EventSet::IN, id),
+        ) {
+            warn!(
+                "custom vsock datagram service for port {} returned an unusable poll fd: {err}",
+                pkt.dst_port()
+            );
+            return;
+        }
+
+        let update = proxy.sendmsg(pkt);
+        self.proxy_map
+            .write()
+            .unwrap()
+            .insert(id, Mutex::new(Box::new(proxy)));
+        self.dgram_peer_map.lock().unwrap().insert(peer_key, id);
+        self.process_proxy_update(id, update);
+    }
+
     pub(crate) fn send_dgram_pkt(&mut self, pkt: &VsockPacket) -> super::Result<()> {
         debug!(
             "send_dgram_pkt: src_port={} dst_port={}",
@@ -518,6 +637,19 @@ impl VsockMuxer {
 
         if pkt.dst_cid() != uapi::VSOCK_HOST_CID {
             debug!("dropping guest packet for unknown CID: {:?}", pkt.hdr());
+            return Ok(());
+        }
+
+        if self
+            .custom_dgram_port_map
+            .as_ref()
+            .is_some_and(|routes| routes.contains_key(&pkt.dst_port()))
+        {
+            if pkt.op() == uapi::VSOCK_OP_RW {
+                self.process_custom_dgram(pkt);
+            } else {
+                debug!("dropping non-RW packet for direct datagram route");
+            }
             return Ok(());
         }
 
@@ -596,7 +728,7 @@ impl VsockMuxer {
             };
             match service.connect(request, notifier.clone()) {
                 Ok(backend) => {
-                    let proxy = UnixProxy::new_custom(
+                    let mut proxy = match CustomStreamProxy::new(
                         id,
                         self.cid,
                         pkt.dst_port(),
@@ -606,8 +738,31 @@ impl VsockMuxer {
                         mem.clone(),
                         queue.clone(),
                         self.rxq.clone(),
-                    );
-                    let poll_fd = proxy.as_raw_fd();
+                    ) {
+                        Ok(proxy) => proxy,
+                        Err(err) => {
+                            warn!(
+                                "custom vsock service failed to initialize port {}: {err}",
+                                pkt.dst_port()
+                            );
+                            push_packet(
+                                self.cid,
+                                MuxerRx::Reset {
+                                    local_port: pkt.dst_port(),
+                                    peer_port: pkt.src_port(),
+                                },
+                                &self.rxq,
+                                queue,
+                                mem,
+                            );
+                            return;
+                        }
+                    };
+                    let connecting = proxy.is_connecting();
+                    if connecting {
+                        proxy.prepare_connect(pkt);
+                    }
+                    let poll_fd = proxy.pollable();
                     if poll_fd < 0 {
                         warn!(
                             "custom vsock service for port {} returned an invalid poll fd",
@@ -632,7 +787,14 @@ impl VsockMuxer {
                     if let Err(err) = self.epoll.ctl(
                         ControlOperation::Add,
                         poll_fd,
-                        &EpollEvent::new(EventSet::IN, id),
+                        &EpollEvent::new(
+                            if connecting {
+                                EventSet::IN | EventSet::OUT
+                            } else {
+                                EventSet::IN
+                            },
+                            id,
+                        ),
                     ) {
                         self.proxy_map.write().unwrap().remove(&id);
                         warn!(
@@ -651,8 +813,10 @@ impl VsockMuxer {
                         );
                         return;
                     }
-                    if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
-                        proxy.lock().unwrap().confirm_connect(pkt);
+                    if !connecting {
+                        if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
+                            proxy.lock().unwrap().confirm_connect(pkt);
+                        }
                     }
                 }
                 Err(err) => {

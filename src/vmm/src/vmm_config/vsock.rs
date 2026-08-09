@@ -4,75 +4,28 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-#[cfg(not(target_os = "windows"))]
 use std::sync::{Arc, Mutex};
 
 #[cfg(not(target_os = "windows"))]
+use devices::virtio::vsock::VsockDatagramPortBackend;
 use devices::virtio::vsock::VsockPortBackend;
-#[cfg(not(target_os = "windows"))]
-use devices::virtio::{TsiFlags, Vsock, VsockError};
+pub use devices::virtio::TsiFlags;
+use devices::virtio::{Vsock, VsockError};
 
-#[cfg(target_os = "windows")]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct TsiFlags(u32);
-
-#[cfg(target_os = "windows")]
-impl TsiFlags {
-    pub const HIJACK_INET: Self = Self(1 << 0);
-    pub const HIJACK_UNIX: Self = Self(1 << 1);
-
-    pub fn empty() -> Self {
-        Self(0)
-    }
-
-    pub fn from_bits(bits: u32) -> Option<Self> {
-        let supported = Self::HIJACK_INET.0 | Self::HIJACK_UNIX.0;
-        if bits & !supported == 0 {
-            Some(Self(bits))
-        } else {
-            None
-        }
-    }
-
-    pub fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
-    }
-
-    pub fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-}
-
-#[cfg(target_os = "windows")]
-impl std::ops::BitOrAssign for TsiFlags {
-    fn bitor_assign(&mut self, rhs: Self) {
-        self.0 |= rhs.0;
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
 type MutexVsock = Arc<Mutex<Vsock>>;
-#[cfg(target_os = "windows")]
-type MutexVsock = ();
 
 /// Errors associated with `NetworkInterfaceConfig`.
 #[derive(Debug)]
 pub enum VsockConfigError {
     /// Failed to create the vsock device.
-    #[cfg(not(target_os = "windows"))]
     CreateVsockDevice(VsockError),
-    #[cfg(target_os = "windows")]
-    UnsupportedOnWindows,
 }
 
 impl fmt::Display for VsockConfigError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use self::VsockConfigError::*;
         match *self {
-            #[cfg(not(target_os = "windows"))]
             CreateVsockDevice(ref e) => write!(f, "Cannot create vsock device: {e:?}"),
-            #[cfg(target_os = "windows")]
-            UnsupportedOnWindows => write!(f, "Vsock device support is not implemented on Windows"),
         }
     }
 }
@@ -92,8 +45,10 @@ pub struct VsockDeviceConfig {
     /// An optional map of guest port to host UNIX domain sockets for IPC.
     pub unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     /// Optional custom in-process services keyed by host vsock port.
-    #[cfg(not(target_os = "windows"))]
     pub custom_port_map: Option<HashMap<u32, Arc<dyn VsockPortBackend>>>,
+    /// Optional custom message-oriented services keyed by host vsock port.
+    #[cfg(not(target_os = "windows"))]
+    pub custom_dgram_port_map: Option<HashMap<u32, Arc<dyn VsockDatagramPortBackend>>>,
     /// TSI feature flags
     pub tsi_flags: TsiFlags,
 }
@@ -106,11 +61,18 @@ impl fmt::Debug for VsockDeviceConfig {
             .field("guest_cid", &self.guest_cid)
             .field("host_port_map", &self.host_port_map)
             .field("unix_ipc_port_map", &self.unix_ipc_port_map);
-        #[cfg(not(target_os = "windows"))]
         debug.field(
             "custom_ports",
             &self
                 .custom_port_map
+                .as_ref()
+                .map(|services| services.keys().collect::<Vec<_>>()),
+        );
+        #[cfg(not(target_os = "windows"))]
+        debug.field(
+            "custom_dgram_ports",
+            &self
+                .custom_dgram_port_map
                 .as_ref()
                 .map(|services| services.keys().collect::<Vec<_>>()),
         );
@@ -140,20 +102,11 @@ impl VsockBuilder {
 
     /// Inserts a Vsock in the store.
     /// If an entry already exists, it will overwrite it.
-    #[cfg(not(target_os = "windows"))]
     pub fn insert(&mut self, cfg: VsockDeviceConfig) -> Result<()> {
         self.tsi_flags = cfg.tsi_flags;
         self.inner = Some(VsockWrapper {
             vsock: Arc::new(Mutex::new(Self::create_vsock(cfg)?)),
         });
-        Ok(())
-    }
-
-    /// Inserts a placeholder Vsock configuration on Windows.
-    #[cfg(target_os = "windows")]
-    pub fn insert(&mut self, cfg: VsockDeviceConfig) -> Result<()> {
-        self.tsi_flags = cfg.tsi_flags;
-        self.inner = Some(VsockWrapper { vsock: () });
         Ok(())
     }
 
@@ -167,13 +120,18 @@ impl VsockBuilder {
     }
 
     /// Creates a Vsock device from a VsockDeviceConfig.
-    #[cfg(not(target_os = "windows"))]
     pub fn create_vsock(cfg: VsockDeviceConfig) -> Result<Vsock> {
+        #[cfg(not(target_os = "windows"))]
+        let custom_dgram_port_map = cfg.custom_dgram_port_map;
+        #[cfg(target_os = "windows")]
+        let custom_dgram_port_map = None;
+
         Vsock::new(
             u64::from(cfg.guest_cid),
             cfg.host_port_map,
             cfg.unix_ipc_port_map,
             cfg.custom_port_map,
+            custom_dgram_port_map,
             cfg.tsi_flags,
         )
         .map_err(VsockConfigError::CreateVsockDevice)
@@ -213,6 +171,7 @@ pub(crate) mod tests {
             host_port_map: None,
             unix_ipc_port_map: None,
             custom_port_map: None,
+            custom_dgram_port_map: None,
             tsi_flags: TsiFlags::empty(),
         }
     }

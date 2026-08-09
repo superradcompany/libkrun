@@ -49,7 +49,6 @@ pub use api::builders::FsBuilder;
 pub use api::builders::NetBuilder;
 #[cfg(feature = "blk")]
 pub use api::builders::SyncMode;
-#[cfg(not(target_os = "windows"))]
 pub use api::builders::VsockBuilder;
 pub use api::builders::{ConsoleBuilder, ExecBuilder, HostCpuId, KernelBuilder, MachineBuilder};
 pub use api::error::{BuildError, ConfigError, Error, Result, RuntimeError};
@@ -71,7 +70,6 @@ pub use backends::fs::DynFileSystem;
 #[cfg(feature = "net")]
 pub use backends::net::NetBackend;
 
-#[cfg(not(target_os = "windows"))]
 pub use backends::vsock::{
     VsockConnectRequest, VsockNotifier, VsockPortBackend, VsockShutdown, VsockStreamBackend,
 };

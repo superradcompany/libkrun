@@ -17,6 +17,7 @@
 /// to temporary buffers, before passing it on to the vsock backend.
 use std::convert::TryInto;
 use std::ffi::CStr;
+#[cfg(unix)]
 use std::net::{Ipv4Addr, SocketAddrV4};
 #[cfg(target_os = "macos")]
 use std::net::{Ipv6Addr, SocketAddrV6};
@@ -25,6 +26,7 @@ use std::result;
 
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{sockaddr, AddressFamily};
+#[cfg(unix)]
 use nix::sys::socket::{SockaddrLike, SockaddrStorage};
 use utils::byte_order;
 use vm_memory::{self, Address, GuestAddress, GuestMemory, GuestMemoryError};
@@ -98,6 +100,7 @@ const HDROFF_BUF_ALLOC: usize = 36;
 // we have successfully written to a backing Unix socket.
 const HDROFF_FWD_CNT: usize = 40;
 
+#[cfg(unix)]
 #[repr(C)]
 pub struct TsiProxyCreate {
     pub peer_port: u32,
@@ -105,17 +108,20 @@ pub struct TsiProxyCreate {
     pub _type: u16,
 }
 
+#[cfg(unix)]
 #[repr(C)]
 pub struct TsiConnectReq {
     pub peer_port: u32,
     pub addr: SockaddrStorage,
 }
 
+#[cfg(unix)]
 #[repr(C)]
 pub struct TsiConnectRsp {
     pub result: i32,
 }
 
+#[cfg(unix)]
 #[repr(C)]
 pub struct TsiGetnameReq {
     pub peer_port: u32,
@@ -123,6 +129,7 @@ pub struct TsiGetnameReq {
     pub peer: u32,
 }
 
+#[cfg(unix)]
 #[repr(C)]
 #[derive(Debug)]
 pub struct TsiGetnameRsp {
@@ -131,6 +138,7 @@ pub struct TsiGetnameRsp {
     pub addr: SockaddrStorage,
 }
 
+#[cfg(unix)]
 impl Default for TsiGetnameRsp {
     fn default() -> Self {
         let addr: SockaddrStorage = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into();
@@ -143,6 +151,7 @@ impl Default for TsiGetnameRsp {
     }
 }
 
+#[cfg(unix)]
 #[repr(C)]
 #[derive(Debug)]
 pub struct TsiSendtoAddr {
@@ -150,6 +159,7 @@ pub struct TsiSendtoAddr {
     pub addr: SockaddrStorage,
 }
 
+#[cfg(unix)]
 #[repr(C)]
 #[derive(Debug)]
 pub struct TsiListenReq {
@@ -159,12 +169,14 @@ pub struct TsiListenReq {
     pub addr: SockaddrStorage,
 }
 
+#[cfg(unix)]
 #[repr(C)]
 #[derive(Debug)]
 pub struct TsiListenRsp {
     pub result: i32,
 }
 
+#[cfg(unix)]
 #[repr(C)]
 #[derive(Debug)]
 pub struct TsiAcceptReq {
@@ -172,12 +184,14 @@ pub struct TsiAcceptReq {
     pub flags: u32,
 }
 
+#[cfg(unix)]
 #[repr(C)]
 #[derive(Debug)]
 pub struct TsiAcceptRsp {
     pub result: i32,
 }
 
+#[cfg(unix)]
 #[repr(C)]
 pub struct TsiReleaseReq {
     pub peer_port: u32,
@@ -545,6 +559,7 @@ impl VsockPacket {
         }
     }
 
+    #[cfg(unix)]
     pub fn read_proxy_create(&self) -> Option<TsiProxyCreate> {
         if self.buf_size >= 6 {
             let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
@@ -561,6 +576,7 @@ impl VsockPacket {
         }
     }
 
+    #[cfg(unix)]
     pub fn read_connect_req(&self) -> Option<TsiConnectReq> {
         if self.buf_size >= 4 {
             let buf = self.buf().unwrap();
@@ -574,6 +590,7 @@ impl VsockPacket {
         }
     }
 
+    #[cfg(unix)]
     pub fn write_connect_rsp(&mut self, rsp: TsiConnectRsp) {
         if self.buf_size >= 4 {
             if let Some(buf) = self.buf_mut() {
@@ -582,6 +599,7 @@ impl VsockPacket {
         }
     }
 
+    #[cfg(unix)]
     pub fn read_getname_req(&self) -> Option<TsiGetnameReq> {
         if self.buf_size >= 12 {
             let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
@@ -597,6 +615,7 @@ impl VsockPacket {
         }
     }
 
+    #[cfg(unix)]
     pub fn write_getname_rsp(&mut self, rsp: TsiGetnameRsp) {
         if self.buf_size >= 132 {
             if let Some(buf) = self.buf_mut() {
@@ -625,6 +644,7 @@ impl VsockPacket {
         }
     }
 
+    #[cfg(unix)]
     pub fn read_sendto_addr(&self) -> Option<TsiSendtoAddr> {
         if self.buf_size >= 4 {
             let buf = self.buf().unwrap();
@@ -638,6 +658,7 @@ impl VsockPacket {
         }
     }
 
+    #[cfg(unix)]
     pub fn read_listen_req(&self) -> Option<TsiListenReq> {
         if self.buf_size >= 12 {
             let buf = self.buf().unwrap();
@@ -658,6 +679,7 @@ impl VsockPacket {
         }
     }
 
+    #[cfg(unix)]
     pub fn write_listen_rsp(&mut self, rsp: TsiListenRsp) {
         if self.buf_size >= 4 {
             if let Some(buf) = self.buf_mut() {
@@ -666,6 +688,7 @@ impl VsockPacket {
         }
     }
 
+    #[cfg(unix)]
     pub fn read_accept_req(&self) -> Option<TsiAcceptReq> {
         if self.buf_size >= 8 {
             let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
@@ -677,6 +700,7 @@ impl VsockPacket {
         }
     }
 
+    #[cfg(unix)]
     pub fn write_accept_rsp(&mut self, rsp: TsiAcceptRsp) {
         if self.buf_size >= 4 {
             if let Some(buf) = self.buf_mut() {
@@ -685,6 +709,7 @@ impl VsockPacket {
         }
     }
 
+    #[cfg(unix)]
     pub fn read_release_req(&self) -> Option<TsiReleaseReq> {
         if self.buf_size >= 8 {
             let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);

@@ -5,13 +5,26 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 
 use super::device::{Vsock, EVQ_INDEX, RXQ_INDEX, TXQ_INDEX};
 use crate::virtio::VirtioDevice;
+
+#[cfg(unix)]
+fn event_pollable(event: &utils::eventfd::EventFd) -> std::os::fd::RawFd {
+    event.as_raw_fd()
+}
+
+#[cfg(windows)]
+fn event_pollable(event: &utils::eventfd::EventFd) -> std::os::windows::io::RawHandle {
+    event.as_raw_handle()
+}
 
 impl Vsock {
     pub(crate) fn handle_rxq_event(&mut self, event: &EpollEvent) -> bool {
@@ -80,15 +93,15 @@ impl Vsock {
         // The subscriber must exist as we previously registered activate_evt via
         // `interest_list()`.
         let self_subscriber = event_manager
-            .subscriber(self.activate_evt.as_raw_fd())
+            .subscriber(event_pollable(&self.activate_evt))
             .unwrap();
 
         event_manager
             .register(
-                self.queue_events[RXQ_INDEX].as_raw_fd(),
+                event_pollable(&self.queue_events[RXQ_INDEX]),
                 EpollEvent::new(
                     EventSet::IN,
-                    self.queue_events[RXQ_INDEX].as_raw_fd() as u64,
+                    event_pollable(&self.queue_events[RXQ_INDEX]) as usize as u64,
                 ),
                 self_subscriber.clone(),
             )
@@ -98,10 +111,10 @@ impl Vsock {
 
         event_manager
             .register(
-                self.queue_events[TXQ_INDEX].as_raw_fd(),
+                event_pollable(&self.queue_events[TXQ_INDEX]),
                 EpollEvent::new(
                     EventSet::IN,
-                    self.queue_events[TXQ_INDEX].as_raw_fd() as u64,
+                    event_pollable(&self.queue_events[TXQ_INDEX]) as usize as u64,
                 ),
                 self_subscriber.clone(),
             )
@@ -110,7 +123,7 @@ impl Vsock {
             });
 
         event_manager
-            .unregister(self.activate_evt.as_raw_fd())
+            .unregister(event_pollable(&self.activate_evt))
             .unwrap_or_else(|e| {
                 error!("Failed to unregister vsock activate evt: {e:?}");
             })
@@ -120,11 +133,11 @@ impl Vsock {
 impl Subscriber for Vsock {
     fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
         let source = event.fd();
-        let rxq = self.queue_events[RXQ_INDEX].as_raw_fd();
-        let txq = self.queue_events[TXQ_INDEX].as_raw_fd();
-        let evq = self.queue_events[EVQ_INDEX].as_raw_fd();
+        let rxq = event_pollable(&self.queue_events[RXQ_INDEX]);
+        let txq = event_pollable(&self.queue_events[TXQ_INDEX]);
+        let evq = event_pollable(&self.queue_events[EVQ_INDEX]);
         //let backend = self.backend.as_raw_fd();
-        let activate_evt = self.activate_evt.as_raw_fd();
+        let activate_evt = event_pollable(&self.activate_evt);
 
         if self.is_activated() {
             let mut raise_irq = false;
@@ -154,7 +167,7 @@ impl Subscriber for Vsock {
     fn interest_list(&self) -> Vec<EpollEvent> {
         vec![EpollEvent::new(
             EventSet::IN,
-            self.activate_evt.as_raw_fd() as u64,
+            event_pollable(&self.activate_evt) as usize as u64,
         )]
     }
 }

@@ -1,6 +1,5 @@
 //! VM Builder for creating and configuring microVMs using nested builders.
 
-#[cfg(not(target_os = "windows"))]
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
@@ -25,7 +24,6 @@ use super::builders::FsConfig;
 use super::builders::{ConsoleBuilder, ExecBuilder, KernelBuilder, MachineBuilder};
 #[cfg(feature = "net")]
 use super::builders::{NetBuilder, NetConfig};
-#[cfg(not(target_os = "windows"))]
 use super::builders::{VsockBuilder, VsockRoute};
 
 use super::error::{BuildError, ConfigError, Error, Result};
@@ -67,7 +65,6 @@ use vmm::vmm_config::net::NetworkInterfaceConfig;
 /// ```
 pub struct VmBuilder {
     machine: MachineBuilder,
-    #[cfg(not(target_os = "windows"))]
     vsock: VsockBuilder,
     kernel: KernelBuilder,
     #[cfg_attr(feature = "tee", allow(dead_code))]
@@ -97,7 +94,6 @@ impl VmBuilder {
     pub fn new() -> Self {
         Self {
             machine: MachineBuilder::new(),
-            #[cfg(not(target_os = "windows"))]
             vsock: VsockBuilder::new(),
             kernel: KernelBuilder::new(),
             #[cfg(not(feature = "tee"))]
@@ -134,7 +130,6 @@ impl VmBuilder {
     /// Configure host services exposed through virtio-vsock.
     ///
     /// A route or enabled TSI transport automatically attaches the device.
-    #[cfg(not(target_os = "windows"))]
     pub fn vsock(mut self, f: impl FnOnce(VsockBuilder) -> VsockBuilder) -> Self {
         self.vsock = f(self.vsock);
         self
@@ -364,31 +359,44 @@ impl VmBuilder {
         #[cfg(target_os = "windows")]
         if self.machine.enable_inet_hijack {
             return Err(Error::Config(ConfigError::Vsock(
-                "virtio-vsock is not supported on Windows".to_string(),
+                "TSI INET hijack is not supported on Windows".to_string(),
             )));
         }
 
         #[cfg(not(target_os = "windows"))]
-        let (vsock_unix_ipc_port_map, vsock_custom_port_map, vsock_host_port_map) = {
-            let mut occupied_ports = HashSet::new();
+        let (
+            vsock_unix_ipc_port_map,
+            vsock_custom_port_map,
+            vsock_custom_dgram_port_map,
+            vsock_host_port_map,
+        ) = {
+            let mut occupied_stream_ports = HashSet::new();
+            let mut occupied_dgram_ports = HashSet::new();
             let mut unix_routes = HashMap::new();
             let mut custom_routes = HashMap::new();
+            let mut custom_dgram_routes = HashMap::new();
 
             for route in self.vsock.routes {
                 let (port, path) = match &route {
                     VsockRoute::UnixConnect { port, path }
                     | VsockRoute::UnixListen { port, path } => (*port, Some(path)),
-                    VsockRoute::Custom { port, .. } => (*port, None),
+                    VsockRoute::Custom { port, .. } | VsockRoute::CustomDatagram { port, .. } => {
+                        (*port, None)
+                    }
                 };
 
-                if port == 0 {
+                if port == 0 || port == u32::MAX {
                     return Err(Error::Config(ConfigError::Vsock(
-                        "route port must be non-zero".to_string(),
+                        "route port must be between 1 and u32::MAX - 1".to_string(),
                     )));
                 }
+                let occupied_ports = match &route {
+                    VsockRoute::CustomDatagram { .. } => &mut occupied_dgram_ports,
+                    _ => &mut occupied_stream_ports,
+                };
                 if !occupied_ports.insert(port) {
                     return Err(Error::Config(ConfigError::Vsock(format!(
-                        "duplicate route for host port {port}"
+                        "duplicate route for host port and socket type: {port}"
                     ))));
                 }
                 if path.is_some_and(|path| path.as_os_str().is_empty()) {
@@ -406,6 +414,9 @@ impl VmBuilder {
                     }
                     VsockRoute::Custom { port, backend } => {
                         custom_routes.insert(port, backend);
+                    }
+                    VsockRoute::CustomDatagram { port, backend } => {
+                        custom_dgram_routes.insert(port, backend);
                     }
                 }
             }
@@ -442,8 +453,30 @@ impl VmBuilder {
             (
                 (!unix_routes.is_empty()).then_some(unix_routes),
                 (!custom_routes.is_empty()).then_some(custom_routes),
+                (!custom_dgram_routes.is_empty()).then_some(custom_dgram_routes),
                 (!host_map.is_empty()).then_some(host_map),
             )
+        };
+
+        #[cfg(target_os = "windows")]
+        let vsock_custom_port_map = {
+            let mut occupied_ports = HashSet::new();
+            let mut custom_routes = HashMap::new();
+            for route in self.vsock.routes {
+                let VsockRoute::Custom { port, backend } = route;
+                if port == 0 || port == u32::MAX {
+                    return Err(Error::Config(ConfigError::Vsock(
+                        "route port must be between 1 and u32::MAX - 1".to_string(),
+                    )));
+                }
+                if !occupied_ports.insert(port) {
+                    return Err(Error::Config(ConfigError::Vsock(format!(
+                        "duplicate stream route for host port: {port}"
+                    ))));
+                }
+                custom_routes.insert(port, backend);
+            }
+            (!custom_routes.is_empty()).then_some(custom_routes)
         };
 
         #[cfg(not(target_os = "windows"))]
@@ -740,8 +773,9 @@ impl VmBuilder {
             enable_inet_hijack,
             #[cfg(not(target_os = "windows"))]
             vsock_unix_ipc_port_map,
-            #[cfg(not(target_os = "windows"))]
             vsock_custom_port_map,
+            #[cfg(not(target_os = "windows"))]
+            vsock_custom_dgram_port_map,
             #[cfg(not(target_os = "windows"))]
             vsock_host_port_map,
         ))
@@ -906,6 +940,37 @@ mod tests {
         assert!(
             matches!(err, Error::Config(ConfigError::Vsock(message)) if message.contains("duplicate route"))
         );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn build_allows_stream_and_datagram_on_same_port() {
+        use std::io;
+
+        use devices::virtio::vsock::{
+            VsockDatagramBackend, VsockDatagramPeer, VsockDatagramPortBackend, VsockNotifier,
+        };
+
+        struct RejectDatagrams;
+
+        impl VsockDatagramPortBackend for RejectDatagrams {
+            fn open_peer(
+                &self,
+                _peer: VsockDatagramPeer,
+                _notifier: VsockNotifier,
+            ) -> io::Result<Box<dyn VsockDatagramBackend>> {
+                Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+            }
+        }
+
+        VmBuilder::new()
+            .vsock(|vsock| {
+                vsock
+                    .unix_connect(5000, "/tmp/stream.sock")
+                    .custom_dgram(5000, Arc::new(RejectDatagrams))
+            })
+            .build()
+            .expect("socket type disambiguates equal port numbers");
     }
 
     #[cfg(not(target_os = "windows"))]

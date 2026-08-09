@@ -103,6 +103,12 @@ pub struct WaitContext {
     sources: Vec<RegisteredSource>,
 }
 
+// Windows HANDLE values are process-wide opaque identifiers. WaitContext never
+// dereferences them, and callers synchronize mutation, so moving a context to
+// its dedicated event-loop thread is safe.
+#[cfg(windows)]
+unsafe impl Send for WaitContext {}
+
 #[derive(Clone, Copy, Debug)]
 struct RegisteredSource {
     source: EventSource,
