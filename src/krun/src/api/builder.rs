@@ -1,5 +1,7 @@
 //! VM Builder for creating and configuring microVMs using nested builders.
 
+#[cfg(not(feature = "tee"))]
+use std::collections::BTreeSet;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
@@ -21,6 +23,8 @@ use super::builders::DiskBuilder;
 use super::builders::FsBuilder;
 #[cfg(not(feature = "tee"))]
 use super::builders::FsConfig;
+#[cfg(not(feature = "tee"))]
+use super::builders::HostMemoryPolicy;
 use super::builders::{ConsoleBuilder, ExecBuilder, KernelBuilder, MachineBuilder};
 #[cfg(feature = "net")]
 use super::builders::{NetBuilder, NetConfig};
@@ -53,6 +57,8 @@ const VSOCK_TIMESYNC_PORT: u32 = 123;
 const TSI_CONTROL_PORT_START: u32 = 1024;
 #[cfg(not(target_os = "windows"))]
 const TSI_CONTROL_PORT_END: u32 = 1031;
+#[cfg(not(feature = "tee"))]
+const MAX_HOST_NUMA_NODE_ID: u32 = u16::MAX as u32;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -531,6 +537,8 @@ impl VmBuilder {
             }
         }
 
+        validate_numa_topology(&self.machine)?;
+
         // Build VmResources
         let mut vmr = VmResources::default();
 
@@ -550,6 +558,7 @@ impl VmBuilder {
         {
             vmr.vcpu_affinity = self.machine.vcpu_affinity;
         }
+        vmr.numa_topology = self.machine.numa_topology;
 
         // Reserved CPU capacity is realized through the private msb-cpu device:
         // the guest driver converges on the requested online count and the
@@ -882,6 +891,176 @@ fn map_vm_config_error(machine: &MachineBuilder, err: VmConfigError) -> Error {
     }
 }
 
+fn validate_numa_topology(machine: &MachineBuilder) -> Result<()> {
+    if machine.numa_topology.is_none() {
+        return Ok(());
+    }
+
+    // Confidential-computing memory is constructed by a separate backend. Until that backend can
+    // realize the same host-memory contract, reject placement instead of accepting and ignoring it.
+    #[cfg(feature = "tee")]
+    return Err(Error::Config(ConfigError::NumaUnsupported(
+        "host memory placement is unavailable with TEE memory".into(),
+    )));
+
+    #[cfg(not(feature = "tee"))]
+    validate_numa_topology_inner(
+        machine,
+        machine
+            .numa_topology
+            .as_ref()
+            .expect("the topology was checked above"),
+    )
+}
+
+#[cfg(not(feature = "tee"))]
+fn validate_numa_topology_inner(
+    machine: &MachineBuilder,
+    topology: &super::builders::NumaTopology,
+) -> Result<()> {
+    if topology.nodes.is_empty() {
+        return Err(Error::Config(ConfigError::InvalidNumaTopology(
+            "at least one guest node is required".into(),
+        )));
+    }
+
+    // The first implementation deliberately enables truthful one-node locality before guest
+    // SRAT/FDT support. A multi-node request must fail rather than silently creating a UMA guest.
+    if topology.nodes.len() != 1 {
+        return Err(Error::Config(ConfigError::NumaUnsupported(
+            "multi-node guest firmware is not enabled in this build".into(),
+        )));
+    }
+
+    let max_vcpus = machine.max_vcpus.unwrap_or(machine.vcpus);
+    let max_memory_mib = machine.max_memory_mib.unwrap_or(machine.memory_mib);
+    let mut vcpus = BTreeSet::new();
+    let mut boot_memory_mib = 0usize;
+    let mut maximum_memory_mib = 0usize;
+
+    for (expected_id, node) in topology.nodes.iter().enumerate() {
+        if usize::from(node.guest_node_id) != expected_id {
+            return Err(Error::Config(ConfigError::InvalidNumaTopology(
+                "guest node IDs must be dense and start at zero".into(),
+            )));
+        }
+        if node.max_memory_mib < node.memory_mib {
+            return Err(Error::Config(ConfigError::InvalidNumaTopology(format!(
+                "node {} maximum memory is below boot memory",
+                node.guest_node_id
+            ))));
+        }
+        if node.memory_mib % 2 != 0 || node.max_memory_mib % 2 != 0 {
+            return Err(Error::Config(ConfigError::InvalidNumaTopology(format!(
+                "node {} memory must be aligned to 2 MiB",
+                node.guest_node_id
+            ))));
+        }
+        boot_memory_mib = boot_memory_mib
+            .checked_add(node.memory_mib)
+            .ok_or_else(|| {
+                Error::Config(ConfigError::InvalidNumaTopology(
+                    "boot memory total overflows".into(),
+                ))
+            })?;
+        maximum_memory_mib = maximum_memory_mib
+            .checked_add(node.max_memory_mib)
+            .ok_or_else(|| {
+                Error::Config(ConfigError::InvalidNumaTopology(
+                    "maximum memory total overflows".into(),
+                ))
+            })?;
+
+        for &vcpu in &node.vcpu_indices {
+            if vcpu >= max_vcpus || !vcpus.insert(vcpu) {
+                return Err(Error::Config(ConfigError::InvalidNumaTopology(format!(
+                    "vCPU index {vcpu} is duplicated or outside 0..{max_vcpus}"
+                ))));
+            }
+        }
+
+        match &node.host_memory {
+            HostMemoryPolicy::Inherit => {}
+            HostMemoryPolicy::Bind { host_nodes } => {
+                if host_nodes.is_empty() {
+                    return Err(Error::Config(ConfigError::InvalidNumaTopology(
+                        "a bind policy requires at least one host node".into(),
+                    )));
+                }
+                if host_nodes
+                    .iter()
+                    .any(|&host_node| host_node > MAX_HOST_NUMA_NODE_ID)
+                {
+                    return Err(Error::Config(ConfigError::InvalidNumaTopology(format!(
+                        "host NUMA node IDs must not exceed {MAX_HOST_NUMA_NODE_ID}"
+                    ))));
+                }
+                #[cfg(not(target_os = "linux"))]
+                return Err(Error::Config(ConfigError::NumaUnsupported(
+                    "bound host memory requires Linux".into(),
+                )));
+            }
+            HostMemoryPolicy::Preferred { host_node } => {
+                if *host_node > MAX_HOST_NUMA_NODE_ID {
+                    return Err(Error::Config(ConfigError::InvalidNumaTopology(format!(
+                        "host NUMA node IDs must not exceed {MAX_HOST_NUMA_NODE_ID}"
+                    ))));
+                }
+                #[cfg(not(target_os = "windows"))]
+                return Err(Error::Config(ConfigError::NumaUnsupported(
+                    "preferred host memory requires Windows".into(),
+                )));
+            }
+        }
+    }
+
+    if vcpus.len() != usize::from(max_vcpus) || vcpus.iter().copied().ne(0..max_vcpus) {
+        return Err(Error::Config(ConfigError::InvalidNumaTopology(format!(
+            "vCPU membership must cover every index in 0..{max_vcpus} exactly once"
+        ))));
+    }
+    if boot_memory_mib != machine.memory_mib {
+        return Err(Error::Config(ConfigError::InvalidNumaTopology(format!(
+            "boot memory totals {boot_memory_mib} MiB, expected {} MiB",
+            machine.memory_mib
+        ))));
+    }
+    if maximum_memory_mib != max_memory_mib {
+        return Err(Error::Config(ConfigError::InvalidNumaTopology(format!(
+            "maximum memory totals {maximum_memory_mib} MiB, expected {max_memory_mib} MiB"
+        ))));
+    }
+
+    let node_count = topology.nodes.len();
+    let expected_distances = node_count.checked_mul(node_count).ok_or_else(|| {
+        Error::Config(ConfigError::InvalidNumaTopology(
+            "guest node count overflows the distance matrix".into(),
+        ))
+    })?;
+    if topology.distances.len() != expected_distances {
+        return Err(Error::Config(ConfigError::InvalidNumaTopology(
+            "distance entries must cover the full square matrix".into(),
+        )));
+    }
+    let mut distances = BTreeSet::new();
+    for distance in &topology.distances {
+        if usize::from(distance.from) >= node_count
+            || usize::from(distance.to) >= node_count
+            || !distances.insert((distance.from, distance.to))
+        {
+            return Err(Error::Config(ConfigError::InvalidNumaTopology(
+                "distance coordinates are duplicated or outside the guest node range".into(),
+            )));
+        }
+        if distance.from == distance.to && distance.value != 10 {
+            return Err(Error::Config(ConfigError::InvalidNumaTopology(
+                "local NUMA distance must equal 10".into(),
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Check that one exec env pair can be carried as a quoted `KEY="value"` kernel-cmdline word: printable ASCII only (the vmm cmdline layer rejects everything else, and the kernel
 /// would misparse it anyway), no double quotes (they would terminate the kernel's quote parsing mid-value), and no whitespace in the key (the kernel splits words on unquoted
 /// whitespace, so a spaced key silently becomes two parameters).
@@ -914,7 +1093,45 @@ mod tests {
     };
 
     use super::*;
-    use crate::api::builders::HostCpuId;
+    use crate::api::builders::{
+        HostCpuId, HostMemoryPolicy, NumaDistance, NumaNodeConfig, NumaTopology,
+    };
+
+    fn one_node_topology(vcpus: Vec<u8>, memory_mib: usize) -> NumaTopology {
+        NumaTopology {
+            nodes: vec![NumaNodeConfig {
+                guest_node_id: 0,
+                vcpu_indices: vcpus,
+                memory_mib,
+                max_memory_mib: memory_mib,
+                host_memory: HostMemoryPolicy::Inherit,
+            }],
+            distances: vec![NumaDistance {
+                from: 0,
+                to: 0,
+                value: 10,
+            }],
+        }
+    }
+
+    #[cfg(feature = "tee")]
+    #[test]
+    fn build_rejects_numa_topology_with_tee_memory() {
+        let err = VmBuilder::new()
+            .machine(|machine| {
+                machine
+                    .memory_mib(512)
+                    .numa_topology(one_node_topology(vec![0], 512))
+            })
+            .build()
+            .err()
+            .expect("TEE memory must not silently ignore host placement");
+
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::NumaUnsupported(_))
+        ));
+    }
 
     #[cfg(not(target_os = "windows"))]
     struct RejectDatagrams;
@@ -1101,6 +1318,181 @@ mod tests {
             }) => {}
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn build_accepts_consistent_one_node_topology() {
+        VmBuilder::new()
+            .machine(|machine| {
+                machine
+                    .vcpus(2)
+                    .memory_mib(512)
+                    .numa_topology(one_node_topology(vec![0, 1], 512))
+            })
+            .build()
+            .expect("consistent one-node topology should build");
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn build_rejects_incomplete_numa_vcpu_membership() {
+        let err = VmBuilder::new()
+            .machine(|machine| {
+                machine
+                    .vcpus(2)
+                    .memory_mib(512)
+                    .numa_topology(one_node_topology(vec![0], 512))
+            })
+            .build()
+            .err()
+            .expect("partial vCPU topology should fail");
+
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::InvalidNumaTopology(_))
+        ));
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn build_rejects_numa_memory_total_mismatch() {
+        let err = VmBuilder::new()
+            .machine(|machine| {
+                machine
+                    .vcpus(1)
+                    .memory_mib(1024)
+                    .numa_topology(one_node_topology(vec![0], 512))
+            })
+            .build()
+            .err()
+            .expect("mismatched memory topology should fail");
+
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::InvalidNumaTopology(_))
+        ));
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn build_accepts_one_node_live_memory_capacity() {
+        let mut topology = one_node_topology(vec![0, 1], 512);
+        topology.nodes[0].max_memory_mib = 1024;
+
+        VmBuilder::new()
+            .machine(|machine| {
+                machine
+                    .vcpus(2)
+                    .memory_mib(512)
+                    .max_memory_mib(1024)
+                    .numa_topology(topology)
+            })
+            .build()
+            .expect("one-node growth should retain the creation-time placement");
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn build_rejects_excessive_host_numa_node_id() {
+        let mut topology = one_node_topology(vec![0], 512);
+        topology.nodes[0].host_memory = HostMemoryPolicy::Bind {
+            host_nodes: vec![u32::from(u16::MAX) + 1],
+        };
+        let err = VmBuilder::new()
+            .machine(|machine| machine.memory_mib(512).numa_topology(topology))
+            .build()
+            .err()
+            .expect("an excessive host node ID should fail before allocating a node mask");
+
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::InvalidNumaTopology(_))
+        ));
+    }
+
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
+    #[test]
+    fn build_rejects_windows_preferred_memory_policy() {
+        let mut topology = one_node_topology(vec![0], 512);
+        topology.nodes[0].host_memory = HostMemoryPolicy::Preferred { host_node: 0 };
+        let err = VmBuilder::new()
+            .machine(|machine| machine.memory_mib(512).numa_topology(topology))
+            .build()
+            .err()
+            .expect("preferred-node backing is Windows-only");
+
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::NumaUnsupported(_))
+        ));
+    }
+
+    #[cfg(all(not(feature = "tee"), target_os = "windows"))]
+    #[test]
+    fn build_accepts_windows_preferred_memory_policy() {
+        let mut topology = one_node_topology(vec![0], 512);
+        topology.nodes[0].host_memory = HostMemoryPolicy::Preferred { host_node: 0 };
+
+        VmBuilder::new()
+            .machine(|machine| machine.memory_mib(512).numa_topology(topology))
+            .build()
+            .expect("Windows should accept preferred-node backing");
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn build_rejects_multi_node_topology_until_guest_tables_land() {
+        let topology = NumaTopology {
+            nodes: vec![
+                NumaNodeConfig {
+                    guest_node_id: 0,
+                    vcpu_indices: vec![0],
+                    memory_mib: 256,
+                    max_memory_mib: 256,
+                    host_memory: HostMemoryPolicy::Inherit,
+                },
+                NumaNodeConfig {
+                    guest_node_id: 1,
+                    vcpu_indices: vec![1],
+                    memory_mib: 256,
+                    max_memory_mib: 256,
+                    host_memory: HostMemoryPolicy::Inherit,
+                },
+            ],
+            distances: vec![
+                NumaDistance {
+                    from: 0,
+                    to: 0,
+                    value: 10,
+                },
+                NumaDistance {
+                    from: 0,
+                    to: 1,
+                    value: 20,
+                },
+                NumaDistance {
+                    from: 1,
+                    to: 0,
+                    value: 20,
+                },
+                NumaDistance {
+                    from: 1,
+                    to: 1,
+                    value: 10,
+                },
+            ],
+        };
+        let err = VmBuilder::new()
+            .machine(|machine| machine.vcpus(2).memory_mib(512).numa_topology(topology))
+            .build()
+            .err()
+            .expect("multi-node topology should fail closed");
+
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::NumaUnsupported(_))
+        ));
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]

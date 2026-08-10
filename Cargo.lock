@@ -1839,8 +1839,7 @@ checksum = "7e21282841a059bb62627ce8441c491f09603622cd5a21c43bfedc85a2952f23"
 [[package]]
 name = "vm-memory"
 version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b55e753c7725603745cb32b2287ef7ef3da05c03c7702cda3fa8abe25ae0465"
+source = "git+https://github.com/superradcompany/vm-memory.git?rev=d0275cbcd968cef46d30299fde61a891d92fc43b#d0275cbcd968cef46d30299fde61a891d92fc43b"
 dependencies = [
  "libc",
  "thiserror 2.0.18",

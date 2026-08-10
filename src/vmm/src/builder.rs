@@ -130,10 +130,12 @@ use polly::event_manager::{Error as EventManagerError, EventManager};
 use utils::eventfd::EventFd;
 use utils::worker_message::WorkerMessage;
 #[cfg(all(
-    target_arch = "x86_64",
-    not(feature = "efi"),
     not(feature = "tee"),
-    not(target_os = "windows")
+    any(
+        target_os = "linux",
+        target_os = "windows",
+        all(target_arch = "x86_64", not(target_os = "windows"))
+    )
 ))]
 use vm_memory::mmap::MmapRegion;
 #[cfg(not(feature = "tee"))]
@@ -141,9 +143,12 @@ use vm_memory::Address;
 use vm_memory::Bytes;
 use vm_memory::GuestMemoryBackend;
 #[cfg(all(
-    target_arch = "x86_64",
     not(feature = "tee"),
-    not(target_os = "windows")
+    any(
+        target_os = "linux",
+        target_os = "windows",
+        all(target_arch = "x86_64", not(target_os = "windows"))
+    )
 ))]
 use vm_memory::GuestRegionMmap;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
@@ -179,6 +184,8 @@ pub enum StartMicrovmError {
     FirmwareRead(io::Error),
     /// Memory regions are overlapping or mmap fails.
     GuestMemoryMmapFromRanges(vm_memory::mmap::FromRangesError),
+    /// Applying a requested host memory policy failed before the guest touched the mapping.
+    HostMemoryPolicy(io::Error),
     /// Guest memory collection operation failed.
     GuestMemoryMmap(vm_memory::GuestMemoryError),
     /// Guest memory region construction failed.
@@ -394,6 +401,9 @@ impl Display for StartMicrovmError {
                 let mut err_msg = format!("{err:?}");
                 err_msg = err_msg.replace('\"', "");
                 write!(f, "Invalid Memory Configuration: {err_msg}")
+            }
+            HostMemoryPolicy(ref err) => {
+                write!(f, "Cannot apply host memory policy: {err}")
             }
             ImageBz2Decoder(ref err) => {
                 write!(f, "The BZIP2 decoder couldn't decompress the kernel. {err}")
@@ -2547,6 +2557,12 @@ pub fn create_guest_memory(
         }
     };
 
+    // Architecture regions are ordinary guest RAM. Shared filesystem/GPU windows added below must
+    // retain their legacy host policy, while a later virtio-mem range must follow guest RAM so live
+    // growth stays on the placement selected at VM creation.
+    #[cfg(not(feature = "tee"))]
+    let mut numa_managed_regions = vec![true; arch_mem_regions.len()];
+
     let mut shm_manager = ShmManager::new(&arch_mem_info);
 
     #[cfg(not(feature = "tee"))]
@@ -2575,7 +2591,10 @@ pub fn create_guest_memory(
             .map_err(StartMicrovmError::ShmCreate)?;
     }
 
-    arch_mem_regions.extend(shm_manager.regions());
+    let shared_regions = shm_manager.regions();
+    #[cfg(not(feature = "tee"))]
+    numa_managed_regions.resize(numa_managed_regions.len() + shared_regions.len(), false);
+    arch_mem_regions.extend(shared_regions);
 
     // Reserve the virtio-mem hotplug region above every other window. The
     // backing is anonymous and lazily faulted, so unplugged capacity costs no
@@ -2600,9 +2619,18 @@ pub fn create_guest_memory(
                 .set_region(base, hotplug_bytes)
                 .expect("hotplug region is block-aligned by construction");
             arch_mem_regions.push((GuestAddress(base), hotplug_bytes as usize));
+            numa_managed_regions.push(true);
         }
     }
 
+    #[cfg(not(feature = "tee"))]
+    let guest_mem = if let Some(topology) = &vm_resources.numa_topology {
+        create_numa_guest_memory(&arch_mem_regions, &numa_managed_regions, topology)?
+    } else {
+        GuestMemoryMmap::from_ranges(&arch_mem_regions)
+            .map_err(StartMicrovmError::GuestMemoryMmapFromRanges)?
+    };
+    #[cfg(feature = "tee")]
     let guest_mem = GuestMemoryMmap::from_ranges(&arch_mem_regions)
         .map_err(StartMicrovmError::GuestMemoryMmapFromRanges)?;
 
@@ -2632,6 +2660,178 @@ pub fn create_guest_memory(
     };
 
     Ok((guest_mem, arch_mem_info, shm_manager, payload_config))
+}
+
+#[cfg(all(target_os = "linux", not(feature = "tee")))]
+fn create_numa_guest_memory(
+    ranges: &[(GuestAddress, usize)],
+    numa_managed_regions: &[bool],
+    topology: &crate::resources::NumaTopology,
+) -> std::result::Result<GuestMemoryMmap, StartMicrovmError> {
+    debug_assert_eq!(ranges.len(), numa_managed_regions.len());
+    let mut regions = Vec::with_capacity(ranges.len());
+
+    for (&(guest_address, size), &numa_managed) in ranges.iter().zip(numa_managed_regions.iter()) {
+        let mapping = MmapRegion::new(size).map_err(|error| {
+            StartMicrovmError::GuestMemoryMmapFromRanges(
+                vm_memory::mmap::FromRangesError::MmapRegion(error),
+            )
+        })?;
+
+        // `MmapRegion::new` uses MAP_NORESERVE and has not touched the mapping. Installing the
+        // VMA policy here means payload writes below are its first page faults; there is nothing to
+        // prefault or migrate and the cold-start path remains lazy.
+        if let Some(policy) = numa_policy_for_region(numa_managed, topology) {
+            match policy {
+                crate::resources::HostMemoryPolicy::Bind { host_nodes } => {
+                    apply_linux_memory_binding(mapping.as_ptr(), mapping.size(), host_nodes)
+                        .map_err(StartMicrovmError::HostMemoryPolicy)?;
+                }
+                crate::resources::HostMemoryPolicy::Inherit => {}
+                crate::resources::HostMemoryPolicy::Preferred { .. } => {
+                    return Err(StartMicrovmError::HostMemoryPolicy(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "preferred host memory is unavailable on Linux",
+                    )));
+                }
+            }
+        }
+
+        regions.push(
+            GuestRegionMmap::new(mapping, guest_address)
+                .ok_or(StartMicrovmError::GuestMemoryRegion)?,
+        );
+    }
+
+    GuestMemoryMmap::from_regions(regions).map_err(StartMicrovmError::GuestMemoryRegionCollection)
+}
+
+#[cfg(all(target_os = "windows", not(feature = "tee")))]
+fn create_numa_guest_memory(
+    ranges: &[(GuestAddress, usize)],
+    numa_managed_regions: &[bool],
+    topology: &crate::resources::NumaTopology,
+) -> std::result::Result<GuestMemoryMmap, StartMicrovmError> {
+    debug_assert_eq!(ranges.len(), numa_managed_regions.len());
+    let mut regions = Vec::with_capacity(ranges.len());
+
+    for (&(guest_address, size), &numa_managed) in ranges.iter().zip(numa_managed_regions.iter()) {
+        let mapping = if let Some(policy) = numa_policy_for_region(numa_managed, topology) {
+            match policy {
+                crate::resources::HostMemoryPolicy::Preferred { host_node } => {
+                    MmapRegion::new_on_numa_node(size, *host_node)
+                        .map_err(StartMicrovmError::HostMemoryPolicy)?
+                }
+                crate::resources::HostMemoryPolicy::Inherit => {
+                    MmapRegion::new(size).map_err(|error| {
+                        StartMicrovmError::GuestMemoryMmapFromRanges(
+                            vm_memory::mmap::FromRangesError::MmapRegion(error),
+                        )
+                    })?
+                }
+                crate::resources::HostMemoryPolicy::Bind { .. } => {
+                    return Err(StartMicrovmError::HostMemoryPolicy(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "bound host memory is unavailable on Windows",
+                    )));
+                }
+            }
+        } else {
+            MmapRegion::new(size).map_err(|error| {
+                StartMicrovmError::GuestMemoryMmapFromRanges(
+                    vm_memory::mmap::FromRangesError::MmapRegion(error),
+                )
+            })?
+        };
+
+        regions.push(
+            GuestRegionMmap::new(mapping, guest_address)
+                .ok_or(StartMicrovmError::GuestMemoryRegion)?,
+        );
+    }
+
+    GuestMemoryMmap::from_regions(regions).map_err(StartMicrovmError::GuestMemoryRegionCollection)
+}
+
+#[cfg(all(not(feature = "tee"), any(target_os = "linux", target_os = "windows")))]
+fn numa_policy_for_region(
+    numa_managed: bool,
+    topology: &crate::resources::NumaTopology,
+) -> Option<&crate::resources::HostMemoryPolicy> {
+    numa_managed.then(|| &topology.nodes[0].host_memory)
+}
+
+#[cfg(all(
+    not(any(target_os = "linux", target_os = "windows")),
+    not(feature = "tee")
+))]
+fn create_numa_guest_memory(
+    ranges: &[(GuestAddress, usize)],
+    _numa_managed_regions: &[bool],
+    _topology: &crate::resources::NumaTopology,
+) -> std::result::Result<GuestMemoryMmap, StartMicrovmError> {
+    // Validation permits only inherited one-node topology on hosts without a backing hook. This is
+    // the explicit no-op profile; managed policies are rejected before VM resources are built.
+    GuestMemoryMmap::from_ranges(ranges).map_err(StartMicrovmError::GuestMemoryMmapFromRanges)
+}
+
+#[cfg(all(target_os = "linux", not(feature = "tee")))]
+fn apply_linux_memory_binding(
+    address: *mut u8,
+    length: usize,
+    host_nodes: &[u32],
+) -> io::Result<()> {
+    const MPOL_BIND: libc::c_int = 2;
+    const MPOL_F_STATIC_NODES: libc::c_int = 1 << 15;
+
+    let (node_mask, max_node_bits) = linux_node_mask(host_nodes)?;
+
+    // Supplying a whole-word bit count avoids the historical maxnode edge case at exact word
+    // boundaries. The static-node mode preserves the absolute host-node IDs resolved by the
+    // embedding runtime even when the caller has a restricted cpuset.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_mbind,
+            address.cast::<libc::c_void>(),
+            length,
+            MPOL_BIND | MPOL_F_STATIC_NODES,
+            node_mask.as_ptr(),
+            max_node_bits,
+            0,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "linux", not(feature = "tee")))]
+fn linux_node_mask(host_nodes: &[u32]) -> io::Result<(Vec<libc::c_ulong>, usize)> {
+    const MAX_HOST_NUMA_NODE_ID: u32 = u16::MAX as u32;
+
+    let highest_node = host_nodes
+        .iter()
+        .copied()
+        .max()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty NUMA node mask"))?;
+    if highest_node > MAX_HOST_NUMA_NODE_ID {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("host NUMA node IDs must not exceed {MAX_HOST_NUMA_NODE_ID}"),
+        ));
+    }
+
+    let bits_per_word = libc::c_ulong::BITS as usize;
+    let mut node_mask = vec![0 as libc::c_ulong; highest_node as usize / bits_per_word + 1];
+    for &node in host_nodes {
+        let node = node as usize;
+        node_mask[node / bits_per_word] |= (1 as libc::c_ulong) << (node % bits_per_word);
+    }
+
+    let max_node_bits = node_mask.len() * bits_per_word;
+    Ok((node_mask, max_node_bits))
 }
 
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
@@ -4108,6 +4308,78 @@ pub mod tests {
     use super::*;
     #[cfg(not(target_os = "windows"))]
     use crate::vmm_config::kernel_bundle::KernelBundle;
+
+    #[cfg(all(not(feature = "tee"), any(target_os = "linux", target_os = "windows")))]
+    use crate::resources::{HostMemoryPolicy, NumaDistance, NumaNodeConfig, NumaTopology};
+
+    #[cfg(all(not(feature = "tee"), any(target_os = "linux", target_os = "windows")))]
+    fn one_node_numa_topology(host_memory: HostMemoryPolicy) -> NumaTopology {
+        NumaTopology {
+            nodes: vec![NumaNodeConfig {
+                guest_node_id: 0,
+                vcpu_indices: vec![0],
+                memory_mib: 128,
+                max_memory_mib: 128,
+                host_memory,
+            }],
+            distances: vec![NumaDistance {
+                from: 0,
+                to: 0,
+                value: 10,
+            }],
+        }
+    }
+
+    #[cfg(all(not(feature = "tee"), any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn numa_policy_applies_only_to_managed_ram() {
+        let topology = one_node_numa_topology(HostMemoryPolicy::Inherit);
+
+        assert!(numa_policy_for_region(true, &topology).is_some());
+        assert!(numa_policy_for_region(false, &topology).is_none());
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    #[test]
+    fn linux_node_mask_uses_absolute_node_bits() {
+        let (mask, max_node_bits) = linux_node_mask(&[0, 65]).unwrap();
+
+        assert_eq!(max_node_bits, 2 * libc::c_ulong::BITS as usize);
+        assert_eq!(mask[0] & 1, 1);
+        assert_eq!(mask[1] & 2, 2);
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    #[test]
+    fn linux_node_mask_rejects_unbounded_node_ids() {
+        let error = linux_node_mask(&[u32::from(u16::MAX) + 1]).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    #[test]
+    #[ignore = "requires a native Linux host that permits NUMA policy syscalls"]
+    fn linux_numa_binding_reaches_faulted_pages() {
+        let mapping = MmapRegion::<()>::new(2 * 1024 * 1024).unwrap();
+        apply_linux_memory_binding(mapping.as_ptr(), mapping.size(), &[0]).unwrap();
+
+        // Fault one page only after the VMA policy is installed, matching the guest boot path.
+        unsafe { mapping.as_ptr().write_volatile(0x5a) };
+
+        let address = format!("{:x}", mapping.as_ptr() as usize);
+        let numa_maps = std::fs::read_to_string("/proc/self/numa_maps").unwrap();
+        let entry = numa_maps
+            .lines()
+            .find(|line| line.starts_with(&address))
+            .expect("the anonymous mapping should appear in numa_maps");
+
+        assert!(entry.contains("bind:0"), "unexpected policy: {entry}");
+        assert!(
+            entry.contains("N0="),
+            "the faulted page is not on node 0: {entry}"
+        );
+    }
 
     #[test]
     #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]

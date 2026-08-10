@@ -8,6 +8,7 @@ use devices::virtio::console::port_io::{
     ConsolePortBackend, ConsolePortBackendInputAdapter, ConsolePortBackendOutputAdapter,
 };
 use vmm::resources::PortConfig;
+pub use vmm::resources::{HostMemoryPolicy, NumaDistance, NumaNodeConfig, NumaTopology};
 pub use vmm::vmm_config::machine_config::HostCpuId;
 
 #[cfg(feature = "blk")]
@@ -61,6 +62,7 @@ pub struct MachineBuilder {
     pub(crate) msb_metrics: bool,
     pub(crate) enable_inet_hijack: bool,
     pub(crate) vcpu_affinity: Option<Vec<HostCpuId>>,
+    pub(crate) numa_topology: Option<NumaTopology>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -429,6 +431,7 @@ impl MachineBuilder {
             msb_metrics: true,
             enable_inet_hijack: false,
             vcpu_affinity: None,
+            numa_topology: None,
         }
     }
 
@@ -461,6 +464,16 @@ impl MachineBuilder {
     /// with [`max_vcpus`](Self::max_vcpus). This is supported on Linux and Windows hosts.
     pub fn vcpu_affinity(mut self, affinity: Vec<HostCpuId>) -> Self {
         self.vcpu_affinity = Some(affinity);
+        self
+    }
+
+    /// Supply a resolved guest NUMA topology and host-memory policy.
+    ///
+    /// Guest node IDs, vCPU membership, memory totals and distances are validated by
+    /// [`VmBuilder::build`](crate::VmBuilder::build). Omitting this option retains the ordinary
+    /// guest-memory construction path.
+    pub fn numa_topology(mut self, topology: NumaTopology) -> Self {
+        self.numa_topology = Some(topology);
         self
     }
 

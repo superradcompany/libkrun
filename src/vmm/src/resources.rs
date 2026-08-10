@@ -152,6 +152,61 @@ pub enum VsockConfig {
     Disabled,
 }
 
+/// A fully resolved guest NUMA description supplied by the embedding runtime.
+///
+/// The VMM intentionally knows nothing about higher-level policies such as `auto` or
+/// `prefer_single`; it only validates and realizes this concrete topology.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NumaTopology {
+    /// Dense guest proximity domains in guest-node order.
+    pub nodes: Vec<NumaNodeConfig>,
+    /// Complete square distance matrix expressed with dense guest node IDs.
+    pub distances: Vec<NumaDistance>,
+}
+
+/// One dense guest proximity domain and the host policy for its backing memory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NumaNodeConfig {
+    /// Dense zero-based guest proximity-domain identifier.
+    pub guest_node_id: u16,
+    /// Possible vCPU indices associated with this guest node.
+    pub vcpu_indices: Vec<u8>,
+    /// Memory available to the guest at boot, in MiB.
+    pub memory_mib: usize,
+    /// Maximum memory promised to this node after live growth, in MiB.
+    pub max_memory_mib: usize,
+    /// Host policy used for boot RAM and reserved hotplug capacity.
+    pub host_memory: HostMemoryPolicy,
+}
+
+/// One entry in the dense guest NUMA distance matrix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NumaDistance {
+    /// Source guest proximity domain.
+    pub from: u16,
+    /// Destination guest proximity domain.
+    pub to: u16,
+    /// Relative distance, with `10` required for local entries.
+    pub value: u8,
+}
+
+/// Host backing policy for guest RAM belonging to a resolved node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostMemoryPolicy {
+    /// Preserve the operating system's ordinary allocation policy.
+    Inherit,
+    /// Restrict future Linux page faults to the selected host nodes.
+    Bind {
+        /// Absolute Linux host NUMA node IDs included in the binding mask.
+        host_nodes: Vec<u32>,
+    },
+    /// Prefer a Windows NUMA node while allowing the host to fall back.
+    Preferred {
+        /// Absolute Windows host NUMA node ID preferred for future page faults.
+        host_node: u32,
+    },
+}
+
 /// A data structure that encapsulates the device configurations
 /// held in the Vmm.
 pub struct VmResources {
@@ -160,6 +215,8 @@ pub struct VmResources {
     /// Resolved host logical processor for every possible vCPU thread.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub vcpu_affinity: Option<Vec<HostCpuId>>,
+    /// Resolved guest and host memory topology. `None` retains the legacy memory path exactly.
+    pub numa_topology: Option<NumaTopology>,
     /// The firmware to be loaded into the microVM.
     pub firmware_config: Option<FirmwareConfig>,
     /// The kernel command line for this microVM.
@@ -251,6 +308,7 @@ impl Default for VmResources {
             vm_config: VmConfig::default(),
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             vcpu_affinity: None,
+            numa_topology: None,
             firmware_config: None,
             kernel_cmdline: KernelCmdlineConfig::default(),
             kernel_bundle: None,
