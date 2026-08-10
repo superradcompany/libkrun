@@ -50,6 +50,8 @@ pub use api::builders::NetBuilder;
 #[cfg(feature = "blk")]
 pub use api::builders::SyncMode;
 pub use api::builders::VsockBuilder;
+#[cfg(feature = "blk")]
+pub use api::builders::WritebackLimit;
 pub use api::builders::{ConsoleBuilder, ExecBuilder, HostCpuId, KernelBuilder, MachineBuilder};
 pub use api::error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use api::exit_handle::ExitHandle;
