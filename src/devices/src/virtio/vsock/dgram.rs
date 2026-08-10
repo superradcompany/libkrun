@@ -73,7 +73,7 @@ impl DatagramProxy {
         self.backend.pollable().is_none()
     }
 
-    fn receive_batch(&self) -> io::Result<bool> {
+    fn receive_batch(&self) -> io::Result<(bool, Option<io::Error>)> {
         if self.uses_notifier() {
             self.notifier.clear()?;
         }
@@ -88,6 +88,11 @@ impl DatagramProxy {
                     exhausted_batch = false;
                     break;
                 }
+                // Preserve messages already copied to the guest receive queue.
+                // Connected Unix datagram sockets on macOS can report
+                // ECONNRESET immediately after the peer replies and closes;
+                // dropping the pending IRQ here would strand that valid reply.
+                Err(err) if delivered => return Ok((true, Some(err))),
                 Err(err) => return Err(err),
             };
 
@@ -127,7 +132,7 @@ impl DatagramProxy {
             self.notifier.notify()?;
         }
 
-        Ok(delivered)
+        Ok((delivered, None))
     }
 }
 
@@ -234,11 +239,20 @@ impl Proxy for DatagramProxy {
         }
 
         match self.receive_batch() {
-            Ok(delivered) => ProxyUpdate {
+            Ok((delivered, None)) => ProxyUpdate {
                 signal_queue: delivered,
                 polling: Some((self.id, self.as_raw_fd(), EventSet::IN)),
                 ..Default::default()
             },
+            Ok((delivered, Some(err))) => {
+                warn!(
+                    "host datagram endpoint closed after delivering data for vsock port {}: {err}",
+                    self.local_port
+                );
+                let mut update = self.release();
+                update.signal_queue = delivered;
+                update
+            }
             Err(err) => {
                 warn!(
                     "failed to receive host datagram for vsock port {}: {err}",
@@ -273,6 +287,7 @@ mod tests {
 
     struct QueueDatagrams {
         messages: Mutex<VecDeque<Vec<u8>>>,
+        terminal_when_empty: bool,
     }
 
     impl VsockDatagramBackend for QueueDatagrams {
@@ -282,6 +297,9 @@ mod tests {
 
         fn receive(&self, buf: &mut [u8]) -> io::Result<VsockDatagramRead> {
             let Some(message) = self.messages.lock().unwrap().pop_front() else {
+                if self.terminal_when_empty {
+                    return Err(io::Error::from(io::ErrorKind::ConnectionReset));
+                }
                 return Err(io::Error::from(io::ErrorKind::WouldBlock));
             };
             let len = message.len().min(buf.len());
@@ -308,6 +326,7 @@ mod tests {
             4000,
             Box::new(QueueDatagrams {
                 messages: Mutex::new(messages),
+                terminal_when_empty: false,
             }),
             notifier.clone(),
             mem,
@@ -315,13 +334,39 @@ mod tests {
             Arc::clone(&rxq),
         );
 
-        assert!(proxy.receive_batch().unwrap());
+        assert!(proxy.receive_batch().unwrap().0);
         assert_eq!(rxq.lock().unwrap().len(), MAX_RECEIVE_BATCH);
         // The full batch explicitly re-signals so the remaining datagram is
         // observable even when the backend only signals empty-to-ready.
         notifier.event().read().unwrap();
 
-        assert!(proxy.receive_batch().unwrap());
+        assert!(proxy.receive_batch().unwrap().0);
         assert_eq!(rxq.lock().unwrap().len(), MAX_RECEIVE_BATCH + 1);
+    }
+
+    #[test]
+    fn terminal_error_after_data_preserves_the_pending_interrupt() {
+        let notifier = VsockNotifier::new().unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let rxq = Arc::new(Mutex::new(MuxerRxQ::new()));
+        let mut proxy = DatagramProxy::new(
+            1,
+            3,
+            5000,
+            4000,
+            Box::new(QueueDatagrams {
+                messages: Mutex::new(VecDeque::from([b"reply".to_vec()])),
+                terminal_when_empty: true,
+            }),
+            notifier,
+            mem,
+            Arc::new(Mutex::new(VirtQueue::new(256))),
+            Arc::clone(&rxq),
+        );
+
+        let update = proxy.process_event(EventSet::IN);
+        assert!(update.signal_queue);
+        assert!(matches!(update.remove_proxy, ProxyRemoval::Immediate));
+        assert_eq!(rxq.lock().unwrap().len(), 1);
     }
 }

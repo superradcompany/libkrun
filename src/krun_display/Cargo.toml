@@ -1,7 +1,7 @@
 [package]
 name = "msb_krun_display"
 description = "Rust bindings for implemeting display backends in Rust for libkrun"
-version = "0.1.27"
+version = "0.1.28"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/containers/libkrun"
