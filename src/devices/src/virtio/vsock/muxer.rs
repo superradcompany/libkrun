@@ -678,7 +678,7 @@ impl VsockMuxer {
         };
 
         let id = self.next_dgram_proxy_id.fetch_add(1, Ordering::Relaxed) << 32;
-        let mut proxy = DatagramProxy::new(
+        let proxy = DatagramProxy::new(
             id,
             self.cid,
             pkt.dst_port(),
@@ -697,6 +697,15 @@ impl VsockMuxer {
             );
             return;
         }
+
+        // Publish the proxy before registering its pollable. A host service can
+        // reply synchronously from `sendmsg`; if readiness wakes the muxer
+        // thread before this map entry exists, that event can be consumed with
+        // no proxy available to drain the datagram.
+        self.proxy_map
+            .write()
+            .unwrap()
+            .insert(id, Mutex::new(Box::new(proxy)));
         if let Err(err) = self.epoll.ctl(
             ControlOperation::Add,
             poll_fd,
@@ -706,14 +715,10 @@ impl VsockMuxer {
                 "custom vsock datagram service for port {} returned an unusable poll fd: {err}",
                 pkt.dst_port()
             );
+            self.proxy_map.write().unwrap().remove(&id);
             return;
         }
 
-        let update = proxy.sendmsg(pkt);
-        self.proxy_map
-            .write()
-            .unwrap()
-            .insert(id, Mutex::new(Box::new(proxy)));
         self.dgram_peer_map.lock().unwrap().insert(
             peer_key,
             DgramPeerEntry {
@@ -721,7 +726,15 @@ impl VsockMuxer {
                 last_used: activity,
             },
         );
-        self.process_proxy_update(id, update);
+        let update = self
+            .proxy_map
+            .read()
+            .unwrap()
+            .get(&id)
+            .map(|proxy| proxy.lock().unwrap().sendmsg(pkt));
+        if let Some(update) = update {
+            self.process_proxy_update(id, update);
+        }
     }
 
     pub(crate) fn send_dgram_pkt(&mut self, pkt: &VsockPacket) -> super::Result<()> {
