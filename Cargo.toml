@@ -18,4 +18,4 @@ lto = true
 
 # Remove this patch once vm-memory exposes the Windows NUMA-aware mapping constructor in a release.
 [patch.crates-io]
-vm-memory = { git = "https://github.com/superradcompany/vm-memory.git", rev = "d0275cbcd968cef46d30299fde61a891d92fc43b" }
+vm-memory = { git = "https://github.com/superradcompany/vm-memory.git", rev = "25d20cba63d46ae598022e18e8a5157667b7a30d" }

@@ -1839,7 +1839,7 @@ checksum = "7e21282841a059bb62627ce8441c491f09603622cd5a21c43bfedc85a2952f23"
 [[package]]
 name = "vm-memory"
 version = "0.18.0"
-source = "git+https://github.com/superradcompany/vm-memory.git?rev=d0275cbcd968cef46d30299fde61a891d92fc43b#d0275cbcd968cef46d30299fde61a891d92fc43b"
+source = "git+https://github.com/superradcompany/vm-memory.git?rev=25d20cba63d46ae598022e18e8a5157667b7a30d#25d20cba63d46ae598022e18e8a5157667b7a30d"
 dependencies = [
  "libc",
  "thiserror 2.0.18",
