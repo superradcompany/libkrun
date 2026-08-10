@@ -4339,6 +4339,17 @@ pub mod tests {
         assert!(numa_policy_for_region(false, &topology).is_none());
     }
 
+    #[cfg(all(target_os = "windows", not(feature = "tee")))]
+    #[test]
+    fn windows_numa_mapping_allocates_accessible_memory() {
+        let mapping = MmapRegion::<()>::new_on_numa_node(2 * 1024 * 1024, 0).unwrap();
+
+        unsafe {
+            mapping.as_ptr().write_volatile(0x5a);
+            assert_eq!(mapping.as_ptr().read_volatile(), 0x5a);
+        }
+    }
+
     #[cfg(all(target_os = "linux", not(feature = "tee")))]
     #[test]
     fn linux_node_mask_uses_absolute_node_bits() {
