@@ -10,6 +10,9 @@ use devices::virtio::console::port_io::{
 use vmm::resources::PortConfig;
 pub use vmm::vmm_config::machine_config::HostCpuId;
 
+#[cfg(feature = "blk")]
+pub use devices::virtio::block::WritebackLimit;
+
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use crate::backends::fs::DynFileSystem;
 
@@ -378,6 +381,7 @@ pub struct DiskBuilder {
     current_direct_io: bool,
     current_sync: SyncMode,
     current_writeback_limit_bytes: Option<u64>,
+    current_writeback_limit: Option<WritebackLimit>,
 }
 
 /// Configuration for a single block device.
@@ -401,6 +405,7 @@ pub struct DiskConfig {
 pub(crate) struct ConfiguredDisk {
     pub(crate) config: DiskConfig,
     pub(crate) writeback_limit_bytes: Option<u64>,
+    pub(crate) writeback_limit: Option<WritebackLimit>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1047,6 +1052,7 @@ impl DiskBuilder {
             current_direct_io: false,
             current_sync: SyncMode::Full,
             current_writeback_limit_bytes: None,
+            current_writeback_limit: None,
         }
     }
 
@@ -1083,6 +1089,7 @@ impl DiskBuilder {
                     sync: self.current_sync,
                 },
                 writeback_limit_bytes: self.current_writeback_limit_bytes,
+                writeback_limit: self.current_writeback_limit.clone(),
             });
             self.current_read_only = false;
             self.current_format = DiskImageFormat::Raw;
@@ -1090,6 +1097,7 @@ impl DiskBuilder {
             self.current_direct_io = false;
             self.current_sync = SyncMode::Full;
             self.current_writeback_limit_bytes = None;
+            self.current_writeback_limit = None;
         }
 
         self.current_path = Some(path.as_ref().to_path_buf());
@@ -1135,6 +1143,17 @@ impl DiskBuilder {
     /// Invalid combinations fail explicitly when the VM is built.
     pub fn writeback_limit_bytes(mut self, bytes: u64) -> Self {
         self.current_writeback_limit_bytes = (bytes > 0).then_some(bytes);
+        self.current_writeback_limit = None;
+        self
+    }
+
+    /// Attach a live writeback limit to the current disk.
+    ///
+    /// Clones of the handle may change the pressure target while the VM is running. The immutable
+    /// maximum receives the same validation as [`Self::writeback_limit_bytes`].
+    pub fn writeback_limit(mut self, limit: WritebackLimit) -> Self {
+        self.current_writeback_limit_bytes = None;
+        self.current_writeback_limit = Some(limit);
         self
     }
 
@@ -1152,6 +1171,7 @@ impl DiskBuilder {
                     sync: self.current_sync,
                 },
                 writeback_limit_bytes: self.current_writeback_limit_bytes,
+                writeback_limit: self.current_writeback_limit.take(),
             });
         }
         self

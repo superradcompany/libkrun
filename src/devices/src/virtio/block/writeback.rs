@@ -14,6 +14,8 @@ use std::thread::{self, JoinHandle};
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use log::warn;
 
+use super::WritebackLimit;
+
 //--------------------------------------------------------------------------------------------------
 // Constants
 //--------------------------------------------------------------------------------------------------
@@ -133,7 +135,7 @@ struct SyncFileRangeBackend {
 #[derive(Clone)]
 pub(crate) struct BufferedWritebackConfig {
     file: Arc<File>,
-    hard_budget_bytes: u64,
+    limit: WritebackLimit,
     page_size: u64,
     health: Arc<SharedHealth>,
 }
@@ -147,7 +149,7 @@ pub(crate) struct BufferedWritebackConfig {
 /// by the existing full backing-image sync, including the data-retrieval metadata required by the
 /// host filesystem.
 pub(crate) struct BufferedWritebackController {
-    hard_budget_bytes: u64,
+    limit: WritebackLimit,
     page_size: u64,
     tracked: ExtentSet,
     current_generation: u64,
@@ -383,12 +385,12 @@ impl WritebackBackend for SyncFileRangeBackend {
 
 #[cfg(target_os = "linux")]
 impl BufferedWritebackConfig {
-    pub(crate) fn new(file: Arc<File>, hard_budget_bytes: u64) -> io::Result<Self> {
+    pub(crate) fn new(file: Arc<File>, limit: WritebackLimit) -> io::Result<Self> {
         let page_size = host_page_size()?;
-        validate_policy(hard_budget_bytes, page_size)?;
+        validate_policy(limit.maximum_bytes(), page_size)?;
         Ok(Self {
             file,
-            hard_budget_bytes,
+            limit,
             page_size,
             health: Arc::new(SharedHealth::new()),
         })
@@ -405,7 +407,7 @@ impl BufferedWritebackConfig {
             Arc::new(SyncFileRangeBackend {
                 file: Arc::clone(&self.file),
             }),
-            self.hard_budget_bytes,
+            self.limit.clone(),
             self.page_size,
             Arc::clone(&self.health),
         )
@@ -434,7 +436,7 @@ impl BufferedWritebackController {
     ) -> io::Result<Self> {
         Self::spawn_with_health(
             backend,
-            hard_budget_bytes,
+            WritebackLimit::new(hard_budget_bytes),
             page_size,
             Arc::new(SharedHealth::new()),
         )
@@ -442,10 +444,11 @@ impl BufferedWritebackController {
 
     fn spawn_with_health(
         backend: Arc<dyn WritebackBackend>,
-        hard_budget_bytes: u64,
+        limit: WritebackLimit,
         page_size: u64,
         health: Arc<SharedHealth>,
     ) -> io::Result<Self> {
+        let hard_budget_bytes = limit.maximum_bytes();
         validate_policy(hard_budget_bytes, page_size)?;
         let queue_capacity = queue_capacity(hard_budget_bytes);
         let (job_sender, job_receiver) = bounded(queue_capacity);
@@ -458,7 +461,7 @@ impl BufferedWritebackController {
             })?;
 
         Ok(Self {
-            hard_budget_bytes,
+            limit,
             page_size,
             tracked: ExtentSet::default(),
             current_generation: 0,
@@ -501,7 +504,31 @@ impl BufferedWritebackController {
             self.reap_completions_while_latching();
             self.check_error()?;
 
-            if let Some((length, range)) = self.plannable_prefix(offset, requested_bytes)? {
+            let active_budget_bytes = self.active_budget_bytes();
+            if self.tracked.bytes > active_budget_bytes {
+                // A live decrease cannot revoke bytes already mutated. Retire the current
+                // generation and stop admitting even hot rewrites until completed writeback has
+                // brought this controller beneath its new target.
+                if !self.current_extents.is_empty() {
+                    if let Err(error) = self.submit_current_generation() {
+                        self.latch_error(&error);
+                        return Err(self
+                            .latched_error
+                            .as_ref()
+                            .expect("submission failure must latch an error")
+                            .to_io_error());
+                    }
+                    continue;
+                }
+                if self.has_in_flight_generations() {
+                    self.wait_for_completion()?;
+                    continue;
+                }
+            }
+
+            if let Some((length, range)) =
+                self.plannable_prefix(offset, requested_bytes, active_budget_bytes)?
+            {
                 let id = self.next_reservation;
                 self.next_reservation = self
                     .next_reservation
@@ -635,6 +662,7 @@ impl BufferedWritebackController {
         &self,
         offset: u64,
         requested_bytes: u64,
+        active_budget_bytes: u64,
     ) -> io::Result<Option<(u64, DirtyRange)>> {
         let first_page = DirtyRange::for_write(offset, 1, self.page_size)?
             .expect("non-empty requested write must have a range");
@@ -644,7 +672,7 @@ impl BufferedWritebackController {
             return Ok(None);
         }
 
-        let capped_length = requested_bytes.min(self.hard_budget_bytes);
+        let capped_length = requested_bytes.min(active_budget_bytes);
         let mut low = 0;
         let mut high = capped_length;
 
@@ -656,12 +684,12 @@ impl BufferedWritebackController {
                 .current_extents
                 .bytes
                 .checked_add(self.current_extents.additional_bytes(range))
-                .is_some_and(|bytes| bytes <= self.hard_budget_bytes);
+                .is_some_and(|bytes| bytes <= active_budget_bytes);
             let fits_hard = self
                 .tracked
                 .bytes
                 .checked_add(self.tracked.additional_bytes(range))
-                .is_some_and(|bytes| bytes <= self.hard_budget_bytes);
+                .is_some_and(|bytes| bytes <= active_budget_bytes);
             if fits_generation && fits_hard {
                 low = candidate;
             } else {
@@ -687,8 +715,8 @@ impl BufferedWritebackController {
             .tracked
             .bytes
             .checked_add(self.tracked.additional_bytes(range));
-        if projected_generation.is_none_or(|bytes| bytes > self.hard_budget_bytes)
-            || projected_hard.is_none_or(|bytes| bytes > self.hard_budget_bytes)
+        if projected_generation.is_none_or(|bytes| bytes > self.limit.maximum_bytes())
+            || projected_hard.is_none_or(|bytes| bytes > self.limit.maximum_bytes())
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -869,6 +897,12 @@ impl BufferedWritebackController {
             )),
             None => Ok(()),
         }
+    }
+
+    fn active_budget_bytes(&self) -> u64 {
+        // An extremely oversubscribed host still leaves every controller one page of progress.
+        // The configured maximum is page-aligned by validation, so this cannot exceed it.
+        self.limit.target_bytes().max(self.page_size)
     }
 }
 
@@ -1460,6 +1494,83 @@ mod tests {
     }
 
     #[test]
+    fn live_target_caps_new_reservations_and_can_grow_again() {
+        let backend = Arc::new(FakeBackend::default());
+        let limit = WritebackLimit::new(MINIMUM_WRITEBACK_BUDGET_BYTES);
+        limit.set_target_bytes(TEST_PAGE_SIZE * 2).unwrap();
+        let mut controller = BufferedWritebackController::spawn_with_health(
+            backend,
+            limit.clone(),
+            TEST_PAGE_SIZE,
+            Arc::new(SharedHealth::new()),
+        )
+        .unwrap();
+
+        let reservation = controller
+            .plan_write(0, MINIMUM_WRITEBACK_BUDGET_BYTES)
+            .unwrap();
+        assert_eq!(reservation.len(), TEST_PAGE_SIZE * 2);
+        controller
+            .finish_write(reservation, WritebackOutcome::Written(TEST_PAGE_SIZE * 2))
+            .unwrap();
+
+        limit.set_target_bytes(TEST_PAGE_SIZE * 3).unwrap();
+        let reservation = controller
+            .plan_write(TEST_PAGE_SIZE * 2, TEST_PAGE_SIZE * 4)
+            .unwrap();
+        assert_eq!(reservation.len(), TEST_PAGE_SIZE);
+        controller
+            .finish_write(reservation, WritebackOutcome::Written(TEST_PAGE_SIZE))
+            .unwrap();
+    }
+
+    #[test]
+    fn live_shrink_retires_existing_bytes_before_admitting_hot_rewrite() {
+        let backend = Arc::new(FakeBackend::default());
+        let limit = WritebackLimit::new(MINIMUM_WRITEBACK_BUDGET_BYTES);
+        let mut controller = BufferedWritebackController::spawn_with_health(
+            backend.clone(),
+            limit.clone(),
+            TEST_PAGE_SIZE,
+            Arc::new(SharedHealth::new()),
+        )
+        .unwrap();
+
+        let reservation = controller.plan_write(0, TEST_PAGE_SIZE * 3).unwrap();
+        controller
+            .finish_write(reservation, WritebackOutcome::Written(TEST_PAGE_SIZE * 3))
+            .unwrap();
+        limit.set_target_bytes(TEST_PAGE_SIZE).unwrap();
+
+        let rewrite = controller.plan_write(0, TEST_PAGE_SIZE).unwrap();
+        assert_eq!(backend.start_calls.lock().unwrap().len(), 1);
+        assert!(controller.tracked.bytes <= TEST_PAGE_SIZE);
+        controller
+            .finish_write(rewrite, WritebackOutcome::Written(TEST_PAGE_SIZE))
+            .unwrap();
+    }
+
+    #[test]
+    fn live_shrink_does_not_invalidate_an_existing_reservation() {
+        let backend = Arc::new(FakeBackend::default());
+        let limit = WritebackLimit::new(MINIMUM_WRITEBACK_BUDGET_BYTES);
+        let mut controller = BufferedWritebackController::spawn_with_health(
+            backend,
+            limit.clone(),
+            TEST_PAGE_SIZE,
+            Arc::new(SharedHealth::new()),
+        )
+        .unwrap();
+
+        let reservation = controller.plan_write(0, TEST_PAGE_SIZE * 2).unwrap();
+        limit.set_target_bytes(TEST_PAGE_SIZE).unwrap();
+        controller
+            .finish_write(reservation, WritebackOutcome::Written(TEST_PAGE_SIZE * 2))
+            .unwrap();
+        assert_eq!(controller.tracked.bytes, TEST_PAGE_SIZE * 2);
+    }
+
+    #[test]
     fn planner_allows_only_one_pending_reservation() {
         let backend = Arc::new(FakeBackend::default());
         let mut controller = BufferedWritebackController::spawn(
@@ -1497,7 +1608,7 @@ mod tests {
             controller.current_extents.insert(range);
             controller.tracked.insert(range);
         }
-        assert!(controller.current_extents.bytes < controller.hard_budget_bytes);
+        assert!(controller.current_extents.bytes < controller.limit.maximum_bytes());
 
         let next_offset = MAX_EXTENTS_PER_GENERATION as u64 * TEST_PAGE_SIZE * 2;
         let reservation = controller.plan_write(next_offset, 512).unwrap();

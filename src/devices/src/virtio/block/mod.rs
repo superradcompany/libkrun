@@ -1,7 +1,12 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use vm_memory::GuestMemoryError;
+
+use super::QueueConfig;
+
 pub mod device;
+mod limit;
 #[cfg(windows)]
 mod windows;
 mod worker;
@@ -9,10 +14,7 @@ mod worker;
 mod writeback;
 
 pub use self::device::{Block, CacheType};
-
-use vm_memory::GuestMemoryError;
-
-use super::QueueConfig;
+pub use self::limit::WritebackLimit;
 
 pub const CONFIG_SPACE_SIZE: usize = 8;
 pub const SECTOR_SHIFT: u8 = 9;

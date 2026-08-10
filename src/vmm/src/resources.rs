@@ -484,6 +484,17 @@ impl VmResources {
             .insert_with_writeback_limit(config, writeback_limit_bytes, self.metrics.clone())
     }
 
+    /// Adds a block device with an optional live dirty-data budget.
+    #[cfg(feature = "blk")]
+    pub fn add_block_device_with_writeback_limit_handle(
+        &mut self,
+        config: BlockDeviceConfig,
+        writeback_limit: Option<devices::virtio::block::WritebackLimit>,
+    ) -> Result<BlockConfigError> {
+        self.block
+            .insert_with_writeback_limit_handle(config, writeback_limit, self.metrics.clone())
+    }
+
     /// Sets a vsock device to be attached when the VM starts.
     pub fn set_vsock_device(&mut self, config: VsockDeviceConfig) -> Result<VsockConfigError> {
         self.vsock.insert(config)

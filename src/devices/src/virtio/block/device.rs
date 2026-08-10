@@ -48,7 +48,7 @@ use super::writeback::{
 };
 use super::{
     super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice, TYPE_BLOCK},
-    Error, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
+    Error, WritebackLimit, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
 };
 
 use crate::virtio::{
@@ -732,8 +732,36 @@ impl Block {
         writeback_limit_bytes: Option<u64>,
         metrics: BlockMetricsWriter,
     ) -> io::Result<Block> {
+        Self::new_with_writeback_limit_handle(
+            id,
+            partuuid,
+            cache_type,
+            disk_image_path,
+            disk_image_format,
+            is_disk_read_only,
+            direct_io,
+            sync_mode,
+            writeback_limit_bytes.map(WritebackLimit::new),
+            metrics,
+        )
+    }
+
+    /// Create a virtio block device with an optional live buffered-writeback budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_writeback_limit_handle(
+        id: String,
+        partuuid: Option<String>,
+        cache_type: CacheType,
+        disk_image_path: String,
+        disk_image_format: ImageType,
+        is_disk_read_only: bool,
+        direct_io: bool,
+        sync_mode: SyncMode,
+        writeback_limit: Option<WritebackLimit>,
+        metrics: BlockMetricsWriter,
+    ) -> io::Result<Block> {
         // Keep zero equivalent to the builder's disabled state for callers of this lower-level API.
-        let writeback_limit_bytes = writeback_limit_bytes.filter(|bytes| *bytes != 0);
+        let writeback_limit = writeback_limit.filter(|limit| limit.maximum_bytes() != 0);
 
         if matches!(disk_image_format, ImageType::Vmdk) && !is_disk_read_only {
             return Err(io::Error::new(
@@ -742,7 +770,9 @@ impl Block {
             ));
         }
 
-        if let Some(_hard_budget_bytes) = writeback_limit_bytes {
+        if let Some(_hard_budget_bytes) =
+            writeback_limit.as_ref().map(WritebackLimit::maximum_bytes)
+        {
             #[cfg(target_os = "linux")]
             if _hard_budget_bytes < MINIMUM_WRITEBACK_BUDGET_BYTES {
                 return Err(io::Error::new(
@@ -804,10 +834,10 @@ impl Block {
         };
 
         #[cfg(target_os = "linux")]
-        let writeback_config = match writeback_limit_bytes {
-            Some(hard_budget_bytes) => Some(BufferedWritebackConfig::new(
+        let writeback_config = match writeback_limit {
+            Some(limit) => Some(BufferedWritebackConfig::new(
                 Arc::new(disk_image.try_clone()?),
-                hard_budget_bytes,
+                limit,
             )?),
             None => None,
         };

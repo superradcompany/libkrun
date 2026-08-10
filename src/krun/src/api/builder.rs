@@ -720,11 +720,13 @@ impl VmBuilder {
                 sync_mode,
             };
 
-            vmr.add_block_device_with_writeback_limit(
-                blk_config,
-                configured_disk.writeback_limit_bytes,
-            )
-            .map_err(|e| Error::Config(ConfigError::Block(e.to_string())))?;
+            let writeback_limit = configured_disk.writeback_limit.or_else(|| {
+                configured_disk
+                    .writeback_limit_bytes
+                    .map(devices::virtio::block::WritebackLimit::new)
+            });
+            vmr.add_block_device_with_writeback_limit_handle(blk_config, writeback_limit)
+                .map_err(|e| Error::Config(ConfigError::Block(e.to_string())))?;
         }
 
         // Format execution configuration
@@ -1219,5 +1221,28 @@ mod tests {
         assert!(!builder.disk.configs[1].config.direct_io);
         assert_eq!(builder.disk.configs[1].config.sync, SyncMode::Full);
         assert_eq!(builder.disk.configs[1].writeback_limit_bytes, None);
+    }
+
+    #[cfg(feature = "blk")]
+    #[test]
+    fn disk_builder_keeps_live_writeback_handle_shared_and_per_disk() {
+        use crate::api::builders::WritebackLimit;
+
+        let limit = WritebackLimit::new(256 * 1024 * 1024);
+        let builder = VmBuilder::new()
+            .disk(|d| d.path("/a.raw").writeback_limit(limit.clone()))
+            .disk(|d| d.path("/b.raw"));
+
+        let configured = builder.disk.configs[0]
+            .writeback_limit
+            .as_ref()
+            .expect("first disk must retain its live limit");
+        assert_eq!(configured.maximum_bytes(), 256 * 1024 * 1024);
+        assert_eq!(configured.target_bytes(), 256 * 1024 * 1024);
+        assert_eq!(builder.disk.configs[0].writeback_limit_bytes, None);
+        assert!(builder.disk.configs[1].writeback_limit.is_none());
+
+        limit.set_target_bytes(128 * 1024 * 1024).unwrap();
+        assert_eq!(configured.target_bytes(), 128 * 1024 * 1024);
     }
 }
