@@ -4374,7 +4374,10 @@ pub mod tests {
             .find(|line| line.starts_with(&address))
             .expect("the anonymous mapping should appear in numa_maps");
 
-        assert!(entry.contains("bind:0"), "unexpected policy: {entry}");
+        assert!(
+            entry.contains("bind=static:0"),
+            "unexpected policy: {entry}"
+        );
         assert!(
             entry.contains("N0="),
             "the faulted page is not on node 0: {entry}"
