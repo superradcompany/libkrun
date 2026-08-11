@@ -50,7 +50,10 @@ pub use builders::NetBuilder;
 pub use builders::VsockBuilder;
 #[cfg(feature = "blk")]
 pub use builders::WritebackLimit;
-pub use builders::{ConsoleBuilder, ExecBuilder, HostCpuId, KernelBuilder, MachineBuilder};
+pub use builders::{
+    ConsoleBuilder, ExecBuilder, HostCpuId, HostMemoryPolicy, KernelBuilder, MachineBuilder,
+    NumaBuilder, NumaDistance, NumaNodeBuilder, NumaNodeConfig, NumaTopology,
+};
 pub use error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use exit_handle::ExitHandle;
 pub use metrics::{

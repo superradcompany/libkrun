@@ -9,6 +9,8 @@ default-members = ["src/libkrun", "src/krun_input", "src/krun", "examples/rust_v
 exclude = ["examples/gtk_display"]
 resolver = "2"
 
+# Keep every vm-memory consumer, including msb-imago, on msb-vm-memory. Cargo treats the upstream
+# and compatibility packages as different type identities even though they expose the same API.
 [profile.dev]
 #panic = "abort"
 

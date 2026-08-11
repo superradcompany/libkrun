@@ -48,6 +48,10 @@ jobs:
       - name: Windows passthrough error test
         run: cargo test --locked --manifest-path src/devices/Cargo.toml read_translates_zero_copy_win32_errors
 
+      # This calls VirtualAlloc2 on the native runner, not just the cross-compiled wrapper.
+      - name: Windows NUMA allocation test
+        run: cargo test --locked --manifest-path src/vmm/Cargo.toml windows_numa_mapping_allocates_accessible_memory
+
       - name: Windows device Clippy
         run: cargo clippy --locked --manifest-path src/devices/Cargo.toml -- -D warnings
 

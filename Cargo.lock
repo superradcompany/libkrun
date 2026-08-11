@@ -750,6 +750,7 @@ dependencies = [
  "libc",
  "libloading",
  "log",
+ "msb-vm-memory",
  "msb_krun_aws_nitro",
  "msb_krun_devices",
  "msb_krun_display",
@@ -761,7 +762,6 @@ dependencies = [
  "nitro-enclaves 0.5.0",
  "once_cell",
  "rand",
- "vm-memory",
 ]
 
 [[package]]
@@ -876,21 +876,32 @@ dependencies = [
 
 [[package]]
 name = "msb-imago"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0720fa987e398d5fb5345d575d1a97a74cb0eaf645355088a21285607895422c"
+checksum = "8563624d245da0b51b13959708758f06d1412cacdd17000b001f5ccae80cf6af"
 dependencies = [
  "async-trait",
  "cfg-if",
  "libc",
  "miniz_oxide",
+ "msb-vm-memory",
  "nix 0.30.1",
  "page_size",
  "rustc_version",
  "tokio",
  "tracing",
- "vm-memory",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "msb-vm-memory"
+version = "0.18.0-msb.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c31dfbf17e640f6d661ae17e098b87c019821fe3eb4aba0e9eeada4ba678096"
+dependencies = [
+ "libc",
+ "thiserror 2.0.18",
+ "winapi",
 ]
 
 [[package]]
@@ -903,6 +914,7 @@ dependencies = [
  "libc",
  "libloading",
  "log",
+ "msb-vm-memory",
  "msb_krun_aws_nitro",
  "msb_krun_devices",
  "msb_krun_display",
@@ -912,7 +924,6 @@ dependencies = [
  "msb_krun_utils",
  "msb_krun_vmm",
  "nitro-enclaves 0.6.1",
- "vm-memory",
 ]
 
 [[package]]
@@ -922,11 +933,11 @@ dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
+ "msb-vm-memory",
  "msb_krun_arch_gen",
  "msb_krun_smbios",
  "msb_krun_utils",
  "tdx",
- "vm-memory",
 ]
 
 [[package]]
@@ -971,6 +982,7 @@ dependencies = [
  "log",
  "lru",
  "msb-imago",
+ "msb-vm-memory",
  "msb_krun_arch",
  "msb_krun_display",
  "msb_krun_hvf",
@@ -985,7 +997,6 @@ dependencies = [
  "tokio",
  "virtio-bindings",
  "vm-fdt",
- "vm-memory",
  "windows-sys 0.61.2",
  "zerocopy",
 ]
@@ -1027,8 +1038,8 @@ dependencies = [
 name = "msb_krun_kernel"
 version = "0.1.29"
 dependencies = [
+ "msb-vm-memory",
  "msb_krun_utils",
- "vm-memory",
 ]
 
 [[package]]
@@ -1060,7 +1071,7 @@ dependencies = [
 name = "msb_krun_smbios"
 version = "0.1.29"
 dependencies = [
- "vm-memory",
+ "msb-vm-memory",
 ]
 
 [[package]]
@@ -1093,6 +1104,7 @@ dependencies = [
  "libc",
  "libloading",
  "log",
+ "msb-vm-memory",
  "msb_krun_arch",
  "msb_krun_arch_gen",
  "msb_krun_cpuid",
@@ -1107,7 +1119,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tdx",
- "vm-memory",
  "windows-sys 0.61.2",
  "zstd",
 ]
@@ -1835,17 +1846,6 @@ name = "vm-fdt"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e21282841a059bb62627ce8441c491f09603622cd5a21c43bfedc85a2952f23"
-
-[[package]]
-name = "vm-memory"
-version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b55e753c7725603745cb32b2287ef7ef3da05c03c7702cda3fa8abe25ae0465"
-dependencies = [
- "libc",
- "thiserror 2.0.18",
- "winapi",
-]
 
 [[package]]
 name = "vmm-sys-util"

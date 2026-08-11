@@ -51,6 +51,12 @@ pub enum ConfigError {
     /// The selected host processor group is not supported on the current platform.
     InvalidHostCpuGroup(u16),
 
+    /// The resolved NUMA topology is internally inconsistent.
+    InvalidNumaTopology(String),
+
+    /// The requested resolved NUMA topology cannot be realized by this build or host.
+    NumaUnsupported(String),
+
     /// Missing kernel configuration.
     MissingKernel,
 
@@ -142,6 +148,12 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::InvalidHostCpuGroup(group) => {
                 write!(f, "host processor group {group} is not supported")
+            }
+            ConfigError::InvalidNumaTopology(reason) => {
+                write!(f, "invalid NUMA topology: {reason}")
+            }
+            ConfigError::NumaUnsupported(reason) => {
+                write!(f, "NUMA topology is unsupported: {reason}")
             }
             ConfigError::MissingKernel => write!(f, "missing kernel configuration"),
             ConfigError::InvalidKernelBundle(s) => write!(f, "invalid kernel bundle: {}", s),
