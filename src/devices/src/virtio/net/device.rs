@@ -213,8 +213,6 @@ impl VirtioDevice for Net {
             error!("Cannot activate net device: backend already taken");
             ActivateError::BadActivate
         })?;
-        let rate_limiters = std::mem::take(&mut self.rate_limiters);
-
         match NetWorker::new(
             rx_q,
             tx_q,
@@ -222,7 +220,7 @@ impl VirtioDevice for Net {
             mem.clone(),
             self.acked_features,
             cfg_backend,
-            rate_limiters,
+            &self.rate_limiters,
         ) {
             Ok(worker) => {
                 worker.run();
