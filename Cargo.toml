@@ -9,13 +9,11 @@ default-members = ["src/libkrun", "src/krun_input", "src/krun", "examples/rust_v
 exclude = ["examples/gtk_display"]
 resolver = "2"
 
+# Keep every vm-memory consumer, including msb-imago, on msb-vm-memory. Cargo treats the upstream
+# and compatibility packages as different type identities even though they expose the same API.
 [profile.dev]
 #panic = "abort"
 
 [profile.release]
 #panic = "abort"
 lto = true
-
-# Remove this patch once vm-memory exposes the Windows NUMA-aware mapping constructor in a release.
-[patch.crates-io]
-vm-memory = { git = "https://github.com/superradcompany/vm-memory.git", rev = "25d20cba63d46ae598022e18e8a5157667b7a30d" }
