@@ -62,6 +62,7 @@ pub struct NetWorker {
     tx_resume_at: Option<Instant>,
 
     rate_limit_timer: Option<TimerFd>,
+    armed_rate_limit_deadline: Option<Instant>,
 }
 
 impl NetWorker {
@@ -146,6 +147,7 @@ impl NetWorker {
             tx_resume_at: None,
 
             rate_limit_timer,
+            armed_rate_limit_deadline: None,
         })
     }
 
@@ -300,21 +302,26 @@ impl NetWorker {
     }
 
     fn process_rx(&mut self) -> result::Result<(), RxError> {
-        self.process_rx_at(Instant::now())
+        let now = self.rx_rate_limiter.as_ref().map(|_| Instant::now());
+        self.process_rx_at(now)
     }
 
-    fn process_rx_at(&mut self, now: Instant) -> result::Result<(), RxError> {
+    fn process_rx_at(&mut self, now: Option<Instant>) -> result::Result<(), RxError> {
         let mut signal_queue = false;
 
         // if we have a deferred frame we try to process it first,
         // if that is not possible, we don't continue processing other frames
         if self.rx_has_deferred_frame {
-            if !self.reserve_rx_tokens(now) {
-                return Ok(());
+            if let Some(now) = now {
+                if !self.reserve_rx_tokens(now) {
+                    return Ok(());
+                }
             }
             if self.write_frame_to_guest() {
                 self.rx_has_deferred_frame = false;
-                self.rx_has_rate_limit_permit = false;
+                if now.is_some() {
+                    self.rx_has_rate_limit_permit = false;
+                }
                 signal_queue = true;
             } else {
                 return Ok(());
@@ -325,12 +332,16 @@ impl NetWorker {
         let result = loop {
             match self.read_into_rx_frame_buf_from_backend() {
                 Ok(()) => {
-                    if !self.reserve_rx_tokens(now) {
-                        self.rx_has_deferred_frame = true;
-                        break Ok(());
+                    if let Some(now) = now {
+                        if !self.reserve_rx_tokens(now) {
+                            self.rx_has_deferred_frame = true;
+                            break Ok(());
+                        }
                     }
                     if self.write_frame_to_guest() {
-                        self.rx_has_rate_limit_permit = false;
+                        if now.is_some() {
+                            self.rx_has_rate_limit_permit = false;
+                        }
                         signal_queue = true;
                     } else {
                         self.rx_has_deferred_frame = true;
@@ -393,10 +404,11 @@ impl NetWorker {
     }
 
     fn process_tx(&mut self) -> result::Result<(), TxError> {
-        self.process_tx_at(Instant::now())
+        let now = self.tx_rate_limiter.as_ref().map(|_| Instant::now());
+        self.process_tx_at(now)
     }
 
-    fn process_tx_at(&mut self, now: Instant) -> result::Result<(), TxError> {
+    fn process_tx_at(&mut self, now: Option<Instant>) -> result::Result<(), TxError> {
         let tx_queue = &mut self.tx_q.queue;
 
         if self.backend.has_unfinished_write()
@@ -449,18 +461,22 @@ impl NetWorker {
             self.tx_frame_len = read_count;
             log::debug!("virtio-net tx descriptor: head={head_index}, bytes={read_count}");
 
-            if !self.tx_has_rate_limit_permit {
-                let frame_len = read_count.saturating_sub(vnet_hdr_len()) as u64;
-                if let Some(limiter) = &mut self.tx_rate_limiter {
+            if let Some(now) = now {
+                if !self.tx_has_rate_limit_permit {
+                    let frame_len = read_count.saturating_sub(vnet_hdr_len()) as u64;
+                    let limiter = self
+                        .tx_rate_limiter
+                        .as_mut()
+                        .expect("timestamp requires a TX rate limiter");
                     if let Err(deadline) = limiter.try_consume_frame(frame_len, now) {
                         self.tx_resume_at = Some(deadline);
                         rate_limit_changed = true;
                         tx_queue.undo_pop();
                         break;
                     }
+                    self.tx_has_rate_limit_permit = true;
+                    rate_limit_changed |= self.tx_resume_at.take().is_some();
                 }
-                self.tx_has_rate_limit_permit = true;
-                rate_limit_changed |= self.tx_resume_at.take().is_some();
             }
 
             match self
@@ -468,7 +484,9 @@ impl NetWorker {
                 .write_frame(vnet_hdr_len(), &mut self.tx_frame_buf[..read_count])
             {
                 Ok(()) => {
-                    self.tx_has_rate_limit_permit = false;
+                    if now.is_some() {
+                        self.tx_has_rate_limit_permit = false;
+                    }
                     self.tx_frame_len = 0;
                     tx_queue
                         .add_used(&self.mem, head_index, 0)
@@ -480,7 +498,9 @@ impl NetWorker {
                     break;
                 }
                 Err(WriteError::PartialWrite) => {
-                    self.tx_has_rate_limit_permit = false;
+                    if now.is_some() {
+                        self.tx_has_rate_limit_permit = false;
+                    }
                     log::trace!("process_tx: partial write");
                     /*
                     This situation should be pretty rare, assuming reasonably sized socket buffers.
@@ -511,7 +531,7 @@ impl NetWorker {
                 .map_err(TxError::DeviceError)?;
         }
 
-        if rate_limit_changed {
+        if let (true, Some(now)) = (rate_limit_changed, now) {
             self.arm_rate_limit_timer(now);
         }
 
@@ -526,13 +546,14 @@ impl NetWorker {
             log::error!("failed to consume virtio-net rate-limit timer: {err}");
             return;
         }
+        self.armed_rate_limit_deadline = None;
 
         let now = Instant::now();
         let retry_rx = self.rx_resume_at.is_some_and(|deadline| deadline <= now);
         let retry_tx = self.tx_resume_at.is_some_and(|deadline| deadline <= now);
         if retry_rx {
             self.rx_resume_at = None;
-            if let Err(err) = self.process_rx_at(now) {
+            if let Err(err) = self.process_rx_at(Some(now)) {
                 log::error!("failed to process rate-limited RX frame: {err:?}");
             }
         }
@@ -548,6 +569,9 @@ impl NetWorker {
             return;
         };
         let deadline = self.rx_resume_at.into_iter().chain(self.tx_resume_at).min();
+        if deadline == self.armed_rate_limit_deadline {
+            return;
+        }
         let result = match deadline {
             Some(deadline) => timer.arm_oneshot(
                 deadline
@@ -556,8 +580,9 @@ impl NetWorker {
             ),
             None => timer.disarm(),
         };
-        if let Err(err) = result {
-            log::error!("failed to arm virtio-net rate-limit timer: {err}");
+        match result {
+            Ok(()) => self.armed_rate_limit_deadline = deadline,
+            Err(err) => log::error!("failed to arm virtio-net rate-limit timer: {err}"),
         }
     }
 
@@ -799,6 +824,7 @@ mod tests {
                 .map(|config| RateLimiter::new(config, now).unwrap()),
             tx_resume_at: None,
             rate_limit_timer: None,
+            armed_rate_limit_deadline: None,
         }
     }
 
@@ -834,11 +860,11 @@ mod tests {
             start,
         );
 
-        worker.process_tx_at(start).unwrap();
+        worker.process_tx_at(Some(start)).unwrap();
         assert_eq!(worker.tx_q.queue.next_used.0, 0);
         assert_eq!(state.lock().unwrap().tx_attempts, 1);
 
-        worker.process_tx_at(start).unwrap();
+        worker.process_tx_at(Some(start)).unwrap();
         assert_eq!(worker.tx_q.queue.next_used.0, 1);
         assert_eq!(worker.tx_resume_at, Some(start + REFILL_TIME));
         {
@@ -848,12 +874,12 @@ mod tests {
         }
 
         worker
-            .process_tx_at(start + REFILL_TIME - Duration::from_nanos(1))
+            .process_tx_at(Some(start + REFILL_TIME - Duration::from_nanos(1)))
             .unwrap();
         assert_eq!(worker.tx_q.queue.next_used.0, 1);
         assert_eq!(state.lock().unwrap().tx_attempts, 2);
 
-        worker.process_tx_at(start + REFILL_TIME).unwrap();
+        worker.process_tx_at(Some(start + REFILL_TIME)).unwrap();
         assert_eq!(worker.tx_q.queue.next_used.0, 2);
         assert_eq!(worker.tx_resume_at, None);
         let state = state.lock().unwrap();
@@ -892,18 +918,18 @@ mod tests {
             start,
         );
 
-        worker.process_rx_at(start).unwrap();
+        worker.process_rx_at(Some(start)).unwrap();
         assert_eq!(worker.rx_q.queue.next_used.0, 1);
         assert!(worker.rx_has_deferred_frame);
         assert_eq!(worker.rx_resume_at, Some(start + REFILL_TIME));
 
         worker
-            .process_rx_at(start + REFILL_TIME - Duration::from_nanos(1))
+            .process_rx_at(Some(start + REFILL_TIME - Duration::from_nanos(1)))
             .unwrap();
         assert_eq!(worker.rx_q.queue.next_used.0, 1);
         assert!(worker.rx_has_deferred_frame);
 
-        worker.process_rx_at(start + REFILL_TIME).unwrap();
+        worker.process_rx_at(Some(start + REFILL_TIME)).unwrap();
         assert_eq!(worker.rx_q.queue.next_used.0, 2);
         assert!(!worker.rx_has_deferred_frame);
         assert_eq!(worker.rx_resume_at, None);
