@@ -1,6 +1,6 @@
 [package]
 name = "msb_krun_kernel"
-version = "0.1.29"
+version = "0.1.30"
 edition = "2021"
 license = "Apache-2.0 AND BSD-3-Clause"
 description = "Kernel loading utilities for msb_krun microVMs"
@@ -9,4 +9,4 @@ repository = "https://github.com/containers/libkrun"
 [dependencies]
 vm-memory = { package = "msb-vm-memory", version = "=0.18.0-msb.1", default-features = false, features = ["backend-mmap"] }
 
-utils = { package = "msb_krun_utils", version = "0.1.29", path = "../utils" }
+utils = { package = "msb_krun_utils", version = "0.1.30", path = "../utils" }
