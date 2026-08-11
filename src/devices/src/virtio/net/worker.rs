@@ -393,6 +393,10 @@ impl NetWorker {
     }
 
     fn process_tx(&mut self) -> result::Result<(), TxError> {
+        self.process_tx_at(Instant::now())
+    }
+
+    fn process_tx_at(&mut self, now: Instant) -> result::Result<(), TxError> {
         let tx_queue = &mut self.tx_q.queue;
 
         if self.backend.has_unfinished_write()
@@ -448,7 +452,7 @@ impl NetWorker {
             if !self.tx_has_rate_limit_permit {
                 let frame_len = read_count.saturating_sub(vnet_hdr_len()) as u64;
                 if let Some(limiter) = &mut self.tx_rate_limiter {
-                    if let Err(deadline) = limiter.try_consume_frame(frame_len, Instant::now()) {
+                    if let Err(deadline) = limiter.try_consume_frame(frame_len, now) {
                         self.tx_resume_at = Some(deadline);
                         rate_limit_changed = true;
                         tx_queue.undo_pop();
@@ -508,7 +512,7 @@ impl NetWorker {
         }
 
         if rate_limit_changed {
-            self.arm_rate_limit_timer(Instant::now());
+            self.arm_rate_limit_timer(now);
         }
 
         Ok(())
@@ -658,6 +662,259 @@ fn timerfd_pollable(timer: &TimerFd) -> Pollable {
 fn event_source_pollable(source: EventSource) -> io::Result<Pollable> {
     match source.raw() {
         RawEventSource::Fd(fd) => Ok(fd),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::collections::VecDeque;
+    use std::os::fd::{AsRawFd, RawFd};
+    use std::sync::{Arc, Mutex};
+
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::net::rate_limit::{RateLimiterConfig, TokenBucketConfig};
+    use crate::virtio::queue::tests::VirtQueue;
+    use crate::virtio::queue::VIRTQ_DESC_F_WRITE;
+
+    use super::*;
+
+    const QUEUE_MEMORY_SIZE: usize = 0x1_0000;
+    const RX_QUEUE_ADDR: GuestAddress = GuestAddress(0);
+    const TX_QUEUE_ADDR: GuestAddress = GuestAddress(0x1000);
+    const RX_BUFFER_ADDRS: [GuestAddress; 2] = [GuestAddress(0x4000), GuestAddress(0x5000)];
+    const TX_BUFFER_ADDRS: [GuestAddress; 2] = [GuestAddress(0x6000), GuestAddress(0x7000)];
+    const BUFFER_SIZE: u32 = 0x1000;
+    const REFILL_TIME: Duration = Duration::from_millis(100);
+
+    #[derive(Default)]
+    struct BackendState {
+        rx_frames: VecDeque<Vec<u8>>,
+        tx_frames: Vec<Vec<u8>>,
+        tx_attempts: usize,
+        reject_next_tx: bool,
+    }
+
+    struct TestBackend {
+        event: EventFd,
+        state: Arc<Mutex<BackendState>>,
+    }
+
+    impl NetBackend for TestBackend {
+        fn read_frame(&mut self, buf: &mut [u8]) -> result::Result<usize, ReadError> {
+            let Some(frame) = self.state.lock().unwrap().rx_frames.pop_front() else {
+                return Err(ReadError::NothingRead);
+            };
+            buf[..frame.len()].copy_from_slice(&frame);
+            Ok(frame.len())
+        }
+
+        fn write_frame(
+            &mut self,
+            hdr_len: usize,
+            buf: &mut [u8],
+        ) -> result::Result<(), WriteError> {
+            let mut state = self.state.lock().unwrap();
+            state.tx_attempts += 1;
+            if state.reject_next_tx {
+                state.reject_next_tx = false;
+                return Err(WriteError::NothingWritten);
+            }
+            state.tx_frames.push(buf[hdr_len..].to_vec());
+            Ok(())
+        }
+
+        fn has_unfinished_write(&self) -> bool {
+            false
+        }
+
+        fn try_finish_write(
+            &mut self,
+            _hdr_len: usize,
+            _buf: &[u8],
+        ) -> result::Result<(), WriteError> {
+            Ok(())
+        }
+
+        fn raw_socket_fd(&self) -> RawFd {
+            self.event.as_raw_fd()
+        }
+    }
+
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0; vnet_hdr_len()];
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn ops_limiter() -> RateLimiterConfig {
+        RateLimiterConfig {
+            bandwidth: None,
+            ops: Some(TokenBucketConfig {
+                size: 1,
+                refill_time: REFILL_TIME,
+                one_time_burst: 0,
+            }),
+        }
+    }
+
+    fn device_queue(queue: crate::virtio::Queue) -> DeviceQueue {
+        DeviceQueue::new(queue, Arc::new(EventFd::new(0).unwrap()))
+    }
+
+    fn worker(
+        mem: GuestMemoryMmap,
+        rx_q: DeviceQueue,
+        tx_q: DeviceQueue,
+        backend_state: Arc<Mutex<BackendState>>,
+        rate_limiters: RateLimiters,
+        now: Instant,
+    ) -> NetWorker {
+        let backend = TestBackend {
+            event: EventFd::new(0).unwrap(),
+            state: backend_state,
+        };
+        NetWorker {
+            rx_q,
+            tx_q,
+            interrupt: InterruptTransport::new(DummyIrqChip::new().into(), "test-net".into())
+                .unwrap(),
+            mem,
+            backend: Box::new(backend),
+            rx_frame_buf: [0; MAX_BUFFER_SIZE],
+            rx_frame_buf_len: 0,
+            rx_has_deferred_frame: false,
+            rx_has_rate_limit_permit: false,
+            rx_rate_limiter: rate_limiters
+                .rx
+                .as_ref()
+                .map(|config| RateLimiter::new(config, now).unwrap()),
+            rx_resume_at: None,
+            tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
+            tx_frame_buf: [0; MAX_BUFFER_SIZE],
+            tx_frame_len: 0,
+            tx_has_rate_limit_permit: false,
+            tx_rate_limiter: rate_limiters
+                .tx
+                .as_ref()
+                .map(|config| RateLimiter::new(config, now).unwrap()),
+            tx_resume_at: None,
+            rate_limit_timer: None,
+        }
+    }
+
+    #[test]
+    fn tx_retries_backpressure_without_double_charging_and_resumes_at_deadline() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), QUEUE_MEMORY_SIZE)]).unwrap();
+        let rx_vq = VirtQueue::new(RX_QUEUE_ADDR, &mem, 8);
+        let tx_vq = VirtQueue::new(TX_QUEUE_ADDR, &mem, 8);
+        let frames = [frame(b"first"), frame(b"second")];
+        for (index, frame) in frames.iter().enumerate() {
+            mem.write_slice(frame, TX_BUFFER_ADDRS[index]).unwrap();
+            tx_vq.dtable[index].set(TX_BUFFER_ADDRS[index].0, frame.len() as u32, 0, 0);
+            tx_vq.avail.ring[index].set(index as u16);
+        }
+        tx_vq.avail.idx.set(frames.len() as u16);
+
+        let state = Arc::new(Mutex::new(BackendState {
+            reject_next_tx: true,
+            ..BackendState::default()
+        }));
+        let rx_q = device_queue(rx_vq.create_queue());
+        let tx_q = device_queue(tx_vq.create_queue());
+        let start = Instant::now();
+        let mut worker = worker(
+            mem.clone(),
+            rx_q,
+            tx_q,
+            Arc::clone(&state),
+            RateLimiters {
+                rx: None,
+                tx: Some(ops_limiter()),
+            },
+            start,
+        );
+
+        worker.process_tx_at(start).unwrap();
+        assert_eq!(worker.tx_q.queue.next_used.0, 0);
+        assert_eq!(state.lock().unwrap().tx_attempts, 1);
+
+        worker.process_tx_at(start).unwrap();
+        assert_eq!(worker.tx_q.queue.next_used.0, 1);
+        assert_eq!(worker.tx_resume_at, Some(start + REFILL_TIME));
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.tx_attempts, 2);
+            assert_eq!(state.tx_frames, [b"first".to_vec()]);
+        }
+
+        worker
+            .process_tx_at(start + REFILL_TIME - Duration::from_nanos(1))
+            .unwrap();
+        assert_eq!(worker.tx_q.queue.next_used.0, 1);
+        assert_eq!(state.lock().unwrap().tx_attempts, 2);
+
+        worker.process_tx_at(start + REFILL_TIME).unwrap();
+        assert_eq!(worker.tx_q.queue.next_used.0, 2);
+        assert_eq!(worker.tx_resume_at, None);
+        let state = state.lock().unwrap();
+        assert_eq!(state.tx_attempts, 3);
+        assert_eq!(state.tx_frames, [b"first".to_vec(), b"second".to_vec()]);
+    }
+
+    #[test]
+    fn rx_preserves_deferred_frame_and_resumes_at_deadline() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), QUEUE_MEMORY_SIZE)]).unwrap();
+        let rx_vq = VirtQueue::new(RX_QUEUE_ADDR, &mem, 8);
+        let tx_vq = VirtQueue::new(TX_QUEUE_ADDR, &mem, 8);
+        for (index, address) in RX_BUFFER_ADDRS.iter().enumerate() {
+            rx_vq.dtable[index].set(address.0, BUFFER_SIZE, VIRTQ_DESC_F_WRITE, 0);
+            rx_vq.avail.ring[index].set(index as u16);
+        }
+        rx_vq.avail.idx.set(RX_BUFFER_ADDRS.len() as u16);
+
+        let frames = [frame(b"first"), frame(b"second")];
+        let state = Arc::new(Mutex::new(BackendState {
+            rx_frames: frames.iter().cloned().collect(),
+            ..BackendState::default()
+        }));
+        let rx_q = device_queue(rx_vq.create_queue());
+        let tx_q = device_queue(tx_vq.create_queue());
+        let start = Instant::now();
+        let mut worker = worker(
+            mem.clone(),
+            rx_q,
+            tx_q,
+            state,
+            RateLimiters {
+                rx: Some(ops_limiter()),
+                tx: None,
+            },
+            start,
+        );
+
+        worker.process_rx_at(start).unwrap();
+        assert_eq!(worker.rx_q.queue.next_used.0, 1);
+        assert!(worker.rx_has_deferred_frame);
+        assert_eq!(worker.rx_resume_at, Some(start + REFILL_TIME));
+
+        worker
+            .process_rx_at(start + REFILL_TIME - Duration::from_nanos(1))
+            .unwrap();
+        assert_eq!(worker.rx_q.queue.next_used.0, 1);
+        assert!(worker.rx_has_deferred_frame);
+
+        worker.process_rx_at(start + REFILL_TIME).unwrap();
+        assert_eq!(worker.rx_q.queue.next_used.0, 2);
+        assert!(!worker.rx_has_deferred_frame);
+        assert_eq!(worker.rx_resume_at, None);
+        for (index, expected) in frames.iter().enumerate() {
+            let mut actual = vec![0; expected.len()];
+            worker
+                .mem
+                .read_slice(&mut actual, RX_BUFFER_ADDRS[index])
+                .unwrap();
+            assert_eq!(&actual, expected);
+        }
     }
 }
 

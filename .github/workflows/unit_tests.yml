@@ -24,6 +24,9 @@ jobs:
       - name: Unit tests
         run: cargo test
 
+      - name: Virtio-net rate-limit tests
+        run: cargo test --locked -p msb_krun_devices --features net virtio::net
+
   unit-tests-windows-x86_64:
     name: Unit tests (Windows x86_64)
     runs-on: windows-latest
