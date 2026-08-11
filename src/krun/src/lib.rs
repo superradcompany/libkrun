@@ -54,7 +54,7 @@ pub use api::builders::VsockBuilder;
 pub use api::builders::WritebackLimit;
 pub use api::builders::{
     ConsoleBuilder, ExecBuilder, HostCpuId, HostMemoryPolicy, KernelBuilder, MachineBuilder,
-    NumaDistance, NumaNodeConfig, NumaTopology,
+    NumaBuilder, NumaDistance, NumaNodeBuilder, NumaNodeConfig, NumaTopology,
 };
 pub use api::error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use api::exit_handle::ExitHandle;

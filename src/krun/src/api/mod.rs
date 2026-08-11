@@ -52,7 +52,7 @@ pub use builders::VsockBuilder;
 pub use builders::WritebackLimit;
 pub use builders::{
     ConsoleBuilder, ExecBuilder, HostCpuId, HostMemoryPolicy, KernelBuilder, MachineBuilder,
-    NumaDistance, NumaNodeConfig, NumaTopology,
+    NumaBuilder, NumaDistance, NumaNodeBuilder, NumaNodeConfig, NumaTopology,
 };
 pub use error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use exit_handle::ExitHandle;

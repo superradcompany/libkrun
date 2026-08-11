@@ -1336,6 +1336,20 @@ mod tests {
 
     #[cfg(not(feature = "tee"))]
     #[test]
+    fn build_accepts_fluent_one_node_topology() {
+        VmBuilder::new()
+            .machine(|machine| {
+                machine
+                    .vcpus(2)
+                    .memory_mib(512)
+                    .numa(|numa| numa.node(|node| node.vcpus([0, 1]).memory_mib(512)))
+            })
+            .build()
+            .expect("the fluent builder should produce a valid resolved topology");
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
     fn build_rejects_incomplete_numa_vcpu_membership() {
         let err = VmBuilder::new()
             .machine(|machine| {

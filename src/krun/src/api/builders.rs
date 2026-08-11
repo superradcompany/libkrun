@@ -65,6 +65,25 @@ pub struct MachineBuilder {
     pub(crate) numa_topology: Option<NumaTopology>,
 }
 
+/// Builder for a resolved guest NUMA topology.
+///
+/// Guest node IDs are assigned by insertion order. Local distance entries are generated with the
+/// standard value `10`, so callers only need to provide non-local distances for multi-node guests.
+#[derive(Debug, Clone, Default)]
+pub struct NumaBuilder {
+    nodes: Vec<NumaNodeConfig>,
+    distances: Vec<NumaDistance>,
+}
+
+/// Builder for one guest NUMA node.
+#[derive(Debug, Clone)]
+pub struct NumaNodeBuilder {
+    vcpu_indices: Vec<u8>,
+    memory_mib: usize,
+    max_memory_mib: Option<usize>,
+    host_memory: HostMemoryPolicy,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Types: Vsock Builder
 //--------------------------------------------------------------------------------------------------
@@ -477,6 +496,35 @@ impl MachineBuilder {
         self
     }
 
+    /// Configure a resolved guest NUMA topology with the fluent API.
+    ///
+    /// Use [`numa_topology`](Self::numa_topology) when the caller already has a fully resolved
+    /// topology value.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use msb_krun::VmBuilder;
+    /// VmBuilder::new().machine(|machine| {
+    ///     machine
+    ///         .vcpus(2)
+    ///         .memory_mib(4096)
+    ///         .max_memory_mib(8192)
+    ///         .numa(|numa| {
+    ///             numa.node(|node| {
+    ///                 node.vcpus([0, 1])
+    ///                     .memory_mib(4096)
+    ///                     .max_memory_mib(8192)
+    ///                     .bind_host_nodes([0])
+    ///             })
+    ///         })
+    /// });
+    /// ```
+    pub fn numa(mut self, configure: impl FnOnce(NumaBuilder) -> NumaBuilder) -> Self {
+        self.numa_topology = Some(configure(NumaBuilder::new()).finish());
+        self
+    }
+
     /// Set the maximum guest memory in MiB reserved for future memory hotplug.
     ///
     /// Currently configuration plumbing only: capacity above
@@ -569,6 +617,129 @@ impl MachineBuilder {
     pub fn enable_inet_hijack(mut self, enabled: bool) -> Self {
         self.enable_inet_hijack = enabled;
         self
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods: NUMA Builder
+//--------------------------------------------------------------------------------------------------
+
+impl NumaBuilder {
+    /// Create an empty resolved topology builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add one guest node. Its dense guest node ID is its insertion index.
+    pub fn node(mut self, configure: impl FnOnce(NumaNodeBuilder) -> NumaNodeBuilder) -> Self {
+        let guest_node_id = u16::try_from(self.nodes.len()).unwrap_or(u16::MAX);
+        self.nodes
+            .push(configure(NumaNodeBuilder::new()).finish(guest_node_id));
+        self
+    }
+
+    /// Set one directed non-local guest distance.
+    ///
+    /// Local entries are generated automatically with value `10`. A later call for the same pair
+    /// replaces the earlier value.
+    pub fn distance(mut self, from: u16, to: u16, value: u8) -> Self {
+        if let Some(distance) = self
+            .distances
+            .iter_mut()
+            .find(|distance| distance.from == from && distance.to == to)
+        {
+            distance.value = value;
+        } else {
+            self.distances.push(NumaDistance { from, to, value });
+        }
+        self
+    }
+
+    fn finish(mut self) -> NumaTopology {
+        for node in &self.nodes {
+            if !self.distances.iter().any(|distance| {
+                distance.from == node.guest_node_id && distance.to == node.guest_node_id
+            }) {
+                self.distances.push(NumaDistance {
+                    from: node.guest_node_id,
+                    to: node.guest_node_id,
+                    value: 10,
+                });
+            }
+        }
+
+        NumaTopology {
+            nodes: self.nodes,
+            distances: self.distances,
+        }
+    }
+}
+
+impl NumaNodeBuilder {
+    /// Create an empty guest node with inherited host-memory placement.
+    pub fn new() -> Self {
+        Self {
+            vcpu_indices: Vec::new(),
+            memory_mib: 0,
+            max_memory_mib: None,
+            host_memory: HostMemoryPolicy::Inherit,
+        }
+    }
+
+    /// Assign the possible vCPU indices belonging to this guest node.
+    pub fn vcpus(mut self, indices: impl IntoIterator<Item = u8>) -> Self {
+        self.vcpu_indices = indices.into_iter().collect();
+        self
+    }
+
+    /// Set the memory available on this node at boot, in MiB.
+    pub fn memory_mib(mut self, mib: usize) -> Self {
+        self.memory_mib = mib;
+        self
+    }
+
+    /// Set the maximum memory promised to this node after live growth, in MiB.
+    ///
+    /// This defaults to the node's boot memory.
+    pub fn max_memory_mib(mut self, mib: usize) -> Self {
+        self.max_memory_mib = Some(mib);
+        self
+    }
+
+    /// Preserve the operating system's ordinary host-memory policy.
+    pub fn inherit_host_memory(mut self) -> Self {
+        self.host_memory = HostMemoryPolicy::Inherit;
+        self
+    }
+
+    /// Bind future Linux page faults to the selected absolute host NUMA node IDs.
+    pub fn bind_host_nodes(mut self, nodes: impl IntoIterator<Item = u32>) -> Self {
+        self.host_memory = HostMemoryPolicy::Bind {
+            host_nodes: nodes.into_iter().collect(),
+        };
+        self
+    }
+
+    /// Prefer one Windows NUMA node while allowing the host to fall back under pressure.
+    pub fn prefer_host_node(mut self, node: u32) -> Self {
+        self.host_memory = HostMemoryPolicy::Preferred { host_node: node };
+        self
+    }
+
+    /// Set an already resolved host-memory policy.
+    pub fn host_memory(mut self, policy: HostMemoryPolicy) -> Self {
+        self.host_memory = policy;
+        self
+    }
+
+    fn finish(self, guest_node_id: u16) -> NumaNodeConfig {
+        NumaNodeConfig {
+            guest_node_id,
+            vcpu_indices: self.vcpu_indices,
+            memory_mib: self.memory_mib,
+            max_memory_mib: self.max_memory_mib.unwrap_or(self.memory_mib),
+            host_memory: self.host_memory,
+        }
     }
 }
 
@@ -1192,8 +1363,14 @@ impl DiskBuilder {
 }
 
 //--------------------------------------------------------------------------------------------------
-// Trait Implementations: Disk Builder
+// Trait Implementations: Builders
 //--------------------------------------------------------------------------------------------------
+
+impl Default for NumaNodeBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[cfg(feature = "blk")]
 impl Default for DiskBuilder {
@@ -1256,6 +1433,50 @@ mod tests {
             .vcpu_affinity(affinity.clone());
 
         assert_eq!(builder.vcpu_affinity, Some(affinity));
+    }
+
+    #[test]
+    fn machine_builder_resolves_fluent_numa_topology() {
+        let topology = MachineBuilder::new()
+            .numa(|numa| {
+                numa.node(|node| {
+                    node.vcpus([0, 1])
+                        .memory_mib(4096)
+                        .max_memory_mib(8192)
+                        .bind_host_nodes([2, 3])
+                })
+            })
+            .numa_topology
+            .unwrap();
+
+        assert_eq!(
+            topology,
+            NumaTopology {
+                nodes: vec![NumaNodeConfig {
+                    guest_node_id: 0,
+                    vcpu_indices: vec![0, 1],
+                    memory_mib: 4096,
+                    max_memory_mib: 8192,
+                    host_memory: HostMemoryPolicy::Bind {
+                        host_nodes: vec![2, 3],
+                    },
+                }],
+                distances: vec![NumaDistance {
+                    from: 0,
+                    to: 0,
+                    value: 10,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn numa_node_max_memory_defaults_to_boot_memory() {
+        let topology = NumaBuilder::new()
+            .node(|node| node.vcpus([0]).memory_mib(512))
+            .finish();
+
+        assert_eq!(topology.nodes[0].max_memory_mib, 512);
     }
 
     #[test]
