@@ -73,7 +73,7 @@ impl NetWorker {
         mem: GuestMemoryMmap,
         _vnet_features: u64,
         cfg_backend: VirtioNetBackend,
-        rate_limiters: RateLimiters,
+        rate_limiters: &RateLimiters,
     ) -> Result<Self, ConnectError> {
         let backend = match cfg_backend {
             #[cfg(unix)]
