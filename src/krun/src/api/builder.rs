@@ -995,9 +995,12 @@ fn validate_numa_topology_inner(
                         "host NUMA node IDs must not exceed {MAX_HOST_NUMA_NODE_ID}"
                     ))));
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )))]
                 return Err(Error::Config(ConfigError::NumaUnsupported(
-                    "bound host memory requires Linux".into(),
+                    "bound host memory requires Linux on x86_64 or AArch64".into(),
                 )));
             }
             HostMemoryPolicy::Preferred { host_node } => {
@@ -1006,9 +1009,12 @@ fn validate_numa_topology_inner(
                         "host NUMA node IDs must not exceed {MAX_HOST_NUMA_NODE_ID}"
                     ))));
                 }
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(not(all(
+                    target_os = "windows",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )))]
                 return Err(Error::Config(ConfigError::NumaUnsupported(
-                    "preferred host memory requires Windows".into(),
+                    "preferred host memory requires Windows on x86_64 or AArch64".into(),
                 )));
             }
         }
@@ -1422,6 +1428,26 @@ mod tests {
         assert!(matches!(
             err,
             Error::Config(ConfigError::InvalidNumaTopology(_))
+        ));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "riscv64", not(feature = "tee")))]
+    #[test]
+    fn build_rejects_bound_numa_memory_on_riscv64() {
+        let mut topology = one_node_topology(vec![0], 512);
+        topology.nodes[0].host_memory = HostMemoryPolicy::Bind {
+            host_nodes: vec![0],
+        };
+
+        let error = VmBuilder::new()
+            .machine(|machine| machine.memory_mib(512).numa_topology(topology))
+            .build()
+            .err()
+            .expect("RISC-V must retain inherited memory placement");
+
+        assert!(matches!(
+            error,
+            Error::Config(ConfigError::NumaUnsupported(_))
         ));
     }
 

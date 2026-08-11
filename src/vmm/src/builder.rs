@@ -7,6 +7,8 @@
 use crossbeam_channel::unbounded;
 use crossbeam_channel::Sender;
 use kernel::cmdline::Cmdline;
+#[cfg(not(feature = "tee"))]
+use std::collections::BTreeSet;
 #[cfg(target_os = "macos")]
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
@@ -186,6 +188,8 @@ pub enum StartMicrovmError {
     GuestMemoryMmapFromRanges(vm_memory::mmap::FromRangesError),
     /// Applying a requested host memory policy failed before the guest touched the mapping.
     HostMemoryPolicy(io::Error),
+    /// A low-level VMM caller supplied an invalid or unsupported NUMA topology.
+    InvalidNumaTopology(String),
     /// Guest memory collection operation failed.
     GuestMemoryMmap(vm_memory::GuestMemoryError),
     /// Guest memory region construction failed.
@@ -404,6 +408,9 @@ impl Display for StartMicrovmError {
             }
             HostMemoryPolicy(ref err) => {
                 write!(f, "Cannot apply host memory policy: {err}")
+            }
+            InvalidNumaTopology(ref reason) => {
+                write!(f, "Invalid NUMA topology: {reason}")
             }
             ImageBz2Decoder(ref err) => {
                 write!(f, "The BZIP2 decoder couldn't decompress the kernel. {err}")
@@ -2485,6 +2492,10 @@ pub fn create_guest_memory(
     (GuestMemoryMmap, ArchMemoryInfo, ShmManager, PayloadConfig),
     StartMicrovmError,
 > {
+    // `VmResources` is also a public low-level VMM interface, so do not rely exclusively on the
+    // higher-level `msb_krun` builder having validated this placement contract.
+    validate_vmm_numa_topology(vm_resources, mem_size)?;
+
     let mem_size = mem_size << 20;
 
     #[cfg(not(feature = "efi"))]
@@ -2660,6 +2671,142 @@ pub fn create_guest_memory(
     };
 
     Ok((guest_mem, arch_mem_info, shm_manager, payload_config))
+}
+
+fn validate_vmm_numa_topology(
+    vm_resources: &VmResources,
+    requested_memory_mib: usize,
+) -> Result<(), StartMicrovmError> {
+    if vm_resources.numa_topology.is_none() {
+        return Ok(());
+    }
+
+    // Confidential-memory backends use a separate allocator and must not silently ignore a policy
+    // attached through the public low-level `VmResources` API.
+    #[cfg(feature = "tee")]
+    return Err(StartMicrovmError::InvalidNumaTopology(
+        "host memory placement is unavailable with TEE memory".into(),
+    ));
+
+    #[cfg(not(feature = "tee"))]
+    {
+        let topology = vm_resources
+            .numa_topology
+            .as_ref()
+            .expect("the topology was checked above");
+        if topology.nodes.len() != 1 {
+            return Err(StartMicrovmError::InvalidNumaTopology(
+                "exactly one guest node is supported until guest NUMA tables are enabled".into(),
+            ));
+        }
+
+        let vm_config = vm_resources.vm_config();
+        let vcpu_count = vm_config.vcpu_count.unwrap_or(1);
+        let max_vcpus = vm_config.max_vcpu_count.unwrap_or(vcpu_count);
+        let boot_memory_mib = vm_config.mem_size_mib.unwrap_or(128);
+        let max_memory_mib = vm_config.max_mem_size_mib.unwrap_or(boot_memory_mib);
+        let node = &topology.nodes[0];
+
+        if requested_memory_mib != boot_memory_mib {
+            return Err(StartMicrovmError::InvalidNumaTopology(format!(
+                "guest-memory request is {requested_memory_mib} MiB, expected {boot_memory_mib} MiB from VmResources"
+            )));
+        }
+
+        if node.guest_node_id != 0 {
+            return Err(StartMicrovmError::InvalidNumaTopology(
+                "the one supported guest node must have ID zero".into(),
+            ));
+        }
+        if node.max_memory_mib < node.memory_mib {
+            return Err(StartMicrovmError::InvalidNumaTopology(
+                "node maximum memory is below boot memory".into(),
+            ));
+        }
+        if node.memory_mib & 1 != 0 || node.max_memory_mib & 1 != 0 {
+            return Err(StartMicrovmError::InvalidNumaTopology(
+                "node memory must be aligned to 2 MiB".into(),
+            ));
+        }
+        if node.memory_mib != boot_memory_mib || node.max_memory_mib != max_memory_mib {
+            return Err(StartMicrovmError::InvalidNumaTopology(format!(
+                "node memory is {}/{} MiB, expected {boot_memory_mib}/{max_memory_mib} MiB",
+                node.memory_mib, node.max_memory_mib
+            )));
+        }
+
+        let mut vcpus = BTreeSet::new();
+        for &vcpu in &node.vcpu_indices {
+            if vcpu >= max_vcpus || !vcpus.insert(vcpu) {
+                return Err(StartMicrovmError::InvalidNumaTopology(format!(
+                    "vCPU index {vcpu} is duplicated or outside 0..{max_vcpus}"
+                )));
+            }
+        }
+        if vcpus.len() != usize::from(max_vcpus) || vcpus.iter().copied().ne(0..max_vcpus) {
+            return Err(StartMicrovmError::InvalidNumaTopology(format!(
+                "vCPU membership must cover every index in 0..{max_vcpus} exactly once"
+            )));
+        }
+
+        match &node.host_memory {
+            crate::resources::HostMemoryPolicy::Inherit => {}
+            crate::resources::HostMemoryPolicy::Bind { host_nodes } => {
+                if host_nodes.is_empty() {
+                    return Err(StartMicrovmError::InvalidNumaTopology(
+                        "a bind policy requires at least one host node".into(),
+                    ));
+                }
+                if host_nodes
+                    .iter()
+                    .any(|&host_node| host_node > u16::MAX.into())
+                {
+                    return Err(StartMicrovmError::InvalidNumaTopology(format!(
+                        "host NUMA node IDs must not exceed {}",
+                        u16::MAX
+                    )));
+                }
+                if !cfg!(all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )) {
+                    return Err(StartMicrovmError::InvalidNumaTopology(
+                        "bound host memory requires Linux on x86_64 or AArch64".into(),
+                    ));
+                }
+            }
+            crate::resources::HostMemoryPolicy::Preferred { host_node } => {
+                if *host_node > u16::MAX.into() {
+                    return Err(StartMicrovmError::InvalidNumaTopology(format!(
+                        "host NUMA node IDs must not exceed {}",
+                        u16::MAX
+                    )));
+                }
+                if !cfg!(all(
+                    target_os = "windows",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )) {
+                    return Err(StartMicrovmError::InvalidNumaTopology(
+                        "preferred host memory requires Windows on x86_64 or AArch64".into(),
+                    ));
+                }
+            }
+        }
+
+        if topology.distances.len() != 1 {
+            return Err(StartMicrovmError::InvalidNumaTopology(
+                "distance entries must cover the full square matrix".into(),
+            ));
+        }
+        let distance = topology.distances[0];
+        if distance.from != 0 || distance.to != 0 || distance.value != 10 {
+            return Err(StartMicrovmError::InvalidNumaTopology(
+                "the one-node distance matrix must contain exactly (0, 0, 10)".into(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(all(target_os = "linux", not(feature = "tee")))]
@@ -4309,10 +4456,8 @@ pub mod tests {
     #[cfg(not(target_os = "windows"))]
     use crate::vmm_config::kernel_bundle::KernelBundle;
 
-    #[cfg(all(not(feature = "tee"), any(target_os = "linux", target_os = "windows")))]
     use crate::resources::{HostMemoryPolicy, NumaDistance, NumaNodeConfig, NumaTopology};
 
-    #[cfg(all(not(feature = "tee"), any(target_os = "linux", target_os = "windows")))]
     fn one_node_numa_topology(host_memory: HostMemoryPolicy) -> NumaTopology {
         NumaTopology {
             nodes: vec![NumaNodeConfig {
@@ -4328,6 +4473,96 @@ pub mod tests {
                 value: 10,
             }],
         }
+    }
+
+    #[test]
+    fn vmm_boundary_rejects_empty_numa_topology() {
+        let mut vm_resources = VmResources::default();
+        vm_resources.numa_topology = Some(NumaTopology {
+            nodes: Vec::new(),
+            distances: Vec::new(),
+        });
+
+        assert!(matches!(
+            validate_vmm_numa_topology(&vm_resources, 128),
+            Err(StartMicrovmError::InvalidNumaTopology(_))
+        ));
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn vmm_boundary_rejects_multi_node_numa_topology() {
+        let mut vm_resources = VmResources::default();
+        let node = one_node_numa_topology(HostMemoryPolicy::Inherit).nodes[0].clone();
+        vm_resources.numa_topology = Some(NumaTopology {
+            nodes: vec![
+                node.clone(),
+                NumaNodeConfig {
+                    guest_node_id: 1,
+                    ..node
+                },
+            ],
+            distances: vec![
+                NumaDistance {
+                    from: 0,
+                    to: 0,
+                    value: 10,
+                },
+                NumaDistance {
+                    from: 0,
+                    to: 1,
+                    value: 20,
+                },
+                NumaDistance {
+                    from: 1,
+                    to: 0,
+                    value: 20,
+                },
+                NumaDistance {
+                    from: 1,
+                    to: 1,
+                    value: 10,
+                },
+            ],
+        });
+
+        assert!(matches!(
+            validate_vmm_numa_topology(&vm_resources, 128),
+            Err(StartMicrovmError::InvalidNumaTopology(_))
+        ));
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn vmm_boundary_accepts_consistent_inherited_topology() {
+        let mut vm_resources = VmResources::default();
+        vm_resources.numa_topology = Some(one_node_numa_topology(HostMemoryPolicy::Inherit));
+
+        validate_vmm_numa_topology(&vm_resources, 128).unwrap();
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn vmm_boundary_rejects_memory_argument_that_disagrees_with_resources() {
+        let mut vm_resources = VmResources::default();
+        vm_resources.numa_topology = Some(one_node_numa_topology(HostMemoryPolicy::Inherit));
+
+        assert!(matches!(
+            validate_vmm_numa_topology(&vm_resources, 256),
+            Err(StartMicrovmError::InvalidNumaTopology(_))
+        ));
+    }
+
+    #[cfg(feature = "tee")]
+    #[test]
+    fn vmm_boundary_rejects_numa_topology_with_tee_memory() {
+        let mut vm_resources = VmResources::default();
+        vm_resources.numa_topology = Some(one_node_numa_topology(HostMemoryPolicy::Inherit));
+
+        assert!(matches!(
+            validate_vmm_numa_topology(&vm_resources, 128),
+            Err(StartMicrovmError::InvalidNumaTopology(_))
+        ));
     }
 
     #[cfg(all(not(feature = "tee"), any(target_os = "linux", target_os = "windows")))]
