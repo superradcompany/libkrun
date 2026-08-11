@@ -27,6 +27,8 @@ use crate::backends::net::NetBackend;
 #[cfg(not(target_os = "windows"))]
 use crate::backends::vsock::VsockDatagramPortBackend;
 use crate::backends::vsock::VsockPortBackend;
+#[cfg(feature = "net")]
+use devices::virtio::net::rate_limit::{RateLimiterConfig, RateLimiters};
 
 //--------------------------------------------------------------------------------------------------
 // Types: Machine Builder
@@ -200,11 +202,19 @@ pub enum FsConfig {
 /// ```
 #[cfg(feature = "net")]
 pub struct NetBuilder {
-    pub(crate) configs: Vec<NetConfig>,
+    pub(crate) configs: Vec<ConfiguredNet>,
     current_mac: Option<[u8; 6]>,
+    current_rate_limiters: RateLimiters,
 }
 
 /// Configuration for a single network device.
+#[cfg(feature = "net")]
+pub(crate) struct ConfiguredNet {
+    pub(crate) backend: NetConfig,
+    pub(crate) rate_limiters: RateLimiters,
+}
+
+/// Backend configuration for a single network device.
 #[cfg(feature = "net")]
 pub enum NetConfig {
     /// Unixgram backend from a pre-opened fd.
@@ -765,6 +775,7 @@ impl NetBuilder {
         Self {
             configs: Vec::new(),
             current_mac: None,
+            current_rate_limiters: RateLimiters::default(),
         }
     }
 
@@ -774,11 +785,23 @@ impl NetBuilder {
         self
     }
 
+    /// Limit frames received by the guest on the next network device.
+    pub fn rx_rate_limiter(mut self, config: RateLimiterConfig) -> Self {
+        self.current_rate_limiters.rx = Some(config);
+        self
+    }
+
+    /// Limit frames transmitted by the guest on the next network device.
+    pub fn tx_rate_limiter(mut self, config: RateLimiterConfig) -> Self {
+        self.current_rate_limiters.tx = Some(config);
+        self
+    }
+
     /// Attach a unixgram network backend from a pre-opened fd.
     #[cfg(unix)]
     pub fn unixgram(mut self, fd: OwnedFd) -> Self {
         let mac = self.current_mac.take();
-        self.configs.push(NetConfig::UnixgramFd { mac, fd });
+        self.push_config(NetConfig::UnixgramFd { mac, fd });
         self
     }
 
@@ -786,7 +809,7 @@ impl NetBuilder {
     #[cfg(unix)]
     pub fn unixgram_path(mut self, path: impl AsRef<Path>, send_vfkit_magic: bool) -> Self {
         let mac = self.current_mac.take();
-        self.configs.push(NetConfig::UnixgramPath {
+        self.push_config(NetConfig::UnixgramPath {
             mac,
             path: path.as_ref().to_path_buf(),
             send_vfkit_magic,
@@ -798,7 +821,7 @@ impl NetBuilder {
     #[cfg(unix)]
     pub fn unixstream(mut self, fd: OwnedFd) -> Self {
         let mac = self.current_mac.take();
-        self.configs.push(NetConfig::UnixstreamFd { mac, fd });
+        self.push_config(NetConfig::UnixstreamFd { mac, fd });
         self
     }
 
@@ -806,7 +829,7 @@ impl NetBuilder {
     #[cfg(unix)]
     pub fn unixstream_path(mut self, path: impl AsRef<Path>) -> Self {
         let mac = self.current_mac.take();
-        self.configs.push(NetConfig::UnixstreamPath {
+        self.push_config(NetConfig::UnixstreamPath {
             mac,
             path: path.as_ref().to_path_buf(),
         });
@@ -817,7 +840,7 @@ impl NetBuilder {
     #[cfg(target_os = "linux")]
     pub fn tap(mut self, name: impl Into<String>) -> Self {
         let mac = self.current_mac.take();
-        self.configs.push(NetConfig::Tap {
+        self.push_config(NetConfig::Tap {
             mac,
             name: name.into(),
         });
@@ -828,7 +851,7 @@ impl NetBuilder {
     #[cfg(windows)]
     pub fn named_pipe(mut self, name: impl Into<String>) -> Self {
         let mac = self.current_mac.take();
-        self.configs.push(NetConfig::NamedPipe {
+        self.push_config(NetConfig::NamedPipe {
             mac,
             name: name.into(),
         });
@@ -838,8 +861,16 @@ impl NetBuilder {
     /// Use a custom network backend.
     pub fn custom(mut self, backend: Box<dyn NetBackend + Send>) -> Self {
         let mac = self.current_mac.take();
-        self.configs.push(NetConfig::Custom { mac, backend });
+        self.push_config(NetConfig::Custom { mac, backend });
         self
+    }
+
+    fn push_config(&mut self, backend: NetConfig) {
+        let rate_limiters = std::mem::take(&mut self.current_rate_limiters);
+        self.configs.push(ConfiguredNet {
+            backend,
+            rate_limiters,
+        });
     }
 }
 
@@ -1250,6 +1281,38 @@ mod tests {
         assert!(MachineBuilder::new().msb_metrics);
         assert!(!MachineBuilder::new().msb_metrics(false).msb_metrics);
         assert!(MachineBuilder::new().msb_metrics(true).msb_metrics);
+    }
+
+    #[cfg(all(feature = "net", unix))]
+    #[test]
+    fn network_rate_limiters_apply_only_to_the_next_device() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixDatagram;
+
+        let (first, _) = UnixDatagram::pair().unwrap();
+        let (second, _) = UnixDatagram::pair().unwrap();
+        let limiter = RateLimiterConfig {
+            bandwidth: Some(devices::virtio::net::rate_limit::TokenBucketConfig {
+                size: 1_048_576,
+                refill_time: Duration::from_secs(1),
+                one_time_burst: 524_288,
+            }),
+            ops: Some(devices::virtio::net::rate_limit::TokenBucketConfig {
+                size: 1_000,
+                refill_time: Duration::from_secs(1),
+                one_time_burst: 0,
+            }),
+        };
+
+        let builder = NetBuilder::new()
+            .rx_rate_limiter(limiter.clone())
+            .tx_rate_limiter(limiter.clone())
+            .unixgram(OwnedFd::from(first))
+            .unixgram(OwnedFd::from(second));
+
+        assert_eq!(builder.configs[0].rate_limiters.rx, Some(limiter.clone()));
+        assert_eq!(builder.configs[0].rate_limiters.tx, Some(limiter));
+        assert!(builder.configs[1].rate_limiters.is_empty());
     }
 
     #[cfg(target_os = "windows")]

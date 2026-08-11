@@ -21,9 +21,9 @@ use super::builders::DiskBuilder;
 use super::builders::FsBuilder;
 #[cfg(not(feature = "tee"))]
 use super::builders::FsConfig;
-use super::builders::{ConsoleBuilder, ExecBuilder, KernelBuilder, MachineBuilder};
 #[cfg(feature = "net")]
-use super::builders::{NetBuilder, NetConfig};
+use super::builders::{ConfiguredNet, NetBuilder, NetConfig};
+use super::builders::{ConsoleBuilder, ExecBuilder, KernelBuilder, MachineBuilder};
 use super::builders::{VsockBuilder, VsockRoute};
 
 use super::error::{BuildError, ConfigError, Error, Result};
@@ -657,6 +657,10 @@ impl VmBuilder {
         // Apply network configuration
         #[cfg(feature = "net")]
         for (i, config) in self.net.configs.into_iter().enumerate() {
+            let ConfiguredNet {
+                backend: config,
+                rate_limiters,
+            } = config;
             let (mac, backend) = match config {
                 #[cfg(unix)]
                 NetConfig::UnixgramFd { mac, fd } => {
@@ -691,6 +695,7 @@ impl VmBuilder {
                 backend,
                 mac,
                 features: 0,
+                rate_limiters,
             };
 
             vmr.net
