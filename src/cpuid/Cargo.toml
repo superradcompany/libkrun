@@ -1,6 +1,6 @@
 [package]
 name = "msb_krun_cpuid"
-version = "0.1.29"
+version = "0.1.30"
 authors = ["Amazon Firecracker team <firecracker-devel@amazon.com>"]
 edition = "2021"
 license = "Apache-2.0 AND BSD-3-Clause"
