@@ -305,22 +305,94 @@ mod tests {
     }
 
     #[test]
-    fn oversized_frame_passes_once_then_repays_debt() {
+    fn oversized_frame_from_partial_balance_repays_exact_debt() {
         let start = Instant::now();
         let mut limiter = RateLimiter::new(&config((1_000, 0), 10), start).unwrap();
 
-        assert_eq!(limiter.try_consume_frame(1_500, start), Ok(()));
+        assert_eq!(limiter.try_consume_frame(600, start), Ok(()));
+        assert_eq!(limiter.try_consume_frame(2_500, start), Ok(()));
         assert_eq!(
-            limiter.try_consume_frame(1, start + Duration::from_millis(499)),
-            Err(start + Duration::from_millis(500))
+            limiter.try_consume_frame(1, start + Duration::from_millis(2_099)),
+            Err(start + Duration::from_millis(2_100))
         );
         assert_eq!(
-            limiter.try_consume_frame(1, start + Duration::from_millis(500)),
-            Err(start + Duration::from_millis(501))
+            limiter.try_consume_frame(1_000, start + Duration::from_millis(2_100)),
+            Err(start + Duration::from_millis(3_100))
         );
         assert_eq!(
-            limiter.try_consume_frame(1, start + Duration::from_millis(501)),
+            limiter.try_consume_frame(1_000, start + Duration::from_millis(3_100)),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn fractional_refill_progress_carries_between_attempts() {
+        let start = Instant::now();
+        let config = RateLimiterConfig {
+            bandwidth: Some(TokenBucketConfig {
+                size: 3,
+                refill_time: Duration::from_secs(1),
+                one_time_burst: 0,
+            }),
+            ops: None,
+        };
+        let mut limiter = RateLimiter::new(&config, start).unwrap();
+
+        assert_eq!(limiter.try_consume_frame(3, start), Ok(()));
+        assert_eq!(
+            limiter.try_consume_frame(1, start + Duration::from_millis(333)),
+            Err(start + Duration::from_nanos(333_333_334))
+        );
+        assert_eq!(
+            limiter.try_consume_frame(1, start + Duration::from_millis(334)),
+            Ok(())
+        );
+        assert_eq!(
+            limiter.try_consume_frame(1, start + Duration::from_millis(667)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn one_time_burst_is_spent_once_and_never_refills() {
+        let start = Instant::now();
+        let config = RateLimiterConfig {
+            bandwidth: Some(TokenBucketConfig {
+                size: 10,
+                refill_time: Duration::from_secs(1),
+                one_time_burst: 5,
+            }),
+            ops: None,
+        };
+        let mut limiter = RateLimiter::new(&config, start).unwrap();
+
+        assert_eq!(limiter.try_consume_frame(15, start), Ok(()));
+        let later = start + Duration::from_secs(60);
+        assert_eq!(limiter.try_consume_frame(10, later), Ok(()));
+        assert_eq!(
+            limiter.try_consume_frame(1, later),
+            Err(later + Duration::from_millis(100))
+        );
+    }
+
+    #[test]
+    fn full_bucket_does_not_bank_idle_refill() {
+        let start = Instant::now();
+        let config = RateLimiterConfig {
+            bandwidth: Some(TokenBucketConfig {
+                size: 1,
+                refill_time: Duration::from_secs(1),
+                one_time_burst: 0,
+            }),
+            ops: None,
+        };
+        let mut limiter = RateLimiter::new(&config, start).unwrap();
+        let idle = start + Duration::from_millis(1_999);
+
+        assert_eq!(limiter.try_consume_frame(1, idle), Ok(()));
+        assert_eq!(
+            limiter.try_consume_frame(1, idle + Duration::from_millis(1)),
+            Err(idle + Duration::from_secs(1))
         );
     }
 
