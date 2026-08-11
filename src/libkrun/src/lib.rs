@@ -8,6 +8,8 @@ use devices::virtio::block::{ImageType, SyncMode};
 use devices::virtio::gpu::display::DisplayInfo;
 #[cfg(feature = "net")]
 use devices::virtio::net::device::VirtioNetBackend;
+#[cfg(feature = "net")]
+use devices::virtio::net::rate_limit::RateLimiters;
 #[cfg(feature = "blk")]
 use devices::virtio::CacheType;
 use env_logger::{Env, Target};
@@ -2120,6 +2122,7 @@ fn create_virtio_net(
         backend,
         mac,
         features,
+        rate_limiters: RateLimiters::default(),
     };
     ctx_cfg.net_index += 1;
     ctx_cfg
