@@ -2675,7 +2675,7 @@ pub fn create_guest_memory(
 
 fn validate_vmm_numa_topology(
     vm_resources: &VmResources,
-    requested_memory_mib: usize,
+    _requested_memory_mib: usize,
 ) -> Result<(), StartMicrovmError> {
     if vm_resources.numa_topology.is_none() {
         return Ok(());
@@ -2707,9 +2707,9 @@ fn validate_vmm_numa_topology(
         let max_memory_mib = vm_config.max_mem_size_mib.unwrap_or(boot_memory_mib);
         let node = &topology.nodes[0];
 
-        if requested_memory_mib != boot_memory_mib {
+        if _requested_memory_mib != boot_memory_mib {
             return Err(StartMicrovmError::InvalidNumaTopology(format!(
-                "guest-memory request is {requested_memory_mib} MiB, expected {boot_memory_mib} MiB from VmResources"
+                "guest-memory request is {_requested_memory_mib} MiB, expected {boot_memory_mib} MiB from VmResources"
             )));
         }
 
