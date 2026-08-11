@@ -16,6 +16,7 @@ pub mod backend;
 pub mod device;
 #[cfg(windows)]
 pub mod namedpipe;
+pub mod rate_limit;
 #[cfg(target_os = "linux")]
 mod tap;
 #[cfg(unix)]
@@ -41,6 +42,10 @@ pub use self::device::Net;
 pub enum Error {
     /// EventFd error.
     EventFd(io::Error),
+    /// Invalid receive rate limiter.
+    InvalidRxRateLimiter(rate_limit::RateLimiterConfigError),
+    /// Invalid transmit rate limiter.
+    InvalidTxRateLimiter(rate_limit::RateLimiterConfigError),
 }
 
 pub type Result<T> = result::Result<T, Error>;

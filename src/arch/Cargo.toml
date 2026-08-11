@@ -1,6 +1,6 @@
 [package]
 name = "msb_krun_arch"
-version = "0.1.28"
+version = "0.1.29"
 authors = ["The Chromium OS Authors"]
 edition = "2021"
 license = "Apache-2.0 AND BSD-3-Clause"
@@ -17,9 +17,9 @@ efi = []
 libc = ">=0.2.39"
 vm-memory = { package = "msb-vm-memory", version = "=0.18.0-msb.1", default-features = false, features = ["backend-mmap"] }
 
-arch_gen = { package = "msb_krun_arch_gen", version = "0.1.28", path = "../arch_gen" }
-smbios = { package = "msb_krun_smbios", version = "0.1.28", path = "../smbios" }
-utils = { package = "msb_krun_utils", version = "0.1.28", path = "../utils" }
+arch_gen = { package = "msb_krun_arch_gen", version = "0.1.29", path = "../arch_gen" }
+smbios = { package = "msb_krun_smbios", version = "0.1.29", path = "../smbios" }
+utils = { package = "msb_krun_utils", version = "0.1.29", path = "../utils" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 kvm-bindings = { version = ">=0.11", features = ["fam-wrappers"] }
@@ -27,4 +27,4 @@ kvm-ioctls = ">=0.21"
 tdx = { version = "0.1.0", optional = true }
 
 [dev-dependencies]
-utils = { package = "msb_krun_utils", version = "0.1.28", path = "../utils" }
+utils = { package = "msb_krun_utils", version = "0.1.29", path = "../utils" }

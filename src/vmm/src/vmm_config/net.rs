@@ -7,6 +7,7 @@ use std::result;
 use std::sync::{Arc, Mutex};
 
 use devices::virtio::net::device::VirtioNetBackend;
+use devices::virtio::net::rate_limit::RateLimiters;
 use devices::virtio::Net;
 
 pub struct NetworkInterfaceConfig {
@@ -18,6 +19,8 @@ pub struct NetworkInterfaceConfig {
     pub mac: [u8; 6],
     /// virtio-net features for the network interface.
     pub features: u32,
+    /// Optional receive and transmit rate limiters.
+    pub rate_limiters: RateLimiters,
 }
 
 /// Errors associated with `NetworkInterfaceConfig`.
@@ -65,7 +68,13 @@ impl NetBuilder {
     /// Creates a Net device from a NetworkInterfaceConfig.
     pub fn create_net(cfg: NetworkInterfaceConfig) -> Result<Net> {
         // Create and return the Net device
-        Net::new(cfg.iface_id, cfg.backend, cfg.mac, cfg.features)
-            .map_err(NetworkInterfaceError::CreateNetworkDevice)
+        Net::new_with_rate_limiters(
+            cfg.iface_id,
+            cfg.backend,
+            cfg.mac,
+            cfg.features,
+            cfg.rate_limiters,
+        )
+        .map_err(NetworkInterfaceError::CreateNetworkDevice)
     }
 }

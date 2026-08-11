@@ -21,6 +21,7 @@ pub enum ConnectError {
     TunSetIff(io::Error),
     TunSetVnetHdrSz(io::Error),
     TunSetOffload(io::Error),
+    RateLimitTimer(io::Error),
 }
 
 #[allow(dead_code)]

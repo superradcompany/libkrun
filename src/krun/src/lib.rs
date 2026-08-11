@@ -65,6 +65,10 @@ pub use api::metrics::{
 pub use api::vm::Vm;
 #[cfg(not(feature = "tee"))]
 pub use api::vm::{VmControl, VmCpuState, VmMemoryState};
+#[cfg(feature = "net")]
+pub use devices::virtio::net::rate_limit::{
+    RateLimiterConfig, RateLimiterConfigError, TokenBucketConfig,
+};
 
 #[cfg(not(target_os = "windows"))]
 pub use backends::console::ConsolePortBackend;

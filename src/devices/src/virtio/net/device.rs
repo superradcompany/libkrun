@@ -14,6 +14,7 @@ use crate::virtio::{
 use crate::Error as DeviceError;
 
 use super::backend::{NetBackend, ReadError, WriteError};
+use super::rate_limit::RateLimiters;
 use super::worker::NetWorker;
 
 use std::cmp;
@@ -80,6 +81,7 @@ pub enum VirtioNetBackend {
 pub struct Net {
     id: String,
     pub cfg_backend: Option<VirtioNetBackend>,
+    rate_limiters: RateLimiters,
 
     avail_features: u64,
     acked_features: u64,
@@ -97,6 +99,28 @@ impl Net {
         mac: [u8; 6],
         features: u32,
     ) -> Result<Self> {
+        Self::new_with_rate_limiters(id, cfg_backend, mac, features, RateLimiters::default())
+    }
+
+    /// Create a virtio network device with receive and transmit rate limiters.
+    pub fn new_with_rate_limiters(
+        id: String,
+        cfg_backend: VirtioNetBackend,
+        mac: [u8; 6],
+        features: u32,
+        rate_limiters: RateLimiters,
+    ) -> Result<Self> {
+        if let Some(config) = &rate_limiters.rx {
+            config
+                .validate()
+                .map_err(super::Error::InvalidRxRateLimiter)?;
+        }
+        if let Some(config) = &rate_limiters.tx {
+            config
+                .validate()
+                .map_err(super::Error::InvalidTxRateLimiter)?;
+        }
+
         let avail_features = features as u64
             | (1 << VIRTIO_NET_F_MAC)
             | (1 << VIRTIO_RING_F_EVENT_IDX)
@@ -111,6 +135,7 @@ impl Net {
         Ok(Net {
             id,
             cfg_backend: Some(cfg_backend),
+            rate_limiters,
 
             avail_features,
             acked_features: 0u64,
@@ -188,7 +213,6 @@ impl VirtioDevice for Net {
             error!("Cannot activate net device: backend already taken");
             ActivateError::BadActivate
         })?;
-
         match NetWorker::new(
             rx_q,
             tx_q,
@@ -196,6 +220,7 @@ impl VirtioDevice for Net {
             mem.clone(),
             self.acked_features,
             cfg_backend,
+            &self.rate_limiters,
         ) {
             Ok(worker) => {
                 worker.run();
