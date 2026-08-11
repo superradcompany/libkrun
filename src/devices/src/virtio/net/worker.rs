@@ -12,6 +12,7 @@ use crate::virtio::{DeviceQueue, InterruptTransport};
 
 use super::backend::{NetBackend, ReadError, WriteError};
 use super::device::{FrontendError, RxError, TxError, VirtioNetBackend};
+use super::rate_limit::{RateLimiter, RateLimiters};
 use super::vnet_hdr_len;
 
 use std::io;
@@ -20,10 +21,12 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::thread;
+use std::time::{Duration, Instant};
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::event::{EventSource, RawEventSource};
 use utils::eventfd::EventFd;
+use utils::timerfd::TimerFd;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 #[cfg(unix)]
@@ -34,6 +37,7 @@ type Pollable = RawHandle;
 const RX_QUEUE_EVENT: u64 = 0;
 const TX_QUEUE_EVENT: u64 = 1;
 const BACKEND_EVENT: u64 = 2;
+const RATE_LIMIT_TIMER_EVENT: u64 = 3;
 
 pub struct NetWorker {
     rx_q: DeviceQueue,
@@ -46,10 +50,18 @@ pub struct NetWorker {
     rx_frame_buf: [u8; MAX_BUFFER_SIZE],
     rx_frame_buf_len: usize,
     rx_has_deferred_frame: bool,
+    rx_has_rate_limit_permit: bool,
+    rx_rate_limiter: Option<RateLimiter>,
+    rx_resume_at: Option<Instant>,
 
     tx_iovec: Vec<(GuestAddress, usize)>,
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
+    tx_has_rate_limit_permit: bool,
+    tx_rate_limiter: Option<RateLimiter>,
+    tx_resume_at: Option<Instant>,
+
+    rate_limit_timer: Option<TimerFd>,
 }
 
 impl NetWorker {
@@ -60,6 +72,7 @@ impl NetWorker {
         mem: GuestMemoryMmap,
         _vnet_features: u64,
         cfg_backend: VirtioNetBackend,
+        rate_limiters: RateLimiters,
     ) -> Result<Self, ConnectError> {
         let backend = match cfg_backend {
             #[cfg(unix)]
@@ -95,6 +108,21 @@ impl NetWorker {
             VirtioNetBackend::Custom(backend) => backend,
         };
 
+        let now = Instant::now();
+        let rx_rate_limiter = rate_limiters
+            .rx
+            .as_ref()
+            .map(|config| RateLimiter::new(config, now).expect("validated RX rate limiter"));
+        let tx_rate_limiter = rate_limiters
+            .tx
+            .as_ref()
+            .map(|config| RateLimiter::new(config, now).expect("validated TX rate limiter"));
+        let rate_limit_timer = if rate_limiters.is_empty() {
+            None
+        } else {
+            Some(TimerFd::new().map_err(ConnectError::RateLimitTimer)?)
+        };
+
         Ok(Self {
             rx_q,
             tx_q,
@@ -106,10 +134,18 @@ impl NetWorker {
             rx_frame_buf: [0u8; MAX_BUFFER_SIZE],
             rx_frame_buf_len: 0,
             rx_has_deferred_frame: false,
+            rx_has_rate_limit_permit: false,
+            rx_rate_limiter,
+            rx_resume_at: None,
 
             tx_frame_buf: [0u8; MAX_BUFFER_SIZE],
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
+            tx_has_rate_limit_permit: false,
+            tx_rate_limiter,
+            tx_resume_at: None,
+
+            rate_limit_timer,
         })
     }
 
@@ -152,6 +188,13 @@ impl NetWorker {
                 BACKEND_EVENT,
             ),
         );
+        if let Some(timer) = &self.rate_limit_timer {
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                timerfd_pollable(timer),
+                &EpollEvent::new(EventSet::IN, RATE_LIMIT_TIMER_EVENT),
+            );
+        }
 
         loop {
             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
@@ -182,6 +225,9 @@ impl NetWorker {
                                         self.process_backend_socket_writeable()
                                     }
                                 }
+                            }
+                            RATE_LIMIT_TIMER_EVENT if event_set.contains(EventSet::IN) => {
+                                self.process_rate_limit_timer_event();
                             }
                             _ => {
                                 log::warn!(
@@ -254,23 +300,37 @@ impl NetWorker {
     }
 
     fn process_rx(&mut self) -> result::Result<(), RxError> {
+        self.process_rx_at(Instant::now())
+    }
+
+    fn process_rx_at(&mut self, now: Instant) -> result::Result<(), RxError> {
+        let mut signal_queue = false;
+
         // if we have a deferred frame we try to process it first,
         // if that is not possible, we don't continue processing other frames
         if self.rx_has_deferred_frame {
+            if !self.reserve_rx_tokens(now) {
+                return Ok(());
+            }
             if self.write_frame_to_guest() {
                 self.rx_has_deferred_frame = false;
+                self.rx_has_rate_limit_permit = false;
+                signal_queue = true;
             } else {
                 return Ok(());
             }
         }
 
-        let mut signal_queue = false;
-
         // Read as many frames as possible.
         let result = loop {
             match self.read_into_rx_frame_buf_from_backend() {
                 Ok(()) => {
+                    if !self.reserve_rx_tokens(now) {
+                        self.rx_has_deferred_frame = true;
+                        break Ok(());
+                    }
                     if self.write_frame_to_guest() {
+                        self.rx_has_rate_limit_permit = false;
                         signal_queue = true;
                     } else {
                         self.rx_has_deferred_frame = true;
@@ -293,6 +353,30 @@ impl NetWorker {
         result
     }
 
+    fn reserve_rx_tokens(&mut self, now: Instant) -> bool {
+        if self.rx_has_rate_limit_permit {
+            return true;
+        }
+
+        let frame_len = self.rx_frame_buf_len.saturating_sub(vnet_hdr_len()) as u64;
+        if let Some(limiter) = &mut self.rx_rate_limiter {
+            match limiter.try_consume_frame(frame_len, now) {
+                Ok(()) => {}
+                Err(deadline) => {
+                    self.rx_resume_at = Some(deadline);
+                    self.arm_rate_limit_timer(now);
+                    return false;
+                }
+            }
+        }
+
+        self.rx_has_rate_limit_permit = true;
+        if self.rx_resume_at.take().is_some() {
+            self.arm_rate_limit_timer(now);
+        }
+        true
+    }
+
     fn process_tx_loop(&mut self) {
         loop {
             self.tx_q.queue.disable_notification(&self.mem).unwrap();
@@ -301,7 +385,8 @@ impl NetWorker {
                 log::error!("Failed to process rx: {e:?} (triggered by backend socket readable)");
             };
 
-            if !self.tx_q.queue.enable_notification(&self.mem).unwrap() {
+            let rate_limited = self.tx_resume_at.is_some();
+            if !self.tx_q.queue.enable_notification(&self.mem).unwrap() || rate_limited {
                 break;
             }
         }
@@ -321,6 +406,7 @@ impl NetWorker {
         }
 
         let mut raise_irq = false;
+        let mut rate_limit_changed = false;
 
         while let Some(head) = tx_queue.pop(&self.mem) {
             let head_index = head.index;
@@ -358,11 +444,27 @@ impl NetWorker {
 
             self.tx_frame_len = read_count;
             log::debug!("virtio-net tx descriptor: head={head_index}, bytes={read_count}");
+
+            if !self.tx_has_rate_limit_permit {
+                let frame_len = read_count.saturating_sub(vnet_hdr_len()) as u64;
+                if let Some(limiter) = &mut self.tx_rate_limiter {
+                    if let Err(deadline) = limiter.try_consume_frame(frame_len, Instant::now()) {
+                        self.tx_resume_at = Some(deadline);
+                        rate_limit_changed = true;
+                        tx_queue.undo_pop();
+                        break;
+                    }
+                }
+                self.tx_has_rate_limit_permit = true;
+                rate_limit_changed |= self.tx_resume_at.take().is_some();
+            }
+
             match self
                 .backend
                 .write_frame(vnet_hdr_len(), &mut self.tx_frame_buf[..read_count])
             {
                 Ok(()) => {
+                    self.tx_has_rate_limit_permit = false;
                     self.tx_frame_len = 0;
                     tx_queue
                         .add_used(&self.mem, head_index, 0)
@@ -374,6 +476,7 @@ impl NetWorker {
                     break;
                 }
                 Err(WriteError::PartialWrite) => {
+                    self.tx_has_rate_limit_permit = false;
                     log::trace!("process_tx: partial write");
                     /*
                     This situation should be pretty rare, assuming reasonably sized socket buffers.
@@ -404,7 +507,54 @@ impl NetWorker {
                 .map_err(TxError::DeviceError)?;
         }
 
+        if rate_limit_changed {
+            self.arm_rate_limit_timer(Instant::now());
+        }
+
         Ok(())
+    }
+
+    fn process_rate_limit_timer_event(&mut self) {
+        let Some(timer) = &self.rate_limit_timer else {
+            return;
+        };
+        if let Err(err) = timer.read() {
+            log::error!("failed to consume virtio-net rate-limit timer: {err}");
+            return;
+        }
+
+        let now = Instant::now();
+        let retry_rx = self.rx_resume_at.is_some_and(|deadline| deadline <= now);
+        let retry_tx = self.tx_resume_at.is_some_and(|deadline| deadline <= now);
+        if retry_rx {
+            self.rx_resume_at = None;
+            if let Err(err) = self.process_rx_at(now) {
+                log::error!("failed to process rate-limited RX frame: {err:?}");
+            }
+        }
+        if retry_tx {
+            self.tx_resume_at = None;
+            self.process_tx_loop();
+        }
+        self.arm_rate_limit_timer(Instant::now());
+    }
+
+    fn arm_rate_limit_timer(&mut self, now: Instant) {
+        let Some(timer) = &self.rate_limit_timer else {
+            return;
+        };
+        let deadline = self.rx_resume_at.into_iter().chain(self.tx_resume_at).min();
+        let result = match deadline {
+            Some(deadline) => timer.arm_oneshot(
+                deadline
+                    .saturating_duration_since(now)
+                    .max(Duration::from_nanos(1)),
+            ),
+            None => timer.disarm(),
+        };
+        if let Err(err) = result {
+            log::error!("failed to arm virtio-net rate-limit timer: {err}");
+        }
     }
 
     // Copies a single frame from `self.rx_frame_buf` into the guest.
@@ -492,6 +642,16 @@ fn eventfd_pollable(event: &EventFd) -> Pollable {
 #[cfg(windows)]
 fn eventfd_pollable(event: &EventFd) -> Pollable {
     event.as_raw_handle()
+}
+
+#[cfg(unix)]
+fn timerfd_pollable(timer: &TimerFd) -> Pollable {
+    timer.as_raw_fd()
+}
+
+#[cfg(windows)]
+fn timerfd_pollable(timer: &TimerFd) -> Pollable {
+    timer.as_raw_handle()
 }
 
 #[cfg(unix)]
