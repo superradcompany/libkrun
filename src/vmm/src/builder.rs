@@ -3214,6 +3214,11 @@ fn apply_linux_memory_preference(
 #[cfg(all(target_os = "linux", not(feature = "tee")))]
 fn apply_linux_inherited_memory_policy(address: *mut u8, length: usize) -> io::Result<()> {
     const MPOL_DEFAULT: libc::c_int = 0;
+    const MPOL_MF_MOVE: libc::c_int = 1 << 1;
+
+    // Payload loading may already have faulted kernel/init pages under the preference. Reset the
+    // VMA and migrate pages owned by this process so the acknowledgement describes both future
+    // faults and the small resident boot payload, not only allocations made after the barrier.
     let result = unsafe {
         libc::syscall(
             libc::SYS_mbind,
@@ -3222,7 +3227,7 @@ fn apply_linux_inherited_memory_policy(address: *mut u8, length: usize) -> io::R
             MPOL_DEFAULT,
             std::ptr::null::<libc::c_ulong>(),
             0,
-            0,
+            MPOL_MF_MOVE,
         )
     };
     if result < 0 {
