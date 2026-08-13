@@ -2578,12 +2578,8 @@ impl MemoryPlacementState {
     }
 
     fn fallback_after_partial_cpu(&mut self) {
-        if !matches!(self.result, MemoryPlacementResult::Applied) {
-            return;
-        }
-
         #[cfg(all(target_os = "linux", not(feature = "tee")))]
-        {
+        if matches!(self.result, MemoryPlacementResult::Applied) {
             let mut failures = Vec::new();
             for &(address, length) in &self.managed_ranges {
                 if let Err(error) = apply_linux_inherited_memory_policy(address as *mut u8, length)
@@ -2605,6 +2601,9 @@ impl MemoryPlacementState {
                 }
             };
         }
+
+        #[cfg(not(all(target_os = "linux", not(feature = "tee"))))]
+        let _ = self;
     }
 }
 

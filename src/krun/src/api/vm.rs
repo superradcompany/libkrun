@@ -19,7 +19,6 @@ use devices::virtio::vsock::VsockPortBackend;
 use log::error;
 use polly::event_manager::EventManager;
 use utils::eventfd::EventFd;
-use vmm::resources::PlacementReport;
 #[cfg(not(target_os = "windows"))]
 use vmm::resources::TsiFlags;
 use vmm::resources::VmResources;
@@ -28,6 +27,7 @@ use vmm::vmm_config::kernel_bundle::KernelBundle;
 use vmm::vmm_config::kernel_cmdline::KernelCmdlineConfig;
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 
+use super::builders::PlacementObserver;
 use super::error::{BuildError, Error, Result, RuntimeError};
 use super::exit_handle::ExitHandle;
 use super::metrics::MetricsHandle;
@@ -57,7 +57,7 @@ pub struct Vm {
     initramfs_path: Option<PathBuf>,
     init_path: Option<String>,
     exit_observers: Vec<Box<dyn Fn(i32) + Send + 'static>>,
-    placement_observer: Option<Box<dyn FnOnce(&PlacementReport) + Send + 'static>>,
+    placement_observer: Option<PlacementObserver>,
     /// Pre-created exit event fd for triggering VM shutdown.
     exit_evt: EventFd,
     /// Shared exit code — written by the VMM, readable by exit observers.
@@ -151,7 +151,7 @@ impl Vm {
         initramfs_path: Option<PathBuf>,
         init_path: Option<String>,
         exit_observers: Vec<Box<dyn Fn(i32) + Send + 'static>>,
-        placement_observer: Option<Box<dyn FnOnce(&PlacementReport) + Send + 'static>>,
+        placement_observer: Option<PlacementObserver>,
         exit_evt: EventFd,
         exit_code: Arc<AtomicI32>,
         #[cfg(not(target_os = "windows"))] enable_inet_hijack: bool,

@@ -14,6 +14,8 @@ pub use vmm::resources::{
 };
 pub use vmm::vmm_config::machine_config::HostCpuId;
 
+pub(crate) type PlacementObserver = Box<dyn FnOnce(&PlacementReport) + Send + 'static>;
+
 #[cfg(feature = "blk")]
 pub use devices::virtio::block::WritebackLimit;
 

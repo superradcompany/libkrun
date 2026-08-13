@@ -25,6 +25,7 @@ use super::builders::FsBuilder;
 use super::builders::FsConfig;
 #[cfg(not(feature = "tee"))]
 use super::builders::HostMemoryPolicy;
+use super::builders::PlacementObserver;
 use super::builders::PlacementReport;
 #[cfg(feature = "net")]
 use super::builders::{ConfiguredNet, NetBuilder, NetConfig};
@@ -95,7 +96,7 @@ pub struct VmBuilder {
     #[cfg(feature = "blk")]
     disk: DiskBuilder,
     exit_observers: Vec<Box<dyn Fn(i32) + Send + 'static>>,
-    placement_observer: Option<Box<dyn FnOnce(&PlacementReport) + Send + 'static>>,
+    placement_observer: Option<PlacementObserver>,
 }
 
 //--------------------------------------------------------------------------------------------------
