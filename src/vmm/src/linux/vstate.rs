@@ -1970,7 +1970,6 @@ enum VcpuEmulation {
 
 #[cfg(test)]
 mod tests {
-    use crossbeam_channel::unbounded;
     use std::sync::{Arc, Barrier};
 
     use super::*;
