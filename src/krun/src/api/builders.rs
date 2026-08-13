@@ -8,8 +8,13 @@ use devices::virtio::console::port_io::{
     ConsolePortBackend, ConsolePortBackendInputAdapter, ConsolePortBackendOutputAdapter,
 };
 use vmm::resources::PortConfig;
-pub use vmm::resources::{HostMemoryPolicy, NumaDistance, NumaNodeConfig, NumaTopology};
+pub use vmm::resources::{
+    HostMemoryPolicy, MemoryPlacementResult, NumaDistance, NumaNodeConfig, NumaTopology,
+    PlacementReport, VcpuPlacementResult,
+};
 pub use vmm::vmm_config::machine_config::HostCpuId;
+
+pub(crate) type PlacementObserver = Box<dyn FnOnce(&PlacementReport) + Send + 'static>;
 
 #[cfg(feature = "blk")]
 pub use devices::virtio::block::WritebackLimit;
@@ -64,6 +69,7 @@ pub struct MachineBuilder {
     pub(crate) msb_metrics: bool,
     pub(crate) enable_inet_hijack: bool,
     pub(crate) vcpu_affinity: Option<Vec<HostCpuId>>,
+    pub(crate) vcpu_affinity_required: bool,
     pub(crate) numa_topology: Option<NumaTopology>,
 }
 
@@ -460,6 +466,7 @@ impl MachineBuilder {
             msb_metrics: true,
             enable_inet_hijack: false,
             vcpu_affinity: None,
+            vcpu_affinity_required: true,
             numa_topology: None,
         }
     }
@@ -493,6 +500,17 @@ impl MachineBuilder {
     /// with [`max_vcpus`](Self::max_vcpus). This is supported on Linux and Windows hosts.
     pub fn vcpu_affinity(mut self, affinity: Vec<HostCpuId>) -> Self {
         self.vcpu_affinity = Some(affinity);
+        self.vcpu_affinity_required = true;
+        self
+    }
+
+    /// Prefer to pin each possible vCPU thread to one resolved host logical processor.
+    ///
+    /// The map has the same shape as [`vcpu_affinity`](Self::vcpu_affinity), but an operating
+    /// system rejection is treated as a placement fallback instead of a VM-start failure.
+    pub fn try_vcpu_affinity(mut self, affinity: Vec<HostCpuId>) -> Self {
+        self.vcpu_affinity = Some(affinity);
+        self.vcpu_affinity_required = false;
         self
     }
 
@@ -725,6 +743,15 @@ impl NumaNodeBuilder {
     /// Bind future Linux page faults to the selected absolute host NUMA node IDs.
     pub fn bind_host_nodes(mut self, nodes: impl IntoIterator<Item = u32>) -> Self {
         self.host_memory = HostMemoryPolicy::Bind {
+            host_nodes: nodes.into_iter().collect(),
+        };
+        self
+    }
+
+    /// Prefer Linux page faults on the selected host NUMA nodes without making VM startup depend
+    /// on the kernel accepting the binding.
+    pub fn prefer_host_nodes(mut self, nodes: impl IntoIterator<Item = u32>) -> Self {
+        self.host_memory = HostMemoryPolicy::PreferredMany {
             host_nodes: nodes.into_iter().collect(),
         };
         self
@@ -1464,6 +1491,29 @@ mod tests {
             .vcpu_affinity(affinity.clone());
 
         assert_eq!(builder.vcpu_affinity, Some(affinity));
+        assert!(builder.vcpu_affinity_required);
+    }
+
+    #[test]
+    fn machine_builder_records_best_effort_vcpu_affinity() {
+        let affinity = vec![HostCpuId::new(2), HostCpuId::new(6)];
+        let builder = MachineBuilder::new()
+            .vcpus(2)
+            .try_vcpu_affinity(affinity.clone());
+
+        assert_eq!(builder.vcpu_affinity, Some(affinity));
+        assert!(!builder.vcpu_affinity_required);
+    }
+
+    #[test]
+    fn numa_node_builder_records_best_effort_linux_memory_policy() {
+        let linux = NumaNodeBuilder::new().prefer_host_nodes([2, 3]);
+        assert_eq!(
+            linux.host_memory,
+            HostMemoryPolicy::PreferredMany {
+                host_nodes: vec![2, 3]
+            }
+        );
     }
 
     #[test]

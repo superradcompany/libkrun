@@ -63,6 +63,7 @@ use crate::device_manager::mmio::MMIODeviceManager;
 use crate::vstate::VcpuEvent;
 use crate::vstate::{Vcpu, VcpuHandle, VcpuResponse, Vm};
 
+use crate::resources::VcpuPlacementResult;
 use arch::{ArchMemoryInfo, InitrdConfig};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use crossbeam_channel::Sender;
@@ -246,8 +247,23 @@ impl Vmm {
     }
 
     /// Starts the microVM vcpus.
-    pub fn start_vcpus(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
+    pub fn start_vcpus(&mut self, vcpus: Vec<Vcpu>) -> Result<()> {
+        self.start_vcpus_paused(vcpus)?;
+
+        // The vcpus start off in the `Paused` state, let them run.
+        self.resume_vcpus()?;
+
+        Ok(())
+    }
+
+    /// Starts every vCPU thread and applies host affinity, but keeps the guest paused.
+    ///
+    /// The returned report is a barrier: every entry describes the effective affinity before any
+    /// guest instruction can execute. Callers may reconcile cooperative reservations and then call
+    /// [`resume_vcpus`](Self::resume_vcpus).
+    pub fn start_vcpus_paused(&mut self, mut vcpus: Vec<Vcpu>) -> Result<Vec<VcpuPlacementResult>> {
         let vcpu_count = vcpus.len();
+        let mut placement = Vec::with_capacity(vcpu_count);
 
         Vcpu::register_kick_signal_handler();
 
@@ -256,14 +272,26 @@ impl Vmm {
         for mut vcpu in vcpus.drain(..) {
             vcpu.set_mmio_bus(self.mmio_device_manager.bus.clone());
 
-            self.vcpus_handles
-                .push(vcpu.start_threaded().map_err(Error::VcpuHandle)?);
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            {
+                let (handle, result) = vcpu.start_threaded().map_err(Error::VcpuHandle)?;
+                self.vcpus_handles.push(handle);
+                placement.push(result);
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let vcpu_index = vcpu.cpu_index();
+                self.vcpus_handles
+                    .push(vcpu.start_threaded().map_err(Error::VcpuHandle)?);
+                placement.push(VcpuPlacementResult::Inherited {
+                    vcpu_index,
+                    requested_host_cpu: None,
+                    reason: None,
+                });
+            }
         }
 
-        // The vcpus start off in the `Paused` state, let them run.
-        self.resume_vcpus()?;
-
-        Ok(())
+        Ok(placement)
     }
 
     /// Sends a resume command to the vcpus.

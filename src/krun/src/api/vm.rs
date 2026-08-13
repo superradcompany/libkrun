@@ -27,6 +27,7 @@ use vmm::vmm_config::kernel_bundle::KernelBundle;
 use vmm::vmm_config::kernel_cmdline::KernelCmdlineConfig;
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 
+use super::builders::PlacementObserver;
 use super::error::{BuildError, Error, Result, RuntimeError};
 use super::exit_handle::ExitHandle;
 use super::metrics::MetricsHandle;
@@ -56,6 +57,7 @@ pub struct Vm {
     initramfs_path: Option<PathBuf>,
     init_path: Option<String>,
     exit_observers: Vec<Box<dyn Fn(i32) + Send + 'static>>,
+    placement_observer: Option<PlacementObserver>,
     /// Pre-created exit event fd for triggering VM shutdown.
     exit_evt: EventFd,
     /// Shared exit code — written by the VMM, readable by exit observers.
@@ -149,6 +151,7 @@ impl Vm {
         initramfs_path: Option<PathBuf>,
         init_path: Option<String>,
         exit_observers: Vec<Box<dyn Fn(i32) + Send + 'static>>,
+        placement_observer: Option<PlacementObserver>,
         exit_evt: EventFd,
         exit_code: Arc<AtomicI32>,
         #[cfg(not(target_os = "windows"))] enable_inet_hijack: bool,
@@ -173,6 +176,7 @@ impl Vm {
             initramfs_path,
             init_path,
             exit_observers,
+            placement_observer,
             exit_evt,
             exit_code,
             #[cfg(not(target_os = "windows"))]
@@ -298,7 +302,7 @@ impl Vm {
         // Build the microVM
         let (sender, _receiver) = unbounded();
 
-        let _vmm = vmm::builder::build_microvm(
+        let (_vmm, placement_report) = vmm::builder::build_microvm_paused(
             &mut self.vmr,
             &mut event_manager,
             shutdown_efd,
@@ -308,6 +312,17 @@ impl Vm {
         )
         .map_err(|e| Error::Build(BuildError::Start(format!("build_microvm: {e:?}"))))?;
         trace.mark("build_microvm.ready");
+
+        if let Some(observer) = self.placement_observer.take() {
+            observer(&placement_report);
+        }
+        trace.mark("placement.reconciled");
+
+        _vmm.lock()
+            .expect("Poisoned VMM mutex")
+            .resume_vcpus()
+            .map_err(|e| Error::Build(BuildError::Start(format!("resume_vcpus: {e:?}"))))?;
+        trace.mark("vcpus.resumed");
 
         // Register user exit observers
         {
@@ -680,6 +695,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
             EventFd::new(EFD_NONBLOCK).unwrap(),
             Arc::new(AtomicI32::new(i32::MAX)),
             #[cfg(not(target_os = "windows"))]
@@ -708,6 +724,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
             EventFd::new(EFD_NONBLOCK).unwrap(),
             Arc::new(AtomicI32::new(i32::MAX)),
             enable_inet_hijack,

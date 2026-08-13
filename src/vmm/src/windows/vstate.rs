@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use crate::vmm_config::machine_config::{CpuFeaturesTemplate, HostCpuId};
 
+use crate::resources::VcpuPlacementResult;
 use arch::ArchMemoryInfo;
 #[cfg(target_arch = "x86_64")]
 use crossbeam_channel::RecvTimeoutError;
@@ -438,6 +439,7 @@ pub struct VcpuConfig {
 pub struct Vcpu {
     id: u8,
     host_cpu: Option<HostCpuId>,
+    host_cpu_required: bool,
     partition_handle: WHV_PARTITION_HANDLE,
     guest_mem: Option<GuestMemoryMmap>,
     mmio_bus: Option<devices::Bus>,
@@ -595,9 +597,9 @@ pub enum VcpuResponse {
 pub struct VcpuHandle {
     id: u8,
     partition_handle: WHV_PARTITION_HANDLE,
-    event_sender: Sender<VcpuEvent>,
+    event_sender: Option<Sender<VcpuEvent>>,
     response_receiver: Receiver<VcpuResponse>,
-    _vcpu_thread: thread::JoinHandle<()>,
+    vcpu_thread: Option<thread::JoinHandle<()>>,
 }
 
 #[derive(Default)]
@@ -857,6 +859,7 @@ impl Vcpu {
         Ok(Self {
             id,
             host_cpu: None,
+            host_cpu_required: true,
             partition_handle,
             guest_mem: None,
             mmio_bus: None,
@@ -878,8 +881,9 @@ impl Vcpu {
     }
 
     /// Selects the host processor group and logical processor for this vCPU thread.
-    pub(crate) fn set_host_cpu(&mut self, host_cpu: HostCpuId) {
+    pub(crate) fn set_host_cpu(&mut self, host_cpu: HostCpuId, required: bool) {
         self.host_cpu = Some(host_cpu);
+        self.host_cpu_required = required;
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -914,7 +918,7 @@ impl Vcpu {
         self.configure_x86_64(guest_mem, entry_addr)
     }
 
-    pub fn start_threaded(mut self) -> Result<VcpuHandle> {
+    pub fn start_threaded(mut self) -> Result<(VcpuHandle, VcpuPlacementResult)> {
         let event_sender = self
             .event_sender
             .take()
@@ -934,6 +938,7 @@ impl Vcpu {
 
         let id = self.id;
         let host_cpu = self.host_cpu;
+        let host_cpu_required = self.host_cpu_required;
         let partition_handle = self.partition_handle;
         let guest_mem = self
             .guest_mem
@@ -952,7 +957,7 @@ impl Vcpu {
         let vcpu_thread = thread::Builder::new()
             .name(format!("whp-vcpu-{id}"))
             .spawn(move || {
-                let init_result = apply_host_cpu_affinity(host_cpu);
+                let init_result = apply_host_cpu_affinity(host_cpu, host_cpu_required, id);
                 let initialized = init_result.is_ok();
                 init_sender
                     .send(init_result)
@@ -991,16 +996,19 @@ impl Vcpu {
 
         // Affinity is part of VM correctness: fail construction before any vCPU can execute if
         // Windows rejects a processor-group coordinate or the inherited host constraints.
-        init_receiver
+        let placement = init_receiver
             .recv()
             .expect("error waiting for WHP vCPU initialization")?;
 
-        Ok(VcpuHandle::new(
-            id,
-            partition_handle,
-            event_sender,
-            response_receiver,
-            vcpu_thread,
+        Ok((
+            VcpuHandle::new(
+                id,
+                partition_handle,
+                event_sender,
+                response_receiver,
+                vcpu_thread,
+            ),
+            placement,
         ))
     }
 
@@ -1111,10 +1119,39 @@ impl Vcpu {
 // Functions: Host CPU Affinity
 //--------------------------------------------------------------------------------------------------
 
-fn apply_host_cpu_affinity(host_cpu: Option<HostCpuId>) -> Result<()> {
+fn apply_host_cpu_affinity(
+    host_cpu: Option<HostCpuId>,
+    required: bool,
+    vcpu_id: u8,
+) -> Result<VcpuPlacementResult> {
     let Some(host_cpu) = host_cpu else {
-        return Ok(());
+        return Ok(VcpuPlacementResult::Inherited {
+            vcpu_index: vcpu_id,
+            requested_host_cpu: None,
+            reason: None,
+        });
     };
+    if let Err(error) = apply_required_host_cpu_affinity(host_cpu) {
+        if required {
+            return Err(error);
+        }
+        let reason = error.to_string();
+        warn!(
+            "WHP vCPU {vcpu_id} host affinity unavailable; continuing with scheduler placement: {error}"
+        );
+        return Ok(VcpuPlacementResult::Inherited {
+            vcpu_index: vcpu_id,
+            requested_host_cpu: Some(host_cpu),
+            reason: Some(reason),
+        });
+    }
+    Ok(VcpuPlacementResult::Pinned {
+        vcpu_index: vcpu_id,
+        host_cpu,
+    })
+}
+
+fn apply_required_host_cpu_affinity(host_cpu: HostCpuId) -> Result<()> {
     let affinity = group_affinity(host_cpu).map_err(Error::VcpuAffinity)?;
 
     // SAFETY: the pseudo-handle refers to this vCPU thread, `affinity` is initialized and remains
@@ -1159,15 +1196,17 @@ impl VcpuHandle {
         Self {
             id,
             partition_handle,
-            event_sender,
+            event_sender: Some(event_sender),
             response_receiver,
-            _vcpu_thread: vcpu_thread,
+            vcpu_thread: Some(vcpu_thread),
         }
     }
 
     pub fn send_event(&self, event: VcpuEvent) -> Result<()> {
         let should_cancel = matches!(event, VcpuEvent::Pause);
         self.event_sender
+            .as_ref()
+            .expect("vCPU event sender missing before handle drop")
             .send(event)
             .expect("event sender channel closed on vcpu end.");
         if should_cancel {
@@ -1186,6 +1225,13 @@ impl Drop for VcpuHandle {
         if self.partition_handle != 0 {
             if let Err(err) = cancel_run_virtual_processor(self.partition_handle, self.id) {
                 error!("{err}");
+            }
+            // Disconnect the control channel and wait for the vCPU loop to observe cancellation
+            // before deleting its WHP processor. This is required when a later vCPU fails the
+            // startup placement barrier and already-created processors unwind.
+            self.event_sender.take();
+            if let Some(thread) = self.vcpu_thread.take() {
+                let _ = thread.join();
             }
             let hresult =
                 unsafe { WHvDeleteVirtualProcessor(self.partition_handle, self.id as u32) };
@@ -2712,6 +2758,17 @@ mod tests {
     }
 
     #[test]
+    fn best_effort_host_affinity_reports_os_rejection_as_inherited() {
+        let unavailable = HostCpuId::new(usize::BITS as u16);
+
+        assert!(apply_host_cpu_affinity(Some(unavailable), true, 0).is_err());
+        assert!(matches!(
+            apply_host_cpu_affinity(Some(unavailable), false, 0),
+            Ok(VcpuPlacementResult::Inherited { .. })
+        ));
+    }
+
+    #[test]
     fn host_affinity_binds_the_current_thread_to_one_allowed_processor() {
         let mut inherited = GROUP_AFFINITY::default();
         let result = unsafe { GetThreadGroupAffinity(GetCurrentThread(), &mut inherited) };
@@ -2722,7 +2779,8 @@ mod tests {
         );
 
         let index = inherited.Mask.trailing_zeros() as u16;
-        apply_host_cpu_affinity(Some(HostCpuId::in_group(inherited.Group, index))).unwrap();
+        apply_host_cpu_affinity(Some(HostCpuId::in_group(inherited.Group, index)), true, 0)
+            .unwrap();
 
         let mut applied = GROUP_AFFINITY::default();
         let result = unsafe { GetThreadGroupAffinity(GetCurrentThread(), &mut applied) };
