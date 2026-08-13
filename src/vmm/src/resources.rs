@@ -26,7 +26,6 @@ use crate::vmm_config::kernel_bundle::{KernelBundle, KernelBundleError};
 #[cfg(feature = "tee")]
 use crate::vmm_config::kernel_bundle::{QbootBundle, QbootBundleError};
 use crate::vmm_config::kernel_cmdline::{KernelCmdlineConfig, KernelCmdlineConfigError};
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::vmm_config::machine_config::HostCpuId;
 use crate::vmm_config::machine_config::{VmConfig, VmConfigError};
 #[cfg(feature = "net")]
@@ -200,10 +199,65 @@ pub enum HostMemoryPolicy {
         /// Absolute Linux host NUMA node IDs included in the binding mask.
         host_nodes: Vec<u32>,
     },
+    /// Prefer the selected Linux host nodes while allowing page faults to spill elsewhere under
+    /// pressure. If the kernel lacks soft multi-node preference, ordinary host policy is retained.
+    PreferredMany {
+        /// Absolute Linux host NUMA node IDs included in the preference mask.
+        host_nodes: Vec<u32>,
+    },
     /// Prefer a Windows NUMA node while allowing the host to fall back.
     Preferred {
         /// Absolute Windows host NUMA node ID preferred for future page faults.
         host_node: u32,
+    },
+}
+
+/// The host placement that was actually established before guest execution begins.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacementReport {
+    /// One result for every possible vCPU, in guest-vCPU order.
+    pub vcpus: Vec<VcpuPlacementResult>,
+    /// Result of applying the requested host-memory policy.
+    pub memory: MemoryPlacementResult,
+}
+
+/// The effective host placement of one guest vCPU.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VcpuPlacementResult {
+    /// The vCPU thread was successfully pinned to the requested host processor.
+    Pinned {
+        /// Guest vCPU index.
+        vcpu_index: u8,
+        /// Host processor selected by the caller.
+        host_cpu: HostCpuId,
+    },
+    /// The vCPU remains under the host scheduler's inherited policy.
+    Inherited {
+        /// Guest vCPU index.
+        vcpu_index: u8,
+        /// Requested host processor, when affinity was attempted.
+        requested_host_cpu: Option<HostCpuId>,
+        /// Why the requested affinity was not established.
+        reason: Option<String>,
+    },
+}
+
+/// The effective host-memory placement of ordinary guest RAM and hotplug capacity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoryPlacementResult {
+    /// No managed memory policy was requested.
+    Inherited,
+    /// The requested managed policy was established.
+    Applied,
+    /// A best-effort policy could not be retained and memory uses inherited placement.
+    Fallback {
+        /// Why the managed policy was abandoned.
+        reason: String,
+    },
+    /// Only part of the requested memory policy remains effective after best-effort fallback.
+    Partial {
+        /// Why the host could not establish one uniform policy.
+        reason: String,
     },
 }
 
@@ -215,6 +269,9 @@ pub struct VmResources {
     /// Resolved host logical processor for every possible vCPU thread.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub vcpu_affinity: Option<Vec<HostCpuId>>,
+    /// Whether failure to apply the resolved vCPU affinity must abort VM startup.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub vcpu_affinity_required: bool,
     /// Resolved guest and host memory topology. `None` retains the legacy memory path exactly.
     pub numa_topology: Option<NumaTopology>,
     /// The firmware to be loaded into the microVM.
@@ -308,6 +365,8 @@ impl Default for VmResources {
             vm_config: VmConfig::default(),
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             vcpu_affinity: None,
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            vcpu_affinity_required: true,
             numa_topology: None,
             firmware_config: None,
             kernel_cmdline: KernelCmdlineConfig::default(),

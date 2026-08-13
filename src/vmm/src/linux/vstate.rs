@@ -39,6 +39,7 @@ use kbs_types::Tee;
 
 #[cfg(feature = "tee")]
 use crate::resources::TeeConfig;
+use crate::resources::VcpuPlacementResult;
 use crate::vmm_config::machine_config::{CpuFeaturesTemplate, HostCpuId};
 #[cfg(target_arch = "x86_64")]
 use cpuid::{c3, filter_cpuid, t2, VmSpec};
@@ -930,6 +931,9 @@ pub struct Vcpu {
     id: u8,
     // Resolved host placement is applied inside the vCPU thread before KVM_RUN.
     host_cpu: Option<HostCpuId>,
+    // Required affinity failures abort startup; preferred affinity failures retain scheduler
+    // placement and let the VM continue.
+    host_cpu_required: bool,
     // Host-authoritative online ceiling; vCPUs at or above it park between
     // emulation steps regardless of guest cooperation.
     enforcement: Option<std::sync::Arc<devices::virtio::CpuEnforcement>>,
@@ -1088,6 +1092,7 @@ impl Vcpu {
             fd: kvm_vcpu,
             id,
             host_cpu: None,
+            host_cpu_required: true,
             enforcement: None,
             kick_slot: None,
             mmio_bus: None,
@@ -1129,6 +1134,7 @@ impl Vcpu {
             fd: kvm_vcpu,
             id,
             host_cpu: None,
+            host_cpu_required: true,
             enforcement: None,
             kick_slot: None,
             mmio_bus: None,
@@ -1165,6 +1171,7 @@ impl Vcpu {
             fd: kvm_vcpu,
             id,
             host_cpu: None,
+            host_cpu_required: true,
             enforcement: None,
             kick_slot: None,
             mmio_bus: None,
@@ -1183,8 +1190,9 @@ impl Vcpu {
     }
 
     /// Selects the host logical processor this vCPU thread must run on.
-    pub(crate) fn set_host_cpu(&mut self, host_cpu: HostCpuId) {
+    pub(crate) fn set_host_cpu(&mut self, host_cpu: HostCpuId, required: bool) {
         self.host_cpu = Some(host_cpu);
+        self.host_cpu_required = required;
     }
 
     pub fn set_enforcement(
@@ -1320,7 +1328,7 @@ impl Vcpu {
 
     /// Moves the vcpu to its own thread and constructs a VcpuHandle.
     /// The handle can be used to control the remote vcpu.
-    pub fn start_threaded(mut self) -> Result<VcpuHandle> {
+    pub fn start_threaded(mut self) -> Result<(VcpuHandle, VcpuPlacementResult)> {
         let event_sender = self.event_sender.take().unwrap();
         let response_receiver = self.response_receiver.take().unwrap();
         let (init_tls_sender, init_tls_receiver) = unbounded();
@@ -1329,7 +1337,7 @@ impl Vcpu {
             .spawn(move || {
                 let init_result = self
                     .apply_host_cpu_affinity()
-                    .and_then(|()| self.init_thread_local_data());
+                    .and_then(|placement| self.init_thread_local_data().map(|()| placement));
 
                 let initialized = init_result.is_ok();
                 init_tls_sender
@@ -1342,44 +1350,19 @@ impl Vcpu {
             })
             .map_err(Error::VcpuSpawn)?;
 
-        init_tls_receiver
+        let placement = init_tls_receiver
             .recv()
             .expect("Error waiting for vcpu initialization.")?;
 
-        Ok(VcpuHandle::new(
-            event_sender,
-            response_receiver,
-            vcpu_thread,
+        Ok((
+            VcpuHandle::new(event_sender, response_receiver, vcpu_thread),
+            placement,
         ))
     }
 
     /// Applies the resolved affinity from within the vCPU thread itself.
-    fn apply_host_cpu_affinity(&self) -> Result<()> {
-        let Some(host_cpu) = self.host_cpu else {
-            return Ok(());
-        };
-
-        let index = host_cpu.index as usize;
-        if index >= libc::CPU_SETSIZE as usize {
-            return Err(Error::VcpuAffinity(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("host CPU {index} exceeds CPU_SETSIZE"),
-            )));
-        }
-
-        // SAFETY: cpu_set_t is initialized before use, the validated index is in range, and pid 0
-        // asks Linux to bind only the current vCPU thread.
-        let result = unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            libc::CPU_ZERO(&mut set);
-            libc::CPU_SET(index, &mut set);
-            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
-        };
-        if result != 0 {
-            return Err(Error::VcpuAffinity(io::Error::last_os_error()));
-        }
-
-        Ok(())
+    fn apply_host_cpu_affinity(&self) -> Result<VcpuPlacementResult> {
+        apply_host_cpu_affinity(self.host_cpu, self.host_cpu_required, self.id)
     }
 
     #[allow(unused)]
@@ -1823,6 +1806,63 @@ impl Vcpu {
     }
 }
 
+fn apply_host_cpu_affinity(
+    host_cpu: Option<HostCpuId>,
+    required: bool,
+    vcpu_id: u8,
+) -> Result<VcpuPlacementResult> {
+    let Some(host_cpu) = host_cpu else {
+        return Ok(VcpuPlacementResult::Inherited {
+            vcpu_index: vcpu_id,
+            requested_host_cpu: None,
+            reason: None,
+        });
+    };
+
+    if let Err(error) = apply_required_host_cpu_affinity(host_cpu) {
+        if required {
+            return Err(error);
+        }
+        let reason = error.to_string();
+        warn!(
+            "vCPU {vcpu_id} host affinity unavailable; continuing with scheduler placement: {error}"
+        );
+        return Ok(VcpuPlacementResult::Inherited {
+            vcpu_index: vcpu_id,
+            requested_host_cpu: Some(host_cpu),
+            reason: Some(reason),
+        });
+    }
+    Ok(VcpuPlacementResult::Pinned {
+        vcpu_index: vcpu_id,
+        host_cpu,
+    })
+}
+
+fn apply_required_host_cpu_affinity(host_cpu: HostCpuId) -> Result<()> {
+    let index = host_cpu.index as usize;
+    if index >= libc::CPU_SETSIZE as usize {
+        return Err(Error::VcpuAffinity(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("host CPU {index} exceeds CPU_SETSIZE"),
+        )));
+    }
+
+    // SAFETY: cpu_set_t is initialized before use, the validated index is in range, and pid 0
+    // asks Linux to bind only the current vCPU thread.
+    let result = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(index, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
+    };
+    if result != 0 {
+        return Err(Error::VcpuAffinity(io::Error::last_os_error()));
+    }
+
+    Ok(())
+}
+
 impl Drop for Vcpu {
     fn drop(&mut self) {
         let _ = self.reset_thread_local_data();
@@ -1909,6 +1949,19 @@ impl VcpuHandle {
     }
 }
 
+impl Drop for VcpuHandle {
+    fn drop(&mut self) {
+        // A startup barrier may abort after earlier vCPU threads reached Paused. Close their
+        // control channels and join them before the owning VM is destroyed.
+        let _ = self.send_event(VcpuEvent::Pause);
+        let (event_sender, _event_receiver) = unbounded();
+        self.event_sender = event_sender;
+        if let Some(thread) = self.vcpu_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 enum VcpuEmulation {
     Handled,
     Interrupted,
@@ -1933,17 +1986,15 @@ mod tests {
 
     use utils::signal::validate_signal_num;
 
-    // In tests we need to close any pending Vcpu threads on test completion.
-    impl Drop for VcpuHandle {
-        fn drop(&mut self) {
-            // Make sure the Vcpu is out of KVM_RUN.
-            self.send_event(VcpuEvent::Pause).unwrap();
-            // Close the original channel so that the Vcpu thread errors and goes to exit state.
-            let (event_sender, _event_receiver) = unbounded();
-            self.event_sender = event_sender;
-            // Wait for the Vcpu thread to finish execution
-            self.vcpu_thread.take().unwrap().join().unwrap();
-        }
+    #[test]
+    fn best_effort_host_affinity_reports_os_rejection_as_inherited() {
+        let unavailable = HostCpuId::new(libc::CPU_SETSIZE as u16);
+
+        assert!(apply_host_cpu_affinity(Some(unavailable), true, 0).is_err());
+        assert!(matches!(
+            apply_host_cpu_affinity(Some(unavailable), false, 0),
+            Ok(VcpuPlacementResult::Inherited { .. })
+        ));
     }
 
     // Auxiliary function being used throughout the tests.

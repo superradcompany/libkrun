@@ -25,6 +25,7 @@ use super::builders::FsBuilder;
 use super::builders::FsConfig;
 #[cfg(not(feature = "tee"))]
 use super::builders::HostMemoryPolicy;
+use super::builders::PlacementReport;
 #[cfg(feature = "net")]
 use super::builders::{ConfiguredNet, NetBuilder, NetConfig};
 use super::builders::{ConsoleBuilder, ExecBuilder, KernelBuilder, MachineBuilder};
@@ -94,6 +95,7 @@ pub struct VmBuilder {
     #[cfg(feature = "blk")]
     disk: DiskBuilder,
     exit_observers: Vec<Box<dyn Fn(i32) + Send + 'static>>,
+    placement_observer: Option<Box<dyn FnOnce(&PlacementReport) + Send + 'static>>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -122,6 +124,7 @@ impl VmBuilder {
             #[cfg(feature = "blk")]
             disk: DiskBuilder::new(),
             exit_observers: Vec::new(),
+            placement_observer: None,
         }
     }
 
@@ -323,6 +326,15 @@ impl VmBuilder {
     /// ```
     pub fn on_exit(mut self, f: impl Fn(i32) + Send + 'static) -> Self {
         self.exit_observers.push(Box::new(f));
+        self
+    }
+
+    /// Register a callback for the effective host placement established before guest execution.
+    ///
+    /// The callback runs once after every vCPU thread has attempted affinity and while all vCPUs
+    /// are still paused. Best-effort affinity may produce a mix of pinned and inherited entries.
+    pub fn on_placement(mut self, f: impl FnOnce(&PlacementReport) + Send + 'static) -> Self {
+        self.placement_observer = Some(Box::new(f));
         self
     }
 
@@ -557,6 +569,7 @@ impl VmBuilder {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
             vmr.vcpu_affinity = self.machine.vcpu_affinity;
+            vmr.vcpu_affinity_required = self.machine.vcpu_affinity_required;
         }
         vmr.numa_topology = self.machine.numa_topology;
 
@@ -815,6 +828,7 @@ impl VmBuilder {
             self.kernel.initramfs_path,
             self.kernel.init_path,
             self.exit_observers,
+            self.placement_observer,
             exit_evt,
             exit_code,
             #[cfg(not(target_os = "windows"))]
@@ -986,7 +1000,8 @@ fn validate_numa_topology_inner(
 
         match &node.host_memory {
             HostMemoryPolicy::Inherit => {}
-            HostMemoryPolicy::Bind { host_nodes } => {
+            HostMemoryPolicy::Bind { host_nodes }
+            | HostMemoryPolicy::PreferredMany { host_nodes } => {
                 if host_nodes.is_empty() {
                     return Err(Error::Config(ConfigError::InvalidNumaTopology(
                         "a bind policy requires at least one host node".into(),
@@ -1454,6 +1469,24 @@ mod tests {
             error,
             Error::Config(ConfigError::NumaUnsupported(_))
         ));
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(feature = "tee")
+    ))]
+    #[test]
+    fn build_accepts_linux_soft_numa_preference() {
+        let mut topology = one_node_topology(vec![0], 512);
+        topology.nodes[0].host_memory = HostMemoryPolicy::PreferredMany {
+            host_nodes: vec![0],
+        };
+
+        VmBuilder::new()
+            .machine(|machine| machine.memory_mib(512).numa_topology(topology))
+            .build()
+            .expect("Linux should accept a spillable host-node preference");
     }
 
     #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]

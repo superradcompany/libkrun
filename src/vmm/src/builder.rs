@@ -88,6 +88,7 @@ use kbs_types::Tee;
 use crate::device_manager;
 #[cfg(unix)]
 use crate::exit_signal::register_exit_signal_handlers;
+use crate::resources::{MemoryPlacementResult, PlacementReport, VcpuPlacementResult};
 #[cfg(target_os = "linux")]
 use crate::signal_handler::register_sigint_handler;
 #[cfg(target_os = "linux")]
@@ -190,6 +191,8 @@ pub enum StartMicrovmError {
     HostMemoryPolicy(io::Error),
     /// A low-level VMM caller supplied an invalid or unsupported NUMA topology.
     InvalidNumaTopology(String),
+    /// A low-level VMM caller supplied an incomplete or unsupported vCPU-affinity map.
+    InvalidVcpuAffinity(String),
     /// Guest memory collection operation failed.
     GuestMemoryMmap(vm_memory::GuestMemoryError),
     /// Guest memory region construction failed.
@@ -411,6 +414,9 @@ impl Display for StartMicrovmError {
             }
             InvalidNumaTopology(ref reason) => {
                 write!(f, "Invalid NUMA topology: {reason}")
+            }
+            InvalidVcpuAffinity(ref reason) => {
+                write!(f, "Invalid vCPU affinity: {reason}")
             }
             ImageBz2Decoder(ref err) => {
                 write!(f, "The BZIP2 decoder couldn't decompress the kernel. {err}")
@@ -1154,24 +1160,55 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
 pub fn build_microvm(
     vm_resources: &mut super::resources::VmResources,
     event_manager: &mut EventManager,
+    shutdown_efd: Option<EventFd>,
+    sender: Sender<WorkerMessage>,
+    exit_evt: EventFd,
+    exit_code: Arc<AtomicI32>,
+) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    let (vmm, _) = build_microvm_paused(
+        vm_resources,
+        event_manager,
+        shutdown_efd,
+        sender,
+        exit_evt,
+        exit_code,
+    )?;
+    vmm.lock()
+        .expect("poisoned VMM mutex before first resume")
+        .resume_vcpus()
+        .map_err(StartMicrovmError::Internal)?;
+    Ok(vmm)
+}
+
+/// Builds a microVM and applies host placement while keeping every vCPU paused.
+///
+/// This is the placement acknowledgement barrier used by embedding runtimes: the report contains
+/// the OS-visible result, and no guest instruction executes until the caller invokes
+/// [`Vmm::resume_vcpus`].
+pub fn build_microvm_paused(
+    vm_resources: &mut super::resources::VmResources,
+    event_manager: &mut EventManager,
     _shutdown_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
     exit_evt: EventFd,
     exit_code: Arc<AtomicI32>,
-) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+) -> std::result::Result<(Arc<Mutex<Vmm>>, PlacementReport), StartMicrovmError> {
     let mut trace = BootTrace::new("vmm");
     trace.mark("build_microvm.start");
 
+    validate_vmm_vcpu_affinity(vm_resources)?;
+
     let payload = choose_payload(vm_resources)?;
 
-    let (guest_memory, arch_memory_info, mut _shm_manager, payload_config) = create_guest_memory(
-        vm_resources
-            .vm_config()
-            .mem_size_mib
-            .ok_or(StartMicrovmError::MissingMemSizeConfig)?,
-        vm_resources,
-        &payload,
-    )?;
+    let (guest_memory, arch_memory_info, mut _shm_manager, payload_config, mut memory_placement) =
+        create_guest_memory_with_placement(
+            vm_resources
+                .vm_config()
+                .mem_size_mib
+                .ok_or(StartMicrovmError::MissingMemSizeConfig)?,
+            vm_resources,
+            &payload,
+        )?;
     trace.mark("guest_memory.ready");
 
     #[allow(unused_mut)]
@@ -1961,13 +1998,30 @@ pub fn build_microvm(
     if let Some(affinity) = &vm_resources.vcpu_affinity {
         // The public builder validates an exact map for the full possible topology.
         for (vcpu, host_cpu) in vcpus.iter_mut().zip(affinity.iter().copied()) {
-            vcpu.set_host_cpu(host_cpu);
+            vcpu.set_host_cpu(host_cpu, vm_resources.vcpu_affinity_required);
         }
     }
 
-    vmm.start_vcpus(vcpus)
+    let vcpu_placement = vmm
+        .start_vcpus_paused(vcpus)
         .map_err(StartMicrovmError::Internal)?;
-    trace.mark("vcpus.started");
+    trace.mark("vcpus.placement_ready");
+
+    if vcpu_placement.iter().any(|result| {
+        matches!(
+            result,
+            VcpuPlacementResult::Inherited {
+                requested_host_cpu: Some(_),
+                ..
+            }
+        )
+    }) {
+        memory_placement.fallback_after_partial_cpu();
+    }
+    let placement_report = PlacementReport {
+        vcpus: vcpu_placement,
+        memory: memory_placement.result,
+    };
 
     // Clippy thinks we don't need Arc<Mutex<...
     // but we don't want to change the event_manager interface
@@ -1978,7 +2032,31 @@ pub fn build_microvm(
         .map_err(StartMicrovmError::RegisterEvent)?;
     trace.mark("build_microvm.done");
 
-    Ok(vmm)
+    Ok((vmm, placement_report))
+}
+
+fn validate_vmm_vcpu_affinity(_vm_resources: &VmResources) -> Result<(), StartMicrovmError> {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    if let Some(affinity) = &_vm_resources.vcpu_affinity {
+        let config = _vm_resources.vm_config();
+        let boot_vcpus = config.vcpu_count.unwrap_or(1);
+        let max_vcpus = config.max_vcpu_count.unwrap_or(boot_vcpus);
+        if affinity.len() != usize::from(max_vcpus) {
+            return Err(StartMicrovmError::InvalidVcpuAffinity(format!(
+                "affinity contains {} entries, expected exactly {max_vcpus}",
+                affinity.len()
+            )));
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(host_cpu) = affinity.iter().find(|host_cpu| host_cpu.group != 0) {
+            return Err(StartMicrovmError::InvalidVcpuAffinity(format!(
+                "Linux host CPU {}:{} uses a nonzero processor group",
+                host_cpu.group, host_cpu.index
+            )));
+        }
+    }
+    Ok(())
 }
 
 struct BootTrace {
@@ -2484,12 +2562,77 @@ pub struct PayloadConfig {
     kernel_cmdline: Option<String>,
 }
 
+struct MemoryPlacementState {
+    result: MemoryPlacementResult,
+    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    managed_ranges: Vec<(usize, usize)>,
+}
+
+impl MemoryPlacementState {
+    fn inherited() -> Self {
+        Self {
+            result: MemoryPlacementResult::Inherited,
+            #[cfg(all(target_os = "linux", not(feature = "tee")))]
+            managed_ranges: Vec::new(),
+        }
+    }
+
+    fn fallback_after_partial_cpu(&mut self) {
+        if !matches!(self.result, MemoryPlacementResult::Applied) {
+            return;
+        }
+
+        #[cfg(all(target_os = "linux", not(feature = "tee")))]
+        {
+            let mut failures = Vec::new();
+            for &(address, length) in &self.managed_ranges {
+                if let Err(error) = apply_linux_inherited_memory_policy(address as *mut u8, length)
+                {
+                    failures.push(error.to_string());
+                }
+            }
+            self.result = if failures.is_empty() {
+                MemoryPlacementResult::Fallback {
+                    reason: "one or more vCPUs retained scheduler placement".into(),
+                }
+            } else {
+                warn!(
+                    "could not fully restore inherited memory policy after partial CPU placement: {}",
+                    failures.join("; ")
+                );
+                MemoryPlacementResult::Partial {
+                    reason: failures.join("; "),
+                }
+            };
+        }
+    }
+}
+
 pub fn create_guest_memory(
     mem_size: usize,
     vm_resources: &VmResources,
     payload: &Payload,
 ) -> std::result::Result<
     (GuestMemoryMmap, ArchMemoryInfo, ShmManager, PayloadConfig),
+    StartMicrovmError,
+> {
+    let (guest_memory, arch_memory_info, shm_manager, payload_config, _) =
+        create_guest_memory_with_placement(mem_size, vm_resources, payload)?;
+    Ok((guest_memory, arch_memory_info, shm_manager, payload_config))
+}
+
+fn create_guest_memory_with_placement(
+    mem_size: usize,
+    vm_resources: &VmResources,
+    payload: &Payload,
+) -> std::result::Result<
+    (
+        GuestMemoryMmap,
+        ArchMemoryInfo,
+        ShmManager,
+        PayloadConfig,
+        MemoryPlacementState,
+    ),
     StartMicrovmError,
 > {
     // `VmResources` is also a public low-level VMM interface, so do not rely exclusively on the
@@ -2635,15 +2778,21 @@ pub fn create_guest_memory(
     }
 
     #[cfg(not(feature = "tee"))]
-    let guest_mem = if let Some(topology) = &vm_resources.numa_topology {
+    let (guest_mem, memory_placement) = if let Some(topology) = &vm_resources.numa_topology {
         create_numa_guest_memory(&arch_mem_regions, &numa_managed_regions, topology)?
     } else {
-        GuestMemoryMmap::from_ranges(&arch_mem_regions)
-            .map_err(StartMicrovmError::GuestMemoryMmapFromRanges)?
+        (
+            GuestMemoryMmap::from_ranges(&arch_mem_regions)
+                .map_err(StartMicrovmError::GuestMemoryMmapFromRanges)?,
+            MemoryPlacementState::inherited(),
+        )
     };
     #[cfg(feature = "tee")]
-    let guest_mem = GuestMemoryMmap::from_ranges(&arch_mem_regions)
-        .map_err(StartMicrovmError::GuestMemoryMmapFromRanges)?;
+    let (guest_mem, memory_placement) = (
+        GuestMemoryMmap::from_ranges(&arch_mem_regions)
+            .map_err(StartMicrovmError::GuestMemoryMmapFromRanges)?,
+        MemoryPlacementState::inherited(),
+    );
 
     let (guest_mem, entry_addr, initrd_config, cmdline) =
         load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;
@@ -2670,7 +2819,13 @@ pub fn create_guest_memory(
         kernel_cmdline: cmdline.clone(),
     };
 
-    Ok((guest_mem, arch_mem_info, shm_manager, payload_config))
+    Ok((
+        guest_mem,
+        arch_mem_info,
+        shm_manager,
+        payload_config,
+        memory_placement,
+    ))
 }
 
 fn validate_vmm_numa_topology(
@@ -2751,7 +2906,8 @@ fn validate_vmm_numa_topology(
 
         match &node.host_memory {
             crate::resources::HostMemoryPolicy::Inherit => {}
-            crate::resources::HostMemoryPolicy::Bind { host_nodes } => {
+            crate::resources::HostMemoryPolicy::Bind { host_nodes }
+            | crate::resources::HostMemoryPolicy::PreferredMany { host_nodes } => {
                 if host_nodes.is_empty() {
                     return Err(StartMicrovmError::InvalidNumaTopology(
                         "a bind policy requires at least one host node".into(),
@@ -2814,9 +2970,17 @@ fn create_numa_guest_memory(
     ranges: &[(GuestAddress, usize)],
     numa_managed_regions: &[bool],
     topology: &crate::resources::NumaTopology,
-) -> std::result::Result<GuestMemoryMmap, StartMicrovmError> {
+) -> std::result::Result<(GuestMemoryMmap, MemoryPlacementState), StartMicrovmError> {
     debug_assert_eq!(ranges.len(), numa_managed_regions.len());
     let mut regions = Vec::with_capacity(ranges.len());
+    let mut state = match &topology.nodes[0].host_memory {
+        crate::resources::HostMemoryPolicy::Inherit => MemoryPlacementState::inherited(),
+        _ => MemoryPlacementState {
+            result: MemoryPlacementResult::Applied,
+            managed_ranges: Vec::new(),
+        },
+    };
+    let mut soft_policy_failed = false;
 
     for (&(guest_address, size), &numa_managed) in ranges.iter().zip(numa_managed_regions.iter()) {
         let mapping = MmapRegion::new(size).map_err(|error| {
@@ -2834,6 +2998,45 @@ fn create_numa_guest_memory(
                     apply_linux_memory_binding(mapping.as_ptr(), mapping.size(), host_nodes)
                         .map_err(StartMicrovmError::HostMemoryPolicy)?;
                 }
+                crate::resources::HostMemoryPolicy::PreferredMany { host_nodes } => {
+                    if !soft_policy_failed {
+                        if let Err(error) = apply_linux_memory_preference(
+                            mapping.as_ptr(),
+                            mapping.size(),
+                            host_nodes,
+                        ) {
+                            warn!(
+                                "host NUMA preference unavailable; continuing with inherited memory placement: {error}"
+                            );
+                            let mut reset_failures = Vec::new();
+                            for &(address, length) in &state.managed_ranges {
+                                if let Err(reset_error) =
+                                    apply_linux_inherited_memory_policy(address as *mut u8, length)
+                                {
+                                    reset_failures.push(reset_error.to_string());
+                                }
+                            }
+                            state.managed_ranges.clear();
+                            state.result = if reset_failures.is_empty() {
+                                MemoryPlacementResult::Fallback {
+                                    reason: error.to_string(),
+                                }
+                            } else {
+                                warn!(
+                                    "could not fully restore inherited memory policy after NUMA preference fallback: {}",
+                                    reset_failures.join("; ")
+                                );
+                                MemoryPlacementResult::Partial {
+                                    reason: format!(
+                                        "preference failed: {error}; reset failed: {}",
+                                        reset_failures.join("; ")
+                                    ),
+                                }
+                            };
+                            soft_policy_failed = true;
+                        }
+                    }
+                }
                 crate::resources::HostMemoryPolicy::Inherit => {}
                 crate::resources::HostMemoryPolicy::Preferred { .. } => {
                     return Err(StartMicrovmError::HostMemoryPolicy(io::Error::new(
@@ -2844,13 +3047,27 @@ fn create_numa_guest_memory(
             }
         }
 
+        if numa_managed
+            && matches!(state.result, MemoryPlacementResult::Applied)
+            && !matches!(
+                &topology.nodes[0].host_memory,
+                crate::resources::HostMemoryPolicy::Inherit
+            )
+        {
+            state
+                .managed_ranges
+                .push((mapping.as_ptr() as usize, mapping.size()));
+        }
+
         regions.push(
             GuestRegionMmap::new(mapping, guest_address)
                 .ok_or(StartMicrovmError::GuestMemoryRegion)?,
         );
     }
 
-    GuestMemoryMmap::from_regions(regions).map_err(StartMicrovmError::GuestMemoryRegionCollection)
+    let memory = GuestMemoryMmap::from_regions(regions)
+        .map_err(StartMicrovmError::GuestMemoryRegionCollection)?;
+    Ok((memory, state))
 }
 
 #[cfg(all(target_os = "windows", not(feature = "tee")))]
@@ -2858,9 +3075,13 @@ fn create_numa_guest_memory(
     ranges: &[(GuestAddress, usize)],
     numa_managed_regions: &[bool],
     topology: &crate::resources::NumaTopology,
-) -> std::result::Result<GuestMemoryMmap, StartMicrovmError> {
+) -> std::result::Result<(GuestMemoryMmap, MemoryPlacementState), StartMicrovmError> {
     debug_assert_eq!(ranges.len(), numa_managed_regions.len());
     let mut regions = Vec::with_capacity(ranges.len());
+    let result = match &topology.nodes[0].host_memory {
+        crate::resources::HostMemoryPolicy::Preferred { .. } => MemoryPlacementResult::Applied,
+        _ => MemoryPlacementResult::Inherited,
+    };
 
     for (&(guest_address, size), &numa_managed) in ranges.iter().zip(numa_managed_regions.iter()) {
         let mapping = if let Some(policy) = numa_policy_for_region(numa_managed, topology) {
@@ -2876,7 +3097,8 @@ fn create_numa_guest_memory(
                         )
                     })?
                 }
-                crate::resources::HostMemoryPolicy::Bind { .. } => {
+                crate::resources::HostMemoryPolicy::Bind { .. }
+                | crate::resources::HostMemoryPolicy::PreferredMany { .. } => {
                     return Err(StartMicrovmError::HostMemoryPolicy(io::Error::new(
                         io::ErrorKind::Unsupported,
                         "bound host memory is unavailable on Windows",
@@ -2897,7 +3119,9 @@ fn create_numa_guest_memory(
         );
     }
 
-    GuestMemoryMmap::from_regions(regions).map_err(StartMicrovmError::GuestMemoryRegionCollection)
+    let memory = GuestMemoryMmap::from_regions(regions)
+        .map_err(StartMicrovmError::GuestMemoryRegionCollection)?;
+    Ok((memory, MemoryPlacementState { result }))
 }
 
 #[cfg(all(not(feature = "tee"), any(target_os = "linux", target_os = "windows")))]
@@ -2916,10 +3140,12 @@ fn create_numa_guest_memory(
     ranges: &[(GuestAddress, usize)],
     _numa_managed_regions: &[bool],
     _topology: &crate::resources::NumaTopology,
-) -> std::result::Result<GuestMemoryMmap, StartMicrovmError> {
+) -> std::result::Result<(GuestMemoryMmap, MemoryPlacementState), StartMicrovmError> {
     // Validation permits only inherited one-node topology on hosts without a backing hook. This is
     // the explicit no-op profile; managed policies are rejected before VM resources are built.
-    GuestMemoryMmap::from_ranges(ranges).map_err(StartMicrovmError::GuestMemoryMmapFromRanges)
+    let memory = GuestMemoryMmap::from_ranges(ranges)
+        .map_err(StartMicrovmError::GuestMemoryMmapFromRanges)?;
+    Ok((memory, MemoryPlacementState::inherited()))
 }
 
 #[cfg(all(target_os = "linux", not(feature = "tee")))]
@@ -2944,6 +3170,58 @@ fn apply_linux_memory_binding(
             MPOL_BIND | MPOL_F_STATIC_NODES,
             node_mask.as_ptr(),
             max_node_bits,
+            0,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "linux", not(feature = "tee")))]
+fn apply_linux_memory_preference(
+    address: *mut u8,
+    length: usize,
+    host_nodes: &[u32],
+) -> io::Result<()> {
+    // MPOL_PREFERRED_MANY was added in Linux 5.15. It keeps allocations near the requested CPUs
+    // while allowing page faults to spill to other nodes under pressure. Older kernels return
+    // EINVAL and the caller deliberately retains inherited placement.
+    const MPOL_PREFERRED_MANY: libc::c_int = 5;
+    const MPOL_F_STATIC_NODES: libc::c_int = 1 << 15;
+
+    let (node_mask, max_node_bits) = linux_node_mask(host_nodes)?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_mbind,
+            address.cast::<libc::c_void>(),
+            length,
+            MPOL_PREFERRED_MANY | MPOL_F_STATIC_NODES,
+            node_mask.as_ptr(),
+            max_node_bits,
+            0,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "linux", not(feature = "tee")))]
+fn apply_linux_inherited_memory_policy(address: *mut u8, length: usize) -> io::Result<()> {
+    const MPOL_DEFAULT: libc::c_int = 0;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_mbind,
+            address.cast::<libc::c_void>(),
+            length,
+            MPOL_DEFAULT,
+            std::ptr::null::<libc::c_ulong>(),
+            0,
             0,
         )
     };
@@ -4553,6 +4831,32 @@ pub mod tests {
         ));
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn vmm_boundary_rejects_incomplete_affinity_map() {
+        let mut vm_resources = VmResources::default();
+        vm_resources.vcpu_affinity = Some(Vec::new());
+
+        assert!(matches!(
+            validate_vmm_vcpu_affinity(&vm_resources),
+            Err(StartMicrovmError::InvalidVcpuAffinity(_))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vmm_boundary_rejects_linux_processor_groups() {
+        let mut vm_resources = VmResources::default();
+        vm_resources.vcpu_affinity = Some(vec![
+            crate::vmm_config::machine_config::HostCpuId::in_group(1, 0),
+        ]);
+
+        assert!(matches!(
+            validate_vmm_vcpu_affinity(&vm_resources),
+            Err(StartMicrovmError::InvalidVcpuAffinity(_))
+        ));
+    }
+
     #[cfg(feature = "tee")]
     #[test]
     fn vmm_boundary_rejects_numa_topology_with_tee_memory() {
@@ -4628,6 +4932,21 @@ pub mod tests {
             entry.contains("N0="),
             "the faulted page is not on node 0: {entry}"
         );
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    #[test]
+    #[ignore = "requires a native Linux host that permits NUMA policy syscalls"]
+    fn linux_numa_preference_allows_faulted_pages() {
+        let mapping = MmapRegion::<()>::new(2 * 1024 * 1024).unwrap();
+        apply_linux_memory_preference(mapping.as_ptr(), mapping.size(), &[0]).unwrap();
+
+        // A soft preference must remain faultable; unlike MPOL_BIND, pressure may spill this page
+        // to another allowed node rather than turning a locality preference into SIGBUS.
+        unsafe {
+            mapping.as_ptr().write_volatile(0x5a);
+            assert_eq!(mapping.as_ptr().read_volatile(), 0x5a);
+        }
     }
 
     #[test]
