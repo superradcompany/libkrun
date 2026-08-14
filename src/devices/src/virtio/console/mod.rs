@@ -18,6 +18,19 @@ pub use self::defs::uapi::VIRTIO_ID_CONSOLE as TYPE_CONSOLE;
 pub use self::device::Console;
 pub use self::port::PortDescription;
 
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Default descriptor count for virtio-console control and port queues.
+pub const DEFAULT_QUEUE_SIZE: u16 = 32;
+
+/// Smallest supported per-port descriptor count.
+pub const MIN_QUEUE_SIZE: u16 = 16;
+
+/// Largest supported per-port descriptor count.
+pub const MAX_QUEUE_SIZE: u16 = 1024;
+
 #[cfg(unix)]
 pub(crate) fn eventfd_pollable(event: &EventFd) -> Pollable {
     event.as_raw_fd()
@@ -40,7 +53,6 @@ pub(crate) fn pollable_token(pollable: Pollable) -> u64 {
 
 mod defs {
     pub const CONSOLE_DEV_ID: &str = "virtio_console";
-    pub const QUEUE_SIZE: u16 = 32;
 
     pub mod uapi {
         /// The device conforms to the virtio spec version 1.0.
@@ -71,6 +83,17 @@ pub enum ConsoleError {
     EventFd(std::io::Error),
     /// Failed to create SIGWINCH pipe.
     SigwinchPipe(std::io::Error),
+    /// A port requested a queue size unsupported by the virtio-console device.
+    InvalidQueueSize { port_id: usize, queue_size: u16 },
 }
 
 type Result<T> = std::result::Result<T, ConsoleError>;
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Return whether a virtio-console port queue size is supported.
+pub fn is_valid_queue_size(queue_size: u16) -> bool {
+    (MIN_QUEUE_SIZE..=MAX_QUEUE_SIZE).contains(&queue_size) && queue_size.is_power_of_two()
+}

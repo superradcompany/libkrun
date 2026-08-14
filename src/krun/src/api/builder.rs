@@ -37,6 +37,7 @@ use super::vm::Vm;
 
 #[cfg(feature = "blk")]
 use devices::virtio::block::ImageType;
+use devices::virtio::console::is_valid_queue_size;
 #[cfg(feature = "blk")]
 use devices::virtio::CacheType;
 #[cfg(feature = "blk")]
@@ -384,6 +385,18 @@ impl VmBuilder {
 
         if self.machine.memory_mib == 0 {
             return Err(Error::Config(ConfigError::InvalidMemorySize(0)));
+        }
+
+        if let Some(port) = self
+            .console
+            .ports
+            .iter()
+            .find(|port| !is_valid_queue_size(port.queue_size()))
+        {
+            return Err(Error::Config(ConfigError::Console(format!(
+                "queue size {} must be a power of two between 16 and 1024",
+                port.queue_size()
+            ))));
         }
 
         #[cfg(target_os = "windows")]
@@ -1121,8 +1134,28 @@ mod tests {
 
     use super::*;
     use crate::api::builders::{
-        HostCpuId, HostMemoryPolicy, NumaDistance, NumaNodeConfig, NumaTopology,
+        ConsolePortOptions, HostCpuId, HostMemoryPolicy, NumaDistance, NumaNodeConfig, NumaTopology,
     };
+    #[cfg(not(target_os = "windows"))]
+    use crate::backends::console::ConsolePortBackend;
+
+    #[cfg(not(target_os = "windows"))]
+    struct EmptyConsoleBackend;
+
+    #[cfg(not(target_os = "windows"))]
+    impl ConsolePortBackend for EmptyConsoleBackend {
+        fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+
+        fn write(&self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+
+        fn read_wake_fd(&self) -> std::os::fd::RawFd {
+            -1
+        }
+    }
 
     fn one_node_topology(vcpus: Vec<u8>, memory_mib: usize) -> NumaTopology {
         NumaTopology {
@@ -1187,6 +1220,28 @@ mod tests {
         match err {
             Error::Config(ConfigError::InvalidVcpuCount(3)) => {}
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn build_rejects_invalid_console_port_queue_sizes() {
+        for queue_size in [15, 24, 2048] {
+            let err = VmBuilder::new()
+                .console(|console| {
+                    console.custom_with_options(
+                        "agent",
+                        Box::new(EmptyConsoleBackend),
+                        ConsolePortOptions::new().queue_size(queue_size),
+                    )
+                })
+                .build()
+                .err()
+                .expect("invalid console queue size must fail VM construction");
+
+            assert!(
+                matches!(err, Error::Config(ConfigError::Console(message)) if message.contains(&queue_size.to_string()))
+            );
         }
     }
 

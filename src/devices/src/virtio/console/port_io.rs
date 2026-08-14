@@ -770,6 +770,12 @@ pub trait ConsolePortBackend: Send + Sync {
     ///
     /// Used by the console RX thread for `poll()`-based blocking. Typically the read end of a wake pipe.
     fn read_wake_fd(&self) -> RawFd;
+
+    /// Wait until [`write`](Self::write) may accept more guest bytes.
+    ///
+    /// The default is intentionally inert for compatibility with existing backends. Bounded
+    /// backends should override this hook so a full output buffer blocks instead of busy-spinning.
+    fn wait_until_writable(&self) {}
 }
 
 /// Adapter that wraps a [`ConsolePortBackend`] as a [`PortInput`].
@@ -846,9 +852,7 @@ impl PortOutput for ConsolePortBackendOutputAdapter {
     }
 
     fn wait_until_writable(&self) {
-        // Ring buffer push is lock-free and practically instant. If the ring
-        // is full, write() returns WouldBlock and the console TX thread's
-        // existing retry loop handles backpressure.
+        self.backend.wait_until_writable();
     }
 }
 
@@ -1063,6 +1067,48 @@ struct WS {
 
 #[cfg(unix)]
 ioctl_read_bad!(tiocgwinsz, TIOCGWINSZ, WS);
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct WritableWaitBackend {
+        waits: Arc<AtomicUsize>,
+    }
+
+    impl ConsolePortBackend for WritableWaitBackend {
+        fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+
+        fn write(&self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+
+        fn read_wake_fd(&self) -> RawFd {
+            -1
+        }
+
+        fn wait_until_writable(&self) {
+            self.waits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn custom_output_adapter_delegates_writable_wait() {
+        let waits = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn ConsolePortBackend> = Arc::new(WritableWaitBackend {
+            waits: Arc::clone(&waits),
+        });
+        let adapter = ConsolePortBackendOutputAdapter::new(backend);
+
+        PortOutput::wait_until_writable(&adapter);
+
+        assert_eq!(waits.load(Ordering::Relaxed), 1);
+    }
+}
 
 #[cfg(all(test, windows))]
 mod tests {

@@ -53,9 +53,9 @@ pub use api::builders::VsockBuilder;
 #[cfg(feature = "blk")]
 pub use api::builders::WritebackLimit;
 pub use api::builders::{
-    ConsoleBuilder, ExecBuilder, HostCpuId, HostMemoryPolicy, KernelBuilder, MachineBuilder,
-    MemoryPlacementResult, NumaBuilder, NumaDistance, NumaNodeBuilder, NumaNodeConfig,
-    NumaTopology, PlacementReport, VcpuPlacementResult,
+    ConsoleBuilder, ConsolePortOptions, ExecBuilder, HostCpuId, HostMemoryPolicy, KernelBuilder,
+    MachineBuilder, MemoryPlacementResult, NumaBuilder, NumaDistance, NumaNodeBuilder,
+    NumaNodeConfig, NumaTopology, PlacementReport, VcpuPlacementResult,
 };
 pub use api::error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use api::exit_handle::ExitHandle;
