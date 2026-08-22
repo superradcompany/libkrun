@@ -243,20 +243,13 @@ impl Console {
                     if !name.is_empty() {
                         self.control.port_name(cmd.id, name)
                     }
-
-                    #[cfg(target_os = "windows")]
-                    {
-                        // The WHP/Linux virtio-console path may report the
-                        // port ready without a later PORT_OPEN event. Start
-                        // data queues once the guest has acknowledged the
-                        // port so early PID 1 handshakes can flow.
-                        ports_to_start.push(cmd.id as usize);
-                    }
                 }
                 control_event::VIRTIO_CONSOLE_PORT_OPEN => {
-                    let opened = match cmd.value {
-                        0 => false,
-                        1 => true,
+                    match cmd.value {
+                        0 => log::debug!("Guest closed port {}", cmd.id),
+                        // PORT_READY only confirms that the guest driver recognizes the port.
+                        // Host-to-guest delivery is safe once guest userspace sends PORT_OPEN.
+                        1 => ports_to_start.push(cmd.id as usize),
                         _ => {
                             log::error!(
                                 "Invalid value ({}) for VIRTIO_CONSOLE_PORT_OPEN on port {}",
@@ -265,14 +258,7 @@ impl Console {
                             );
                             continue;
                         }
-                    };
-
-                    if !opened {
-                        log::debug!("Guest closed port {}", cmd.id);
-                        continue;
                     }
-
-                    ports_to_start.push(cmd.id as usize);
                 }
                 _ => log::warn!("Unknown console control event {:x}", cmd.event),
             }
