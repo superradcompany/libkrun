@@ -208,9 +208,7 @@ impl Mem {
     fn handle_unplug_all(&mut self) -> VirtioMemResp {
         let addr = self.config.addr;
         let size = self.config.region_size;
-        for block in &mut self.plugged_blocks {
-            *block = false;
-        }
+        self.plugged_blocks.fill(false);
         self.config.plugged_size = 0;
         self.discard_range(addr, size);
         resp(VIRTIO_MEM_RESP_ACK, 0)
