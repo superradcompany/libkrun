@@ -30,12 +30,6 @@ pub(crate) const AVAIL_FEATURES: u64 = (1 << uapi::VIRTIO_CONSOLE_F_SIZE as u64)
     | (1 << uapi::VIRTIO_CONSOLE_F_MULTIPORT as u64)
     | (1 << uapi::VIRTIO_F_VERSION_1 as u64);
 
-fn port_io_start_requested(cmd: &VirtioConsoleControl) -> bool {
-    // PORT_READY only confirms that the guest driver recognizes the port. Generic ports are not
-    // safe for host-to-guest delivery until guest userspace opens them and sends PORT_OPEN.
-    cmd.event == control_event::VIRTIO_CONSOLE_PORT_OPEN && cmd.value == 1
-}
-
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C, packed)]
 pub struct VirtioConsoleConfig {
@@ -236,9 +230,11 @@ impl Console {
                     }
                 }
                 control_event::VIRTIO_CONSOLE_PORT_OPEN => {
-                    let opened = match cmd.value {
-                        0 => false,
-                        1 => true,
+                    match cmd.value {
+                        0 => log::debug!("Guest closed port {}", cmd.id),
+                        // PORT_READY only confirms that the guest driver recognizes the port.
+                        // Host-to-guest delivery is safe once guest userspace sends PORT_OPEN.
+                        1 => ports_to_start.push(cmd.id as usize),
                         _ => {
                             log::error!(
                                 "Invalid value ({}) for VIRTIO_CONSOLE_PORT_OPEN on port {}",
@@ -247,17 +243,9 @@ impl Console {
                             );
                             continue;
                         }
-                    };
-
-                    if !opened {
-                        log::debug!("Guest closed port {}", cmd.id);
                     }
                 }
                 _ => log::warn!("Unknown console control event {:x}", cmd.event),
-            }
-
-            if port_io_start_requested(&cmd) {
-                ports_to_start.push(cmd.id as usize);
             }
         }
 
@@ -378,36 +366,5 @@ impl VmmExitObserver for Console {
     fn on_vmm_exit(&mut self, _exit_code: i32) {
         self.reset();
         log::trace!("Console on_vmm_exit finished");
-    }
-}
-
-//--------------------------------------------------------------------------------------------------
-// Tests
-//--------------------------------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn console_starts_port_io_only_after_guest_opens_port() {
-        let port_ready = VirtioConsoleControl {
-            id: 0,
-            event: control_event::VIRTIO_CONSOLE_PORT_READY,
-            value: 1,
-        };
-        let port_open = VirtioConsoleControl {
-            id: 0,
-            event: control_event::VIRTIO_CONSOLE_PORT_OPEN,
-            value: 1,
-        };
-        let port_closed = VirtioConsoleControl {
-            value: 0,
-            ..port_open
-        };
-
-        assert!(!port_io_start_requested(&port_ready));
-        assert!(port_io_start_requested(&port_open));
-        assert!(!port_io_start_requested(&port_closed));
     }
 }
