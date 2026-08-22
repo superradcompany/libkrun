@@ -16,11 +16,11 @@ use super::{defs, defs::control_event, defs::uapi};
 use crate::virtio::console::console_control::{
     ConsoleControl, VirtioConsoleControl, VirtioConsoleResize,
 };
-use crate::virtio::console::defs::QUEUE_SIZE;
 use crate::virtio::console::port::Port;
 use crate::virtio::console::port_queue_mapping::{
     num_queues, port_id_to_queue_idx, QueueDirection,
 };
+use crate::virtio::console::{is_valid_queue_size, ConsoleError, DEFAULT_QUEUE_SIZE};
 use crate::virtio::{InterruptTransport, PortDescription, VmmExitObserver};
 
 pub(crate) const CONTROL_RXQ_INDEX: usize = 2;
@@ -78,9 +78,24 @@ impl Console {
         assert!(!ports.is_empty(), "Expected at least 1 port");
 
         let num_queues = num_queues(ports.len());
-        let queue_config: Vec<QueueConfig> = (0..num_queues)
-            .map(|_| QueueConfig::new(QUEUE_SIZE))
+        let mut queue_config: Vec<QueueConfig> = (0..num_queues)
+            .map(|_| QueueConfig::new(DEFAULT_QUEUE_SIZE))
             .collect();
+
+        // Control queues retain the default while each port independently sizes its RX/TX pair.
+        for (port_id, description) in ports.iter().enumerate() {
+            if !is_valid_queue_size(description.queue_size) {
+                return Err(ConsoleError::InvalidQueueSize {
+                    port_id,
+                    queue_size: description.queue_size,
+                });
+            }
+
+            queue_config[port_id_to_queue_idx(QueueDirection::Rx, port_id)] =
+                QueueConfig::new(description.queue_size);
+            queue_config[port_id_to_queue_idx(QueueDirection::Tx, port_id)] =
+                QueueConfig::new(description.queue_size);
+        }
 
         let ports: Vec<Port> = zip(0u32.., ports)
             .map(|(port_id, description)| Port::new(port_id, description))
@@ -380,5 +395,49 @@ impl VmmExitObserver for Console {
     fn on_vmm_exit(&mut self, _exit_code: i32) {
         self.reset();
         log::trace!("Console on_vmm_exit finished");
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn port(name: &'static str, queue_size: u16) -> PortDescription {
+        PortDescription {
+            name: name.into(),
+            input: None,
+            output: None,
+            terminal: None,
+            queue_size,
+        }
+    }
+
+    #[test]
+    fn console_assigns_independent_port_queue_sizes() {
+        let console = Console::new(vec![port("agent", 32), port("agent-bulk", 256)]).unwrap();
+        let sizes: Vec<u16> = console
+            .queue_config
+            .iter()
+            .map(|queue| queue.size)
+            .collect();
+
+        assert_eq!(sizes, vec![32, 32, 32, 32, 256, 256]);
+    }
+
+    #[test]
+    fn console_rejects_invalid_port_queue_sizes() {
+        for queue_size in [15, 24, 2048] {
+            match Console::new(vec![port("agent", queue_size)]) {
+                Err(ConsoleError::InvalidQueueSize {
+                    port_id: 0,
+                    queue_size: actual,
+                }) => assert_eq!(actual, queue_size),
+                _ => panic!("queue size {queue_size} should be rejected"),
+            }
+        }
     }
 }

@@ -2659,6 +2659,7 @@ pub unsafe extern "C" fn krun_add_console_port_tty(
                     ports.push(PortConfig::Tty {
                         name: name_str,
                         tty_fd,
+                        queue_size: devices::virtio::console::DEFAULT_QUEUE_SIZE,
                     });
                     KRUN_SUCCESS
                 }
@@ -2698,6 +2699,7 @@ pub unsafe extern "C" fn krun_add_console_port_inout(
                         name: name_str,
                         input_fd,
                         output_fd,
+                        queue_size: devices::virtio::console::DEFAULT_QUEUE_SIZE,
                     });
                     KRUN_SUCCESS
                 }

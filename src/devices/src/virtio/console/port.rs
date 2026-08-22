@@ -10,6 +10,7 @@ use crate::virtio::console::console_control::ConsoleControl;
 use crate::virtio::console::port_io::{PortInput, PortOutput};
 use crate::virtio::console::process_rx::process_rx;
 use crate::virtio::console::process_tx::process_tx;
+use crate::virtio::console::DEFAULT_QUEUE_SIZE;
 use crate::virtio::port_io::PortTerminalProperties;
 use crate::virtio::{InterruptTransport, Queue};
 
@@ -18,6 +19,7 @@ pub struct PortDescription {
     pub input: Option<Box<dyn PortInput + Send>>,
     pub output: Option<Box<dyn PortOutput + Send>>,
     pub terminal: Option<Box<dyn PortTerminalProperties>>,
+    pub queue_size: u16,
 }
 
 impl PortDescription {
@@ -31,6 +33,7 @@ impl PortDescription {
             input,
             output,
             terminal: Some(terminal),
+            queue_size: DEFAULT_QUEUE_SIZE,
         }
     }
 
@@ -43,6 +46,7 @@ impl PortDescription {
             input: None,
             output: Some(output),
             terminal: None,
+            queue_size: DEFAULT_QUEUE_SIZE,
         }
     }
 
@@ -55,6 +59,7 @@ impl PortDescription {
             input: Some(input),
             output: None,
             terminal: None,
+            queue_size: DEFAULT_QUEUE_SIZE,
         }
     }
 }

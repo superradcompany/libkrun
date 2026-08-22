@@ -7,6 +7,7 @@ use std::time::Duration;
 use devices::virtio::console::port_io::{
     ConsolePortBackend, ConsolePortBackendInputAdapter, ConsolePortBackendOutputAdapter,
 };
+use devices::virtio::console::DEFAULT_QUEUE_SIZE;
 use vmm::resources::PortConfig;
 pub use vmm::resources::{
     HostMemoryPolicy, MemoryPlacementResult, NumaDistance, NumaNodeConfig, NumaTopology,
@@ -309,6 +310,12 @@ pub struct ConsoleBuilder {
     pub(crate) gpu_virgl_flags: Option<u32>,
     #[cfg(feature = "gpu")]
     pub(crate) gpu_shm_size: Option<usize>,
+}
+
+/// Options for one named virtio-console port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsolePortOptions {
+    pub(crate) queue_size: u16,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1115,6 +1122,7 @@ impl ConsoleBuilder {
     pub fn virtio_output(mut self, path: impl AsRef<Path>) -> Self {
         self.ports.push(PortConfig::ConsoleOutputFile {
             path: path.as_ref().to_path_buf(),
+            queue_size: DEFAULT_QUEUE_SIZE,
         });
         self
     }
@@ -1123,10 +1131,22 @@ impl ConsoleBuilder {
     ///
     /// The guest sees the port as `/dev/virtio-ports/<name>`. The host connects to `pipe_name` as a client, so the helper should create the pipe server first.
     #[cfg(target_os = "windows")]
-    pub fn named_pipe(mut self, name: &str, pipe_name: impl Into<String>) -> Self {
+    pub fn named_pipe(self, name: &str, pipe_name: impl Into<String>) -> Self {
+        self.named_pipe_with_options(name, pipe_name, ConsolePortOptions::default())
+    }
+
+    /// Add a Windows named-pipe console port with explicit device queue options.
+    #[cfg(target_os = "windows")]
+    pub fn named_pipe_with_options(
+        mut self,
+        name: &str,
+        pipe_name: impl Into<String>,
+        options: ConsolePortOptions,
+    ) -> Self {
         self.ports.push(PortConfig::NamedPipe {
             name: name.to_string(),
             pipe_name: pipe_name.into(),
+            queue_size: options.queue_size,
         });
         self
     }
@@ -1163,6 +1183,7 @@ impl ConsoleBuilder {
             name: name.to_string(),
             input_fd,
             output_fd,
+            queue_size: DEFAULT_QUEUE_SIZE,
         });
         self
     }
@@ -1177,6 +1198,7 @@ impl ConsoleBuilder {
         self.ports.push(PortConfig::Tty {
             name: name.to_string(),
             tty_fd,
+            queue_size: DEFAULT_QUEUE_SIZE,
         });
         self
     }
@@ -1204,7 +1226,18 @@ impl ConsoleBuilder {
     ///     .console(|c| c.custom("agent", Box::new(my_backend)))
     /// ```
     #[cfg(not(target_os = "windows"))]
-    pub fn custom(mut self, name: &str, backend: Box<dyn ConsolePortBackend>) -> Self {
+    pub fn custom(self, name: &str, backend: Box<dyn ConsolePortBackend>) -> Self {
+        self.custom_with_options(name, backend, ConsolePortOptions::default())
+    }
+
+    /// Add a custom console port backend with explicit device queue options.
+    #[cfg(not(target_os = "windows"))]
+    pub fn custom_with_options(
+        mut self,
+        name: &str,
+        backend: Box<dyn ConsolePortBackend>,
+        options: ConsolePortOptions,
+    ) -> Self {
         let backend: Arc<dyn ConsolePortBackend> = Arc::from(backend);
         let input = Box::new(ConsolePortBackendInputAdapter::new(Arc::clone(&backend)));
         let output = Box::new(ConsolePortBackendOutputAdapter::new(backend));
@@ -1212,8 +1245,32 @@ impl ConsoleBuilder {
             name: name.to_string(),
             input,
             output,
+            queue_size: options.queue_size,
         });
         self
+    }
+}
+
+impl ConsolePortOptions {
+    /// Create options that preserve libkrun's existing queue size.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request the descriptor count for both directions of this port.
+    ///
+    /// Validation happens during [`VmBuilder::build`](crate::VmBuilder::build).
+    pub fn queue_size(mut self, queue_size: u16) -> Self {
+        self.queue_size = queue_size;
+        self
+    }
+}
+
+impl Default for ConsolePortOptions {
+    fn default() -> Self {
+        Self {
+            queue_size: DEFAULT_QUEUE_SIZE,
+        }
     }
 }
 
@@ -1607,7 +1664,13 @@ mod tests {
 
         assert_eq!(builder.ports.len(), 1);
         match builder.ports.pop().unwrap() {
-            PortConfig::ConsoleOutputFile { path: actual } => assert_eq!(actual, path),
+            PortConfig::ConsoleOutputFile {
+                path: actual,
+                queue_size,
+            } => {
+                assert_eq!(actual, path);
+                assert_eq!(queue_size, DEFAULT_QUEUE_SIZE);
+            }
             _ => panic!("unexpected console port config"),
         }
     }
@@ -1619,9 +1682,14 @@ mod tests {
 
         assert_eq!(builder.ports.len(), 1);
         match builder.ports.pop().unwrap() {
-            PortConfig::NamedPipe { name, pipe_name } => {
+            PortConfig::NamedPipe {
+                name,
+                pipe_name,
+                queue_size,
+            } => {
                 assert_eq!(name, "agent");
                 assert_eq!(pipe_name, r"\\.\pipe\msb-agent-console");
+                assert_eq!(queue_size, DEFAULT_QUEUE_SIZE);
             }
             _ => panic!("unexpected console port config"),
         }

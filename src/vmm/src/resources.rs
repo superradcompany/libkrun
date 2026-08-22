@@ -120,23 +120,49 @@ pub enum PortConfig {
     Tty {
         name: String,
         tty_fd: RawFd,
+        queue_size: u16,
     },
     InOut {
         name: String,
         input_fd: RawFd,
         output_fd: RawFd,
+        queue_size: u16,
     },
     Custom {
         name: String,
         input: Box<dyn devices::virtio::port_io::PortInput + Send>,
         output: Box<dyn devices::virtio::port_io::PortOutput + Send>,
+        queue_size: u16,
     },
 }
 
 #[cfg(target_os = "windows")]
 pub enum PortConfig {
-    ConsoleOutputFile { path: PathBuf },
-    NamedPipe { name: String, pipe_name: String },
+    ConsoleOutputFile {
+        path: PathBuf,
+        queue_size: u16,
+    },
+    NamedPipe {
+        name: String,
+        pipe_name: String,
+        queue_size: u16,
+    },
+}
+
+impl PortConfig {
+    /// Return the descriptor count requested for both directions of this port.
+    pub fn queue_size(&self) -> u16 {
+        match self {
+            #[cfg(not(target_os = "windows"))]
+            Self::Tty { queue_size, .. }
+            | Self::InOut { queue_size, .. }
+            | Self::Custom { queue_size, .. } => *queue_size,
+            #[cfg(target_os = "windows")]
+            Self::ConsoleOutputFile { queue_size, .. } | Self::NamedPipe { queue_size, .. } => {
+                *queue_size
+            }
+        }
+    }
 }
 
 /// Configuration for the vsock device

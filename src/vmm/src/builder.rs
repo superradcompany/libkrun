@@ -256,6 +256,8 @@ pub enum StartMicrovmError {
     OpenConsoleFile(io::Error),
     /// Cannot open console named pipe.
     OpenConsolePipe(io::Error),
+    /// Cannot construct a virtio-console device.
+    CreateConsoleDevice(devices::virtio::console::ConsoleError),
     /// The GZIP decoder couldn't decompress the kernel.
     PeGzDecoder(io::Error),
     /// Cannot open the file containing the kernel code.
@@ -369,6 +371,9 @@ impl Display for StartMicrovmError {
                 write!(f, "Cannot create KVM in-kernel IrqChip: {err}")
             }
             CreateRateLimiter(ref err) => write!(f, "Cannot create RateLimiter: {err}"),
+            CreateConsoleDevice(ref err) => {
+                write!(f, "Cannot create virtio-console device: {err:?}")
+            }
             #[cfg(not(target_os = "windows"))]
             ElfOpenKernel(ref err) => {
                 write!(f, "Cannot open the file containing the kernel code: {err}")
@@ -4324,7 +4329,11 @@ fn create_explicit_ports(
 
     for port_cfg in port_configs {
         let port_desc = match port_cfg {
-            PortConfig::Tty { name, tty_fd } => {
+            PortConfig::Tty {
+                name,
+                tty_fd,
+                queue_size,
+            } => {
                 assert!(tty_fd > 0, "PortConfig::Tty must have a valid tty_fd");
                 let term_fd = unsafe { BorrowedFd::borrow_raw(tty_fd) };
                 setup_terminal_raw_mode(vmm, Some(term_fd), false);
@@ -4334,12 +4343,14 @@ fn create_explicit_ports(
                     input: Some(port_io::input_to_raw_fd_dup(tty_fd).unwrap()),
                     output: Some(port_io::output_to_raw_fd_dup(tty_fd).unwrap()),
                     terminal: Some(port_io::term_fd(tty_fd).unwrap()),
+                    queue_size,
                 }
             }
             PortConfig::InOut {
                 name,
                 input_fd,
                 output_fd,
+                queue_size,
             } => PortDescription {
                 name: name.into(),
                 input: if input_fd < 0 {
@@ -4353,16 +4364,19 @@ fn create_explicit_ports(
                     Some(port_io::output_to_raw_fd_dup(output_fd).unwrap())
                 },
                 terminal: None,
+                queue_size,
             },
             PortConfig::Custom {
                 name,
                 input,
                 output,
+                queue_size,
             } => PortDescription {
                 name: name.into(),
                 input: Some(input),
                 output: Some(output),
                 terminal: None,
+                queue_size,
             },
         };
 
@@ -4382,16 +4396,22 @@ fn create_explicit_ports(
 
     for port_cfg in port_configs {
         let port_desc = match port_cfg {
-            PortConfig::ConsoleOutputFile { path } => {
+            PortConfig::ConsoleOutputFile { path, queue_size } => {
                 let file = File::create(path).map_err(OpenConsoleFile)?;
 
-                PortDescription::console(
+                let mut description = PortDescription::console(
                     Some(port_io::input_empty().unwrap()),
                     Some(port_io::output_file(file).unwrap()),
                     port_io::term_fixed_size(0, 0),
-                )
+                );
+                description.queue_size = queue_size;
+                description
             }
-            PortConfig::NamedPipe { name, pipe_name } => {
+            PortConfig::NamedPipe {
+                name,
+                pipe_name,
+                queue_size,
+            } => {
                 let (input, output) = port_io::named_pipe(&pipe_name).map_err(OpenConsolePipe)?;
 
                 PortDescription {
@@ -4399,6 +4419,7 @@ fn create_explicit_ports(
                     input: Some(input),
                     output: Some(output),
                     terminal: None,
+                    queue_size,
                 }
             }
         };
@@ -4433,7 +4454,9 @@ fn attach_console_devices(
         Some(VirtioConsoleConfigMode::Explicit(ports)) => create_explicit_ports(vmm, ports)?,
     };
 
-    let console = Arc::new(Mutex::new(devices::virtio::Console::new(ports).unwrap()));
+    let console = Arc::new(Mutex::new(
+        devices::virtio::Console::new(ports).map_err(CreateConsoleDevice)?,
+    ));
 
     vmm.exit_observers.push(console.clone());
 
@@ -4466,7 +4489,9 @@ fn attach_console_devices(
         VirtioConsoleConfigMode::Explicit(ports) => create_explicit_ports(ports)?,
     };
 
-    let console = Arc::new(Mutex::new(devices::virtio::Console::new(ports).unwrap()));
+    let console = Arc::new(Mutex::new(
+        devices::virtio::Console::new(ports).map_err(CreateConsoleDevice)?,
+    ));
 
     vmm.exit_observers.push(console.clone());
 
@@ -5031,15 +5056,21 @@ pub mod tests {
             std::process::id()
         ));
 
-        let ports =
-            create_explicit_ports(vec![PortConfig::ConsoleOutputFile { path: path.clone() }])
-                .unwrap();
+        let ports = create_explicit_ports(vec![PortConfig::ConsoleOutputFile {
+            path: path.clone(),
+            queue_size: devices::virtio::console::DEFAULT_QUEUE_SIZE,
+        }])
+        .unwrap();
 
         assert_eq!(ports.len(), 1);
         assert!(ports[0].name.is_empty());
         assert!(ports[0].input.is_some());
         assert!(ports[0].output.is_some());
         assert!(ports[0].terminal.is_some());
+        assert_eq!(
+            ports[0].queue_size,
+            devices::virtio::console::DEFAULT_QUEUE_SIZE
+        );
 
         let _ = std::fs::remove_file(path);
     }
