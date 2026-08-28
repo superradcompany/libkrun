@@ -118,6 +118,25 @@ impl MMIODeviceManager {
         Ok(())
     }
 
+    /// Register the PCIe ECAM config-access window on the MMIO bus. The guest
+    /// kernel reaches config space through this `PciConfigMmio`, which shares
+    /// the `PciBus` across vCPUs (the bus map is cloned per-vCPU, but each
+    /// device is an `Arc<Mutex<..>>`).
+    #[cfg(all(target_arch = "aarch64", feature = "pci"))]
+    pub fn register_pci(
+        &mut self,
+        pci_bus: Arc<Mutex<devices::pci::PciBus>>,
+    ) -> Result<()> {
+        use arch::aarch64::layout::{PCIE_ECAM_BASE, PCIE_ECAM_SIZE};
+
+        let cfg_mmio = devices::pci::PciConfigMmio::new(pci_bus);
+        self.bus
+            .insert(Arc::new(Mutex::new(cfg_mmio)), PCIE_ECAM_BASE, PCIE_ECAM_SIZE)
+            .map_err(Error::BusError)?;
+
+        Ok(())
+    }
+
     /// Register an already created MMIO device to be used via MMIO transport.
     pub fn register_mmio_device(
         &mut self,
