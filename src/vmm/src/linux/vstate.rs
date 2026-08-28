@@ -757,6 +757,34 @@ impl Vm {
         Ok(())
     }
 
+    /// Register a raw MMIO passthrough memslot — e.g. a VFIO BAR mmap'd from a
+    /// physical device — at `guest_addr`, backed by the host mapping at
+    /// `host_addr`. The guest BAR window must not overlap guest RAM.
+    #[cfg(all(target_arch = "aarch64", feature = "vfio"))]
+    pub fn register_mmio_memslot(
+        &mut self,
+        guest_addr: u64,
+        host_addr: u64,
+        size: u64,
+    ) -> Result<()> {
+        let memory_region = kvm_userspace_memory_region {
+            slot: self.next_mem_slot,
+            guest_phys_addr: guest_addr,
+            memory_size: size,
+            userspace_addr: host_addr,
+            flags: 0,
+        };
+        // Safe: `host_addr` is a valid mmap of `size` bytes (the VFIO BAR), and
+        // the guest BAR window is placed clear of guest RAM.
+        unsafe {
+            self.fd
+                .set_user_memory_region(memory_region)
+                .map_err(Error::SetUserMemoryRegion)?;
+        }
+        self.next_mem_slot += 1;
+        Ok(())
+    }
+
     #[cfg(feature = "tdx")]
     pub fn tdx_secure_virt_prepare(&self) -> Result<tdx::launch::Launcher> {
         match &self.tdx {

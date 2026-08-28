@@ -281,6 +281,12 @@ pub enum StartMicrovmError {
     RegisterFsSigwinch(kvm_ioctls::Error),
     /// Cannot initialize a MMIO Gpu device or add a device to the MMIO Bus.
     RegisterGpuDevice(device_manager::mmio::Error),
+    /// Cannot register the PCIe host bridge (ECAM) on the MMIO Bus.
+    #[cfg(feature = "pci")]
+    RegisterPciDevice(device_manager::mmio::Error),
+    /// Cannot open or attach a VFIO passthrough PCI device.
+    #[cfg(feature = "vfio")]
+    AttachVfioDevice(String),
     /// Cannot initialize a MMIO Input device or add a device to the MMIO Bus.
     RegisterInputDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Network Device or add a device to the MMIO Bus.
@@ -597,6 +603,19 @@ impl Display for StartMicrovmError {
                     f,
                     "Cannot initialize a MMIO Input Device or add a device to the MMIO Bus. {err_msg}"
                 )
+            }
+            #[cfg(feature = "pci")]
+            RegisterPciDevice(ref err) => {
+                let mut err_msg = format!("{err}");
+                err_msg = err_msg.replace('\"', "");
+                write!(
+                    f,
+                    "Cannot register the PCIe host bridge on the MMIO Bus. {err_msg}"
+                )
+            }
+            #[cfg(feature = "vfio")]
+            AttachVfioDevice(ref msg) => {
+                write!(f, "Cannot attach VFIO passthrough device. {msg}")
             }
             RegisterNetDevice(ref err) => {
                 let mut err_msg = format!("{err}");
@@ -1766,6 +1785,19 @@ pub fn build_microvm_paused(
     #[cfg(not(target_os = "windows"))]
     for serial_tty in serial_ttys {
         setup_terminal_raw_mode(&mut vmm, Some(serial_tty), false);
+    }
+
+    // Register the PCIe host bridge (ECAM) so the guest enumerates the PCI bus.
+    #[cfg(all(target_arch = "aarch64", feature = "pci"))]
+    {
+        let _pci_bus = attach_pci_root(&mut vmm)?;
+        // Attach VFIO passthrough devices named in KRUN_VFIO_PCI (comma-separated BDFs).
+        #[cfg(feature = "vfio")]
+        if let Ok(bdfs) = std::env::var("KRUN_VFIO_PCI") {
+            for bdf in bdfs.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                attach_vfio_device(&mut vmm, &_pci_bus, bdf)?;
+            }
+        }
     }
 
     #[cfg(not(feature = "tee"))]
@@ -4668,6 +4700,142 @@ fn attach_rng_device(
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc.clone(), rng).map_err(RegisterRngDevice)?;
+
+    Ok(())
+}
+
+/// Creates the PCIe host bridge and registers its ECAM config window on the
+/// MMIO bus, so the guest kernel enumerates a (initially empty) PCI bus. VFIO
+/// devices are added to this same bus in a later step.
+#[cfg(all(target_arch = "aarch64", feature = "pci"))]
+fn attach_pci_root(
+    vmm: &mut Vmm,
+) -> std::result::Result<Arc<Mutex<devices::pci::PciBus>>, StartMicrovmError> {
+    // No-op BAR relocation for now: the host bridge has no BARs to move, and
+    // VFIO BAR reprogramming is wired with the VFIO device in a later step.
+    struct NoopRelocation;
+    impl devices::pci::DeviceRelocation for NoopRelocation {
+        fn move_bar(
+            &self,
+            _old_base: u64,
+            _new_base: u64,
+            _len: u64,
+            _pci_dev: &mut dyn devices::pci::PciDevice,
+            _region_type: devices::pci::PciBarRegionType,
+        ) -> std::result::Result<(), std::io::Error> {
+            Ok(())
+        }
+    }
+
+    let pci_root = devices::pci::PciRoot::new(None);
+    let pci_bus = Arc::new(Mutex::new(devices::pci::PciBus::new(
+        pci_root,
+        Arc::new(NoopRelocation),
+    )));
+    vmm.mmio_device_manager
+        .register_pci(pci_bus.clone())
+        .map_err(StartMicrovmError::RegisterPciDevice)?;
+
+    Ok(pci_bus)
+}
+
+/// Open a physical PCI device via VFIO and add it to the guest PCI bus. Config
+/// space passes through to the device; BARs are emulated (and mmap'd in a later
+/// step). The device is selected by BDF (e.g. "0002:01:00.0").
+#[cfg(all(target_arch = "aarch64", feature = "vfio"))]
+fn attach_vfio_device(
+    vmm: &mut Vmm,
+    pci_bus: &Arc<Mutex<devices::pci::PciBus>>,
+    bdf: &str,
+) -> std::result::Result<(), StartMicrovmError> {
+    let id = format!("vfio-{bdf}");
+    let device = devices::vfio_pci::VfioPciDevice::new(id, bdf)
+        .map_err(|e| StartMicrovmError::AttachVfioDevice(format!("{bdf}: {e}")))?;
+
+    // Step 6: mmap each mmappable BAR from the device fd and register it as a
+    // guest MMIO memslot at the allocated BAR address, so guest accesses reach
+    // the hardware directly. (The MSI-X table page is trapped separately once
+    // MSI-X remapping lands; whole-BAR mapping is the intermediate state.)
+    for region in device.mmio_regions() {
+        match device.vfio().mmap_region(region.index) {
+            Ok((host_addr, len)) => {
+                vmm.register_mmio_memslot(region.start, host_addr as u64, len as u64)
+                    .map_err(|e| {
+                        StartMicrovmError::AttachVfioDevice(format!("{bdf} BAR{}: {e}", region.index))
+                    })?;
+                info!(
+                    "vfio: {bdf} BAR{} mapped guest {:#x} len {:#x}",
+                    region.index, region.start, len
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "vfio: {bdf} BAR{} not mmappable ({e}); accesses will be trapped",
+                    region.index
+                );
+            }
+        }
+    }
+
+    // Step 7: identity-map all guest RAM into the device's IOMMU (iova == gpa)
+    // so the GPU can DMA to/from guest memory.
+    {
+        use vm_memory::GuestMemoryRegion;
+        let gm = vmm.guest_memory();
+        for region in gm.iter() {
+            let gpa = region.start_addr().raw_value();
+            let host = gm.get_host_address(region.start_addr()).map_err(|e| {
+                StartMicrovmError::AttachVfioDevice(format!("{bdf} dma host addr: {e}"))
+            })? as u64;
+            let size = region.len();
+            device
+                .vfio()
+                .container()
+                .map_dma(host, gpa, size)
+                .map_err(|e| {
+                    StartMicrovmError::AttachVfioDevice(format!("{bdf} dma map: {e}"))
+                })?;
+        }
+        info!("vfio: {bdf} guest RAM identity-mapped into device IOMMU");
+    }
+
+    // Step 8: bind the VFIO group to KVM (KVM_DEV_VFIO) so KVM can coordinate
+    // interrupt routing and IOMMU coherence with the device.
+    {
+        let mut kvm_vfio = kvm_bindings::kvm_create_device {
+            type_: kvm_bindings::kvm_device_type_KVM_DEV_TYPE_VFIO,
+            fd: 0,
+            flags: 0,
+        };
+        let kvm_vfio_fd = vmm
+            .kvm_vm()
+            .fd()
+            .create_device(&mut kvm_vfio)
+            .map_err(|e| {
+                StartMicrovmError::AttachVfioDevice(format!("{bdf} kvm vfio device: {e}"))
+            })?;
+        let group_fd: i32 = device.vfio().group_as_raw_fd();
+        let attr = kvm_bindings::kvm_device_attr {
+            group: kvm_bindings::KVM_DEV_VFIO_GROUP,
+            attr: u64::from(kvm_bindings::KVM_DEV_VFIO_GROUP_ADD),
+            addr: &group_fd as *const i32 as u64,
+            flags: 0,
+        };
+        kvm_vfio_fd.set_device_attr(&attr).map_err(|e| {
+            StartMicrovmError::AttachVfioDevice(format!("{bdf} kvm vfio group add: {e}"))
+        })?;
+        // The KVM VFIO device fd must outlive the VM; leak it (closed at exit).
+        std::mem::forget(kvm_vfio_fd);
+        info!("vfio: {bdf} group bound to KVM");
+    }
+
+    let mut bus = pci_bus.lock().unwrap();
+    let slot = bus
+        .allocate_device_id(None)
+        .map_err(|e| StartMicrovmError::AttachVfioDevice(format!("{bdf}: {e:?}")))?;
+    bus.add_device(slot, Arc::new(Mutex::new(device)))
+        .map_err(|e| StartMicrovmError::AttachVfioDevice(format!("{bdf}: {e:?}")))?;
+    info!("vfio: attached {bdf} at 0000:00:{slot:02x}.0");
 
     Ok(())
 }
