@@ -12,6 +12,10 @@ default = []
 net = ["devices/net", "vmm/net"]
 blk = ["devices/blk", "vmm/blk"]
 gpu = ["krun_display", "devices/gpu", "vmm/gpu"]
+# Linux + upstream virglrenderer >= 1.x: venus mappable blobs ride
+# virgl_renderer_resource_map_fixed; enable from Linux consumers only
+# (the macOS krunkit virglrenderer does not export the symbol).
+virgl_resource_map2 = ["devices/virgl_resource_map2"]
 snd = ["devices/snd", "vmm/snd"]
 tee = ["devices/tee", "vmm/tee"]
 aws-nitro = ["dep:aws-nitro", "dep:nitro-enclaves", "devices/aws-nitro", "vmm/aws-nitro"]
