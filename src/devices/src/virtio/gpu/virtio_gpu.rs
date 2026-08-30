@@ -147,6 +147,28 @@ impl VirtioGpuResource {
 /// making the device allocate something huge on the worker thread.
 const MAX_CURSOR_SIZE: u32 = 512;
 
+/// The alpha-carrying twin of an alpha-less format.
+///
+/// The guest allocates its cursor as a dumb buffer, and Linux creates the host
+/// resource with a hardcoded `DRM_FORMAT_HOST_XRGB8888` whatever the
+/// framebuffer's format is (v6.12 `virtgpu_gem.c:78`), so an `ARGB8888` cursor
+/// arrives as an `X` resource even though its pixels do carry alpha. Dropping
+/// that alpha draws an opaque box around the pointer. QEMU sidesteps the same
+/// problem by ignoring the resource format for cursors entirely and copying the
+/// raw pixels as ARGB (`hw/display/virtio-gpu.c:44`
+/// `virtio_gpu_update_cursor_data` memcpys `width * height * 4` bytes and never
+/// looks at `res->format`); do the same, but keep the channel order the
+/// resource declared rather than assuming one.
+fn cursor_format_with_alpha(format: ResourceFormat) -> ResourceFormat {
+    match format {
+        ResourceFormat::BGRX => ResourceFormat::BGRA,
+        ResourceFormat::XRGB => ResourceFormat::ARGB,
+        ResourceFormat::RGBX => ResourceFormat::RGBA,
+        ResourceFormat::XBGR => ResourceFormat::ABGR,
+        already_has_alpha => already_has_alpha,
+    }
+}
+
 /// Maps a cursor call's result onto a queue response.
 ///
 /// A backend that never negotiated the cursor feature is not worth an error
@@ -593,6 +615,12 @@ impl VirtioGpu {
             warn!("Cannot use cursor resource {resource_id} with unknown format");
             return Err(ErrUnspec);
         };
+        let format = cursor_format_with_alpha(format);
+        debug!(
+            "update_cursor: scanout {scanout_id} resource {resource_id} {width}x{height} \
+             {:?} -> {format:?} hotspot ({hot_x},{hot_y})",
+            resource.format
+        );
 
         let mut data =
             vec![0u8; width as usize * height as usize * ResourceFormat::BYTES_PER_PIXEL];
