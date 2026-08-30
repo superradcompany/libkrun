@@ -678,7 +678,19 @@ impl VmBuilder {
             if let Some(shm_size) = self.console.gpu_shm_size {
                 vmr.set_gpu_shm_size(shm_size);
             }
+
+            for (width, height) in self.console.gpu_displays {
+                vmr.displays
+                    .push(devices::virtio::display::DisplayInfo::new(width, height));
+            }
+
+            if let Some(backend) = self.console.gpu_display_backend {
+                vmr.display_backend = Some(backend);
+            }
         }
+
+        #[cfg(feature = "input")]
+        vmr.input_backends.extend(self.console.input_devices);
 
         // Apply console port configuration
         if !self.console.ports.is_empty() {

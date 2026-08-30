@@ -310,6 +310,15 @@ pub struct ConsoleBuilder {
     pub(crate) gpu_virgl_flags: Option<u32>,
     #[cfg(feature = "gpu")]
     pub(crate) gpu_shm_size: Option<usize>,
+    #[cfg(feature = "gpu")]
+    pub(crate) gpu_displays: Vec<(u32, u32)>,
+    #[cfg(feature = "gpu")]
+    pub(crate) gpu_display_backend: Option<krun_display::DisplayBackend<'static>>,
+    #[cfg(feature = "input")]
+    pub(crate) input_devices: Vec<(
+        krun_input::InputConfigBackend<'static>,
+        krun_input::InputEventProviderBackend<'static>,
+    )>,
 }
 
 /// Options for one named virtio-console port.
@@ -1169,6 +1178,38 @@ impl ConsoleBuilder {
     #[cfg(feature = "gpu")]
     pub fn gpu_shm_size(mut self, size: usize) -> Self {
         self.gpu_shm_size = Some(size);
+        self
+    }
+
+    /// Add a virtio-gpu scanout of `width` x `height` pixels.
+    ///
+    /// Each call adds one display (up to `VIRTIO_GPU_MAX_SCANOUTS`). Without any
+    /// display the guest driver disables KMS and exposes a render-only node.
+    /// Frames go to the VMM's display backend (a no-op sink unless one is set).
+    #[cfg(feature = "gpu")]
+    pub fn gpu_display(mut self, width: u32, height: u32) -> Self {
+        self.gpu_displays.push((width, height));
+        self
+    }
+
+    /// Receive scanout frames in a `krun_display` backend (see
+    /// `krun_display::IntoDisplayBackend`). Without one, frames are dropped.
+    #[cfg(feature = "gpu")]
+    pub fn gpu_display_backend(mut self, backend: krun_display::DisplayBackend<'static>) -> Self {
+        self.gpu_display_backend = Some(backend);
+        self
+    }
+
+    /// Attach a virtio-input device described by `config` whose events come
+    /// from `events` (see `krun_input::IntoInputConfig` / `IntoInputEvents`).
+    /// Each call adds one device.
+    #[cfg(feature = "input")]
+    pub fn input_device(
+        mut self,
+        config: krun_input::InputConfigBackend<'static>,
+        events: krun_input::InputEventProviderBackend<'static>,
+    ) -> Self {
+        self.input_devices.push((config, events));
         self
     }
 

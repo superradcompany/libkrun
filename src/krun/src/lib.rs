@@ -38,6 +38,12 @@ pub mod backends;
 //--------------------------------------------------------------------------------------------------
 
 pub use api::builder::VmBuilder;
+/// Display backend types for `ConsoleBuilder::gpu_display_backend`.
+#[cfg(feature = "gpu")]
+pub use krun_display;
+/// Input backend types for `ConsoleBuilder::input_device`.
+#[cfg(feature = "input")]
+pub use krun_input;
 #[cfg(feature = "blk")]
 pub use api::builders::CacheMode;
 #[cfg(feature = "blk")]
