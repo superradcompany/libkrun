@@ -942,3 +942,88 @@ impl GpuResponse {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::descriptor_utils::{create_descriptor_chain, DescriptorType};
+    use super::*;
+    use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
+
+    /// Decode `payload` written after a header of `type_`, the way the worker
+    /// decodes a command popped off a queue.
+    fn decode<T: ByteValued>(type_: u32, payload: T) -> (virtio_gpu_ctrl_hdr, GpuCommand) {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0x0), 0x10000)]).unwrap();
+        let buffer = GuestAddress(0x100);
+        let hdr = virtio_gpu_ctrl_hdr {
+            type_,
+            fence_id: 42,
+            ..Default::default()
+        };
+        memory.write_obj(hdr, buffer).unwrap();
+        memory
+            .write_obj(
+                payload,
+                buffer.unchecked_add(size_of::<virtio_gpu_ctrl_hdr>() as u64),
+            )
+            .unwrap();
+
+        let len = (size_of::<virtio_gpu_ctrl_hdr>() + size_of_val(&payload)) as u32;
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0x0),
+            buffer,
+            vec![(DescriptorType::Readable, len)],
+            0,
+        )
+        .unwrap();
+        let mut reader = Reader::new(&memory, chain).unwrap();
+        GpuCommand::decode(&mut reader).unwrap()
+    }
+
+    /// The cursor queue's command, as the guest lays it out.
+    fn update_cursor() -> virtio_gpu_update_cursor {
+        virtio_gpu_update_cursor {
+            pos: virtio_gpu_cursor_pos {
+                scanout_id: 0,
+                x: 640,
+                y: 480,
+                padding: 0,
+            },
+            resource_id: 7,
+            hot_x: 4,
+            hot_y: 5,
+            padding: 0,
+        }
+    }
+
+    #[test]
+    fn update_cursor_decodes_the_image_and_the_position() {
+        let (hdr, cmd) = decode(VIRTIO_GPU_CMD_UPDATE_CURSOR, update_cursor());
+        assert_eq!(hdr.fence_id, 42);
+        let GpuCommand::UpdateCursor(info) = cmd else {
+            panic!("expected UpdateCursor, got {cmd:?}");
+        };
+        assert_eq!(info.resource_id, 7);
+        assert_eq!((info.hot_x, info.hot_y), (4, 5));
+        assert_eq!((info.pos.scanout_id, info.pos.x, info.pos.y), (0, 640, 480));
+    }
+
+    /// MOVE_CURSOR carries the same struct; only `pos` is meaningful.
+    #[test]
+    fn move_cursor_decodes_the_position() {
+        let (_, cmd) = decode(VIRTIO_GPU_CMD_MOVE_CURSOR, update_cursor());
+        let GpuCommand::MoveCursor(info) = cmd else {
+            panic!("expected MoveCursor, got {cmd:?}");
+        };
+        assert_eq!((info.pos.scanout_id, info.pos.x, info.pos.y), (0, 640, 480));
+    }
+
+    /// The device reads these straight out of guest memory, so their layout is
+    /// part of the wire format.
+    #[test]
+    fn the_cursor_structs_match_the_virtio_layout() {
+        assert_eq!(size_of::<virtio_gpu_ctrl_hdr>(), 24);
+        assert_eq!(size_of::<virtio_gpu_cursor_pos>(), 16);
+        assert_eq!(size_of::<virtio_gpu_update_cursor>(), 32);
+    }
+}

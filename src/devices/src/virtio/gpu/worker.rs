@@ -3,7 +3,9 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use utils::eventfd::EventFd;
 
 #[cfg(target_os = "macos")]
@@ -33,6 +35,11 @@ use krun_display::Rect;
 pub struct Worker {
     control_evt: EventFd,
     control_queue: Arc<Mutex<VirtQueue>>,
+    // The cursor queue never leaves this thread: it carries no fences, so
+    // nothing outside the worker (the rutabaga fence handler, in particular)
+    // ever has to reach it.
+    cursor_evt: EventFd,
+    cursor_queue: VirtQueue,
     mem: GuestMemoryMmap,
     interrupt: InterruptTransport,
     shm_region: VirtioShmRegion,
@@ -44,10 +51,22 @@ pub struct Worker {
     display_backend: DisplayBackend<'static>,
 }
 
+/// Our own file description for a queue's event, in blocking mode: the worker
+/// only ever reads it once `poll` has said it is ready.
+fn blocking_event(queue: &DeviceQueue) -> EventFd {
+    let event = queue.event.try_clone().unwrap();
+    // SAFETY: event is valid for the duration of the fcntl calls.
+    let fd = unsafe { BorrowedFd::borrow_raw(event.as_raw_fd()) };
+    let flags = OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL).unwrap()) & !OFlag::O_NONBLOCK;
+    fcntl(fd, FcntlArg::F_SETFL(flags)).unwrap();
+    event
+}
+
 impl Worker {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         control_q: DeviceQueue,
+        cursor_q: DeviceQueue,
         mem: GuestMemoryMmap,
         interrupt: InterruptTransport,
         shm_region: VirtioShmRegion,
@@ -57,17 +76,14 @@ impl Worker {
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend<'static>,
     ) -> Self {
-        // Clone the eventfd so we have our own file description, then set it to blocking mode.
-        let control_evt = control_q.event.try_clone().unwrap();
-        // SAFETY: control_evt is valid for the duration of the fcntl calls.
-        let fd = unsafe { BorrowedFd::borrow_raw(control_evt.as_raw_fd()) };
-        let flags =
-            OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL).unwrap()) & !OFlag::O_NONBLOCK;
-        fcntl(fd, FcntlArg::F_SETFL(flags)).unwrap();
+        let control_evt = blocking_event(&control_q);
+        let cursor_evt = blocking_event(&cursor_q);
 
         Self {
             control_evt,
             control_queue: Arc::new(Mutex::new(control_q.queue)),
+            cursor_evt,
+            cursor_queue: cursor_q.queue,
             mem,
             interrupt,
             shm_region,
@@ -101,16 +117,120 @@ impl Worker {
         );
 
         loop {
-            if let Err(e) = self.control_evt.read() {
-                error!("Failed to read control_evt: {e:?}");
+            // Rebuilt every iteration: `PollFd` borrows the fds, and the
+            // handlers below need `&mut self`.
+            // SAFETY: both eventfds live as long as `self`.
+            let control_fd = unsafe { BorrowedFd::borrow_raw(self.control_evt.as_raw_fd()) };
+            let cursor_fd = unsafe { BorrowedFd::borrow_raw(self.cursor_evt.as_raw_fd()) };
+            let mut fds = [
+                PollFd::new(control_fd, PollFlags::POLLIN),
+                PollFd::new(cursor_fd, PollFlags::POLLIN),
+            ];
+            if let Err(e) = poll(&mut fds, PollTimeout::NONE) {
+                if e != Errno::EINTR {
+                    error!("Failed to poll the gpu queues: {e:?}");
+                }
                 continue;
             }
-            if self.process_queue(&mut virtio_gpu, &self.control_queue.clone()) {
+            let readable =
+                |fd: &PollFd| fd.revents().is_some_and(|r| r.contains(PollFlags::POLLIN));
+            let (control_ready, cursor_ready) = (readable(&fds[0]), readable(&fds[1]));
+
+            let mut used_any = false;
+            if control_ready {
+                if let Err(e) = self.control_evt.read() {
+                    error!("Failed to read control_evt: {e:?}");
+                } else {
+                    used_any |= self.process_queue(&mut virtio_gpu, &self.control_queue.clone());
+                }
+            }
+            if cursor_ready {
+                if let Err(e) = self.cursor_evt.read() {
+                    error!("Failed to read cursor_evt: {e:?}");
+                } else {
+                    used_any |= self.process_cursor_queue(&mut virtio_gpu);
+                }
+            }
+            if used_any {
                 if let Err(e) = self.interrupt.try_signal_used_queue() {
                     error!("Error signaling queue: {e:?}");
                 }
             }
         }
+    }
+
+    /// Handle a command that arrived on either queue but only ever acts on the
+    /// cursor plane.
+    fn process_cursor_command(virtio_gpu: &mut VirtioGpu, cmd: GpuCommand) -> VirtioGpuResult {
+        match cmd {
+            GpuCommand::UpdateCursor(info) => virtio_gpu.update_cursor(
+                info.pos.scanout_id,
+                info.resource_id,
+                info.hot_x,
+                info.hot_y,
+                info.pos.x,
+                info.pos.y,
+            ),
+            GpuCommand::MoveCursor(info) => {
+                virtio_gpu.move_cursor(info.pos.scanout_id, info.pos.x, info.pos.y)
+            }
+            _ => {
+                error!("virtio_gpu: {cmd:?} is not a cursor command");
+                Err(GpuResponse::ErrUnspec)
+            }
+        }
+    }
+
+    /// Drain the cursor queue.
+    ///
+    /// It only ever carries UPDATE_CURSOR and MOVE_CURSOR, which need no
+    /// fences, and Linux's `virtio_gpu_queue_cursor` queues a single
+    /// out-descriptor with no response buffer — so a response is encoded only
+    /// when the driver did provide one. Nothing here may block: this thread
+    /// also serves the control queue.
+    fn process_cursor_queue(&mut self, virtio_gpu: &mut VirtioGpu) -> bool {
+        let mem = self.mem.clone();
+        let mut used_any = false;
+
+        while let Some(head) = self.cursor_queue.pop(&mem) {
+            let mut len = 0;
+            match Reader::new(&mem, head.clone()).map_err(GpuError::QueueReader) {
+                Ok(mut reader) => match GpuCommand::decode(&mut reader) {
+                    Ok((hdr, cmd)) => {
+                        let resp =
+                            Self::process_cursor_command(virtio_gpu, cmd).unwrap_or_else(|resp| {
+                                debug!("{cmd:?} -> {resp:?}");
+                                resp
+                            });
+                        match Writer::new(&mem, head.clone()) {
+                            Ok(mut writer) if writer.available_bytes() != 0 => {
+                                match resp.encode(
+                                    0,
+                                    hdr.fence_id,
+                                    hdr.ctx_id,
+                                    hdr.ring_idx,
+                                    &mut writer,
+                                ) {
+                                    Ok(written) => len = written,
+                                    Err(e) => debug!("cursor queue response encode error: {e:?}"),
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => debug!("cursor queue writer error: {e:?}"),
+                        }
+                    }
+                    Err(e) => debug!("cursor descriptor decode error: {e:?}"),
+                },
+                Err(e) => debug!("cursor queue reader error: {e:?}"),
+            }
+
+            if let Err(e) = self.cursor_queue.add_used(&mem, head.index, len) {
+                error!("failed to add used elements to the cursor queue: {e:?}");
+            }
+            used_any = true;
+        }
+
+        used_any
     }
 
     fn process_gpu_command(
@@ -187,11 +307,11 @@ impl Worker {
                 }
             }
             GpuCommand::ResourceDetachBacking(info) => virtio_gpu.detach_backing(info.resource_id),
-            GpuCommand::UpdateCursor(_info) => {
-                panic!("virtio_gpu: GpuCommand:UpdateCursor unimplemented");
-            }
-            GpuCommand::MoveCursor(_info) => {
-                panic!("virtio_gpu: GpuCommand::MoveCursor unimplemented");
+            // The cursor queue is where these belong, but the spec does not
+            // forbid the control queue and a panic would take the whole
+            // device down with it.
+            GpuCommand::UpdateCursor(_) | GpuCommand::MoveCursor(_) => {
+                Self::process_cursor_command(virtio_gpu, cmd)
             }
             GpuCommand::ResourceAssignUuid(info) => {
                 let resource_id = info.resource_id;

@@ -15,7 +15,8 @@ use super::protocol::{
 #[cfg(target_os = "macos")]
 use crossbeam_channel::{unbounded, Sender};
 use krun_display::{
-    DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, Rect, ResourceFormat,
+    CursorImage, DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendCursor,
+    DisplayBackendError, DisplayBackendInstance, Rect, ResourceFormat,
 };
 use libc::c_void;
 #[cfg(target_os = "macos")]
@@ -138,6 +139,27 @@ impl VirtioGpuResource {
             shmem_offset: None,
             rutabaga_external_mapping: false,
         }
+    }
+}
+
+/// Largest cursor image the device reads out of a resource. The guest picks
+/// the size (Linux asks for 64x64); this only stops a bogus resource from
+/// making the device allocate something huge on the worker thread.
+const MAX_CURSOR_SIZE: u32 = 512;
+
+/// Maps a cursor call's result onto a queue response.
+///
+/// A backend that never negotiated the cursor feature is not worth an error
+/// line per pointer move — and the guest never reads cursor queue responses
+/// anyway (`virtio_gpu_queue_cursor` sends no response buffer).
+fn cursor_result(result: std::result::Result<(), DisplayBackendError>) -> VirtioGpuResult {
+    match result {
+        Ok(()) => Ok(OkNoData),
+        Err(DisplayBackendError::MethodNotSupported) => {
+            debug!("Display backend has no cursor plane, ignoring the cursor command");
+            Err(ErrUnspec)
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -531,6 +553,79 @@ impl VirtioGpu {
             })?;
 
         Ok(OkNoData)
+    }
+
+    /// Presents the cursor resource on `scanout_id`, or hides the cursor when
+    /// `resource_id` is 0, and moves it to `(x, y)`.
+    ///
+    /// The guest uploads the image into the resource with TRANSFER_TO_HOST_2D
+    /// before sending this, so the pixels are read back out of rutabaga the
+    /// same way a scanout flush reads a frame.
+    pub fn update_cursor(
+        &mut self,
+        scanout_id: u32,
+        resource_id: u32,
+        hot_x: u32,
+        hot_y: u32,
+        x: u32,
+        y: u32,
+    ) -> VirtioGpuResult {
+        if scanout_id as usize >= self.displays.len() {
+            return Err(ErrInvalidScanoutId);
+        }
+
+        // Virtio spec: "The driver can use resource_id = 0 to hide the cursor."
+        if resource_id == 0 {
+            cursor_result(self.display_backend.set_cursor(scanout_id, None))?;
+            return Ok(OkNoData);
+        }
+
+        let resource = *self
+            .resources
+            .get(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+        let (width, height) = (resource.width, resource.height);
+        if width == 0 || height == 0 || width > MAX_CURSOR_SIZE || height > MAX_CURSOR_SIZE {
+            warn!("Refusing cursor resource {resource_id} of {width}x{height}");
+            return Err(ErrUnspec);
+        }
+        let Some(format) = resource.format else {
+            warn!("Cannot use cursor resource {resource_id} with unknown format");
+            return Err(ErrUnspec);
+        };
+
+        let mut data =
+            vec![0u8; width as usize * height as usize * ResourceFormat::BYTES_PER_PIXEL];
+        if let Err(e) =
+            Self::read_2d_resource(&mut self.rutabaga, resource, &mut data, width, height)
+        {
+            log::error!("Failed to read cursor resource {resource_id}: {e}");
+            return Err(ErrUnspec);
+        }
+
+        cursor_result(self.display_backend.set_cursor(
+            scanout_id,
+            Some(CursorImage {
+                width,
+                height,
+                format,
+                data: &data,
+                hot_x,
+                hot_y,
+            }),
+        ))?;
+        self.move_cursor(scanout_id, x, y)
+    }
+
+    /// The guest moved the cursor's hotspot to `(x, y)` on `scanout_id`.
+    pub fn move_cursor(&mut self, scanout_id: u32, x: u32, y: u32) -> VirtioGpuResult {
+        if scanout_id as usize >= self.displays.len() {
+            return Err(ErrInvalidScanoutId);
+        }
+        cursor_result(
+            self.display_backend
+                .move_cursor(scanout_id, x as i32, y as i32),
+        )
     }
 
     /// If the resource is the scanout resource, flush it to the display.
