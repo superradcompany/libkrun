@@ -289,7 +289,7 @@ fn from_rust_result(result: Result<(), DisplayBackendError>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DisplayBackendInstance;
+    use crate::{DisplayBackendInstance, c_to_rust::OriginalBasicFramebufferVtable};
     use std::cell::RefCell;
 
     /// What [`TestBackend`] recorded, so a call can be checked after it has
@@ -396,32 +396,23 @@ mod tests {
         }
     }
 
-    /// The vtable as it was before the cursor methods were appended. An old
-    /// caller passes this, and `backend_size` bytes of it.
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    struct OldVtable {
-        destroy: crate::header::krun_display_destroy_fn,
-        disable_scanout: crate::header::krun_display_disable_scanout_fn,
-        configure_scanout: crate::header::krun_display_configure_scanout_fn,
-        alloc_frame: crate::header::krun_display_alloc_frame_fn,
-        present_frame: crate::header::krun_display_present_frame_fn,
-    }
-
     /// A backend struct as `krun_set_display_backend` reconstructs it from a
     /// caller that only knows the old, shorter vtable: the bytes it did pass
     /// copied into a zeroed struct, the rest left NULL.
     fn as_old_caller(backend: &DisplayBackend<'static>) -> DisplayBackend<'static> {
         // SAFETY: BASIC_FRAMEBUFFER is set on everything this helper is given.
         let full = unsafe { backend.vtable.basic_framebuffer };
-        let old = OldVtable {
+        let old = OriginalBasicFramebufferVtable {
             destroy: full.destroy,
             disable_scanout: full.disable_scanout,
             configure_scanout: full.configure_scanout,
             alloc_frame: full.alloc_frame,
             present_frame: full.present_frame,
         };
-        assert!(size_of::<OldVtable>() < size_of::<DisplayBasicFramebufferVtable>());
+        assert!(
+            size_of::<OriginalBasicFramebufferVtable>()
+                < size_of::<DisplayBasicFramebufferVtable>()
+        );
 
         let mut truncated: DisplayBasicFramebufferVtable = unsafe { std::mem::zeroed() };
         // SAFETY: both are `#[repr(C)]` with the same prefix layout, and only
@@ -430,7 +421,7 @@ mod tests {
             std::ptr::copy_nonoverlapping(
                 (&raw const old).cast::<u8>(),
                 (&raw mut truncated).cast::<u8>(),
-                size_of::<OldVtable>(),
+                size_of::<OriginalBasicFramebufferVtable>(),
             );
         }
         DisplayBackend {

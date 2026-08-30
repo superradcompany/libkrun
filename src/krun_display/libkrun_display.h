@@ -228,10 +228,8 @@ struct krun_display_basic_framebuffer_vtable {
     // New methods are appended, so the existing fields keep their offsets and a caller built
     // against an older header can pass a shorter struct with a smaller backend_size: the fields it
     // did not carry are NULL and their feature bits unset, which is exactly "not supported".
-    // NOTE: for that to hold, krun_set_display_backend must accept any backend_size down to the
-    // original struct size and copy only that many bytes into a zeroed struct. It currently
-    // requires backend_size >= the full current size and reads the whole struct, so growing the
-    // vtable rejects old callers until that check is relaxed.
+    // krun_set_display_backend accepts any backend_size down to the original struct size and
+    // copies only that many bytes into a zeroed struct, so this stays true as the vtable grows.
     krun_display_set_cursor_fn          set_cursor; // Required by KRUN_DISPLAY_FEATURE_CURSOR
     krun_display_move_cursor_fn         move_cursor; // Required by KRUN_DISPLAY_FEATURE_CURSOR
 };
