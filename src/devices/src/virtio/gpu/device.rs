@@ -26,6 +26,11 @@ pub(crate) const AVAIL_FEATURES: u64 = (1u64 << uapi::VIRTIO_F_VERSION_1)
     | (1u64 << uapi::VIRTIO_GPU_F_RESOURCE_BLOB)
     | (1u64 << uapi::VIRTIO_GPU_F_CONTEXT_INIT);
 
+// Features of the 2D-only device: no virgl, no blobs, no contexts. Not
+// advertising VIRGL also keeps guest mesa from probing the virgl driver.
+pub(crate) const AVAIL_FEATURES_2D: u64 =
+    (1u64 << uapi::VIRTIO_F_VERSION_1) | (1u64 << uapi::VIRTIO_GPU_F_EDID);
+
 const QUEUE_SIZE: u16 = 256;
 static QUEUE_CONFIG: [QueueConfig; defs::NUM_QUEUES] =
     [QueueConfig::new(QUEUE_SIZE); defs::NUM_QUEUES];
@@ -51,7 +56,11 @@ impl Gpu {
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
     ) -> super::Result<Gpu> {
         Ok(Gpu {
-            avail_features: AVAIL_FEATURES,
+            avail_features: if super::is_2d_only(virgl_flags) {
+                AVAIL_FEATURES_2D
+            } else {
+                AVAIL_FEATURES
+            },
             acked_features: 0,
             device_state: DeviceState::Inactive,
             shm_region: None,
@@ -163,7 +172,7 @@ impl VirtioDevice for Gpu {
             events_read: 0,
             events_clear: 0,
             num_scanouts: self.displays.len() as u32,
-            num_capsets: 5,
+            num_capsets: if super::is_2d_only(self.virgl_flags) { 0 } else { 5 },
         };
 
         let config_slice = config.as_slice();

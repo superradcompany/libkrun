@@ -10,6 +10,18 @@ use super::descriptor_utils::Error as DescriptorError;
 pub use self::defs::uapi::VIRTIO_ID_GPU as TYPE_GPU;
 pub use self::device::Gpu;
 
+/// virglrenderer init flags the device inspects to choose its renderer.
+pub(crate) const VIRGL_RENDERER_VENUS: u32 = 1 << 6;
+pub(crate) const VIRGL_RENDERER_NO_VIRGL: u32 = 1 << 7;
+
+/// `NO_VIRGL` without `VENUS` means the host offers no 3D renderer at all
+/// (macOS without a display server, for instance). Run as a plain 2D
+/// virtio-gpu on rutabaga's software component instead of virglrenderer,
+/// which rejects every non-blob resource when vrend is not initialized.
+pub(crate) fn is_2d_only(virgl_flags: u32) -> bool {
+    virgl_flags & VIRGL_RENDERER_NO_VIRGL != 0 && virgl_flags & VIRGL_RENDERER_VENUS == 0
+}
+
 mod defs {
     pub const GPU_DEV_ID: &str = "virtio_gpu";
     pub const NUM_QUEUES: usize = 2;

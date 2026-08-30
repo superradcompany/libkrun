@@ -143,6 +143,10 @@ impl VirtioGpuResource {
 
 pub struct VirtioGpuScanout {
     resource_id: u32,
+    /// Size of the scanout rectangle the guest asked for; also the size of
+    /// the frame buffers the display backend hands out for this scanout.
+    width: u32,
+    height: u32,
 }
 
 pub struct VirtioGpu {
@@ -218,6 +222,13 @@ impl VirtioGpu {
         virgl_flags: u32,
         export_table: Option<ExportTable>,
     ) -> Option<Rutabaga> {
+        if super::is_2d_only(virgl_flags) {
+            let fence = Self::create_fence_handler(mem, queue_ctl, fence_state, interrupt);
+            return RutabagaBuilder::new(rutabaga_gfx::RutabagaComponentType::Rutabaga2D, 0, 0)
+                .build(fence, None)
+                .ok();
+        }
+
         let xdg_runtime_dir = match env::var("XDG_RUNTIME_DIR") {
             Ok(dir) => dir,
             Err(_) => "/run/user/1000".to_string(),
@@ -282,12 +293,9 @@ impl VirtioGpu {
         interrupt: InterruptTransport,
         fence_state: Arc<Mutex<FenceState>>,
     ) -> Option<Rutabaga> {
-        const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
-        let builder = RutabagaBuilder::new(
-            rutabaga_gfx::RutabagaComponentType::VirglRenderer,
-            VIRGLRENDERER_NO_VIRGL,
-            0,
-        );
+        // The software 2D component has no host dependencies, so it is the
+        // one renderer that can always be built.
+        let builder = RutabagaBuilder::new(rutabaga_gfx::RutabagaComponentType::Rutabaga2D, 0, 0);
 
         let fence =
             Self::create_fence_handler(mem, queue_ctl.clone(), fence_state.clone(), interrupt);
@@ -479,32 +487,48 @@ impl VirtioGpu {
             format,
         )?;
 
-        *scanout = Some(VirtioGpuScanout { resource_id });
+        *scanout = Some(VirtioGpuScanout {
+            resource_id,
+            width,
+            height,
+        });
         Ok(OkNoData)
     }
 
+    /// Copies the top-left `dst_width` x `dst_height` pixels of `resource`
+    /// into `output`, whose rows are `dst_width` pixels wide. The resource
+    /// may be larger than the scanout (padded strides, oversized dumb
+    /// buffers) or, if the guest is misbehaving, smaller; only the
+    /// intersection is transferred.
     fn read_2d_resource(
         rutabaga: &mut Rutabaga,
         resource: VirtioGpuResource,
         output: &mut [u8],
+        dst_width: u32,
+        dst_height: u32,
     ) -> VirtioGpuResult {
         let transfer = Transfer3D {
             x: 0,
             y: 0,
             z: 0,
-            w: resource.width,
-            h: resource.height,
+            w: resource.width.min(dst_width),
+            h: resource.height.min(dst_height),
             d: 1,
             level: 0,
-            stride: resource.width * ResourceFormat::BYTES_PER_PIXEL as u32,
+            stride: dst_width * ResourceFormat::BYTES_PER_PIXEL as u32,
             layer_stride: 0,
             offset: 0,
         };
 
         rutabaga
             .transfer_read(0, resource.id, transfer, Some(IoSliceMut::new(output)))
-            .map_err(|e| format!("{e}"))
-            .unwrap();
+            .map_err(|e| {
+                log::error!(
+                    "transfer_read of resource {} ({}x{}) into a {}x{} frame failed: {e}",
+                    resource.id, resource.width, resource.height, dst_width, dst_height
+                );
+                ErrUnspec
+            })?;
 
         Ok(OkNoData)
     }
@@ -521,8 +545,18 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         for scanout_id in resource.scanouts.iter_enabled() {
+            let (dst_width, dst_height) = match self.scanouts.get(scanout_id as usize) {
+                Some(Some(scanout)) => (scanout.width, scanout.height),
+                _ => return Err(ErrInvalidScanoutId),
+            };
             let (frame_id, buffer) = self.display_backend.alloc_frame(scanout_id)?;
-            if let Err(e) = Self::read_2d_resource(&mut self.rutabaga, resource, buffer) {
+            if let Err(e) = Self::read_2d_resource(
+                &mut self.rutabaga,
+                resource,
+                buffer,
+                dst_width,
+                dst_height,
+            ) {
                 log::error!("Failed to read resource {resource_id} for scanout {scanout_id}: {e}");
                 return Err(ErrUnspec);
             }
