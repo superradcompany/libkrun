@@ -15,7 +15,8 @@ use super::protocol::{
 #[cfg(target_os = "macos")]
 use crossbeam_channel::{unbounded, Sender};
 use krun_display::{
-    DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, Rect, ResourceFormat,
+    CursorImage, DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendCursor,
+    DisplayBackendError, DisplayBackendInstance, Rect, ResourceFormat,
 };
 use libc::c_void;
 #[cfg(target_os = "macos")]
@@ -141,8 +142,55 @@ impl VirtioGpuResource {
     }
 }
 
+/// Largest cursor image the device reads out of a resource. The guest picks
+/// the size (Linux asks for 64x64); this only stops a bogus resource from
+/// making the device allocate something huge on the worker thread.
+const MAX_CURSOR_SIZE: u32 = 512;
+
+/// The alpha-carrying twin of an alpha-less format.
+///
+/// The guest allocates its cursor as a dumb buffer, and Linux creates the host
+/// resource with a hardcoded `DRM_FORMAT_HOST_XRGB8888` whatever the
+/// framebuffer's format is (v6.12 `virtgpu_gem.c:78`), so an `ARGB8888` cursor
+/// arrives as an `X` resource even though its pixels do carry alpha. Dropping
+/// that alpha draws an opaque box around the pointer. QEMU sidesteps the same
+/// problem by ignoring the resource format for cursors entirely and copying the
+/// raw pixels as ARGB (`hw/display/virtio-gpu.c:44`
+/// `virtio_gpu_update_cursor_data` memcpys `width * height * 4` bytes and never
+/// looks at `res->format`); do the same, but keep the channel order the
+/// resource declared rather than assuming one.
+fn cursor_format_with_alpha(format: ResourceFormat) -> ResourceFormat {
+    match format {
+        ResourceFormat::BGRX => ResourceFormat::BGRA,
+        ResourceFormat::XRGB => ResourceFormat::ARGB,
+        ResourceFormat::RGBX => ResourceFormat::RGBA,
+        ResourceFormat::XBGR => ResourceFormat::ABGR,
+        already_has_alpha => already_has_alpha,
+    }
+}
+
+/// Maps a cursor call's result onto a queue response.
+///
+/// A backend that never negotiated the cursor feature is not worth an error
+/// line per pointer move — and the guest never reads cursor queue responses
+/// anyway (`virtio_gpu_queue_cursor` sends no response buffer).
+fn cursor_result(result: std::result::Result<(), DisplayBackendError>) -> VirtioGpuResult {
+    match result {
+        Ok(()) => Ok(OkNoData),
+        Err(DisplayBackendError::MethodNotSupported) => {
+            debug!("Display backend has no cursor plane, ignoring the cursor command");
+            Err(ErrUnspec)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub struct VirtioGpuScanout {
     resource_id: u32,
+    /// Size of the scanout rectangle the guest asked for; also the size of
+    /// the frame buffers the display backend hands out for this scanout.
+    width: u32,
+    height: u32,
 }
 
 pub struct VirtioGpu {
@@ -218,6 +266,13 @@ impl VirtioGpu {
         virgl_flags: u32,
         export_table: Option<ExportTable>,
     ) -> Option<Rutabaga> {
+        if super::is_2d_only(virgl_flags) {
+            let fence = Self::create_fence_handler(mem, queue_ctl, fence_state, interrupt);
+            return RutabagaBuilder::new(rutabaga_gfx::RutabagaComponentType::Rutabaga2D, 0, 0)
+                .build(fence, None)
+                .ok();
+        }
+
         let xdg_runtime_dir = match env::var("XDG_RUNTIME_DIR") {
             Ok(dir) => dir,
             Err(_) => "/run/user/1000".to_string(),
@@ -282,12 +337,9 @@ impl VirtioGpu {
         interrupt: InterruptTransport,
         fence_state: Arc<Mutex<FenceState>>,
     ) -> Option<Rutabaga> {
-        const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
-        let builder = RutabagaBuilder::new(
-            rutabaga_gfx::RutabagaComponentType::VirglRenderer,
-            VIRGLRENDERER_NO_VIRGL,
-            0,
-        );
+        // The software 2D component has no host dependencies, so it is the
+        // one renderer that can always be built.
+        let builder = RutabagaBuilder::new(rutabaga_gfx::RutabagaComponentType::Rutabaga2D, 0, 0);
 
         let fence =
             Self::create_fence_handler(mem, queue_ctl.clone(), fence_state.clone(), interrupt);
@@ -479,34 +531,129 @@ impl VirtioGpu {
             format,
         )?;
 
-        *scanout = Some(VirtioGpuScanout { resource_id });
+        *scanout = Some(VirtioGpuScanout {
+            resource_id,
+            width,
+            height,
+        });
         Ok(OkNoData)
     }
 
+    /// Copies the top-left `dst_width` x `dst_height` pixels of `resource`
+    /// into `output`, whose rows are `dst_width` pixels wide. The resource
+    /// may be larger than the scanout (padded strides, oversized dumb
+    /// buffers) or, if the guest is misbehaving, smaller; only the
+    /// intersection is transferred.
     fn read_2d_resource(
         rutabaga: &mut Rutabaga,
         resource: VirtioGpuResource,
         output: &mut [u8],
+        dst_width: u32,
+        dst_height: u32,
     ) -> VirtioGpuResult {
         let transfer = Transfer3D {
             x: 0,
             y: 0,
             z: 0,
-            w: resource.width,
-            h: resource.height,
+            w: resource.width.min(dst_width),
+            h: resource.height.min(dst_height),
             d: 1,
             level: 0,
-            stride: resource.width * ResourceFormat::BYTES_PER_PIXEL as u32,
+            stride: dst_width * ResourceFormat::BYTES_PER_PIXEL as u32,
             layer_stride: 0,
             offset: 0,
         };
 
         rutabaga
             .transfer_read(0, resource.id, transfer, Some(IoSliceMut::new(output)))
-            .map_err(|e| format!("{e}"))
-            .unwrap();
+            .map_err(|e| {
+                log::error!(
+                    "transfer_read of resource {} ({}x{}) into a {}x{} frame failed: {e}",
+                    resource.id, resource.width, resource.height, dst_width, dst_height
+                );
+                ErrUnspec
+            })?;
 
         Ok(OkNoData)
+    }
+
+    /// Presents the cursor resource on `scanout_id`, or hides the cursor when
+    /// `resource_id` is 0, and moves it to `(x, y)`.
+    ///
+    /// The guest uploads the image into the resource with TRANSFER_TO_HOST_2D
+    /// before sending this, so the pixels are read back out of rutabaga the
+    /// same way a scanout flush reads a frame.
+    pub fn update_cursor(
+        &mut self,
+        scanout_id: u32,
+        resource_id: u32,
+        hot_x: u32,
+        hot_y: u32,
+        x: u32,
+        y: u32,
+    ) -> VirtioGpuResult {
+        if scanout_id as usize >= self.displays.len() {
+            return Err(ErrInvalidScanoutId);
+        }
+
+        // Virtio spec: "The driver can use resource_id = 0 to hide the cursor."
+        if resource_id == 0 {
+            cursor_result(self.display_backend.set_cursor(scanout_id, None))?;
+            return Ok(OkNoData);
+        }
+
+        let resource = *self
+            .resources
+            .get(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+        let (width, height) = (resource.width, resource.height);
+        if width == 0 || height == 0 || width > MAX_CURSOR_SIZE || height > MAX_CURSOR_SIZE {
+            warn!("Refusing cursor resource {resource_id} of {width}x{height}");
+            return Err(ErrUnspec);
+        }
+        let Some(format) = resource.format else {
+            warn!("Cannot use cursor resource {resource_id} with unknown format");
+            return Err(ErrUnspec);
+        };
+        let format = cursor_format_with_alpha(format);
+        debug!(
+            "update_cursor: scanout {scanout_id} resource {resource_id} {width}x{height} \
+             {:?} -> {format:?} hotspot ({hot_x},{hot_y})",
+            resource.format
+        );
+
+        let mut data =
+            vec![0u8; width as usize * height as usize * ResourceFormat::BYTES_PER_PIXEL];
+        if let Err(e) =
+            Self::read_2d_resource(&mut self.rutabaga, resource, &mut data, width, height)
+        {
+            log::error!("Failed to read cursor resource {resource_id}: {e}");
+            return Err(ErrUnspec);
+        }
+
+        cursor_result(self.display_backend.set_cursor(
+            scanout_id,
+            Some(CursorImage {
+                width,
+                height,
+                format,
+                data: &data,
+                hot_x,
+                hot_y,
+            }),
+        ))?;
+        self.move_cursor(scanout_id, x, y)
+    }
+
+    /// The guest moved the cursor's hotspot to `(x, y)` on `scanout_id`.
+    pub fn move_cursor(&mut self, scanout_id: u32, x: u32, y: u32) -> VirtioGpuResult {
+        if scanout_id as usize >= self.displays.len() {
+            return Err(ErrInvalidScanoutId);
+        }
+        cursor_result(
+            self.display_backend
+                .move_cursor(scanout_id, x as i32, y as i32),
+        )
     }
 
     /// If the resource is the scanout resource, flush it to the display.
@@ -521,8 +668,18 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         for scanout_id in resource.scanouts.iter_enabled() {
+            let (dst_width, dst_height) = match self.scanouts.get(scanout_id as usize) {
+                Some(Some(scanout)) => (scanout.width, scanout.height),
+                _ => return Err(ErrInvalidScanoutId),
+            };
             let (frame_id, buffer) = self.display_backend.alloc_frame(scanout_id)?;
-            if let Err(e) = Self::read_2d_resource(&mut self.rutabaga, resource, buffer) {
+            if let Err(e) = Self::read_2d_resource(
+                &mut self.rutabaga,
+                resource,
+                buffer,
+                dst_width,
+                dst_height,
+            ) {
                 log::error!("Failed to read resource {resource_id} for scanout {scanout_id}: {e}");
                 return Err(ErrUnspec);
             }

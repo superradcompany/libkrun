@@ -1656,14 +1656,28 @@ pub extern "C" fn krun_set_display_backend(
     vtable: *const c_void,
     vtable_size: usize,
 ) -> i32 {
-    if vtable_size < size_of::<DisplayBackend>() {
+    // Methods are only ever appended to the display vtable, so a caller built against an older
+    // libkrun_display.h passes a shorter struct whose fields all sit where this version expects
+    // them. Accept anything from the struct's original size upwards and copy only the bytes the
+    // caller actually passed; the rest stays zeroed, which is a NULL method pointer with its
+    // feature bit unset — exactly what `verify()` reads as "the backend does not support this".
+    if vtable_size < krun_display::MIN_BACKEND_SIZE {
         return -libc::EINVAL;
     }
 
-    // SAFETY: We have checked the vtable size is fine, otherwise we have to trust the user. Just
-    // to be extra careful, this uses read_unaligned, but we could probably get away with ptr::read.
-    let display_backend: DisplayBackend =
-        unsafe { std::ptr::read_unaligned(vtable as *const DisplayBackend) };
+    let mut backend = std::mem::MaybeUninit::<DisplayBackend>::zeroed();
+    // A newer caller's struct may be longer than ours; the trailing bytes are methods this
+    // libkrun does not know about, and `verify()` warns about the feature bits that go with them.
+    let copied = vtable_size.min(size_of::<DisplayBackend>());
+    // SAFETY: the caller promises `vtable_size` readable bytes at `vtable` and we copy no more
+    // than that, nor more than the struct holds. The copy is byte-wise, so `vtable` needs no
+    // particular alignment — the reason the previous code used read_unaligned.
+    unsafe {
+        std::ptr::copy_nonoverlapping(vtable as *const u8, backend.as_mut_ptr() as *mut u8, copied);
+    }
+    // SAFETY: every field is now either bytes the caller passed or zero, and all-zeroes is a valid
+    // DisplayBackend: no features, a null userdata pointer and NULL (`None`) function pointers.
+    let display_backend: DisplayBackend = unsafe { backend.assume_init() };
 
     if !display_backend.verify() {
         return -libc::EINVAL;

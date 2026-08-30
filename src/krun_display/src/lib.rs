@@ -20,6 +20,7 @@ mod header {
 bitflags! {
     pub struct DisplayFeatures: u64 {
         const BASIC_FRAMEBUFFER = header::KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER as u64;
+        const CURSOR = header::KRUN_DISPLAY_FEATURE_CURSOR as u64;
     }
 }
 
@@ -73,6 +74,21 @@ impl TryFrom<u32> for ResourceFormat {
             _ => Err(()),
         }
     }
+}
+
+/// A cursor plane image: `width * height` tightly packed pixels in `format`.
+///
+/// The hotspot is in pixels from the top-left of the image, so the image's
+/// top-left corner sits at `(x - hot_x, y - hot_y)` on the scanout for the
+/// position last given to `move_cursor`.
+#[derive(Debug, Clone, Copy)]
+pub struct CursorImage<'data> {
+    pub width: u32,
+    pub height: u32,
+    pub format: ResourceFormat,
+    pub data: &'data [u8],
+    pub hot_x: u32,
+    pub hot_y: u32,
 }
 
 pub type DisplayVtable = header::krun_display_vtable;

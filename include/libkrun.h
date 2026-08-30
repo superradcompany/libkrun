@@ -721,7 +721,11 @@ int32_t krun_display_set_refresh_rate(uint32_t ctx_id, uint32_t display_id, uint
  * Arguments:
  *  "ctx_id"          - the configuration context ID
  *  "display_backend" - Pointer to a krun_display_backend struct
- *  "backend_size"    - sizeof() the krun_display_backend struct
+ *  "backend_size"    - sizeof() the krun_display_backend struct the caller was built against.
+ *                      Methods are only ever appended to the vtable, so this may be smaller than
+ *                      the struct this libkrun knows: the fields the caller did not carry are
+ *                      taken as NULL and the features it did not advertise as unsupported. It
+ *                      must be at least the size the struct had when it was first published.
  *
  * Returns:
  *  Zero on success or a negative error number (errno) on failure.
