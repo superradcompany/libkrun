@@ -1,6 +1,6 @@
 use crate::{
-    DisplayBackendBasicFramebuffer, DisplayBackendError, DisplayBasicFramebufferVtable,
-    DisplayFeatures, DisplayVtable, Rect, ResourceFormat, header,
+    CursorImage, DisplayBackendBasicFramebuffer, DisplayBackendCursor, DisplayBackendError,
+    DisplayBasicFramebufferVtable, DisplayFeatures, DisplayVtable, Rect, ResourceFormat, header,
 };
 use log::{error, warn};
 use static_assertions::assert_not_impl_any;
@@ -45,6 +45,9 @@ macro_rules! method_call {
 pub struct DisplayBackendInstance {
     instance: *mut c_void,
     vtable: DisplayBasicFramebufferVtable,
+    /// The features the backend advertised; optional methods are only called
+    /// when their bit is set, even if the pointer happens to be non-NULL.
+    features: DisplayFeatures,
 }
 
 // By design the struct is !Send and !Sync to allow for the implementation to safely assume that
@@ -132,6 +135,51 @@ impl DisplayBackendBasicFramebuffer for DisplayBackendInstance {
     }
 }
 
+impl DisplayBackendCursor for DisplayBackendInstance {
+    fn set_cursor(
+        &mut self,
+        scanout_id: u32,
+        image: Option<CursorImage<'_>>,
+    ) -> Result<(), DisplayBackendError> {
+        if !self.features.contains(DisplayFeatures::CURSOR) {
+            return Err(DisplayBackendError::MethodNotSupported);
+        }
+        // A zero-sized image with a NULL pointer is how the ABI hides the cursor.
+        let (width, height, format, data, hot_x, hot_y) = match image {
+            Some(image) => (
+                image.width,
+                image.height,
+                image.format as u32,
+                image.data,
+                image.hot_x,
+                image.hot_y,
+            ),
+            None => (0, 0, ResourceFormat::BGRA as u32, &[][..], 0, 0),
+        };
+        let ptr = if data.is_empty() {
+            null()
+        } else {
+            data.as_ptr()
+        };
+        into_rust_result! {
+            method_call! {
+                self.set_cursor(scanout_id, width, height, format, ptr, data.len(), hot_x, hot_y)
+            }
+        }
+    }
+
+    fn move_cursor(&mut self, scanout_id: u32, x: i32, y: i32) -> Result<(), DisplayBackendError> {
+        if !self.features.contains(DisplayFeatures::CURSOR) {
+            return Err(DisplayBackendError::MethodNotSupported);
+        }
+        into_rust_result! {
+            method_call! {
+                self.move_cursor(scanout_id, x, y)
+            }
+        }
+    }
+}
+
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub struct DisplayBackend<'userdata> {
@@ -158,9 +206,24 @@ impl DisplayBackend<'_> {
             instance,
             // SAFETY: we have checked the feature flags, so basic_framebuffer should be populated
             vtable: unsafe { self.vtable.basic_framebuffer },
+            features: DisplayFeatures::from_bits_truncate(self.features),
         })
     }
 
+    /// Whether the backend struct is usable: every feature it advertises has
+    /// its methods filled in.
+    ///
+    /// Methods are only ever appended to the vtable, so the existing fields keep
+    /// their offsets and a struct that stops short of the cursor methods is
+    /// accepted here: those fields are NULL and their feature bits unset, which
+    /// is exactly the "backend does not support this" case.
+    ///
+    /// This is the half of the compatibility story that lives in the bindings.
+    /// The other half is `krun_set_display_backend`, which must accept any
+    /// `backend_size` down to the original struct size and copy only that many
+    /// bytes into a zeroed struct; today it demands the full current size and
+    /// reads the whole struct, so an old caller is rejected before it ever
+    /// reaches this check.
     pub fn verify(&self) -> bool {
         let features = DisplayFeatures::from_bits_retain(self.features);
 
@@ -181,6 +244,16 @@ impl DisplayBackend<'_> {
                         || self.vtable.basic_framebuffer.present_frame.is_none()
                 } {
                     error!("Missing required methods for BASIC_FRAMEBUFFER");
+                    return false;
+                }
+            } else if feature.contains(DisplayFeatures::CURSOR) {
+                // SAFETY: BASIC_FRAMEBUFFER is required above, so the union
+                // field is the one that is populated.
+                if unsafe {
+                    self.vtable.basic_framebuffer.set_cursor.is_none()
+                        || self.vtable.basic_framebuffer.move_cursor.is_none()
+                } {
+                    error!("Missing required methods for CURSOR");
                     return false;
                 }
             } else {

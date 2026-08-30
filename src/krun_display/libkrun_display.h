@@ -40,6 +40,13 @@ extern "C" {
 #define KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER 1
 
 /**
+ * Indicates support for a hardware cursor plane.
+ * If supported, the implementation must provide `set_cursor` and `move_cursor`, and the guest's
+ * cursor is composited by the backend instead of being drawn into the scanout.
+ */
+#define KRUN_DISPLAY_FEATURE_CURSOR 2
+
+/**
  * Called to create a display instance.
  *
  * Arguments:
@@ -146,6 +153,56 @@ struct krun_rect {
 typedef int32_t (*krun_display_present_frame_fn)(void *instance, uint32_t scanout_id, uint32_t frame_id, const struct krun_rect* damage_area);
 
 /**
+ * Presents a new cursor image for a scanout, or hides the cursor.
+ *
+ * Only called when KRUN_DISPLAY_FEATURE_CURSOR is set.
+ *
+ * Arguments:
+ *  "instance"    - userdata set by `krun_display_create`, represents this/self argument
+ *  "scanout_id"  - The identifier of the scanout the cursor belongs to.
+ *  "width"       - The width of the cursor image in pixels, or 0 to hide the cursor.
+ *  "height"      - The height of the cursor image in pixels, or 0 to hide the cursor.
+ *  "format"      - The pixel format of the image (see KRUN_DISPLAY_FORMAT_* constants),
+ *                  normally KRUN_DISPLAY_FORMAT_B8G8R8A8_UNORM.
+ *  "data"        - `width * height` tightly packed pixels in `format`, valid only for the
+ *                  duration of the call. May be NULL when the cursor is hidden.
+ *  "data_size"   - The size of `data` in bytes. This is a sanity check, the size is already
+ *                  determined by `width`, `height` and `format`.
+ *  "hot_x"       - The x coordinate of the hotspot, in pixels from the left of the image.
+ *  "hot_y"       - The y coordinate of the hotspot, in pixels from the top of the image.
+ *
+ * Returns:
+ *  Zero on success or a negative error code (KRUN_DISPLAY_ERR_*) otherwise.
+ */
+typedef int32_t (*krun_display_set_cursor_fn)(void *instance,
+    uint32_t scanout_id,
+    uint32_t width,
+    uint32_t height,
+    uint32_t format,
+    const uint8_t *data,
+    size_t data_size,
+    uint32_t hot_x,
+    uint32_t hot_y);
+
+/**
+ * The guest moved the cursor of a scanout.
+ *
+ * Only called when KRUN_DISPLAY_FEATURE_CURSOR is set. The position is where the hotspot of the
+ * image last passed to `set_cursor` now sits, so the top-left corner of the image is at
+ * (x - hot_x, y - hot_y).
+ *
+ * Arguments:
+ *  "instance"    - userdata set by `krun_display_create`, represents this/self argument
+ *  "scanout_id"  - The identifier of the scanout the cursor belongs to.
+ *  "x"           - The x coordinate of the hotspot in scanout pixels.
+ *  "y"           - The y coordinate of the hotspot in scanout pixels.
+ *
+ * Returns:
+ *  Zero on success or a negative error code (KRUN_DISPLAY_ERR_*) otherwise.
+ */
+typedef int32_t (*krun_display_move_cursor_fn)(void *instance, uint32_t scanout_id, int32_t x, int32_t y);
+
+/**
  * Defines the set of callbacks for a display implementation.
  * This structure holds function pointers that a display backend implements to integrate with the libkrun.
  *
@@ -168,6 +225,15 @@ struct krun_display_basic_framebuffer_vtable {
     krun_display_configure_scanout_fn   configure_scanout; // Required by KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER
     krun_display_alloc_frame_fn         alloc_frame; // Required by KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER
     krun_display_present_frame_fn       present_frame; // Required by KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER
+    // New methods are appended, so the existing fields keep their offsets and a caller built
+    // against an older header can pass a shorter struct with a smaller backend_size: the fields it
+    // did not carry are NULL and their feature bits unset, which is exactly "not supported".
+    // NOTE: for that to hold, krun_set_display_backend must accept any backend_size down to the
+    // original struct size and copy only that many bytes into a zeroed struct. It currently
+    // requires backend_size >= the full current size and reads the whole struct, so growing the
+    // vtable rejects old callers until that check is relaxed.
+    krun_display_set_cursor_fn          set_cursor; // Required by KRUN_DISPLAY_FEATURE_CURSOR
+    krun_display_move_cursor_fn         move_cursor; // Required by KRUN_DISPLAY_FEATURE_CURSOR
 };
 
 union krun_display_vtable {
