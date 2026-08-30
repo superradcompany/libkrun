@@ -25,6 +25,84 @@ use std::time::Duration;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 use arch::aarch64::sysreg::{sys_reg_name, SYSREG_MASK};
 use log::debug;
+use serde::{Deserialize, Serialize};
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+const GENERAL_REGISTER_COUNT: usize = 35;
+const SIMD_REGISTER_COUNT: usize = 32;
+
+// Hypervisor.framework does not expose a bulk architectural-state operation for a vCPU. Keep the
+// exact writable register set explicit so a framework update cannot silently change the artifact.
+const EL1_SYSTEM_REGISTERS: &[hv_sys_reg_t] = &[
+    hv_sys_reg_t_HV_SYS_REG_SCTLR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ACTLR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CPACR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TTBR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TCR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIAKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIBKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIBKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDAKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDBKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDBKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APGAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APGAKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ELR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_SP_EL0,
+    hv_sys_reg_t_HV_SYS_REG_SP_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AFSR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AFSR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ESR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_FAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_PAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_MAIR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AMAIR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_VBAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CONTEXTIDR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL0,
+    hv_sys_reg_t_HV_SYS_REG_TPIDRRO_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTKCTL_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CSSELR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTP_CTL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTP_CVAL_EL0,
+];
+
+const EL2_SYSTEM_REGISTERS: &[hv_sys_reg_t] = &[
+    hv_sys_reg_t_HV_SYS_REG_CNTHCTL_EL2,
+    hv_sys_reg_t_HV_SYS_REG_CNTHP_CTL_EL2,
+    hv_sys_reg_t_HV_SYS_REG_CNTHP_CVAL_EL2,
+    hv_sys_reg_t_HV_SYS_REG_CNTVOFF_EL2,
+    hv_sys_reg_t_HV_SYS_REG_CPTR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_ELR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_ESR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_FAR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_HCR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_HPFAR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_MAIR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_MDCR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_SCTLR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_SPSR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_SP_EL2,
+    hv_sys_reg_t_HV_SYS_REG_TCR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_TTBR0_EL2,
+    hv_sys_reg_t_HV_SYS_REG_TTBR1_EL2,
+    hv_sys_reg_t_HV_SYS_REG_VBAR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_VMPIDR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_VPIDR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_VTCR_EL2,
+    hv_sys_reg_t_HV_SYS_REG_VTTBR_EL2,
+];
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -127,18 +205,29 @@ pub enum Error {
     EnableEL2,
     FindSymbol(libloading::Error),
     MemoryMap,
+    MemoryProtect,
     MemoryUnmap,
     NestedCheck,
     VcpuCreate,
     VcpuInitialRegisters,
     VcpuReadRegister,
+    VcpuReadPendingInterrupt,
+    VcpuReadSimdRegister,
     VcpuReadSystemRegister,
+    VcpuReadVtimer,
     VcpuRequestExit,
     VcpuRun,
     VcpuSetPendingIrq,
     VcpuSetRegister,
+    VcpuSetSimdRegister,
     VcpuSetSystemRegister(u16, u64),
     VcpuSetVtimerMask,
+    VcpuSetVtimerOffset,
+    VcpuStatePendingMmio,
+    VcpuStateTopology,
+    GicStateCreate,
+    GicStateRead,
+    GicStateWrite,
     VmCreate,
 }
 
@@ -150,6 +239,7 @@ impl Display for Error {
             EnableEL2 => write!(f, "Error enabling EL2 mode in HVF"),
             FindSymbol(ref err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
             MemoryMap => write!(f, "Error registering memory region in HVF"),
+            MemoryProtect => write!(f, "Error changing HVF memory permissions"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
             NestedCheck => write!(
                 f,
@@ -158,16 +248,26 @@ impl Display for Error {
             VcpuCreate => write!(f, "Error creating HVF vCPU instance"),
             VcpuInitialRegisters => write!(f, "Error setting up initial HVF vCPU registers"),
             VcpuReadRegister => write!(f, "Error reading HVF vCPU register"),
+            VcpuReadPendingInterrupt => write!(f, "Error reading HVF vCPU interrupt state"),
+            VcpuReadSimdRegister => write!(f, "Error reading HVF vCPU SIMD register"),
             VcpuReadSystemRegister => write!(f, "Error reading HVF vCPU system register"),
+            VcpuReadVtimer => write!(f, "Error reading HVF vCPU virtual timer state"),
             VcpuRequestExit => write!(f, "Error requesting HVF vCPU exit"),
             VcpuRun => write!(f, "Error running HVF vCPU"),
             VcpuSetPendingIrq => write!(f, "Error setting HVF vCPU pending irq"),
             VcpuSetRegister => write!(f, "Error setting HVF vCPU register"),
+            VcpuSetSimdRegister => write!(f, "Error setting HVF vCPU SIMD register"),
             VcpuSetSystemRegister(reg, val) => write!(
                 f,
                 "Error setting HVF vCPU system register 0x{reg:#x} to 0x{val:#x}"
             ),
             VcpuSetVtimerMask => write!(f, "Error setting HVF vCPU vtimer mask"),
+            VcpuSetVtimerOffset => write!(f, "Error setting HVF vCPU vtimer offset"),
+            VcpuStatePendingMmio => write!(f, "HVF vCPU has an incomplete MMIO read"),
+            VcpuStateTopology => write!(f, "HVF vCPU state does not match its configuration"),
+            GicStateCreate => write!(f, "Error creating an HVF GIC state object"),
+            GicStateRead => write!(f, "Error reading HVF GIC state"),
+            GicStateWrite => write!(f, "Error restoring HVF GIC state"),
             VmCreate => write!(f, "Error creating HVF VM instance"),
         }
     }
@@ -321,6 +421,85 @@ impl HvfVm {
             Ok(())
         }
     }
+
+    /// Changes the second-stage permissions for an existing guest-memory mapping.
+    pub fn protect_memory(
+        &self,
+        guest_start_addr: u64,
+        size: u64,
+        writable: bool,
+    ) -> Result<(), Error> {
+        protect_memory(guest_start_addr, size, writable)
+    }
+
+    /// Captures the complete in-kernel GIC state into an opaque framework-owned byte stream.
+    pub fn capture_gic_state(&self) -> Result<Vec<u8>, Error> {
+        type StateCreate = unsafe extern "C" fn() -> hv_gic_state_t;
+        type StateGetSize = unsafe extern "C" fn(hv_gic_state_t, *mut usize) -> hv_return_t;
+        type StateGetData =
+            unsafe extern "C" fn(hv_gic_state_t, *mut core::ffi::c_void) -> hv_return_t;
+
+        let create: libloading::Symbol<'static, StateCreate> =
+            unsafe { HVF.get(b"hv_gic_state_create") }.map_err(Error::FindSymbol)?;
+        let get_size: libloading::Symbol<'static, StateGetSize> =
+            unsafe { HVF.get(b"hv_gic_state_get_size") }.map_err(Error::FindSymbol)?;
+        let get_data: libloading::Symbol<'static, StateGetData> =
+            unsafe { HVF.get(b"hv_gic_state_get_data") }.map_err(Error::FindSymbol)?;
+
+        let state = unsafe { create() };
+        if state.is_null() {
+            return Err(Error::GicStateCreate);
+        }
+        let mut size = 0usize;
+        let size_result = unsafe { get_size(state, &mut size) };
+        if size_result != HV_SUCCESS || size == 0 {
+            unsafe { os_release(state.cast()) };
+            return Err(Error::GicStateRead);
+        }
+        let mut bytes = vec![0_u8; size];
+        let data_result = unsafe { get_data(state, bytes.as_mut_ptr().cast()) };
+        unsafe { os_release(state.cast()) };
+        if data_result != HV_SUCCESS {
+            return Err(Error::GicStateRead);
+        }
+        Ok(bytes)
+    }
+
+    /// Restores a byte stream previously returned by [`Self::capture_gic_state`].
+    pub fn restore_gic_state(&self, bytes: &[u8]) -> Result<(), Error> {
+        type SetState = unsafe extern "C" fn(*const core::ffi::c_void, usize) -> hv_return_t;
+        let set_state: libloading::Symbol<'static, SetState> =
+            unsafe { HVF.get(b"hv_gic_set_state") }.map_err(Error::FindSymbol)?;
+        let result = unsafe { set_state(bytes.as_ptr().cast(), bytes.len()) };
+        if result == HV_SUCCESS {
+            Ok(())
+        } else {
+            Err(Error::GicStateWrite)
+        }
+    }
+}
+
+/// Changes the second-stage permissions for an existing guest-memory mapping.
+///
+/// This free form is used by vCPU threads servicing first-write faults; Hypervisor.framework owns
+/// one process-wide VM, so no host-side `HvfVm` handle is required by the API.
+pub fn protect_memory(guest_start_addr: u64, size: u64, writable: bool) -> Result<(), Error> {
+    let mut flags = HV_MEMORY_READ | HV_MEMORY_EXEC;
+    if writable {
+        flags |= HV_MEMORY_WRITE;
+    }
+    let ret = unsafe {
+        hv_vm_protect(
+            guest_start_addr,
+            size.try_into().map_err(|_| Error::MemoryProtect)?,
+            flags.into(),
+        )
+    };
+    if ret != HV_SUCCESS {
+        Err(Error::MemoryProtect)
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -347,6 +526,23 @@ struct MmioRead {
     addr: u64,
     len: usize,
     srt: u32,
+}
+
+/// Complete architectural and framework state for one HVF vCPU.
+///
+/// Register identifiers are kept in the payload to make decoding reject a build whose explicit
+/// register contract differs, instead of applying values to a shifted positional list.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HvfVcpuState {
+    general: Vec<(hv_reg_t, u64)>,
+    simd: Vec<(hv_simd_fp_reg_t, u128)>,
+    system: Vec<(hv_sys_reg_t, u64)>,
+    pending_irq: bool,
+    pending_fiq: bool,
+    vtimer_mask: bool,
+    vtimer_offset: u64,
+    pending_advance_pc: bool,
+    nested_enabled: bool,
 }
 
 pub struct HvfVcpu<'a> {
@@ -542,6 +738,140 @@ impl HvfVcpu<'_> {
         }
     }
 
+    /// Captures this vCPU on its owning thread at a stopped execution boundary.
+    pub fn capture_state(&self) -> Result<HvfVcpuState, Error> {
+        if self.pending_mmio_read.is_some() {
+            // An MMIO read is completed on the next run entry. Capturing only the architectural
+            // registers here would lose both the destination register and the pending bus value.
+            return Err(Error::VcpuStatePendingMmio);
+        }
+
+        let mut general = Vec::with_capacity(GENERAL_REGISTER_COUNT);
+        for register in 0..GENERAL_REGISTER_COUNT as hv_reg_t {
+            general.push((register, self.read_reg(register)?));
+        }
+
+        let mut simd = Vec::with_capacity(SIMD_REGISTER_COUNT);
+        for register in 0..SIMD_REGISTER_COUNT as hv_simd_fp_reg_t {
+            let mut value = 0_u128;
+            let result = unsafe { hv_vcpu_get_simd_fp_reg(self.vcpuid, register, &mut value) };
+            if result != HV_SUCCESS {
+                return Err(Error::VcpuReadSimdRegister);
+            }
+            simd.push((register, value));
+        }
+
+        let system_registers = self.state_system_registers();
+        let mut system = Vec::with_capacity(system_registers.len());
+        for register in system_registers {
+            system.push((register, self.read_sys_reg(register)?));
+        }
+
+        let pending_irq = self.read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ)?;
+        let pending_fiq = self.read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_FIQ)?;
+        let mut vtimer_mask = false;
+        let mut vtimer_offset = 0_u64;
+        if unsafe { hv_vcpu_get_vtimer_mask(self.vcpuid, &mut vtimer_mask) } != HV_SUCCESS
+            || unsafe { hv_vcpu_get_vtimer_offset(self.vcpuid, &mut vtimer_offset) } != HV_SUCCESS
+        {
+            return Err(Error::VcpuReadVtimer);
+        }
+
+        Ok(HvfVcpuState {
+            general,
+            simd,
+            system,
+            pending_irq,
+            pending_fiq,
+            vtimer_mask,
+            vtimer_offset,
+            pending_advance_pc: self.pending_advance_pc,
+            nested_enabled: self.nested_enabled,
+        })
+    }
+
+    /// Restores this vCPU on its owning thread before the first guest instruction executes.
+    pub fn restore_state(&mut self, state: &HvfVcpuState) -> Result<(), Error> {
+        let expected_general = (0..GENERAL_REGISTER_COUNT as hv_reg_t).collect::<Vec<_>>();
+        let expected_simd = (0..SIMD_REGISTER_COUNT as hv_simd_fp_reg_t).collect::<Vec<_>>();
+        let expected_system = self.state_system_registers();
+        if state.nested_enabled != self.nested_enabled
+            || state
+                .general
+                .iter()
+                .map(|(register, _)| *register)
+                .collect::<Vec<_>>()
+                != expected_general
+            || state
+                .simd
+                .iter()
+                .map(|(register, _)| *register)
+                .collect::<Vec<_>>()
+                != expected_simd
+            || state
+                .system
+                .iter()
+                .map(|(register, _)| *register)
+                .collect::<Vec<_>>()
+                != expected_system
+        {
+            return Err(Error::VcpuStateTopology);
+        }
+
+        for &(register, value) in &state.general {
+            self.write_reg(register, value)?;
+        }
+        for &(register, value) in &state.simd {
+            let result = unsafe { hv_vcpu_set_simd_fp_reg(self.vcpuid, register, value) };
+            if result != HV_SUCCESS {
+                return Err(Error::VcpuSetSimdRegister);
+            }
+        }
+        for &(register, value) in &state.system {
+            let result = unsafe { hv_vcpu_set_sys_reg(self.vcpuid, register, value) };
+            if result != HV_SUCCESS {
+                return Err(Error::VcpuSetSystemRegister(register, value));
+            }
+        }
+        if unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, state.vtimer_offset) } != HV_SUCCESS {
+            return Err(Error::VcpuSetVtimerOffset);
+        }
+        vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, state.pending_irq)?;
+        vcpu_set_pending_irq(self.vcpuid, InterruptType::Fiq, state.pending_fiq)?;
+        vcpu_set_vtimer_mask(self.vcpuid, state.vtimer_mask)?;
+
+        self.pending_mmio_read = None;
+        self.pending_advance_pc = state.pending_advance_pc;
+        self.vtimer_masked = state.vtimer_mask;
+        Ok(())
+    }
+
+    fn read_pending_interrupt(&self, interrupt: hv_interrupt_type_t) -> Result<bool, Error> {
+        let mut pending = false;
+        let result = unsafe { hv_vcpu_get_pending_interrupt(self.vcpuid, interrupt, &mut pending) };
+        if result == HV_SUCCESS {
+            Ok(pending)
+        } else {
+            Err(Error::VcpuReadPendingInterrupt)
+        }
+    }
+
+    fn state_system_registers(&self) -> Vec<hv_sys_reg_t> {
+        let mut registers = Vec::with_capacity(
+            EL1_SYSTEM_REGISTERS.len()
+                + if self.nested_enabled {
+                    EL2_SYSTEM_REGISTERS.len()
+                } else {
+                    0
+                },
+        );
+        registers.extend_from_slice(EL1_SYSTEM_REGISTERS);
+        if self.nested_enabled {
+            registers.extend_from_slice(EL2_SYSTEM_REGISTERS);
+        }
+        registers
+    }
+
     pub fn write_reg(&self, rt: u32, val: u64) -> Result<(), Error> {
         let ret = unsafe { hv_vcpu_set_reg(self.vcpuid, rt, val) };
         if ret != HV_SUCCESS {
@@ -549,6 +879,14 @@ impl HvfVcpu<'_> {
         } else {
             Ok(())
         }
+    }
+
+    /// Retries the instruction that caused the current emulation exit.
+    ///
+    /// Ordinary MMIO advances after emulation. A write-protection fault instead removes write
+    /// protection and must execute the original guest instruction again.
+    pub fn retry_current_instruction(&mut self) {
+        self.pending_advance_pc = false;
     }
 
     fn read_sys_reg(&self, reg: u16) -> Result<u64, Error> {
@@ -712,6 +1050,7 @@ impl HvfVcpu<'_> {
 
                     match len {
                         1 => self.mmio_buf[0..1].copy_from_slice(&(val as u8).to_le_bytes()),
+                        2 => self.mmio_buf[0..2].copy_from_slice(&(val as u16).to_le_bytes()),
                         4 => self.mmio_buf[0..4].copy_from_slice(&(val as u32).to_le_bytes()),
                         8 => self.mmio_buf[0..8].copy_from_slice(&val.to_le_bytes()),
                         _ => panic!("unsupported mmio len={len}"),

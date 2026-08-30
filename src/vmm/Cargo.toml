@@ -9,8 +9,8 @@ repository = "https://github.com/containers/libkrun"
 
 [features]
 tee = []
-amd-sev = [ "blk", "bitfield", "bitflags", "iocuddle", "tee", "kbs-types", "serde", "serde_json" ]
-tdx = [ "blk", "tee", "kbs-types", "serde", "serde_json", "dep:tdx" ]
+amd-sev = [ "blk", "bitfield", "bitflags", "iocuddle", "tee", "kbs-types", "serde_json" ]
+tdx = [ "blk", "tee", "kbs-types", "serde_json", "dep:tdx" ]
 net = []
 blk = []
 efi = [ "blk", "net" ]
@@ -21,6 +21,7 @@ aws-nitro = []
 
 [dependencies]
 crossbeam-channel = ">=0.5.15"
+bincode = { version = "2.0.1", features = ["serde"] }
 flate2 = "1.0.35"
 libc = ">=0.2.39"
 log = "0.4.0"
@@ -38,7 +39,7 @@ polly = { package = "msb_krun_polly", version = "0.1.32", path = "../polly" }
 
 # Dependencies for amd-sev
 kbs-types = { version = "0.13.0", optional = true }
-serde = { version = "1.0.125", optional = true }
+serde = { version = "1.0.125", features = ["derive"] }
 serde_json = { version = "1.0.64", optional = true }
 iocuddle = { version = "0.1.1", optional = true }
 bitfield = { version = "0.19.4", optional = true }
@@ -53,7 +54,7 @@ cpuid = { package = "msb_krun_cpuid", version = "0.1.32", path = "../cpuid" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tdx = { version = "0.1.0", optional = true }
-kvm-bindings = { version = ">=0.11", features = ["fam-wrappers"] }
+kvm-bindings = { version = ">=0.11", features = ["fam-wrappers", "serde"] }
 kvm-ioctls = ">=0.21"
 
 [target.'cfg(target_os = "macos")'.dependencies]

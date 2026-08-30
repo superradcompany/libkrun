@@ -6,22 +6,28 @@
 // found in the THIRD-PARTY file.
 
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::io;
 use std::result;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
+use super::super::{
+    VcpuControlRequestId, FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK,
+    VCPU_CONTROL_MAILBOX_CAPACITY,
+};
+use crate::memory_state::GuestMemoryRange;
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 
 use arch::ArchMemoryInfo;
-use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use devices::legacy::VcpuList;
-use hvf::{vcpu_request_exit, HvfVcpu, HvfVm, VcpuExit, Vcpus};
+use hvf::{protect_memory, vcpu_request_exit, HvfVcpu, HvfVcpuState, HvfVm, VcpuExit, Vcpus};
+use serde::{Deserialize, Serialize};
 use utils::eventfd::EventFd;
 use utils::metrics::MetricsWriter;
 use vm_memory::{
@@ -39,8 +45,16 @@ pub enum Error {
     REGSConfiguration(arch::aarch64::regs::Error),
     /// Cannot set the memory regions.
     SetUserMemoryRegion(hvf::Error),
+    /// Cannot change guest-memory permissions for dirty tracking.
+    DirtyMemoryProtect(hvf::Error),
+    /// Dirty tracking is not active for this VM.
+    DirtyTrackingInactive,
+    /// Cannot determine the host protection granule.
+    DirtyPageSize(io::Error),
     /// Failed writing a PSCI result into the vCPU.
     VcpuHvf(hvf::Error),
+    /// Backend execution state could not be encoded or decoded.
+    StateCodec(String),
     /// Failed to signal Vcpu.
     SignalVcpu(utils::errno::Error),
     /// Error doing Vcpu Init on Arm.
@@ -77,7 +91,11 @@ impl Display for Error {
                 "The number of configured slots is bigger than the maximum reported by KVM"
             ),
             SetUserMemoryRegion(e) => write!(f, "Cannot set the memory regions: {e:?}"),
+            DirtyMemoryProtect(e) => write!(f, "Cannot change tracked memory permissions: {e}"),
+            DirtyTrackingInactive => write!(f, "HVF dirty tracking is not active"),
+            DirtyPageSize(e) => write!(f, "Cannot determine the HVF protection granule: {e}"),
             VcpuHvf(e) => write!(f, "Failed writing a PSCI result into the vCPU: {e:?}"),
+            StateCodec(e) => write!(f, "HVF execution-state codec failed: {e}"),
             SignalVcpu(e) => write!(f, "Failed to signal Vcpu: {e}"),
             REGSConfiguration(e) => write!(
                 f,
@@ -98,6 +116,14 @@ pub type Result<T> = result::Result<T, Error>;
 /// A wrapper around creating and using a VM.
 pub struct Vm {
     hvf_vm: HvfVm,
+    dirty_tracker: Arc<HvfDirtyTracker>,
+}
+
+pub(crate) struct HvfDirtyTracker {
+    regions: Mutex<Vec<GuestMemoryRange>>,
+    dirty_pages: Mutex<BTreeSet<u64>>,
+    page_size: u64,
+    active: AtomicBool,
 }
 
 impl Vm {
@@ -105,7 +131,16 @@ impl Vm {
     pub fn new(nested_enabled: bool) -> Result<Self> {
         let hvf_vm = HvfVm::new(nested_enabled).map_err(Error::VmSetup)?;
 
-        Ok(Vm { hvf_vm })
+        let page_size = host_page_size()?;
+        Ok(Vm {
+            hvf_vm,
+            dirty_tracker: Arc::new(HvfDirtyTracker {
+                regions: Mutex::new(Vec::new()),
+                dirty_pages: Mutex::new(BTreeSet::new()),
+                page_size,
+                active: AtomicBool::new(false),
+            }),
+        })
     }
 
     pub fn hvf_vm(&self) -> &HvfVm {
@@ -130,9 +165,56 @@ impl Vm {
                     region.len(),
                 )
                 .map_err(Error::SetUserMemoryRegion)?;
+            self.dirty_tracker
+                .regions
+                .lock()
+                .expect("HVF dirty-region mutex poisoned")
+                .push(
+                    GuestMemoryRange::new(region.start_addr().raw_value(), region.len())
+                        .expect("guest-memory regions are non-empty and bounded"),
+                );
         }
 
         Ok(())
+    }
+
+    pub(crate) fn dirty_tracker(&self) -> Arc<HvfDirtyTracker> {
+        Arc::clone(&self.dirty_tracker)
+    }
+
+    /// Starts first-write tracking for every ordinary guest-memory mapping.
+    pub fn begin_dirty_tracking(&mut self) -> Result<()> {
+        self.dirty_tracker.begin()
+    }
+
+    /// Seals the current first-write generation and re-protects its dirty pages.
+    pub fn take_dirty_ranges(&mut self) -> Result<Vec<GuestMemoryRange>> {
+        self.dirty_tracker.take_dirty_ranges()
+    }
+
+    /// Stops first-write tracking and restores writable mappings.
+    pub fn stop_dirty_tracking(&mut self) -> Result<()> {
+        self.dirty_tracker.stop()
+    }
+
+    /// Captures the process-wide in-kernel interrupt-controller state.
+    pub fn capture_execution_state(&self) -> Result<Vec<u8>> {
+        self.hvf_vm.capture_gic_state().map_err(Error::VmSetup)
+    }
+
+    /// Restores the process-wide in-kernel interrupt-controller state.
+    pub fn restore_execution_state(&self, bytes: &[u8]) -> Result<()> {
+        self.hvf_vm.restore_gic_state(bytes).map_err(Error::VmSetup)
+    }
+
+    /// Completes a vCPU artifact on the VMM controller thread.
+    pub fn complete_vcpu_execution_capture(&self, _id: u32, bytes: Vec<u8>) -> Result<Vec<u8>> {
+        Ok(bytes)
+    }
+
+    /// Prepares a vCPU artifact for restoration on its owning thread.
+    pub fn prepare_vcpu_execution_restore(&self, _id: u32, bytes: &[u8]) -> Result<Vec<u8>> {
+        Ok(bytes.to_vec())
     }
 
     pub fn add_mapping(
@@ -164,6 +246,122 @@ impl Vm {
             reply_sender.send(true).unwrap();
         }
     }
+}
+
+impl HvfDirtyTracker {
+    fn begin(&self) -> Result<()> {
+        if self.active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let regions = self
+            .regions
+            .lock()
+            .expect("HVF dirty-region mutex poisoned");
+        for region in regions.iter() {
+            protect_memory(region.start(), region.length(), false)
+                .map_err(Error::DirtyMemoryProtect)?;
+        }
+        self.dirty_pages
+            .lock()
+            .expect("HVF dirty-page mutex poisoned")
+            .clear();
+        self.active.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn take_dirty_ranges(&self) -> Result<Vec<GuestMemoryRange>> {
+        if !self.active.load(Ordering::Acquire) {
+            return Err(Error::DirtyTrackingInactive);
+        }
+
+        let mut pages = self
+            .dirty_pages
+            .lock()
+            .expect("HVF dirty-page mutex poisoned");
+        for page in pages.iter().copied() {
+            protect_memory(page, self.page_size, false).map_err(Error::DirtyMemoryProtect)?;
+        }
+
+        let ranges = pages_to_ranges(pages.iter().copied(), self.page_size);
+        pages.clear();
+        Ok(ranges)
+    }
+
+    fn stop(&self) -> Result<()> {
+        if !self.active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let regions = self
+            .regions
+            .lock()
+            .expect("HVF dirty-region mutex poisoned");
+        for region in regions.iter() {
+            protect_memory(region.start(), region.length(), true)
+                .map_err(Error::DirtyMemoryProtect)?;
+        }
+        self.dirty_pages
+            .lock()
+            .expect("HVF dirty-page mutex poisoned")
+            .clear();
+        self.active.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn handle_write_fault(&self, guest_addr: u64) -> Result<bool> {
+        if !self.active.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+
+        let tracked = self
+            .regions
+            .lock()
+            .expect("HVF dirty-region mutex poisoned")
+            .iter()
+            .any(|region| guest_addr >= region.start() && guest_addr < region.end());
+        if !tracked {
+            return Ok(false);
+        }
+
+        let page = guest_addr / self.page_size * self.page_size;
+        self.dirty_pages
+            .lock()
+            .expect("HVF dirty-page mutex poisoned")
+            .insert(page);
+        protect_memory(page, self.page_size, true).map_err(Error::DirtyMemoryProtect)?;
+        Ok(true)
+    }
+}
+
+fn host_page_size() -> Result<u64> {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        Err(Error::DirtyPageSize(io::Error::last_os_error()))
+    } else {
+        Ok(page_size as u64)
+    }
+}
+
+fn pages_to_ranges<I>(pages: I, page_size: u64) -> Vec<GuestMemoryRange>
+where
+    I: IntoIterator<Item = u64>,
+{
+    let mut ranges: Vec<GuestMemoryRange> = Vec::new();
+    for page in pages {
+        if let Some(previous) = ranges.last_mut() {
+            if previous.end() == page {
+                *previous = GuestMemoryRange::new(previous.start(), previous.length() + page_size)
+                    .expect("coalesced HVF dirty range remains bounded");
+                continue;
+            }
+        }
+        ranges.push(
+            GuestMemoryRange::new(page, page_size)
+                .expect("HVF dirty pages are non-empty and bounded"),
+        );
+    }
+    ranges
 }
 
 /// Encapsulates configuration parameters for the guest vCPUS.
@@ -216,6 +414,14 @@ pub struct Vcpu {
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
     metrics: MetricsWriter,
+    dirty_tracker: Arc<HvfDirtyTracker>,
+    restored_state: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+struct MacVcpuExecutionState {
+    hvf: HvfVcpuState,
+    parked: bool,
 }
 
 impl Vcpu {
@@ -283,17 +489,19 @@ impl Vcpu {
     /// * `id` - Represents the CPU number between [0, max vcpus).
     /// * `vm_fd` - The kvm `VmFd` for the virtual machine this vcpu will get attached to.
     /// * `exit_evt` - An `EventFd` that will be written into when this vcpu exits.
-    pub fn new_aarch64(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_aarch64(
         id: u8,
         boot_entry_addr: GuestAddress,
         boot_receiver: Option<Receiver<u64>>,
         exit_evt: EventFd,
         vcpu_list: Arc<VcpuList>,
+        dirty_tracker: Arc<HvfDirtyTracker>,
         nested_enabled: bool,
         metrics: MetricsWriter,
     ) -> Result<Self> {
-        let (event_sender, event_receiver) = unbounded();
-        let (response_sender, response_receiver) = unbounded();
+        let (event_sender, event_receiver) = bounded(VCPU_CONTROL_MAILBOX_CAPACITY);
+        let (response_sender, response_receiver) = bounded(VCPU_CONTROL_MAILBOX_CAPACITY);
 
         Ok(Vcpu {
             id,
@@ -313,6 +521,8 @@ impl Vcpu {
             vcpu_list,
             nested_enabled,
             metrics,
+            dirty_tracker,
+            restored_state: false,
         })
     }
 
@@ -354,6 +564,13 @@ impl Vcpu {
         }
     }
 
+    fn is_parked(&self) -> bool {
+        self.parked_cpus
+            .as_ref()
+            .and_then(|parked_cpus| parked_cpus.get(&self.mpidr))
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
     /// Configures an aarch64 specific vcpu.
     ///
     /// # Arguments
@@ -382,11 +599,12 @@ impl Vcpu {
             })
             .map_err(Error::VcpuSpawn)?;
 
-        init_tls_receiver
+        let hvf_vcpuid = init_tls_receiver
             .recv()
             .expect("Error waiting for TLS initialization.");
 
         Ok(VcpuHandle::new(
+            hvf_vcpuid,
             event_sender,
             response_receiver,
             vcpu_thread,
@@ -405,7 +623,7 @@ impl Vcpu {
                 }
                 VcpuExit::Canceled => {
                     debug!("vCPU {vcpuid} canceled");
-                    Ok(VcpuEmulation::Handled)
+                    Ok(VcpuEmulation::Interrupted)
                 }
                 VcpuExit::AffinityInfo(mpidr) => {
                     debug!("AffinityInfo: mpidr=0x{mpidr:x}");
@@ -449,6 +667,12 @@ impl Vcpu {
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::MmioWrite(addr, data) => {
+                    if self.dirty_tracker.handle_write_fault(addr)? {
+                        // The protected RAM write has not executed. Make the mapping writable and
+                        // retry the original instruction instead of treating it as device MMIO.
+                        hvf_vcpu.retry_current_instruction();
+                        return Ok(VcpuEmulation::Handled);
+                    }
                     if let Some(ref mmio_bus) = self.mmio_bus {
                         mmio_bus.write(vcpuid, addr, data);
                     }
@@ -493,17 +717,23 @@ impl Vcpu {
     }
 
     /// Main loop of the vCPU thread.
-    pub fn run(&mut self, init_tls_sender: Sender<bool>) {
+    pub fn run(&mut self, init_tls_sender: Sender<u64>) {
         let mut hvf_vcpu =
             HvfVcpu::new(self.mpidr, self.nested_enabled).expect("Can't create HVF vCPU");
         let hvf_vcpuid = hvf_vcpu.id();
 
         init_tls_sender
-            .send(true)
+            .send(hvf_vcpuid)
             .expect("Cannot notify vcpu TLS initialization.");
 
         let (wfe_sender, wfe_receiver) = unbounded();
         self.vcpu_list.register(hvf_vcpuid, wfe_sender);
+
+        // All backends expose the same construction barrier: a newly started vCPU thread must not
+        // execute guest instructions until the VMM explicitly resumes it.
+        if !self.wait_for_resume(&mut hvf_vcpu) {
+            return;
+        }
 
         // Register with the enforcement kicker: a hard-spinning guest takes no VM exits on HVF (even the vtimer is hardware-virtualized), so when enforcement drops below
         // this vCPU's index the kicker must be able to force it out of guest mode for the enforcement check below to run at all — and to bound its slice while throttled.
@@ -516,22 +746,42 @@ impl Vcpu {
             )
         });
 
-        // The boot CPU starts immediately at the kernel entry point; every other CPU
-        // parks on its boot channel until PSCI CPU_ON supplies an entry point.
-        let entry_addr = if self.id == 0 {
-            self.boot_entry_addr
-        } else if let Some(boot_receiver) = &self.boot_receiver {
-            self.set_parked(true);
-            let entry = boot_receiver.recv().unwrap();
-            self.set_parked(false);
-            entry
+        if self.restored_state {
+            // A CPU that was offline at capture remains offline. CPU_ON deliberately resets it to
+            // the guest-provided entry point, exactly like an ordinary PSCI restart.
+            if self.is_parked() {
+                let Some(boot_receiver) = self.boot_receiver.clone() else {
+                    self.exit(FC_EXIT_CODE_GENERIC_ERROR);
+                    return;
+                };
+                let Some(entry) = self.wait_for_boot_entry(&mut hvf_vcpu, &boot_receiver) else {
+                    return;
+                };
+                self.set_parked(false);
+                hvf_vcpu
+                    .set_initial_state(entry, self.fdt_addr)
+                    .unwrap_or_else(|_| panic!("Can't restart restored HVF vCPU {hvf_vcpuid}"));
+            }
         } else {
-            self.boot_entry_addr
-        };
+            // The boot CPU starts immediately at the kernel entry point; every other CPU parks on
+            // its boot channel until PSCI CPU_ON supplies an entry point.
+            let entry_addr = if self.id == 0 {
+                self.boot_entry_addr
+            } else if let Some(boot_receiver) = self.boot_receiver.clone() {
+                self.set_parked(true);
+                let Some(entry) = self.wait_for_boot_entry(&mut hvf_vcpu, &boot_receiver) else {
+                    return;
+                };
+                self.set_parked(false);
+                entry
+            } else {
+                self.boot_entry_addr
+            };
 
-        hvf_vcpu
-            .set_initial_state(entry_addr, self.fdt_addr)
-            .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
+            hvf_vcpu
+                .set_initial_state(entry_addr, self.fdt_addr)
+                .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
+        }
 
         let mut last_exec_time_ns = hvf_vcpu.exec_time_ns().unwrap_or(0);
         let mut enforcement_deadline: Option<std::time::Instant> = None;
@@ -577,9 +827,12 @@ impl Vcpu {
                 // The guest offlined this CPU (PSCI CPU_OFF). Park until a later
                 // CPU_ON supplies a fresh entry point, then restart from it.
                 Ok(VcpuEmulation::CpuOff) => {
-                    if let Some(boot_receiver) = &self.boot_receiver {
+                    if let Some(boot_receiver) = self.boot_receiver.clone() {
                         self.set_parked(true);
-                        let entry = boot_receiver.recv().unwrap();
+                        let Some(entry) = self.wait_for_boot_entry(&mut hvf_vcpu, &boot_receiver)
+                        else {
+                            break;
+                        };
                         self.set_parked(false);
                         hvf_vcpu
                             .set_initial_state(entry, self.fdt_addr)
@@ -595,14 +848,22 @@ impl Vcpu {
                     }
                 }
                 // Emulation was interrupted by a breakpoint.
-                Ok(VcpuEmulation::Interrupted) => self.wait_for_resume(),
+                Ok(VcpuEmulation::Interrupted) => {
+                    if !self.handle_pending_control(&mut hvf_vcpu) {
+                        break;
+                    }
+                }
                 // Wait for an external event.
                 Ok(VcpuEmulation::WaitForEvent) => {
-                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, None)
+                    if !self.wait_for_event(&mut hvf_vcpu, &wfe_receiver, None) {
+                        break;
+                    }
                 }
                 Ok(VcpuEmulation::WaitForEventExpired) => (),
                 Ok(VcpuEmulation::WaitForEventTimeout(timeout)) => {
-                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout))
+                    if !self.wait_for_event(&mut hvf_vcpu, &wfe_receiver, Some(timeout)) {
+                        break;
+                    }
                 }
                 // The guest was rebooted or halted.
                 Ok(VcpuEmulation::Stopped) => {
@@ -620,26 +881,177 @@ impl Vcpu {
 
     fn wait_for_event(
         &mut self,
-        hvf_vcpuid: u64,
+        hvf_vcpu: &mut HvfVcpu,
         receiver: &Receiver<u32>,
         timeout: Option<Duration>,
-    ) {
-        if self.vcpu_list.should_wait(hvf_vcpuid) {
-            if let Some(timeout) = timeout {
-                match receiver.recv_timeout(timeout) {
-                    Ok(_) => {}
-                    Err(e) => match e {
-                        RecvTimeoutError::Timeout => {}
-                        RecvTimeoutError::Disconnected => panic!("WFE channel closed unexpectedly"),
-                    },
+    ) -> bool {
+        let hvf_vcpuid = hvf_vcpu.id();
+        if !self.vcpu_list.should_wait(hvf_vcpuid) {
+            return true;
+        }
+
+        let control_receiver = self.event_receiver.clone();
+        let deadline = timeout.map(|duration| Instant::now() + duration);
+
+        loop {
+            if let Some(deadline) = deadline {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return true;
+                };
+                crossbeam_channel::select! {
+                    recv(receiver) -> wake => {
+                        wake.expect("WFE channel closed unexpectedly");
+                        return true;
+                    }
+                    recv(control_receiver) -> event => {
+                        let Ok(event) = event else {
+                            return false;
+                        };
+                        if !self.handle_control_event(hvf_vcpu, event) {
+                            return false;
+                        }
+                    }
+                    default(remaining) => return true,
                 }
             } else {
-                receiver.recv().unwrap();
+                crossbeam_channel::select! {
+                    recv(receiver) -> wake => {
+                        wake.expect("WFE channel closed unexpectedly");
+                        return true;
+                    }
+                    recv(control_receiver) -> event => {
+                        let Ok(event) = event else {
+                            return false;
+                        };
+                        if !self.handle_control_event(hvf_vcpu, event) {
+                            return false;
+                        }
+                    }
+                }
             }
         }
     }
 
-    fn wait_for_resume(&mut self) {}
+    fn wait_for_boot_entry(
+        &mut self,
+        hvf_vcpu: &mut HvfVcpu,
+        receiver: &Receiver<u64>,
+    ) -> Option<u64> {
+        let control_receiver = self.event_receiver.clone();
+        loop {
+            crossbeam_channel::select! {
+                recv(receiver) -> entry => return entry.ok(),
+                recv(control_receiver) -> event => {
+                    let Ok(event) = event else {
+                        return None;
+                    };
+                    if !self.handle_control_event(hvf_vcpu, event) {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_pending_control(&mut self, hvf_vcpu: &mut HvfVcpu) -> bool {
+        match self.event_receiver.try_recv() {
+            Ok(event) => self.handle_control_event(hvf_vcpu, event),
+            Err(crossbeam_channel::TryRecvError::Empty) => true,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => false,
+        }
+    }
+
+    fn handle_control_event(&mut self, hvf_vcpu: &mut HvfVcpu, event: VcpuEvent) -> bool {
+        match event {
+            VcpuEvent::Pause { request_id } => {
+                self.response_sender
+                    .send(VcpuResponse::Paused { request_id })
+                    .expect("failed to send pause status");
+                self.wait_for_resume(hvf_vcpu)
+            }
+            VcpuEvent::Resume { request_id } => {
+                self.response_sender
+                    .send(VcpuResponse::Resumed { request_id })
+                    .expect("failed to send resume status");
+                true
+            }
+            VcpuEvent::CaptureState { request_id } => {
+                let result = self.capture_execution_state(hvf_vcpu);
+                self.response_sender
+                    .send(VcpuResponse::StateCaptured { request_id, result })
+                    .expect("failed to send execution-state capture status");
+                true
+            }
+            VcpuEvent::RestoreState { request_id, bytes } => {
+                let result = self.restore_execution_state(hvf_vcpu, &bytes);
+                self.response_sender
+                    .send(VcpuResponse::StateRestored { request_id, result })
+                    .expect("failed to send execution-state restore status");
+                true
+            }
+        }
+    }
+
+    fn wait_for_resume(&mut self, hvf_vcpu: &mut HvfVcpu) -> bool {
+        loop {
+            match self.event_receiver.recv() {
+                Ok(VcpuEvent::Resume { request_id }) => {
+                    self.response_sender
+                        .send(VcpuResponse::Resumed { request_id })
+                        .expect("failed to send resume status");
+                    return true;
+                }
+                Ok(VcpuEvent::Pause { request_id }) => {
+                    self.response_sender
+                        .send(VcpuResponse::Paused { request_id })
+                        .expect("failed to send pause status");
+                }
+                Ok(VcpuEvent::CaptureState { request_id }) => {
+                    let result = self.capture_execution_state(hvf_vcpu);
+                    self.response_sender
+                        .send(VcpuResponse::StateCaptured { request_id, result })
+                        .expect("failed to send execution-state capture status");
+                }
+                Ok(VcpuEvent::RestoreState { request_id, bytes }) => {
+                    let result = self.restore_execution_state(hvf_vcpu, &bytes);
+                    self.response_sender
+                        .send(VcpuResponse::StateRestored { request_id, result })
+                        .expect("failed to send execution-state restore status");
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+
+    fn capture_execution_state(&self, hvf_vcpu: &HvfVcpu) -> result::Result<Vec<u8>, String> {
+        let state = MacVcpuExecutionState {
+            hvf: hvf_vcpu
+                .capture_state()
+                .map_err(|error| error.to_string())?,
+            parked: self.is_parked(),
+        };
+        bincode::serde::encode_to_vec(&state, bincode::config::standard())
+            .map_err(|error| error.to_string())
+    }
+
+    fn restore_execution_state(
+        &mut self,
+        hvf_vcpu: &mut HvfVcpu,
+        bytes: &[u8],
+    ) -> result::Result<(), String> {
+        let (state, consumed): (MacVcpuExecutionState, usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|error| error.to_string())?;
+        if consumed != bytes.len() {
+            return Err("trailing vCPU state bytes".to_string());
+        }
+        hvf_vcpu
+            .restore_state(&state.hvf)
+            .map_err(|error| error.to_string())?;
+        self.set_parked(state.parked);
+        self.restored_state = true;
+        Ok(())
+    }
 
     fn exit(&mut self, exit_code: u8) {
         self.response_sender
@@ -664,56 +1076,97 @@ impl Drop for Vcpu {
 /// List of events that the Vcpu can receive.
 pub enum VcpuEvent {
     /// Pause the Vcpu.
-    Pause,
+    Pause {
+        /// Correlates this command with its acknowledgement.
+        request_id: VcpuControlRequestId,
+    },
     /// Event that should resume the Vcpu.
-    Resume,
-    // Serialize and Deserialize to follow after we get the support from kvm-ioctls.
+    Resume {
+        /// Correlates this command with its acknowledgement.
+        request_id: VcpuControlRequestId,
+    },
+    /// Capture execution state on the owning vCPU thread.
+    CaptureState {
+        /// Correlates this command with its acknowledgement.
+        request_id: VcpuControlRequestId,
+    },
+    /// Restore execution state on the owning vCPU thread.
+    RestoreState {
+        /// Correlates this command with its acknowledgement.
+        request_id: VcpuControlRequestId,
+        /// Backend-private execution-state bytes.
+        bytes: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
 /// List of responses that the Vcpu reports.
 pub enum VcpuResponse {
     /// Vcpu is paused.
-    Paused,
+    Paused {
+        /// Request acknowledged by this response.
+        request_id: VcpuControlRequestId,
+    },
     /// Vcpu is resumed.
-    Resumed,
+    Resumed {
+        /// Request acknowledged by this response.
+        request_id: VcpuControlRequestId,
+    },
+    /// A vCPU execution-state capture completed.
+    StateCaptured {
+        /// Request acknowledged by this response.
+        request_id: VcpuControlRequestId,
+        /// Encoded backend state or an explanatory backend error.
+        result: result::Result<Vec<u8>, String>,
+    },
+    /// A vCPU execution-state restore completed.
+    StateRestored {
+        /// Request acknowledged by this response.
+        request_id: VcpuControlRequestId,
+        /// Restore result from the backend.
+        result: result::Result<(), String>,
+    },
     /// Vcpu is stopped.
     Exited(u8),
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
 pub struct VcpuHandle {
+    hvf_vcpuid: u64,
     event_sender: Sender<VcpuEvent>,
     response_receiver: Receiver<VcpuResponse>,
+    _vcpu_thread: thread::JoinHandle<()>,
 }
 
 impl VcpuHandle {
     pub fn new(
+        hvf_vcpuid: u64,
         event_sender: Sender<VcpuEvent>,
         response_receiver: Receiver<VcpuResponse>,
-        _vcpu_thread: thread::JoinHandle<()>,
+        vcpu_thread: thread::JoinHandle<()>,
     ) -> Self {
         Self {
+            hvf_vcpuid,
             event_sender,
             response_receiver,
+            _vcpu_thread: vcpu_thread,
         }
     }
 
     pub fn send_event(&self, event: VcpuEvent) -> Result<()> {
+        let should_interrupt = matches!(event, VcpuEvent::Pause { .. });
         // Use expect() to crash if the other thread closed this channel.
         self.event_sender
             .send(event)
             .expect("event sender channel closed on vcpu end.");
-        // Kick the vcpu so it picks up the message.
-        /*
-        self.vcpu_thread
-            .as_ref()
-            // Safe to unwrap since constructor make this 'Some'.
-            .unwrap()
-            .kill(sigrtmin() + VCPU_RTSIG_OFFSET)
-            .map_err(Error::SignalVcpu)?;
-        */
+        if should_interrupt {
+            self.kick()?;
+        }
         Ok(())
+    }
+
+    pub fn kick(&self) -> Result<()> {
+        vcpu_request_exit(self.hvf_vcpuid).map_err(Error::VcpuHvf)
     }
 
     pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
@@ -1131,6 +1584,12 @@ mod tests {
             None,
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
             Arc::new(VcpuList::new(1)),
+            Arc::new(HvfDirtyTracker {
+                regions: Mutex::new(Vec::new()),
+                dirty_pages: Mutex::new(BTreeSet::new()),
+                page_size: 0x4000,
+                active: AtomicBool::new(false),
+            }),
             false,
             MetricsWriter::default(),
         )

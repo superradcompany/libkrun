@@ -78,6 +78,7 @@ pub struct MmioTransport {
     queue_config: Vec<QueueConfig>,
     shm_region_select: u32,
     interrupt: InterruptTransport,
+    memory_access: MemoryAccessDomain,
 }
 
 struct InterruptTransportInner {
@@ -169,6 +170,16 @@ impl MmioTransport {
         intc: IrqChip,
         device: Arc<Mutex<dyn VirtioDevice>>,
     ) -> Result<MmioTransport, CreateMmioTransportError> {
+        Self::new_with_memory_access(mem, intc, device, MemoryAccessDomain::new())
+    }
+
+    /// Constructs an MMIO transport attached to a shared VM memory-access epoch.
+    pub fn new_with_memory_access(
+        mem: GuestMemoryMmap,
+        intc: IrqChip,
+        device: Arc<Mutex<dyn VirtioDevice>>,
+        memory_access: MemoryAccessDomain,
+    ) -> Result<MmioTransport, CreateMmioTransportError> {
         let locked = device
             .try_lock()
             .expect("Mutex of VirtioDevice should not be locked when calling MmioTransport::new");
@@ -177,11 +188,12 @@ impl MmioTransport {
         let queue_config: Vec<QueueConfig> = locked.queue_config().to_vec();
         drop(locked);
 
-        let queues = Self::create_queues(&queue_config);
+        let queues = Self::create_queues(&queue_config, &memory_access);
         let queue_evts = Self::create_queue_evts(queue_config.len())?;
 
         Ok(MmioTransport {
             interrupt: InterruptTransport::new(intc, debug_log_target)?,
+            memory_access,
             device,
             features_select: 0,
             acked_features_select: 0,
@@ -197,8 +209,18 @@ impl MmioTransport {
     }
 
     /// Create queues from queue configuration.
-    fn create_queues(queue_config: &[QueueConfig]) -> Vec<Queue> {
-        queue_config.iter().map(|c| Queue::new(c.size)).collect()
+    fn create_queues(
+        queue_config: &[QueueConfig],
+        memory_access: &MemoryAccessDomain,
+    ) -> Vec<Queue> {
+        queue_config
+            .iter()
+            .map(|config| {
+                let mut queue = Queue::new(config.size);
+                queue.set_memory_access_domain(memory_access);
+                queue
+            })
+            .collect()
     }
 
     /// Create eventfds for queue notifications.
@@ -294,7 +316,7 @@ impl MmioTransport {
         // Recreate queues from queue_config for the next negotiation cycle.
         // Keep queue_evts as is - they are reused across reset cycles.
         // TODO: consider resting the events when we refactor event handling
-        self.queues = Some(Self::create_queues(&self.queue_config));
+        self.queues = Some(Self::create_queues(&self.queue_config, &self.memory_access));
         // . Do not reset config_generation and keep it monotonically increasing
     }
 
