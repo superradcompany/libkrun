@@ -122,6 +122,10 @@ impl NetBackend for Tap {
         Ok(())
     }
 
+    fn supports_quiesce(&self) -> bool {
+        true
+    }
+
     fn raw_socket_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }

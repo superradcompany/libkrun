@@ -90,6 +90,12 @@ impl MuxerRxQ {
     pub fn is_full(&self) -> bool {
         self.len() == Self::SIZE
     }
+
+    /// Drops connection-local responses after the owning muxer has stopped.
+    pub(crate) fn clear(&mut self) {
+        self.q.clear();
+        self.synced = true;
+    }
 }
 
 pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) -> bool {

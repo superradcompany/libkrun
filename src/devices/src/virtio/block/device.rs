@@ -1416,6 +1416,10 @@ impl VirtioDevice for Block {
         true
     }
 
+    fn supports_quiesce(&self) -> bool {
+        true
+    }
+
     fn quiesce(&mut self) -> Result<Vec<DeviceQueue>, VirtioStateError> {
         if !self.device_state.is_activated() && self.quiesced_queue.is_none() {
             return Err(VirtioStateError::InvalidLifecycle(

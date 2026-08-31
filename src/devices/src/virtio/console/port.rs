@@ -66,12 +66,16 @@ impl PortDescription {
 
 enum PortState {
     Inactive,
-    Active {
-        stopfd: utils::eventfd::EventFd,
-        stop: Arc<AtomicBool>,
-        rx_thread: Option<JoinHandle<()>>,
-        tx_thread: Option<JoinHandle<()>>,
-    },
+    Active(Box<ActivePortState>),
+}
+
+struct ActivePortState {
+    stopfd: utils::eventfd::EventFd,
+    stop: Arc<AtomicBool>,
+    rx_thread: Option<JoinHandle<Queue>>,
+    tx_thread: Option<JoinHandle<Queue>>,
+    rx_queue: Option<Queue>,
+    tx_queue: Option<Queue>,
 }
 
 pub(crate) struct Port {
@@ -107,27 +111,23 @@ impl Port {
     }
 
     pub fn notify_rx(&self) {
-        if let PortState::Active {
-            rx_thread: Some(handle),
-            ..
-        } = &self.state
-        {
-            handle.thread().unpark()
+        if let PortState::Active(state) = &self.state {
+            if let Some(handle) = &state.rx_thread {
+                handle.thread().unpark()
+            }
         }
     }
 
     pub fn notify_tx(&self) {
-        if let PortState::Active {
-            tx_thread: Some(handle),
-            ..
-        } = &self.state
-        {
-            handle.thread().unpark()
+        if let PortState::Active(state) = &self.state {
+            if let Some(handle) = &state.tx_thread {
+                handle.thread().unpark()
+            }
         }
     }
 
     pub fn is_active(&self) -> bool {
-        matches!(self.state, PortState::Active { .. })
+        matches!(self.state, PortState::Active(_))
     }
 
     pub fn start(
@@ -138,7 +138,7 @@ impl Port {
         interrupt: InterruptTransport,
         control: Arc<ConsoleControl>,
     ) {
-        if let PortState::Active { .. } = &mut self.state {
+        if let PortState::Active(_) = &mut self.state {
             self.shutdown();
         };
 
@@ -149,12 +149,14 @@ impl Port {
             .expect("Failed to create EventFd for interrupt_evt");
         let stop = Arc::new(AtomicBool::new(false));
 
+        let mut rx_queue = Some(rx_queue);
         let rx_thread = input.map(|input| {
             let mem = mem.clone();
             let interrupt = interrupt.clone();
             let port_id = self.port_id;
             let stopfd = stopfd.try_clone().unwrap();
             let stop = stop.clone();
+            let rx_queue = rx_queue.take().expect("RX queue is owned once");
             thread::Builder::new()
                 .name("console port".into())
                 .spawn(move || {
@@ -165,47 +167,47 @@ impl Port {
                 .unwrap()
         });
 
+        let mut tx_queue = Some(tx_queue);
         let tx_thread = output.map(|output| {
             let stop = stop.clone();
+            let tx_queue = tx_queue.take().expect("TX queue is owned once");
             thread::spawn(move || process_tx(mem, tx_queue, interrupt, output, stop))
         });
 
-        self.state = PortState::Active {
+        self.state = PortState::Active(Box::new(ActivePortState {
             stopfd,
             stop,
             rx_thread,
             tx_thread,
-        }
+            rx_queue,
+            tx_queue,
+        }))
     }
 
     pub fn shutdown(&mut self) {
-        if let PortState::Active {
-            stopfd,
-            stop,
-            tx_thread,
-            rx_thread,
-        } = &mut self.state
-        {
-            stop.store(true, Ordering::Release);
-            if let Some(tx_thread) = mem::take(tx_thread) {
+        let _ = self.quiesce();
+    }
+
+    /// Stops both directions and returns the queues at terminal descriptor boundaries.
+    pub(crate) fn quiesce(&mut self) -> Result<(Queue, Queue), &'static str> {
+        if let PortState::Active(state) = &mut self.state {
+            state.stop.store(true, Ordering::Release);
+            let tx_queue = if let Some(tx_thread) = mem::take(&mut state.tx_thread) {
                 tx_thread.thread().unpark();
-                if let Err(e) = tx_thread.join() {
-                    log::error!(
-                        "Failed to flush tx for port {port_id}, thread panicked: {e:?}",
-                        port_id = self.port_id
-                    )
-                }
-            }
-            stopfd.write(1).unwrap();
-            if let Some(rx_thread) = mem::take(rx_thread) {
+                tx_thread.join().map_err(|_| "console TX worker panicked")?
+            } else {
+                state.tx_queue.take().ok_or("console TX queue is missing")?
+            };
+            state.stopfd.write(1).unwrap();
+            let rx_queue = if let Some(rx_thread) = mem::take(&mut state.rx_thread) {
                 rx_thread.thread().unpark();
-                if let Err(e) = rx_thread.join() {
-                    log::error!(
-                        "Failed to flush tx for port {port_id}, thread panicked: {e:?}",
-                        port_id = self.port_id
-                    )
-                }
-            }
-        };
+                rx_thread.join().map_err(|_| "console RX worker panicked")?
+            } else {
+                state.rx_queue.take().ok_or("console RX queue is missing")?
+            };
+            self.state = PortState::Inactive;
+            return Ok((rx_queue, tx_queue));
+        }
+        Err("console port is not active")
     }
 }

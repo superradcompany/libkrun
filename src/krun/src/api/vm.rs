@@ -1395,6 +1395,41 @@ impl VmControl {
         self.with_running_vmm(|vmm| vmm.capture_block_device_state(device_id))
     }
 
+    /// Returns the deterministic logical inventory of registered virtio-mmio devices.
+    #[cfg(feature = "blk")]
+    pub fn virtio_device_inventory(&self) -> Result<Vec<(u32, String)>> {
+        self.with_running_vmm(|vmm| Ok(vmm.virtio_device_inventory()))
+    }
+
+    /// Reports whether one configured virtio device supports reversible queue quiescence.
+    #[cfg(feature = "blk")]
+    pub fn virtio_device_supports_quiesce(
+        &self,
+        device_type: u32,
+        device_id: &str,
+    ) -> Result<bool> {
+        self.with_running_vmm(|vmm| vmm.virtio_device_supports_quiesce(device_type, device_id))
+    }
+
+    /// Captures one quiesce-capable destination-recreated virtio device.
+    #[cfg(feature = "blk")]
+    pub fn capture_virtio_device_state(
+        &self,
+        device_type: u32,
+        device_id: &str,
+    ) -> Result<vmm::device_state::VirtioDeviceState> {
+        self.with_running_vmm(|vmm| vmm.capture_virtio_device_state(device_type, device_id))
+    }
+
+    /// Restores one destination-recreated virtio device before resuming the paused VM.
+    #[cfg(feature = "blk")]
+    pub fn restore_virtio_device_state(
+        &self,
+        state: &vmm::device_state::VirtioDeviceState,
+    ) -> Result<()> {
+        self.with_running_vmm(|vmm| vmm.restore_virtio_device_state(state))
+    }
+
     /// Restores one parked virtio-block device before resuming the paused VM.
     #[cfg(feature = "blk")]
     pub fn restore_block_device_state(

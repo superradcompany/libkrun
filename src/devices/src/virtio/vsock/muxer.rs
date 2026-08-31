@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::thread::JoinHandle;
 
 use super::super::Queue as VirtQueue;
 use super::custom_stream::CustomStreamProxy;
@@ -26,6 +27,7 @@ use super::{
 };
 use crossbeam_channel::{unbounded, Sender};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use vm_memory::GuestMemoryMmap;
 
 use crate::virtio::InterruptTransport;
@@ -151,6 +153,13 @@ pub struct VsockMuxer {
     next_dgram_proxy_id: AtomicU64,
     next_dgram_activity: AtomicU64,
     tsi_flags: TsiFlags,
+    stop_evt: EventFd,
+    muxer_thread: Option<JoinHandle<()>>,
+    reaper_thread: Option<JoinHandle<()>>,
+    #[cfg(target_os = "macos")]
+    timesync_stop: Arc<(Mutex<bool>, Condvar)>,
+    #[cfg(target_os = "macos")]
+    timesync_thread: Option<JoinHandle<()>>,
 }
 
 impl VsockMuxer {
@@ -182,6 +191,13 @@ impl VsockMuxer {
             next_dgram_proxy_id: AtomicU64::new(1),
             next_dgram_activity: AtomicU64::new(1),
             tsi_flags,
+            stop_evt: EventFd::new(EFD_NONBLOCK).expect("failed to create vsock stop event"),
+            muxer_thread: None,
+            reaper_thread: None,
+            #[cfg(target_os = "macos")]
+            timesync_stop: Arc::new((Mutex::new(false), Condvar::new())),
+            #[cfg(target_os = "macos")]
+            timesync_thread: None,
         }
     }
 
@@ -197,9 +213,15 @@ impl VsockMuxer {
 
         #[cfg(target_os = "macos")]
         {
-            let timesync =
-                TimesyncThread::new(self.cid, mem.clone(), queue.clone(), interrupt.clone());
-            timesync.run();
+            *self.timesync_stop.0.lock().unwrap() = false;
+            let timesync = TimesyncThread::new(
+                self.cid,
+                mem.clone(),
+                queue.clone(),
+                interrupt.clone(),
+                Arc::clone(&self.timesync_stop),
+            );
+            self.timesync_thread = Some(timesync.run());
         }
 
         let (sender, receiver) = unbounded();
@@ -214,12 +236,52 @@ impl VsockMuxer {
             interrupt.clone(),
             sender.clone(),
             self.unix_ipc_port_map.clone().unwrap_or_default(),
+            self.stop_evt
+                .try_clone()
+                .expect("failed to clone vsock stop event"),
         );
-        thread.run();
+        self.muxer_thread = Some(thread.run());
 
         self.reaper_sender = Some(sender);
         let reaper = ReaperThread::new(receiver, self.proxy_map.clone());
-        reaper.run();
+        self.reaper_thread = Some(reaper.run());
+    }
+
+    /// Stops every background writer and drops connection-local proxy state.
+    pub(crate) fn quiesce(&mut self) -> std::io::Result<()> {
+        if let Some(thread) = self.muxer_thread.take() {
+            self.stop_evt.write(1)?;
+            thread
+                .join()
+                .map_err(|_| std::io::Error::other("vsock muxer thread panicked"))?;
+        }
+
+        #[cfg(target_os = "macos")]
+        if let Some(thread) = self.timesync_thread.take() {
+            let (stopped, changed) = &*self.timesync_stop;
+            *stopped.lock().unwrap() = true;
+            changed.notify_all();
+            thread
+                .join()
+                .map_err(|_| std::io::Error::other("vsock timesync thread panicked"))?;
+        }
+
+        // The muxer owned the only other sender. Dropping this endpoint lets the reaper terminate
+        // without a second stop protocol.
+        self.reaper_sender.take();
+        if let Some(thread) = self.reaper_thread.take() {
+            thread
+                .join()
+                .map_err(|_| std::io::Error::other("vsock reaper thread panicked"))?;
+        }
+
+        self.proxy_map.write().unwrap().clear();
+        self.dgram_peer_map.lock().unwrap().clear();
+        self.rxq.lock().unwrap().clear();
+        self.queue = None;
+        self.mem = None;
+        self.interrupt = None;
+        Ok(())
     }
 
     pub(crate) fn has_pending_rx(&self) -> bool {

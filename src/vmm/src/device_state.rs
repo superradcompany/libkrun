@@ -19,6 +19,8 @@ use devices::virtio::{
 #[cfg(feature = "blk")]
 const BLOCK_DEVICE_STATE_MAGIC: &[u8; 9] = b"MSBKBLK\0\0";
 #[cfg(feature = "blk")]
+const VIRTIO_DEVICE_STATE_MAGIC: &[u8; 9] = b"MSBKVIO\0\0";
+#[cfg(feature = "blk")]
 const BLOCK_DEVICE_STATE_SCHEMA: u16 = 1;
 #[cfg(feature = "blk")]
 const MAX_DEVICE_STATE_BYTES: usize = 1024 * 1024;
@@ -43,6 +45,21 @@ pub struct BlockDeviceState {
     pub transport: VirtioMmioState,
     /// Guest-visible block identity, capacity, policy, and negotiated features.
     pub device: BlockState,
+}
+
+/// Generic host-maintained state for a quiesced, destination-recreated virtio device.
+///
+/// Device-specific configuration is reconstructed from the admitted sandbox resource plan. This
+/// envelope preserves the exact transport and queue boundary plus the logical device binding.
+#[cfg(feature = "blk")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VirtioDeviceState {
+    /// Source pause generation shared with execution and memory capture orchestration.
+    pub pause_generation: u64,
+    /// Stable device identifier used by the runtime resource plan.
+    pub device_id: String,
+    /// Generic virtio-mmio registers and exact queue cursors.
+    pub transport: VirtioMmioState,
 }
 
 /// Framing and compatibility errors for virtio-block state artifacts.
@@ -231,6 +248,47 @@ impl BlockDeviceState {
 }
 
 #[cfg(feature = "blk")]
+impl VirtioDeviceState {
+    /// Encodes this typed state into deterministic, bounded bytes.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = Writer { bytes: Vec::new() };
+        writer.bytes(VIRTIO_DEVICE_STATE_MAGIC);
+        writer.u16(BLOCK_DEVICE_STATE_SCHEMA);
+        writer.u64(self.pause_generation);
+        writer.string(&self.device_id, MAX_DEVICE_STRING_BYTES)?;
+        encode_transport(&mut writer, &self.transport)?;
+        if writer.bytes.len() > MAX_DEVICE_STATE_BYTES {
+            return Err(Error::InvalidLength);
+        }
+        Ok(writer.bytes)
+    }
+
+    /// Decodes and validates one generic virtio state artifact.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_DEVICE_STATE_BYTES {
+            return Err(Error::InvalidLength);
+        }
+        let mut reader = Reader { bytes, offset: 0 };
+        if reader.take(VIRTIO_DEVICE_STATE_MAGIC.len())? != VIRTIO_DEVICE_STATE_MAGIC
+            || reader.u16()? != BLOCK_DEVICE_STATE_SCHEMA
+        {
+            return Err(Error::UnsupportedFormat);
+        }
+        let pause_generation = reader.u64()?;
+        let device_id = reader.string(MAX_DEVICE_STRING_BYTES)?;
+        let transport = decode_transport(&mut reader)?;
+        if reader.offset != bytes.len() {
+            return Err(Error::TrailingBytes);
+        }
+        Ok(Self {
+            pause_generation,
+            device_id,
+            transport,
+        })
+    }
+}
+
+#[cfg(feature = "blk")]
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
@@ -382,6 +440,93 @@ impl<'a> Reader<'a> {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(feature = "blk")]
+fn encode_transport(writer: &mut Writer, transport: &VirtioMmioState) -> Result<()> {
+    writer.u16(transport.version);
+    writer.u32(transport.device_type);
+    writer.u32(transport.features_select);
+    writer.u32(transport.acked_features_select);
+    writer.u32(transport.queue_select);
+    writer.u32(transport.device_status);
+    writer.u32(transport.config_generation);
+    writer.u32(transport.shm_region_select);
+    writer.u64(u64::try_from(transport.interrupt_status).map_err(|_| Error::InvalidValue)?);
+    writer.option_u32(transport.irq_line);
+    writer.u64(transport.acked_features);
+    writer.len(transport.queues.len(), MAX_QUEUES)?;
+    for queue in &transport.queues {
+        writer.u16(queue.version);
+        writer.u16(queue.max_size);
+        writer.u16(queue.size);
+        writer.bool(queue.ready);
+        writer.u64(queue.desc_table);
+        writer.u64(queue.avail_ring);
+        writer.u64(queue.used_ring);
+        writer.u16(queue.next_avail);
+        writer.u16(queue.next_used);
+        writer.bool(queue.event_idx_enabled);
+        writer.u16(queue.num_added);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "blk")]
+fn decode_transport(reader: &mut Reader<'_>) -> Result<VirtioMmioState> {
+    let version = reader.u16()?;
+    if version != VIRTIO_MMIO_STATE_VERSION {
+        return Err(Error::UnsupportedFormat);
+    }
+    let device_type = reader.u32()?;
+    let features_select = reader.u32()?;
+    let acked_features_select = reader.u32()?;
+    let queue_select = reader.u32()?;
+    let device_status = reader.u32()?;
+    let config_generation = reader.u32()?;
+    let shm_region_select = reader.u32()?;
+    let interrupt_status = usize::try_from(reader.u64()?).map_err(|_| Error::InvalidValue)?;
+    let irq_line = reader.option_u32()?;
+    let acked_features = reader.u64()?;
+    let queue_count = reader.len(MAX_QUEUES)?;
+    let mut queues = Vec::with_capacity(queue_count);
+    for _ in 0..queue_count {
+        let version = reader.u16()?;
+        if version != QUEUE_STATE_VERSION {
+            return Err(Error::UnsupportedFormat);
+        }
+        queues.push(QueueState {
+            version,
+            max_size: reader.u16()?,
+            size: reader.u16()?,
+            ready: reader.bool()?,
+            desc_table: reader.u64()?,
+            avail_ring: reader.u64()?,
+            used_ring: reader.u64()?,
+            next_avail: reader.u16()?,
+            next_used: reader.u16()?,
+            event_idx_enabled: reader.bool()?,
+            num_added: reader.u16()?,
+        });
+    }
+    Ok(VirtioMmioState {
+        version,
+        device_type,
+        features_select,
+        acked_features_select,
+        queue_select,
+        device_status,
+        config_generation,
+        shm_region_select,
+        interrupt_status,
+        irq_line,
+        acked_features,
+        queues,
+    })
+}
+
+//--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
 
@@ -433,6 +578,18 @@ mod tests {
         }
     }
 
+    fn generic_state() -> VirtioDeviceState {
+        let block = state();
+        VirtioDeviceState {
+            pause_generation: block.pause_generation,
+            device_id: "console".to_string(),
+            transport: VirtioMmioState {
+                device_type: 3,
+                ..block.transport
+            },
+        }
+    }
+
     #[test]
     fn block_device_state_round_trip_is_deterministic() {
         let state = state();
@@ -451,6 +608,28 @@ mod tests {
         encoded.push(0);
         assert_eq!(
             BlockDeviceState::decode(&encoded),
+            Err(Error::TrailingBytes)
+        );
+    }
+
+    #[test]
+    fn generic_virtio_state_round_trip_is_deterministic() {
+        let state = generic_state();
+        let encoded = state.encode().unwrap();
+        assert_eq!(VirtioDeviceState::decode(&encoded).unwrap(), state);
+        assert_eq!(state.encode().unwrap(), encoded);
+    }
+
+    #[test]
+    fn generic_virtio_state_rejects_trailing_and_truncated_bytes() {
+        let mut encoded = generic_state().encode().unwrap();
+        assert!(matches!(
+            VirtioDeviceState::decode(&encoded[..encoded.len() - 1]),
+            Err(Error::InvalidLength)
+        ));
+        encoded.push(0);
+        assert_eq!(
+            VirtioDeviceState::decode(&encoded),
             Err(Error::TrailingBytes)
         );
     }

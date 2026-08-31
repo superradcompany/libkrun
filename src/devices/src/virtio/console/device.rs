@@ -11,6 +11,7 @@ use vm_memory::{ByteValued, Bytes, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
+    VirtioStateError,
 };
 use super::{defs, defs::control_event, defs::uapi};
 use crate::virtio::console::console_control::{
@@ -349,6 +350,14 @@ impl VirtioDevice for Console {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
+        if queues.len() != self.queue_config.len() {
+            error!(
+                "Cannot activate console. Expected {} queue(s), got {}",
+                self.queue_config.len(),
+                queues.len()
+            );
+            return Err(ActivateError::BadActivate);
+        }
         if self.activate_evt.write(1).is_err() {
             error!("Cannot write to activate_evt");
             return Err(ActivateError::BadActivate);
@@ -375,6 +384,46 @@ impl VirtioDevice for Console {
         self.device_state = DeviceState::Inactive;
         true
     }
+
+    fn supports_quiesce(&self) -> bool {
+        true
+    }
+
+    fn quiesce(&mut self) -> Result<Vec<DeviceQueue>, VirtioStateError> {
+        if !self.device_state.is_activated() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "console must be activated before quiescence",
+            ));
+        }
+
+        // Port workers own their RX/TX queues independently of the event-manager-owned control
+        // queues. Join every active port first so no host I/O or guest-memory access can outlive
+        // the returned queue boundary.
+        for (port_id, port) in self.ports.iter_mut().enumerate() {
+            if !port.is_active() {
+                continue;
+            }
+            let (rx, tx) = port
+                .quiesce()
+                .map_err(|message| VirtioStateError::Device(std::io::Error::other(message)))?;
+            let rx_index = port_id_to_queue_idx(QueueDirection::Rx, port_id);
+            let tx_index = port_id_to_queue_idx(QueueDirection::Tx, port_id);
+            self.queues[rx_index] = Some(DeviceQueue::new(rx, self.queue_events[rx_index].clone()));
+            self.queues[tx_index] = Some(DeviceQueue::new(tx, self.queue_events[tx_index].clone()));
+        }
+
+        let queues = self
+            .queues
+            .iter_mut()
+            .map(|queue| {
+                queue.take().ok_or(VirtioStateError::InvalidLifecycle(
+                    "console queue is missing after worker drain",
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.device_state = DeviceState::Inactive;
+        Ok(queues)
+    }
 }
 
 impl VmmExitObserver for Console {
@@ -390,6 +439,15 @@ impl VmmExitObserver for Console {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use utils::eventfd::EventFd;
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::console::port_io;
+    use crate::virtio::{DeviceQueue, InterruptTransport, Queue};
+
     use super::*;
 
     fn port(name: &'static str, queue_size: u16) -> PortDescription {
@@ -425,5 +483,35 @@ mod tests {
                 _ => panic!("queue size {queue_size} should be rejected"),
             }
         }
+    }
+
+    #[test]
+    fn console_quiesce_stops_blocked_port_workers_and_returns_every_queue() {
+        let description = PortDescription::input_pipe("agent", port_io::input_empty().unwrap());
+        let mut console = Console::new(vec![description]).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap();
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "test-console".into()).unwrap();
+        let queues = console
+            .queue_config()
+            .iter()
+            .map(|config| {
+                DeviceQueue::new(Queue::new(config.size), Arc::new(EventFd::new(0).unwrap()))
+            })
+            .collect();
+        console
+            .activate(mem.clone(), interrupt.clone(), queues)
+            .unwrap();
+
+        let rx_index = port_id_to_queue_idx(QueueDirection::Rx, 0);
+        let tx_index = port_id_to_queue_idx(QueueDirection::Tx, 0);
+        let rx = console.queues[rx_index].take().unwrap().queue;
+        let tx = console.queues[tx_index].take().unwrap().queue;
+        console.ports[0].start(mem, rx, tx, interrupt, Arc::clone(&console.control));
+
+        let queues = console.quiesce().unwrap();
+        assert_eq!(queues.len(), console.queue_config().len());
+        assert!(!console.is_activated());
+        assert!(!console.ports[0].is_active());
     }
 }

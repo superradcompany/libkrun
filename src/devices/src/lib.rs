@@ -41,7 +41,7 @@ pub enum Error {
 }
 
 /// Types of devices that can get attached to this platform.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Copy)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum DeviceType {
     /// Device Type: Virtio.
     Virtio(u32),

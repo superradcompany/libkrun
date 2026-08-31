@@ -4,6 +4,7 @@ use vm_memory::{ByteValued, Bytes, GuestMemoryMmap, Le32, Le64};
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
+    VirtioStateError,
 };
 use super::{defs, defs::uapi, MsbMetricsError};
 use crate::virtio::InterruptTransport;
@@ -191,6 +192,30 @@ impl VirtioDevice for MsbMetrics {
         self.queues = None;
         self.device_state = DeviceState::Inactive;
         true
+    }
+
+    fn supports_quiesce(&self) -> bool {
+        true
+    }
+
+    fn quiesce(&mut self) -> Result<Vec<DeviceQueue>, VirtioStateError> {
+        if !self.device_state.is_activated() {
+            return self.queues.take().ok_or(VirtioStateError::InvalidLifecycle(
+                "metrics queues are unavailable while inactive",
+            ));
+        }
+
+        // Metrics samples are observational. The event-manager callback completes the currently
+        // consumed descriptor under this same mutex; taking the queues therefore establishes the
+        // exact terminal boundary without inventing telemetry continuity state.
+        let queues = self
+            .queues
+            .take()
+            .ok_or(VirtioStateError::InvalidLifecycle(
+                "metrics device is activated without queues",
+            ))?;
+        self.device_state = DeviceState::Inactive;
+        Ok(queues)
     }
 }
 

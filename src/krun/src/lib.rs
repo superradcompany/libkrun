@@ -72,12 +72,12 @@ pub use api::vm::{
     VmGenerationState, VmGenerationWaitOutcome, VmMemoryRestoreSource, VmMemoryRestoreTarget,
     VmMemoryState, VmPauseGeneration,
 };
-#[cfg(all(feature = "blk", not(feature = "tee")))]
-pub use api::BlockDeviceState;
 #[cfg(feature = "blk")]
 pub use api::{
     BlockBackendSpec, BlockImageFormat, BlockLayerSpec, BlockSyncMode, PreparedBlockBackend,
 };
+#[cfg(all(feature = "blk", not(feature = "tee")))]
+pub use api::{BlockDeviceState, VirtioDeviceState};
 #[cfg(not(feature = "tee"))]
 pub use api::{
     ExecutionArchitecture, ExecutionBackend, ExecutionState, FullCaptureReason, GuestMemoryRange,

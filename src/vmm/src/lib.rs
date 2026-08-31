@@ -708,7 +708,7 @@ pub struct Vmm {
     // Guest VM devices.
     mmio_device_manager: MMIODeviceManager,
     #[cfg(feature = "blk")]
-    quiesced_block_devices: BTreeSet<String>,
+    quiesced_virtio_devices: BTreeSet<(u32, String)>,
     #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
     pio_device_manager: PortIODeviceManager,
 }
@@ -721,6 +721,133 @@ impl Vmm {
         device_id: &str,
     ) -> Option<&Mutex<dyn BusDevice>> {
         self.mmio_device_manager.get_device(device_type, device_id)
+    }
+
+    /// Returns the deterministic logical inventory of registered virtio-mmio devices.
+    #[cfg(feature = "blk")]
+    pub fn virtio_device_inventory(&self) -> Vec<(u32, String)> {
+        self.mmio_device_manager
+            .device_keys()
+            .into_iter()
+            .filter_map(|(device_type, id)| match device_type {
+                DeviceType::Virtio(device_type) => Some((device_type, id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Reports whether one configured virtio device supports reversible queue quiescence.
+    #[cfg(feature = "blk")]
+    pub fn virtio_device_supports_quiesce(
+        &self,
+        device_type: u32,
+        device_id: &str,
+    ) -> Result<bool> {
+        let bus_device = self
+            .mmio_device_manager
+            .get_device(DeviceType::Virtio(device_type), device_id)
+            .ok_or_else(|| Error::DeviceStateNotFound(device_id.to_string()))?;
+        let mut bus_device = bus_device
+            .lock()
+            .map_err(|_| Error::DeviceState("MMIO device mutex is poisoned".to_string()))?;
+        let transport = bus_device
+            .as_mut_any()
+            .downcast_mut::<MmioTransport>()
+            .ok_or_else(|| Error::DeviceState("device is not on virtio-mmio".to_string()))?;
+        let supported = transport.locked_device().supports_quiesce();
+        Ok(supported)
+    }
+
+    /// Quiesces and captures one destination-recreated virtio device.
+    #[cfg(feature = "blk")]
+    pub fn capture_virtio_device_state(
+        &mut self,
+        device_type: u32,
+        device_id: &str,
+    ) -> Result<device_state::VirtioDeviceState> {
+        self.require_paused_device_boundary()?;
+        if device_type == TYPE_BLOCK {
+            return Err(Error::DeviceState(
+                "virtio-block requires its typed device-state capture".to_string(),
+            ));
+        }
+        let pause_generation = match self.execution_state {
+            VmmExecutionState::Paused(generation) => generation.request_id().get(),
+            _ => unreachable!("paused boundary was checked before capture"),
+        };
+        let bus_device = self
+            .mmio_device_manager
+            .get_device(DeviceType::Virtio(device_type), device_id)
+            .ok_or_else(|| Error::DeviceStateNotFound(device_id.to_string()))?;
+        let mut bus_device = bus_device
+            .lock()
+            .map_err(|_| Error::DeviceState("MMIO device mutex is poisoned".to_string()))?;
+        let transport = bus_device
+            .as_mut_any()
+            .downcast_mut::<MmioTransport>()
+            .ok_or_else(|| Error::DeviceState("device is not on virtio-mmio".to_string()))?;
+
+        if !transport.locked_device().supports_quiesce() {
+            return Err(Error::DeviceState(format!(
+                "virtio device {device_id} does not support reversible quiescence"
+            )));
+        }
+
+        self.quiesced_virtio_devices
+            .insert((device_type, device_id.to_string()));
+        transport
+            .quiesce()
+            .map_err(|error| Error::DeviceState(error.to_string()))?;
+        let transport = transport
+            .capture_state()
+            .map_err(|error| Error::DeviceState(error.to_string()))?;
+        Ok(device_state::VirtioDeviceState {
+            pause_generation,
+            device_id: device_id.to_string(),
+            transport,
+        })
+    }
+
+    /// Restores one destination-recreated virtio device before vCPU activation.
+    #[cfg(feature = "blk")]
+    pub fn restore_virtio_device_state(
+        &mut self,
+        state: &device_state::VirtioDeviceState,
+    ) -> Result<()> {
+        self.require_paused_device_boundary()?;
+        let device_type = state.transport.device_type;
+        if device_type == TYPE_BLOCK {
+            return Err(Error::DeviceState(
+                "virtio-block requires its typed device-state restore".to_string(),
+            ));
+        }
+        let bus_device = self
+            .mmio_device_manager
+            .get_device(DeviceType::Virtio(device_type), &state.device_id)
+            .ok_or_else(|| Error::DeviceStateNotFound(state.device_id.clone()))?;
+        let mut bus_device = bus_device
+            .lock()
+            .map_err(|_| Error::DeviceState("MMIO device mutex is poisoned".to_string()))?;
+        let transport = bus_device
+            .as_mut_any()
+            .downcast_mut::<MmioTransport>()
+            .ok_or_else(|| Error::DeviceState("device is not on virtio-mmio".to_string()))?;
+
+        if !transport.locked_device().supports_quiesce() {
+            return Err(Error::DeviceState(format!(
+                "virtio device {} does not support reversible quiescence",
+                state.device_id
+            )));
+        }
+
+        self.quiesced_virtio_devices
+            .insert((device_type, state.device_id.clone()));
+        transport
+            .quiesce()
+            .map_err(|error| Error::DeviceState(error.to_string()))?;
+        transport
+            .restore_state(&state.transport)
+            .map_err(|error| Error::DeviceState(error.to_string()))
     }
 
     /// Captures one virtio-block device and keeps its worker quiesced until VM resume.
@@ -749,7 +876,8 @@ impl Vmm {
         // Record intent immediately before entering the participant. If drain or flush fails after
         // the worker has stopped, ordinary VM resume must reconcile this device instead of
         // releasing vCPUs against a silently parked backend.
-        self.quiesced_block_devices.insert(device_id.to_string());
+        self.quiesced_virtio_devices
+            .insert((TYPE_BLOCK, device_id.to_string()));
         transport
             .quiesce()
             .map_err(|error| Error::DeviceState(error.to_string()))?;
@@ -793,7 +921,8 @@ impl Vmm {
             .as_mut_any()
             .downcast_mut::<MmioTransport>()
             .ok_or_else(|| Error::DeviceState("block device is not on virtio-mmio".to_string()))?;
-        self.quiesced_block_devices.insert(device_id.to_string());
+        self.quiesced_virtio_devices
+            .insert((TYPE_BLOCK, device_id.to_string()));
         transport
             .quiesce()
             .map_err(|error| Error::DeviceState(error.to_string()))?;
@@ -835,7 +964,8 @@ impl Vmm {
             .as_mut_any()
             .downcast_mut::<MmioTransport>()
             .ok_or_else(|| Error::DeviceState("block device is not on virtio-mmio".to_string()))?;
-        self.quiesced_block_devices.insert(device_id.to_string());
+        self.quiesced_virtio_devices
+            .insert((TYPE_BLOCK, device_id.to_string()));
         transport
             .quiesce()
             .map_err(|error| Error::DeviceState(error.to_string()))?;
@@ -864,16 +994,16 @@ impl Vmm {
     }
 
     #[cfg(feature = "blk")]
-    fn resume_quiesced_block_devices(&mut self) -> Result<()> {
-        for device_id in self
-            .quiesced_block_devices
+    fn resume_quiesced_virtio_devices(&mut self) -> Result<()> {
+        for (device_type, device_id) in self
+            .quiesced_virtio_devices
             .iter()
             .cloned()
             .collect::<Vec<_>>()
         {
             let bus_device = self
                 .mmio_device_manager
-                .get_device(DeviceType::Virtio(TYPE_BLOCK), &device_id)
+                .get_device(DeviceType::Virtio(device_type), &device_id)
                 .ok_or_else(|| Error::DeviceStateNotFound(device_id.clone()))?;
             let mut bus_device = bus_device
                 .lock()
@@ -881,9 +1011,7 @@ impl Vmm {
             let transport = bus_device
                 .as_mut_any()
                 .downcast_mut::<MmioTransport>()
-                .ok_or_else(|| {
-                    Error::DeviceState("block device is not on virtio-mmio".to_string())
-                })?;
+                .ok_or_else(|| Error::DeviceState("device is not on virtio-mmio".to_string()))?;
             // Quiesce is idempotent and also reconciles a prior stop whose durability fence failed.
             transport
                 .quiesce()
@@ -891,7 +1019,8 @@ impl Vmm {
             transport
                 .resume()
                 .map_err(|error| Error::DeviceState(error.to_string()))?;
-            self.quiesced_block_devices.remove(&device_id);
+            self.quiesced_virtio_devices
+                .remove(&(device_type, device_id));
         }
         Ok(())
     }
@@ -1007,7 +1136,7 @@ impl Vmm {
         // Device participants reopen before vCPUs so saved queue work cannot race a guest that is
         // already executing. Any reconciliation failure leaves the VM at the paused generation.
         #[cfg(feature = "blk")]
-        self.resume_quiesced_block_devices()?;
+        self.resume_quiesced_virtio_devices()?;
 
         let request_id = self.next_control_request_id()?;
         self.execution_state = VmmExecutionState::Indeterminate;

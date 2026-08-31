@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread::JoinHandle;
 
 use crossbeam_channel::{unbounded, Sender};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use vm_memory::GuestMemoryMmap;
 
 use super::super::Queue as VirtQueue;
@@ -64,6 +66,9 @@ pub struct VsockMuxer {
     proxy_map: ProxyMap,
     reaper_sender: Option<Sender<u64>>,
     custom_port_map: Option<HashMap<u32, Arc<dyn VsockPortBackend>>>,
+    stop_evt: EventFd,
+    muxer_thread: Option<JoinHandle<()>>,
+    reaper_thread: Option<JoinHandle<()>>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -125,6 +130,9 @@ impl VsockMuxer {
             proxy_map: Arc::new(RwLock::new(HashMap::new())),
             reaper_sender: None,
             custom_port_map,
+            stop_evt: EventFd::new(EFD_NONBLOCK).expect("failed to create vsock stop event"),
+            muxer_thread: None,
+            reaper_thread: None,
         }
     }
 
@@ -139,19 +147,46 @@ impl VsockMuxer {
         self.interrupt = Some(interrupt.clone());
 
         let (sender, receiver) = unbounded();
-        MuxerThread::new(
-            self.cid,
-            self.epoll.clone(),
-            self.rxq.clone(),
-            self.proxy_map.clone(),
-            mem,
-            queue,
-            interrupt,
-            sender.clone(),
-        )
-        .run();
+        self.muxer_thread = Some(
+            MuxerThread::new(
+                self.cid,
+                self.epoll.clone(),
+                self.rxq.clone(),
+                self.proxy_map.clone(),
+                mem,
+                queue,
+                interrupt,
+                sender.clone(),
+                self.stop_evt
+                    .try_clone()
+                    .expect("failed to clone vsock stop event"),
+            )
+            .run(),
+        );
         self.reaper_sender = Some(sender);
-        ReaperThread::new(receiver, self.proxy_map.clone()).run();
+        self.reaper_thread = Some(ReaperThread::new(receiver, self.proxy_map.clone()).run());
+    }
+
+    /// Stops every background writer and drops connection-local proxy state.
+    pub(crate) fn quiesce(&mut self) -> std::io::Result<()> {
+        if let Some(thread) = self.muxer_thread.take() {
+            self.stop_evt.write(1)?;
+            thread
+                .join()
+                .map_err(|_| std::io::Error::other("vsock muxer thread panicked"))?;
+        }
+        self.reaper_sender.take();
+        if let Some(thread) = self.reaper_thread.take() {
+            thread
+                .join()
+                .map_err(|_| std::io::Error::other("vsock reaper thread panicked"))?;
+        }
+        self.proxy_map.write().unwrap().clear();
+        self.rxq.lock().unwrap().clear();
+        self.queue = None;
+        self.mem = None;
+        self.interrupt = None;
+        Ok(())
     }
 
     pub(crate) fn has_pending_rx(&self) -> bool {

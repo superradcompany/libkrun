@@ -1780,7 +1780,7 @@ pub fn build_microvm_paused(
         vm,
         mmio_device_manager,
         #[cfg(feature = "blk")]
-        quiesced_block_devices: Default::default(),
+        quiesced_virtio_devices: Default::default(),
         #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
         pio_device_manager,
     };

@@ -204,6 +204,14 @@ pub trait VirtioDevice: AsAny + Send {
         false
     }
 
+    /// Reports whether the device can establish a reversible queue-ownership boundary.
+    ///
+    /// Resource admission uses this before pausing vCPUs. Implementations must return `true` only
+    /// when [`quiesce`](Self::quiesce) either succeeds or leaves enough local state for retry/resume.
+    fn supports_quiesce(&self) -> bool {
+        false
+    }
+
     /// Stops dequeuing new work and returns every queue after consumed work is terminal.
     ///
     /// Devices that implement this operation must leave themselves inactive. The transport owns

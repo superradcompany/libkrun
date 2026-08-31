@@ -75,7 +75,7 @@ pub use vm::{
     VmMemoryState, VmPauseGeneration,
 };
 #[cfg(all(feature = "blk", not(feature = "tee")))]
-pub use vmm::device_state::BlockDeviceState;
+pub use vmm::device_state::{BlockDeviceState, VirtioDeviceState};
 #[cfg(not(feature = "tee"))]
 pub use vmm::execution_state::{
     ExecutionArchitecture, ExecutionBackend, ExecutionState, VcpuExecutionState,

@@ -13,10 +13,10 @@ pub(crate) fn process_tx(
     interrupt: InterruptTransport,
     output: Arc<Mutex<Box<dyn PortOutput + Send>>>,
     stop: Arc<AtomicBool>,
-) {
+) -> Queue {
     loop {
         let Some(head) = pop_head_blocking(&mut queue, &mem, &interrupt, &stop) else {
-            return;
+            return queue;
         };
 
         let head_index = head.index;

@@ -12,6 +12,7 @@ type BackendError = io::Error;
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum ConnectError {
+    WorkerEvent(io::Error),
     InvalidAddress(BackendError),
     CreateSocket(BackendError),
     Binding(BackendError),
@@ -51,6 +52,24 @@ pub trait NetBackend {
     fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError>;
     fn has_unfinished_write(&self) -> bool;
     fn try_finish_write(&mut self, hdr_len: usize, buf: &[u8]) -> Result<(), WriteError>;
+
+    /// Stops backend-owned helper work before the virtio worker returns its queues.
+    ///
+    /// Most Unix backends perform all work on the virtio worker and need no extra action. Backends
+    /// with private helper threads override this hook so no host writer remains live across a
+    /// quiesced device boundary.
+    fn quiesce(&mut self) {}
+
+    /// Restarts backend-owned helper work when a quiesced source device resumes.
+    fn resume(&mut self) {}
+
+    /// Reports whether every backend operation is cooperatively stoppable at a frame boundary.
+    ///
+    /// Custom backends opt in explicitly. Returning `false` keeps normal networking available but
+    /// lets checkpoint admission reject the device before the VM is paused.
+    fn supports_quiesce(&self) -> bool {
+        false
+    }
 
     #[cfg(unix)]
     fn raw_socket_fd(&self) -> RawFd;
