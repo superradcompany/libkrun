@@ -26,6 +26,7 @@ use std::thread;
 #[cfg(target_arch = "x86_64")]
 use std::time::Duration;
 
+#[cfg(target_arch = "x86_64")]
 use serde::{Deserialize, Serialize};
 
 use super::super::{
@@ -49,6 +50,8 @@ use crate::resources::VcpuPlacementResult;
 use crate::vmm_config::machine_config::{CpuFeaturesTemplate, HostCpuId};
 #[cfg(target_arch = "x86_64")]
 use cpuid::{c3, filter_cpuid, t2, VmSpec};
+#[cfg(not(feature = "tee"))]
+use kvm_bindings::KVM_MEM_LOG_DIRTY_PAGES;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
     kvm_clock_data, kvm_cpuid_entry2, kvm_debugregs, kvm_irqchip, kvm_lapic_state, kvm_mp_state,
@@ -58,8 +61,7 @@ use kvm_bindings::{
 };
 use kvm_bindings::{
     kvm_create_guest_memfd, kvm_userspace_memory_region, kvm_userspace_memory_region2,
-    KVM_API_VERSION, KVM_MEM_GUEST_MEMFD, KVM_MEM_LOG_DIRTY_PAGES, KVM_SYSTEM_EVENT_RESET,
-    KVM_SYSTEM_EVENT_SHUTDOWN,
+    KVM_API_VERSION, KVM_MEM_GUEST_MEMFD, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN,
 };
 #[cfg(feature = "tee")]
 use kvm_bindings::{kvm_enable_cap, KVM_CAP_EXIT_HYPERCALL, KVM_MEMORY_EXIT_FLAG_PRIVATE};
@@ -526,6 +528,7 @@ struct MappedMemoryRegion {
     slot: u32,
     guest_addr: u64,
     size: u64,
+    #[cfg(not(feature = "tee"))]
     host_addr: u64,
 }
 
@@ -887,6 +890,7 @@ impl Vm {
             slot,
             guest_addr: start,
             size: region.len(),
+            #[cfg(not(feature = "tee"))]
             host_addr: host_addr as u64,
         });
 

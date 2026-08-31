@@ -741,9 +741,14 @@ impl Vmm {
         self.mmio_device_manager
             .device_keys()
             .into_iter()
-            .filter_map(|(device_type, id)| match device_type {
-                DeviceType::Virtio(device_type) => Some((device_type, id)),
-                _ => None,
+            .filter_map(|(device_type, id)| {
+                // x86 currently has only the Virtio variant, while other architectures also
+                // register platform devices that must stay out of the checkpoint inventory.
+                #[allow(unreachable_patterns)]
+                match device_type {
+                    DeviceType::Virtio(device_type) => Some((device_type, id)),
+                    _ => None,
+                }
             })
             .collect()
     }
