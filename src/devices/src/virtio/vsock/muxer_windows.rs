@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -21,6 +22,16 @@ use super::{
     VsockPortBackend,
 };
 use crate::virtio::InterruptTransport;
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Epoll token reserved for the muxer stop event.
+///
+/// Stream proxy identifiers occupy the full `u64` made from their two `u32` ports, so the matching
+/// port tuple is rejected before a proxy can be admitted.
+pub(super) const MUXER_STOP_TOKEN: u64 = u64::MAX - 1;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -141,7 +152,15 @@ impl VsockMuxer {
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
-    ) {
+    ) -> std::io::Result<()> {
+        // Register the stop handle before reporting activation success. Ignoring this failure would
+        // leave quiescence waiting forever for a muxer thread that can never observe its wakeup.
+        self.epoll.ctl(
+            ControlOperation::Add,
+            self.stop_evt.as_raw_handle(),
+            &EpollEvent::new(EventSet::IN, MUXER_STOP_TOKEN),
+        )?;
+
         self.queue = Some(queue.clone());
         self.mem = Some(mem.clone());
         self.interrupt = Some(interrupt.clone());
@@ -165,6 +184,7 @@ impl VsockMuxer {
         );
         self.reaper_sender = Some(sender);
         self.reaper_thread = Some(ReaperThread::new(receiver, self.proxy_map.clone()).run());
+        Ok(())
     }
 
     /// Stops every background writer and drops connection-local proxy state.
@@ -267,8 +287,7 @@ impl VsockMuxer {
         }
     }
 
-    fn process_op_request(&self, pkt: &VsockPacket) {
-        let id = ((pkt.src_port() as u64) << 32) | pkt.dst_port() as u64;
+    fn process_op_request(&self, id: u64, pkt: &VsockPacket) {
         let existing = self
             .proxy_map
             .read()
@@ -373,8 +392,7 @@ impl VsockMuxer {
         }
     }
 
-    fn with_proxy_update(&self, pkt: &VsockPacket, f: impl FnOnce(&mut dyn Proxy) -> ProxyUpdate) {
-        let id = ((pkt.src_port() as u64) << 32) | pkt.dst_port() as u64;
+    fn with_proxy_update(&self, id: u64, f: impl FnOnce(&mut dyn Proxy) -> ProxyUpdate) {
         let update = self
             .proxy_map
             .read()
@@ -390,31 +408,38 @@ impl VsockMuxer {
         if pkt.dst_cid() != uapi::VSOCK_HOST_CID {
             return Ok(());
         }
+        let Some(id) = stream_proxy_id(pkt.src_port(), pkt.dst_port()) else {
+            warn!(
+                "rejecting reserved vsock proxy port tuple {}:{}",
+                pkt.src_port(),
+                pkt.dst_port()
+            );
+            self.push_reset(pkt);
+            return Ok(());
+        };
         match pkt.op() {
-            uapi::VSOCK_OP_REQUEST => self.process_op_request(pkt),
+            uapi::VSOCK_OP_REQUEST => self.process_op_request(id, pkt),
             uapi::VSOCK_OP_RESPONSE => {
-                self.with_proxy_update(pkt, |proxy| proxy.process_op_response(pkt));
+                self.with_proxy_update(id, |proxy| proxy.process_op_response(pkt));
             }
             uapi::VSOCK_OP_SHUTDOWN => {
-                let id = ((pkt.src_port() as u64) << 32) | pkt.dst_port() as u64;
                 if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
                     proxy.lock().unwrap().shutdown(pkt);
                 }
             }
             uapi::VSOCK_OP_CREDIT_UPDATE => {
-                self.with_proxy_update(pkt, |proxy| proxy.update_peer_credit(pkt));
+                self.with_proxy_update(id, |proxy| proxy.update_peer_credit(pkt));
             }
             uapi::VSOCK_OP_RW => {
-                let id = ((pkt.src_port() as u64) << 32) | pkt.dst_port() as u64;
                 let found = self.proxy_map.read().unwrap().contains_key(&id);
                 if found {
-                    self.with_proxy_update(pkt, |proxy| proxy.sendmsg(pkt));
+                    self.with_proxy_update(id, |proxy| proxy.sendmsg(pkt));
                 } else {
                     self.push_reset(pkt);
                 }
             }
             uapi::VSOCK_OP_RST => {
-                self.with_proxy_update(pkt, |proxy| proxy.release());
+                self.with_proxy_update(id, |proxy| proxy.release());
             }
             _ => warn!("stream: unhandled op={}", pkt.op()),
         }
@@ -425,5 +450,29 @@ impl VsockMuxer {
         // Windows does not advertise VIRTIO_VSOCK_F_DGRAM, so a conforming guest
         // never reaches this path. Drop malformed traffic without affecting streams.
         Ok(())
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+fn stream_proxy_id(src_port: u32, dst_port: u32) -> Option<u64> {
+    let id = ((src_port as u64) << 32) | dst_port as u64;
+    (id != MUXER_STOP_TOKEN).then_some(id)
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_proxy_id_reserves_muxer_stop_token() {
+        assert_eq!(stream_proxy_id(u32::MAX, u32::MAX - 1), None);
+        assert_eq!(stream_proxy_id(u32::MAX, u32::MAX), Some(u64::MAX));
     }
 }

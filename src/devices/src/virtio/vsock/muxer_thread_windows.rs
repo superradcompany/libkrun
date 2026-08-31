@@ -8,7 +8,7 @@ use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
 
 use super::super::Queue as VirtQueue;
-use super::muxer::ProxyMap;
+use super::muxer::{ProxyMap, MUXER_STOP_TOKEN};
 use super::muxer_rxq::MuxerRxQ;
 use super::proxy::{ProxyRemoval, ProxyUpdate};
 use super::VsockPollable;
@@ -104,20 +104,14 @@ impl MuxerThread {
     }
 
     fn work(self) {
-        const STOP_EVENT: u64 = u64::MAX;
         let stop_handle = self.stop_evt.as_raw_handle();
-        let _ = self.epoll.ctl(
-            ControlOperation::Add,
-            stop_handle,
-            &EpollEvent::new(EventSet::IN, STOP_EVENT),
-        );
         loop {
             let mut events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match self.epoll.wait(events.len(), -1, &mut events) {
                 Ok(count) => {
                     if events[..count]
                         .iter()
-                        .any(|event| event.data() == STOP_EVENT)
+                        .any(|event| event.data() == MUXER_STOP_TOKEN)
                     {
                         let _ = self.stop_evt.read();
                         let _ = self.epoll.ctl(

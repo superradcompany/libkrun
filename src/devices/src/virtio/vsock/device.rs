@@ -289,6 +289,15 @@ impl VirtioDevice for Vsock {
         self.queue_tx = Some(Arc::new(Mutex::new(tx_queue)));
         self.queue_rx = Some(Arc::new(Mutex::new(rx_queue)));
         self.queue_ev = Some(evq);
+        #[cfg(windows)]
+        self.muxer
+            .activate(
+                mem.clone(),
+                self.queue_rx.clone().unwrap(),
+                interrupt.clone(),
+            )
+            .map_err(ActivateError::EpollCtl)?;
+        #[cfg(unix)]
         self.muxer.activate(
             mem.clone(),
             self.queue_rx.clone().unwrap(),
