@@ -66,9 +66,8 @@ impl Console {
                 });
         }
 
-        event_manager.unregister(activate_evt).unwrap_or_else(|e| {
-            error!("Failed to unregister fs activate evt: {e:?}");
-        })
+        // Keep the activation event registered. Virtio device reset is a valid
+        // lifecycle transition and a later activation reuses this eventfd.
     }
 
     fn handle_sigwinch_event(&mut self, event: &EpollEvent) {
@@ -159,5 +158,37 @@ impl Subscriber for Console {
             event(eventfd_pollable(&self.sigwinch_evt)),
             event(eventfd_pollable(self.control.queue_evt())),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::virtio::PortDescription;
+
+    #[test]
+    fn activation_event_remains_registered_for_device_reactivation() {
+        let console = Arc::new(Mutex::new(
+            Console::new(vec![PortDescription {
+                name: "agent".into(),
+                input: None,
+                output: None,
+                terminal: None,
+                queue_size: 32,
+            }])
+            .unwrap(),
+        ));
+        let mut event_manager = EventManager::new().unwrap();
+        event_manager.add_subscriber(console.clone()).unwrap();
+        let activate_evt = eventfd_pollable(&console.lock().unwrap().activate_evt);
+
+        console
+            .lock()
+            .unwrap()
+            .handle_activate_event(&mut event_manager);
+
+        assert!(event_manager.subscriber(activate_evt).is_ok());
     }
 }
