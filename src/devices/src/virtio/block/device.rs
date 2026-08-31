@@ -1061,9 +1061,11 @@ impl Block {
             ));
         }
         #[cfg(target_os = "linux")]
-        if self.writeback_config.is_some() {
+        let leaving_bounded_writeback = self.writeback_config.is_some() && backend.direct_io;
+        #[cfg(target_os = "linux")]
+        if self.writeback_config.is_some() && !leaving_bounded_writeback {
             return Err(VirtioStateError::Incompatible(
-                "bounded writeback devices cannot replace their file description".to_string(),
+                "bounded writeback backend replacement requires direct I/O".to_string(),
             ));
         }
         let configured_capacity = self.config.capacity;
@@ -1087,7 +1089,13 @@ impl Block {
         }
         let replacement_discard_alignment = backend.discard_alignment as u32 / SECTOR_SIZE as u32;
         let configured_discard_alignment = self.config.discard_sector_alignment;
-        if replacement_discard_alignment != configured_discard_alignment {
+        #[cfg(target_os = "linux")]
+        let discard_alignment_is_compatible = leaving_bounded_writeback
+            || replacement_discard_alignment == configured_discard_alignment;
+        #[cfg(not(target_os = "linux"))]
+        let discard_alignment_is_compatible =
+            replacement_discard_alignment == configured_discard_alignment;
+        if !discard_alignment_is_compatible {
             return Err(VirtioStateError::Incompatible(format!(
                 "replacement discard alignment {replacement_discard_alignment} differs from guest-visible alignment {configured_discard_alignment}",
             )));
@@ -1102,6 +1110,12 @@ impl Block {
         )?;
         #[cfg(windows)]
         disk.set_windows_raw_file(backend.windows_raw_file.clone());
+        #[cfg(target_os = "linux")]
+        if leaving_bounded_writeback {
+            // Guest-visible discard/unmap remains conservatively disabled, but the new direct-I/O
+            // backend bypasses the host page cache and no longer needs raw-offset accounting.
+            self.writeback_config = None;
+        }
         self.disk_image = backend.disk_image;
         #[cfg(windows)]
         {
@@ -1454,6 +1468,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     use utils::tempfile::TempFile;
 
+    #[cfg(target_os = "linux")]
+    use crate::virtio::block::BlockLayerSpec;
+
     use super::*;
 
     #[test]
@@ -1641,6 +1658,51 @@ mod tests {
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("buffered I/O"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_writeback_can_transition_to_a_direct_backend() {
+        let original = temp_image_path("bounded-rebind-original");
+        let replacement = temp_image_path("bounded-rebind-replacement");
+        for path in [&original, &replacement] {
+            let file = File::create(path).unwrap();
+            file.set_len(4 * 1024 * 1024).unwrap();
+        }
+        let mut block = Block::new_with_writeback_limit(
+            "raw".to_string(),
+            None,
+            CacheType::Writeback,
+            original.to_string_lossy().into_owned(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            Some(MINIMUM_WRITEBACK_BUDGET_BYTES),
+            MetricsWriter::default().register_block_device("raw".to_string()),
+        )
+        .unwrap();
+
+        let buffered =
+            PreparedBlockBackend::open(&BlockBackendSpec::new(vec![BlockLayerSpec::new(
+                &replacement,
+                ImageType::Raw,
+            )]))
+            .unwrap();
+        assert!(block.replace_backend(buffered).is_err());
+        assert!(block.writeback_config.is_some());
+
+        let direct = PreparedBlockBackend::open(
+            &BlockBackendSpec::new(vec![BlockLayerSpec::new(&replacement, ImageType::Raw)])
+                .direct_io(true),
+        )
+        .unwrap();
+        block.replace_backend(direct).unwrap();
+
+        assert!(block.writeback_config.is_none());
+        assert!(!block.disk.as_ref().unwrap().has_writeback_limit());
+        std::fs::remove_file(original).unwrap();
+        std::fs::remove_file(replacement).unwrap();
     }
 
     #[cfg(not(target_os = "linux"))]

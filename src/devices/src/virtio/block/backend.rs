@@ -52,6 +52,8 @@ pub struct PreparedBlockBackend {
     pub(crate) capacity_sectors: u64,
     pub(crate) read_only: bool,
     pub(crate) sync_mode: SyncMode,
+    #[cfg(target_os = "linux")]
+    pub(crate) direct_io: bool,
     #[cfg(windows)]
     pub(crate) windows_raw_file: Option<Arc<WindowsRawFile>>,
 }
@@ -223,6 +225,8 @@ impl PreparedBlockBackend {
             capacity_sectors: capacity_bytes / SECTOR_SIZE,
             read_only: spec.read_only,
             sync_mode: spec.sync_mode.clone(),
+            #[cfg(target_os = "linux")]
+            direct_io: spec.direct_io,
             #[cfg(windows)]
             windows_raw_file,
         })
