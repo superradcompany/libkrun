@@ -294,31 +294,33 @@ impl Balloon {
 impl Subscriber for Balloon {
     fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
         let source = event.fd();
+        let activate_evt = eventfd_pollable(&self.activate_evt);
+        if source == activate_evt {
+            self.handle_activate_event(event_manager);
+            return;
+        }
+        if !self.is_activated() {
+            warn!("balloon: The device is not yet activated. Spurious event received: {source:?}");
+            return;
+        }
+
         let ifq = eventfd_pollable(self.queue_event(IFQ_INDEX));
         let dfq = eventfd_pollable(self.queue_event(DFQ_INDEX));
         let stq = eventfd_pollable(self.queue_event(STQ_INDEX));
         let phq = eventfd_pollable(self.queue_event(PHQ_INDEX));
         let frq = eventfd_pollable(self.queue_event(FRQ_INDEX));
-        let activate_evt = eventfd_pollable(&self.activate_evt);
         let stats_timer = timerfd_pollable(&self.stats_timer);
 
-        if self.is_activated() {
-            match source {
-                _ if source == ifq => self.handle_ifq_event(event),
-                _ if source == dfq => self.handle_dfq_event(event),
-                _ if source == stq => self.handle_stq_event(event),
-                _ if self.stats_enabled() && source == stats_timer => {
-                    self.handle_stats_timer_event(event)
-                }
-                _ if source == phq => self.handle_phq_event(event),
-                _ if source == frq => self.handle_frq_event(event),
-                _ if source == activate_evt => {
-                    self.handle_activate_event(event_manager);
-                }
-                _ => warn!("Unexpected balloon event received: {source:?}"),
+        match source {
+            _ if source == ifq => self.handle_ifq_event(event),
+            _ if source == dfq => self.handle_dfq_event(event),
+            _ if source == stq => self.handle_stq_event(event),
+            _ if self.stats_enabled() && source == stats_timer => {
+                self.handle_stats_timer_event(event)
             }
-        } else {
-            warn!("balloon: The device is not yet activated. Spurious event received: {source:?}");
+            _ if source == phq => self.handle_phq_event(event),
+            _ if source == frq => self.handle_frq_event(event),
+            _ => warn!("Unexpected balloon event received: {source:?}"),
         }
     }
 
