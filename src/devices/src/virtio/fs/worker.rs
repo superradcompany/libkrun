@@ -7,8 +7,8 @@ use utils::worker_message::WorkerMessage;
 use std::os::fd::{AsRawFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, RawHandle};
-use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicI32;
 use std::thread;
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
@@ -44,6 +44,12 @@ pub struct FsWorker<F: FileSystem + Sync + 'static> {
     map_sender: Option<Sender<WorkerMessage>>,
 }
 
+/// Queue ownership returned after the worker reaches a reversible stop boundary.
+pub struct FsWorkerState {
+    pub queues: Vec<Queue>,
+    pub queue_evts: Vec<Arc<EventFd>>,
+}
+
 impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -73,14 +79,14 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
         }
     }
 
-    pub fn run(self) -> thread::JoinHandle<()> {
+    pub fn run(self) -> thread::JoinHandle<FsWorkerState> {
         thread::Builder::new()
             .name("fs worker".into())
             .spawn(|| self.work())
             .unwrap()
     }
 
-    fn work(mut self) {
+    fn work(mut self) -> FsWorkerState {
         let virtq_hpq_ev = eventfd_pollable(&self.queue_evts[HPQ_INDEX]);
         let virtq_req_ev = eventfd_pollable(&self.queue_evts[REQ_INDEX]);
         let stop_ev = eventfd_pollable(&self.stop_fd);
@@ -107,6 +113,16 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
+                    // Stop wins over queue readiness from the same wait. This bounds quiescence
+                    // by a request already owned by the worker rather than the guest's queued
+                    // backlog.
+                    if epoll_events[..ev_cnt].iter().any(|event| {
+                        event.data() == STOP_EVENT && event.event_set().contains(EventSet::IN)
+                    }) {
+                        debug!("stopping worker thread");
+                        let _ = self.stop_fd.read();
+                        break;
+                    }
                     for event in &epoll_events[0..ev_cnt] {
                         let source = event.data();
                         let event_set = event.event_set();
@@ -118,9 +134,7 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
                                 self.handle_event(REQ_INDEX);
                             }
                             STOP_EVENT if event_set.contains(EventSet::IN) => {
-                                debug!("stopping worker thread");
-                                let _ = self.stop_fd.read();
-                                return;
+                                unreachable!("stop events are handled before queue events");
                             }
                             _ => {
                                 log::warn!(
@@ -135,6 +149,11 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
                 }
             }
         }
+
+        FsWorkerState {
+            queues: self.queues,
+            queue_evts: self.queue_evts,
+        }
     }
 
     fn handle_event(&mut self, queue_index: usize) {
@@ -148,7 +167,12 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
                 .disable_notification(&self.mem)
                 .unwrap();
 
-            self.process_queue(queue_index);
+            if self.process_queue(queue_index) {
+                // Re-enable guest notification before returning ownership. The queue cursors are
+                // captured by the transport after the worker joins.
+                let _ = self.queues[queue_index].enable_notification(&self.mem);
+                return;
+            }
 
             if !self.queues[queue_index]
                 .enable_notification(&self.mem)
@@ -159,9 +183,22 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
         }
     }
 
-    fn process_queue(&mut self, queue_index: usize) {
+    fn process_queue(&mut self, queue_index: usize) -> bool {
         let queue = &mut self.queues[queue_index];
-        while let Some(head) = queue.pop(&self.mem) {
+        loop {
+            // A FUSE operation is synchronous once consumed. Between descriptors, observe stop
+            // before taking ownership of more guest work.
+            match self.stop_fd.read() {
+                Ok(_) => return true,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    error!("failed to read virtio-fs stop event: {error}");
+                    return true;
+                }
+            }
+            let Some(head) = queue.pop(&self.mem) else {
+                return false;
+            };
             let reader = Reader::new(&self.mem, head.clone())
                 .map_err(FsError::QueueReader)
                 .unwrap();

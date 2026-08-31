@@ -2,11 +2,11 @@
 use crossbeam_channel::Sender;
 use std::cmp;
 use std::io::Write;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
-use utils::eventfd::{EventFd, EFD_NONBLOCK};
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use utils::worker_message::WorkerMessage;
 use virtio_bindings::{virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX};
@@ -15,10 +15,10 @@ use vm_memory::{ByteValued, GuestMemoryMmap};
 use super::super::{
     ActivateResult, DeviceQueue, DeviceState, FsError, QueueConfig, VirtioDevice, VirtioShmRegion,
 };
+use super::ExportTable;
 use super::dyn_filesystem::{DynFileSystem, DynFileSystemAdapter};
 use super::passthrough::{self, PassthroughFs};
 use super::worker::FsWorker;
-use super::ExportTable;
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
 
@@ -52,7 +52,7 @@ pub struct Fs {
     config: VirtioFsConfig,
     shm_region: Option<VirtioShmRegion>,
     backend: FsBackend,
-    worker_thread: Option<JoinHandle<()>>,
+    worker_thread: Option<JoinHandle<super::worker::FsWorkerState>>,
     worker_stopfd: EventFd,
     exit_code: Arc<AtomicI32>,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -267,5 +267,103 @@ impl VirtioDevice for Fs {
         }
         self.device_state = DeviceState::Inactive;
         true
+    }
+
+    fn supports_quiesce(&self) -> bool {
+        true
+    }
+
+    fn quiesce(&mut self) -> Result<Vec<DeviceQueue>, super::super::VirtioStateError> {
+        if !self.device_state.is_activated() {
+            return Err(super::super::VirtioStateError::InvalidLifecycle(
+                "virtio-fs must be activated before quiescence",
+            ));
+        }
+        let worker =
+            self.worker_thread
+                .take()
+                .ok_or(super::super::VirtioStateError::InvalidLifecycle(
+                    "virtio-fs worker is missing while activated",
+                ))?;
+        self.worker_stopfd
+            .write(1)
+            .map_err(super::super::VirtioStateError::Device)?;
+        let state = worker.join().map_err(|_| {
+            super::super::VirtioStateError::Device(std::io::Error::other(
+                "virtio-fs worker panicked during quiescence",
+            ))
+        })?;
+        if state.queues.len() != state.queue_evts.len() {
+            return Err(super::super::VirtioStateError::InvalidLifecycle(
+                "virtio-fs worker returned mismatched queues and events",
+            ));
+        }
+        self.device_state = DeviceState::Inactive;
+        Ok(state
+            .queues
+            .into_iter()
+            .zip(state.queue_evts)
+            .map(|(queue, event)| DeviceQueue::new(queue, event))
+            .collect())
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use utils::eventfd::EventFd;
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::{DeviceQueue, InterruptTransport, Queue, VirtioDevice};
+
+    use super::*;
+
+    #[test]
+    fn fs_quiesce_returns_queues_and_can_reactivate() {
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+        let directory = std::env::temp_dir().join(format!(
+            "msb-krun-fs-quiesce-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+
+        let mut fs = Fs::new(
+            "test-fs".into(),
+            directory.to_string_lossy().into_owned(),
+            Arc::new(AtomicI32::new(0)),
+            false,
+        )
+        .unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap();
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "test-fs".into()).unwrap();
+        let make_queues = || {
+            fs.queue_config()
+                .iter()
+                .map(|config| {
+                    DeviceQueue::new(Queue::new(config.size), Arc::new(EventFd::new(0).unwrap()))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        fs.activate(mem.clone(), interrupt.clone(), make_queues())
+            .unwrap();
+        let queues = fs.quiesce().unwrap();
+        assert_eq!(queues.len(), fs.queue_config().len());
+        assert!(!fs.is_activated());
+
+        fs.activate(mem, interrupt, queues).unwrap();
+        assert!(fs.is_activated());
+        assert_eq!(fs.quiesce().unwrap().len(), fs.queue_config().len());
+
+        std::fs::remove_dir(directory).unwrap();
     }
 }
