@@ -7,8 +7,8 @@ use utils::worker_message::WorkerMessage;
 use std::os::fd::{AsRawFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, RawHandle};
-use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
+use std::sync::Arc;
 use std::thread;
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};

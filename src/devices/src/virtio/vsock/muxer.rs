@@ -2,8 +2,11 @@ use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
+
+#[cfg(target_os = "macos")]
+use std::sync::Condvar;
 
 use super::super::Queue as VirtQueue;
 use super::custom_stream::CustomStreamProxy;
