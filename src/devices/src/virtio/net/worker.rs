@@ -38,7 +38,9 @@ const RX_QUEUE_EVENT: u64 = 0;
 const TX_QUEUE_EVENT: u64 = 1;
 const BACKEND_EVENT: u64 = 2;
 const RATE_LIMIT_TIMER_EVENT: u64 = 3;
-const STOP_EVENT: u64 = u64::MAX;
+// The Windows epoll shim reserves `u64::MAX` for its internal control wakeup. Keep the worker's
+// stop token distinct so quiescence can always register and observe its wake event.
+const STOP_EVENT: u64 = u64::MAX - 1;
 
 pub struct NetWorker {
     rx_q: DeviceQueue,
