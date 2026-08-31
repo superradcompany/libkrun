@@ -51,8 +51,13 @@ pub(crate) fn process_rx(
             }
         }
 
-        // We signal_used_queue only when we get WouldBlock or EOF
+        // EOF is terminal for the buffer already consumed from the available ring. Return the
+        // descriptor with a zero-length completion before closing the port so a later checkpoint
+        // never observes private queue ownership left behind by a departed RX worker.
         if eof {
+            if let Err(e) = queue.add_used(mem, head_index, 0) {
+                error!("failed to add EOF buffer to the used ring: {e:?}");
+            }
             interrupt.signal_used_queue();
             log::trace!("signaling EOF on port {port_id}");
             control.port_open(port_id, false);
@@ -111,4 +116,53 @@ fn read_to_desc(
                 Err(e) => Err(GuestMemoryError::IOError(e)),
             }
         })
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    use utils::eventfd::{EventFd, EFD_NONBLOCK};
+    use virtio_bindings::virtio_ring::VRING_DESC_F_WRITE;
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::console::console_control::ConsoleControl;
+    use crate::virtio::console::port_io::{PortInput, PortInputEmpty};
+    use crate::virtio::queue::tests::VirtQueue;
+
+    use super::*;
+
+    #[test]
+    fn eof_completes_the_consumed_receive_buffer() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap();
+        let virt_queue = VirtQueue::new(GuestAddress(0), &mem, 8);
+        virt_queue.dtable[0].set(0x8000, 256, VRING_DESC_F_WRITE as u16, 0);
+        virt_queue.avail.ring[0].set(0);
+        virt_queue.avail.idx.set(1);
+
+        let input: Arc<Mutex<Box<dyn PortInput + Send>>> =
+            Arc::new(Mutex::new(Box::new(PortInputEmpty::new())));
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "console-rx".into()).unwrap();
+        let queue = process_rx(
+            mem.clone(),
+            virt_queue.create_queue(),
+            interrupt,
+            input,
+            ConsoleControl::new(),
+            0,
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert!(queue.capture_state().is_ok());
+        assert_eq!(virt_queue.used.idx.get(), 1);
+        assert_eq!(virt_queue.used.ring[0].get().len, 0);
+    }
 }

@@ -57,6 +57,11 @@ fn pop_head_blocking<'mem>(
     stop: &AtomicBool,
 ) -> Option<DescriptorChain<'mem>> {
     loop {
+        // Once quiescence is requested, work already owned by the caller of this helper may
+        // finish, but no additional descriptor may cross into worker ownership.
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
         match queue.pop(mem) {
             Some(descriptor) => break Some(descriptor),
             None => {
@@ -95,4 +100,36 @@ fn write_desc_to_output(
                 }
             }
         })
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::queue::tests::VirtQueue;
+
+    use super::*;
+
+    #[test]
+    fn stop_priority_leaves_available_transmit_buffers_unconsumed() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap();
+        let virt_queue = VirtQueue::new(GuestAddress(0), &mem, 8);
+        virt_queue.dtable[0].set(0x8000, 16, 0, 0);
+        virt_queue.avail.ring[0].set(0);
+        virt_queue.avail.idx.set(1);
+        let mut queue = virt_queue.create_queue();
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "console-tx".into()).unwrap();
+
+        assert!(pop_head_blocking(&mut queue, &mem, &interrupt, &AtomicBool::new(true)).is_none());
+        assert_eq!(queue.len(&mem), 1);
+        assert!(queue.capture_state().is_ok());
+    }
 }

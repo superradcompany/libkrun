@@ -340,7 +340,12 @@ impl MmioTransport {
         let device = self.locked_device();
         let queue_states = queues
             .iter()
-            .map(Queue::capture_state)
+            .enumerate()
+            .map(|(index, queue)| {
+                queue.capture_state().map_err(|error| {
+                    VirtioStateError::Incompatible(format!("queue {index}: {error}"))
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(VirtioMmioState {
