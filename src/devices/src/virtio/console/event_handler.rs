@@ -53,6 +53,10 @@ impl Console {
 
         for queue_index in 0..self.queues.len() {
             let queue_evt = eventfd_pollable(&self.queue_events[queue_index]);
+            // A virtio reset leaves the event-manager subscription alive even
+            // though the guest will activate the same queue eventfd again.
+            // Remove that stale subscription before re-registering it.
+            let _ = event_manager.unregister(queue_evt);
             event_manager
                 .register(
                     queue_evt,
@@ -170,16 +174,19 @@ mod tests {
 
     #[test]
     fn activation_event_remains_registered_for_device_reactivation() {
-        let console = Arc::new(Mutex::new(
-            Console::new(vec![PortDescription {
-                name: "agent".into(),
-                input: None,
-                output: None,
-                terminal: None,
-                queue_size: 32,
-            }])
-            .unwrap(),
-        ));
+        let mut console = Console::new(vec![PortDescription {
+            name: "agent".into(),
+            input: None,
+            output: None,
+            terminal: None,
+            queue_size: 32,
+        }])
+        .unwrap();
+        console.queues = (0..2).map(|_| None).collect();
+        console.queue_events = (0..2)
+            .map(|_| Arc::new(utils::eventfd::EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap()))
+            .collect();
+        let console = Arc::new(Mutex::new(console));
         let mut event_manager = EventManager::new().unwrap();
         event_manager.add_subscriber(console.clone()).unwrap();
         let activate_evt = eventfd_pollable(&console.lock().unwrap().activate_evt);
@@ -189,6 +196,16 @@ mod tests {
             .unwrap()
             .handle_activate_event(&mut event_manager);
 
+        console
+            .lock()
+            .unwrap()
+            .handle_activate_event(&mut event_manager);
+
         assert!(event_manager.subscriber(activate_evt).is_ok());
+        for queue_evt in &console.lock().unwrap().queue_events {
+            assert!(event_manager
+                .subscriber(eventfd_pollable(queue_evt))
+                .is_ok());
+        }
     }
 }
