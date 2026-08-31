@@ -240,4 +240,28 @@ impl VirtioDevice for Balloon {
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
     }
+
+    fn reset(&mut self) -> bool {
+        self.queues = None;
+        self.stats_desc_index = None;
+        self.device_state = DeviceState::Inactive;
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_drops_guest_queue_state_for_reactivation() {
+        let mut balloon = Balloon::new(MetricsWriter::default(), None).unwrap();
+        balloon.queues = Some(Vec::new());
+        balloon.stats_desc_index = Some(7);
+
+        assert!(balloon.reset());
+        assert!(balloon.queues.is_none());
+        assert_eq!(balloon.stats_desc_index, None);
+        assert!(!balloon.is_activated());
+    }
 }

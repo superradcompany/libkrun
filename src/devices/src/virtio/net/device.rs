@@ -23,6 +23,8 @@ use std::io::Write;
 use std::os::fd::RawFd;
 #[cfg(unix)]
 use std::path::PathBuf;
+use std::thread::JoinHandle;
+use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
@@ -88,6 +90,9 @@ pub struct Net {
 
     pub(crate) device_state: DeviceState,
 
+    worker_stopfd: EventFd,
+    worker_thread: Option<JoinHandle<VirtioNetBackend>>,
+
     config: VirtioNetConfig,
 }
 
@@ -141,6 +146,8 @@ impl Net {
             acked_features: 0u64,
 
             device_state: DeviceState::Inactive,
+            worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(super::Error::EventFd)?,
+            worker_thread: None,
             config,
         })
     }
@@ -221,9 +228,13 @@ impl VirtioDevice for Net {
             self.acked_features,
             cfg_backend,
             &self.rate_limiters,
+            self.worker_stopfd.try_clone().map_err(|error| {
+                error!("Cannot clone virtio-net reset event: {error}");
+                ActivateError::BadActivate
+            })?,
         ) {
             Ok(worker) => {
-                worker.run();
+                self.worker_thread = Some(worker.run());
                 self.device_state = DeviceState::Activated(mem, interrupt);
                 Ok(())
             }
@@ -239,5 +250,28 @@ impl VirtioDevice for Net {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    fn reset(&mut self) -> bool {
+        let Some(worker) = self.worker_thread.take() else {
+            self.device_state = DeviceState::Inactive;
+            return true;
+        };
+        if let Err(error) = self.worker_stopfd.write(1) {
+            error!("Cannot signal virtio-net worker reset: {error}");
+            self.worker_thread = Some(worker);
+            return false;
+        }
+        match worker.join() {
+            Ok(backend) => {
+                self.cfg_backend = Some(backend);
+                self.device_state = DeviceState::Inactive;
+                true
+            }
+            Err(error) => {
+                error!("Cannot join virtio-net worker during reset: {error:?}");
+                false
+            }
+        }
     }
 }

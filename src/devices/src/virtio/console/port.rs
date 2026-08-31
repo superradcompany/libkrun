@@ -179,33 +179,64 @@ impl Port {
     }
 
     pub fn shutdown(&mut self) {
-        if let PortState::Active {
+        let PortState::Active {
             stopfd,
             stop,
             tx_thread,
             rx_thread,
-        } = &mut self.state
-        {
-            stop.store(true, Ordering::Release);
-            if let Some(tx_thread) = mem::take(tx_thread) {
-                tx_thread.thread().unpark();
-                if let Err(e) = tx_thread.join() {
-                    log::error!(
-                        "Failed to flush tx for port {port_id}, thread panicked: {e:?}",
-                        port_id = self.port_id
-                    )
-                }
-            }
-            stopfd.write(1).unwrap();
-            if let Some(rx_thread) = mem::take(rx_thread) {
-                rx_thread.thread().unpark();
-                if let Err(e) = rx_thread.join() {
-                    log::error!(
-                        "Failed to flush tx for port {port_id}, thread panicked: {e:?}",
-                        port_id = self.port_id
-                    )
-                }
-            }
+        } = mem::replace(&mut self.state, PortState::Inactive)
+        else {
+            return;
         };
+
+        stop.store(true, Ordering::Release);
+        if let Some(tx_thread) = tx_thread {
+            tx_thread.thread().unpark();
+            if let Err(e) = tx_thread.join() {
+                log::error!(
+                    "Failed to flush tx for port {port_id}, thread panicked: {e:?}",
+                    port_id = self.port_id
+                )
+            }
+        }
+        stopfd.write(1).unwrap();
+        if let Some(rx_thread) = rx_thread {
+            rx_thread.thread().unpark();
+            if let Err(e) = rx_thread.join() {
+                log::error!(
+                    "Failed to flush tx for port {port_id}, thread panicked: {e:?}",
+                    port_id = self.port_id
+                )
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_marks_an_active_port_inactive() {
+        let mut port = Port::new(
+            0,
+            PortDescription {
+                name: "agent".into(),
+                input: None,
+                output: None,
+                terminal: None,
+                queue_size: DEFAULT_QUEUE_SIZE,
+            },
+        );
+        port.state = PortState::Active {
+            stopfd: utils::eventfd::EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            stop: Arc::new(AtomicBool::new(false)),
+            rx_thread: None,
+            tx_thread: None,
+        };
+
+        port.shutdown();
+
+        assert!(!port.is_active());
     }
 }

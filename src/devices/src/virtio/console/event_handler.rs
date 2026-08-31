@@ -53,6 +53,10 @@ impl Console {
 
         for queue_index in 0..self.queues.len() {
             let queue_evt = eventfd_pollable(&self.queue_events[queue_index]);
+            // A virtio reset leaves the event-manager subscription alive even
+            // though the guest will activate the same queue eventfd again.
+            // Remove that stale subscription before re-registering it.
+            let _ = event_manager.unregister(queue_evt);
             event_manager
                 .register(
                     queue_evt,
@@ -66,9 +70,8 @@ impl Console {
                 });
         }
 
-        event_manager.unregister(activate_evt).unwrap_or_else(|e| {
-            error!("Failed to unregister fs activate evt: {e:?}");
-        })
+        // Keep the activation event registered. Virtio device reset is a valid
+        // lifecycle transition and a later activation reuses this eventfd.
     }
 
     fn handle_sigwinch_event(&mut self, event: &EpollEvent) {
@@ -106,46 +109,53 @@ impl Console {
 impl Subscriber for Console {
     fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
         let source = event.fd();
+        let activate_evt = eventfd_pollable(&self.activate_evt);
+        let sigwinch_evt = eventfd_pollable(&self.sigwinch_evt);
+
+        if source == activate_evt {
+            self.handle_activate_event(event_manager);
+            return;
+        }
+        if source == sigwinch_evt {
+            self.handle_sigwinch_event(event);
+            return;
+        }
+        if !self.is_activated() {
+            warn!("console: The device is not yet activated. Spurious event received: {source:?}");
+            return;
+        }
+        if self.queue_events.len() <= CONTROL_RXQ_INDEX.max(CONTROL_TXQ_INDEX) {
+            warn!("console: queue event received while queues are reset: {source:?}");
+            return;
+        }
 
         let control_rxq = eventfd_pollable(&self.queue_events[CONTROL_RXQ_INDEX]);
         let control_txq = eventfd_pollable(&self.queue_events[CONTROL_TXQ_INDEX]);
         let control_rxq_control = eventfd_pollable(self.control.queue_evt());
+        let mut raise_irq = false;
 
-        let activate_evt = eventfd_pollable(&self.activate_evt);
-        let sigwinch_evt = eventfd_pollable(&self.sigwinch_evt);
-
-        if self.is_activated() {
-            let mut raise_irq = false;
-
-            if source == control_txq {
-                raise_irq |=
-                    self.read_queue_event(CONTROL_TXQ_INDEX, event) && self.process_control_tx()
-            } else if source == control_rxq_control {
-                self.read_control_queue_event(event);
-                raise_irq |= self.process_control_rx();
-            } else if source == control_rxq {
-                raise_irq |= self.read_queue_event(CONTROL_RXQ_INDEX, event)
-            }
-            /* Guest signaled input/output on port */
-            else if let Some(queue_index) = self
-                .queue_events
-                .iter()
-                .position(|fd| eventfd_pollable(fd) == source)
-            {
-                raise_irq |= self.read_queue_event(queue_index, event);
-                self.notify_port_queue_event(queue_index);
-            } else if source == activate_evt {
-                self.handle_activate_event(event_manager);
-            } else if source == sigwinch_evt {
-                self.handle_sigwinch_event(event);
-            } else {
-                log::warn!("Unexpected console event received: {source:?}")
-            }
-            if raise_irq {
-                self.device_state.signal_used_queue();
-            }
+        if source == control_txq {
+            raise_irq |=
+                self.read_queue_event(CONTROL_TXQ_INDEX, event) && self.process_control_tx()
+        } else if source == control_rxq_control {
+            self.read_control_queue_event(event);
+            raise_irq |= self.process_control_rx();
+        } else if source == control_rxq {
+            raise_irq |= self.read_queue_event(CONTROL_RXQ_INDEX, event)
+        }
+        /* Guest signaled input/output on port */
+        else if let Some(queue_index) = self
+            .queue_events
+            .iter()
+            .position(|fd| eventfd_pollable(fd) == source)
+        {
+            raise_irq |= self.read_queue_event(queue_index, event);
+            self.notify_port_queue_event(queue_index);
         } else {
-            warn!("console: The device is not yet activated. Spurious event received: {source:?}");
+            log::warn!("Unexpected console event received: {source:?}")
+        }
+        if raise_irq {
+            self.device_state.signal_used_queue();
         }
     }
 
@@ -159,5 +169,74 @@ impl Subscriber for Console {
             event(eventfd_pollable(&self.sigwinch_evt)),
             event(eventfd_pollable(self.control.queue_evt())),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::virtio::PortDescription;
+
+    #[test]
+    fn activation_event_remains_registered_for_device_reactivation() {
+        let mut console = Console::new(vec![PortDescription {
+            name: "agent".into(),
+            input: None,
+            output: None,
+            terminal: None,
+            queue_size: 32,
+        }])
+        .unwrap();
+        console.queues = (0..2).map(|_| None).collect();
+        console.queue_events = (0..2)
+            .map(|_| Arc::new(utils::eventfd::EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap()))
+            .collect();
+        let console = Arc::new(Mutex::new(console));
+        let mut event_manager = EventManager::new().unwrap();
+        event_manager.add_subscriber(console.clone()).unwrap();
+        let activate_evt = eventfd_pollable(&console.lock().unwrap().activate_evt);
+
+        console
+            .lock()
+            .unwrap()
+            .handle_activate_event(&mut event_manager);
+
+        console
+            .lock()
+            .unwrap()
+            .handle_activate_event(&mut event_manager);
+
+        assert!(event_manager.subscriber(activate_evt).is_ok());
+        for queue_evt in &console.lock().unwrap().queue_events {
+            assert!(event_manager
+                .subscriber(eventfd_pollable(queue_evt))
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn activation_event_is_safe_while_queue_vectors_are_empty() {
+        let console = Arc::new(Mutex::new(
+            Console::new(vec![PortDescription {
+                name: "agent".into(),
+                input: None,
+                output: None,
+                terminal: None,
+                queue_size: 32,
+            }])
+            .unwrap(),
+        ));
+        let mut event_manager = EventManager::new().unwrap();
+        event_manager.add_subscriber(console.clone()).unwrap();
+        let activate_evt = eventfd_pollable(&console.lock().unwrap().activate_evt);
+
+        console.lock().unwrap().process(
+            &EpollEvent::new(EventSet::IN, pollable_token(activate_evt)),
+            &mut event_manager,
+        );
+
+        assert!(event_manager.subscriber(activate_evt).is_ok());
     }
 }
