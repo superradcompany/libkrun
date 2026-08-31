@@ -274,9 +274,10 @@ impl MmioTransport {
             // FIXME: check if activated!
             self.with_queue_mut(f);
         } else {
+            let device_name = self.locked_device().device_name().to_string();
             warn!(
-                "update virtio queue in invalid state 0x{:x}",
-                self.device_status
+                "update virtio queue for {device_name} in invalid state 0x{:x}",
+                self.device_status,
             );
         }
     }
@@ -330,6 +331,11 @@ impl MmioTransport {
     #[allow(unused_assignments)]
     fn set_device_status(&mut self, status: u32) {
         use device_status::*;
+        let device_name = self.locked_device().device_name().to_string();
+        debug!(
+            "virtio {device_name} status transition request: 0x{:x} -> 0x{status:x}",
+            self.device_status,
+        );
         // match changed bits
         match !self.device_status & status {
             ACKNOWLEDGE if self.device_status == INIT => {
@@ -365,8 +371,8 @@ impl MmioTransport {
             }
             _ => {
                 warn!(
-                    "invalid virtio driver status transition: 0x{:x} -> 0x{:x}",
-                    self.device_status, status
+                    "invalid virtio {device_name} driver status transition: 0x{:x} -> 0x{:x}",
+                    self.device_status, status,
                 );
             }
         }
