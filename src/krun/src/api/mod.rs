@@ -70,7 +70,8 @@ pub use metrics::{
 pub use vm::Vm;
 #[cfg(not(feature = "tee"))]
 pub use vm::{
-    VmControl, VmCpuState, VmExecutionState, VmMemoryRestoreSource, VmMemoryRestoreTarget,
+    VmControl, VmCpuState, VmExecutionState, VmGenerationId, VmGenerationRequest,
+    VmGenerationState, VmGenerationWaitOutcome, VmMemoryRestoreSource, VmMemoryRestoreTarget,
     VmMemoryState, VmPauseGeneration,
 };
 #[cfg(all(feature = "blk", not(feature = "tee")))]

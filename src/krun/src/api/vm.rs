@@ -152,6 +152,7 @@ pub struct VmControl {
     mem: Option<Arc<std::sync::Mutex<devices::virtio::Mem>>>,
     cpu: Option<Arc<std::sync::Mutex<devices::virtio::Cpu>>>,
     vmm: Arc<VmControlRegistry>,
+    generation: Option<Arc<std::sync::Mutex<devices::virtio::Generation>>>,
 }
 
 /// Runtime-local generation of one completed VM-wide pause barrier.
@@ -179,6 +180,52 @@ pub enum VmExecutionState {
     },
     /// A partial or timed-out control barrier makes the execution boundary uncertain.
     Indeterminate,
+}
+
+/// Opaque 16-byte value mixed into the guest kernel CRNG after clone or rollback.
+#[cfg(not(feature = "tee"))]
+pub type VmGenerationId = devices::virtio::GenerationId;
+
+/// One exact VM-generation request installed by the host.
+#[cfg(not(feature = "tee"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmGenerationRequest {
+    /// Device-local sequence used to reject delayed acknowledgements.
+    pub sequence: u64,
+
+    /// Identifier the guest kernel must process for this request.
+    pub id: VmGenerationId,
+}
+
+/// Point-in-time state of the VM-generation device.
+#[cfg(not(feature = "tee"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmGenerationState {
+    /// Whether the guest driver completed probing.
+    pub driver_ready: bool,
+
+    /// Whether the guest driver rejected the device protocol.
+    pub driver_error: bool,
+
+    /// Request currently published by the host, if one has been installed.
+    pub requested: Option<VmGenerationRequest>,
+
+    /// Request last reported as processed by the guest kernel, if any.
+    pub processed: Option<VmGenerationRequest>,
+}
+
+/// Result of waiting for one exact VM-generation request.
+#[cfg(not(feature = "tee"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmGenerationWaitOutcome {
+    /// The guest kernel processed the exact sequence and identifier.
+    Processed,
+
+    /// A newer request replaced this request before it was acknowledged.
+    Superseded,
+
+    /// The deadline elapsed without an exact acknowledgement.
+    TimedOut,
 }
 
 /// Point-in-time CPU sizing of a running VM as seen through [`VmControl`].
@@ -343,6 +390,7 @@ impl Vm {
             mem: self.vmr.mem_device.clone(),
             cpu: self.vmr.cpu_device.clone(),
             vmm: Arc::clone(&self.vmm_control),
+            generation: self.vmr.generation_device.clone(),
         }
     }
 
@@ -1427,6 +1475,61 @@ impl VmControl {
         let vmm = self.vmm.running_vmm().ok()?;
         let baseline = vmm.lock().ok()?.retained_memory_baseline();
         baseline
+    }
+
+    /// Whether this VM was constructed with the VM-generation transport.
+    ///
+    /// Use [`vm_generation_state`](Self::vm_generation_state) after boot to distinguish transport
+    /// presence from a bundled or custom kernel that actually bound the guest driver.
+    pub fn vm_generation_transport_present(&self) -> bool {
+        self.generation.is_some()
+    }
+
+    /// Publish a fresh VM generation and signal the guest driver.
+    ///
+    /// The caller must generate `id` with its operating-system CSPRNG and persist it with the
+    /// restore attempt. Returning `None` means the transport is absent or its sequence space was
+    /// exhausted. Clone/rollback activation must fail closed in either case.
+    pub fn install_vm_generation_id(&self, id: VmGenerationId) -> Option<VmGenerationRequest> {
+        let generation = self.generation.as_ref()?;
+        let sequence = generation.lock().unwrap().install(id)?;
+        Some(VmGenerationRequest { sequence, id })
+    }
+
+    /// Wait without polling for the guest kernel to process one exact generation request.
+    pub fn wait_vm_generation_processed(
+        &self,
+        request: VmGenerationRequest,
+        timeout: Duration,
+    ) -> Option<VmGenerationWaitOutcome> {
+        let generation = self.generation.as_ref()?;
+        let processing = generation.lock().unwrap().processing_handle();
+        let outcome = processing.wait_processed(request.sequence, request.id, timeout);
+        Some(match outcome {
+            devices::virtio::GenerationWaitOutcome::Processed => VmGenerationWaitOutcome::Processed,
+            devices::virtio::GenerationWaitOutcome::Superseded => {
+                VmGenerationWaitOutcome::Superseded
+            }
+            devices::virtio::GenerationWaitOutcome::TimedOut => VmGenerationWaitOutcome::TimedOut,
+        })
+    }
+
+    /// Return the latest request and guest-kernel acknowledgement.
+    pub fn vm_generation_state(&self) -> Option<VmGenerationState> {
+        let generation = self.generation.as_ref()?;
+        let snapshot = generation.lock().unwrap().state_snapshot();
+        Some(VmGenerationState {
+            driver_ready: snapshot.driver_ready,
+            driver_error: snapshot.driver_error,
+            requested: (snapshot.request_sequence != 0).then_some(VmGenerationRequest {
+                sequence: snapshot.request_sequence,
+                id: snapshot.requested_id,
+            }),
+            processed: (snapshot.processed_sequence != 0).then_some(VmGenerationRequest {
+                sequence: snapshot.processed_sequence,
+                id: snapshot.processed_id,
+            }),
+        })
     }
 
     /// Whether the running VM can resize memory live.
