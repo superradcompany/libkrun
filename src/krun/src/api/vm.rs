@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+#[cfg(not(feature = "tee"))]
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
@@ -176,6 +177,7 @@ pub struct VmControl {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VmPauseGeneration(vmm::PauseGeneration);
 
+#[cfg(not(feature = "tee"))]
 impl VmPauseGeneration {
     /// Returns the request id that established this pause boundary.
     pub fn get(self) -> u64 {
