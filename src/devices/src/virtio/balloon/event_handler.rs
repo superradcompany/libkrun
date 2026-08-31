@@ -237,6 +237,13 @@ impl Balloon {
         let frq = eventfd_pollable(self.queue_event(FRQ_INDEX));
         let stats_timer = timerfd_pollable(&self.stats_timer);
 
+        // Reset keeps event-manager subscriptions alive while dropping the
+        // guest queues. Remove stale registrations before reusing the stable
+        // queue eventfds for a new activation.
+        for source in [ifq, dfq, stq, phq, frq, stats_timer] {
+            let _ = event_manager.unregister(source);
+        }
+
         event_manager
             .register(ifq, pollable_event(ifq), self_subscriber.clone())
             .unwrap_or_else(|e| {
@@ -279,9 +286,8 @@ impl Balloon {
                 error!("Failed to register balloon frq with event manager: {e:?}");
             });
 
-        event_manager.unregister(activate_evt).unwrap_or_else(|e| {
-            error!("Failed to unregister balloon activate evt: {e:?}");
-        })
+        // Keep the activation event registered. A virtio reset drops the
+        // queues and a later guest activation reuses this eventfd.
     }
 }
 

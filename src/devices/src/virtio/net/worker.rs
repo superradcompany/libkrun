@@ -21,6 +21,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
@@ -38,6 +39,7 @@ const RX_QUEUE_EVENT: u64 = 0;
 const TX_QUEUE_EVENT: u64 = 1;
 const BACKEND_EVENT: u64 = 2;
 const RATE_LIMIT_TIMER_EVENT: u64 = 3;
+const STOP_EVENT: u64 = 4;
 
 pub struct NetWorker {
     rx_q: DeviceQueue,
@@ -63,6 +65,7 @@ pub struct NetWorker {
 
     rate_limit_timer: Option<TimerFd>,
     armed_rate_limit_deadline: Option<Instant>,
+    stop_evt: EventFd,
 }
 
 impl NetWorker {
@@ -74,6 +77,7 @@ impl NetWorker {
         _vnet_features: u64,
         cfg_backend: VirtioNetBackend,
         rate_limiters: &RateLimiters,
+        stop_evt: EventFd,
     ) -> Result<Self, ConnectError> {
         let backend = match cfg_backend {
             #[cfg(unix)]
@@ -148,17 +152,18 @@ impl NetWorker {
 
             rate_limit_timer,
             armed_rate_limit_deadline: None,
+            stop_evt,
         })
     }
 
-    pub fn run(self) {
+    pub fn run(self) -> JoinHandle<VirtioNetBackend> {
         thread::Builder::new()
             .name("virtio-net worker".into())
             .spawn(|| self.work())
-            .unwrap();
+            .expect("failed to spawn virtio-net worker")
     }
 
-    fn work(mut self) {
+    fn work(mut self) -> VirtioNetBackend {
         let virtq_rx_ev = eventfd_pollable(&self.rx_q.event);
         let virtq_tx_ev = eventfd_pollable(&self.tx_q.event);
         let backend_source = self.backend.event_source(BACKEND_EVENT);
@@ -166,9 +171,10 @@ impl NetWorker {
             Ok(pollable) => pollable,
             Err(err) => {
                 log::error!("virtio-net backend event source is unsupported: {err}");
-                return;
+                return VirtioNetBackend::Custom(self.backend);
             }
         };
+        let stop_pollable = eventfd_pollable(&self.stop_evt);
 
         let epoll = Epoll::new().unwrap();
 
@@ -197,6 +203,11 @@ impl NetWorker {
                 &EpollEvent::new(EventSet::IN, RATE_LIMIT_TIMER_EVENT),
             );
         }
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            stop_pollable,
+            &EpollEvent::new(EventSet::IN, STOP_EVENT),
+        );
 
         loop {
             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
@@ -230,6 +241,14 @@ impl NetWorker {
                             }
                             RATE_LIMIT_TIMER_EVENT if event_set.contains(EventSet::IN) => {
                                 self.process_rate_limit_timer_event();
+                            }
+                            STOP_EVENT if event_set.contains(EventSet::IN) => {
+                                if let Err(error) = self.stop_evt.read() {
+                                    log::error!(
+                                        "Failed to consume virtio-net reset event: {error:?}"
+                                    );
+                                }
+                                return VirtioNetBackend::Custom(self.backend);
                             }
                             _ => {
                                 log::warn!(
@@ -825,7 +844,31 @@ mod tests {
             tx_resume_at: None,
             rate_limit_timer: None,
             armed_rate_limit_deadline: None,
+            stop_evt: EventFd::new(0).unwrap(),
         }
+    }
+
+    #[test]
+    fn worker_stop_returns_backend_for_reactivation() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), QUEUE_MEMORY_SIZE)]).unwrap();
+        let rx_vq = VirtQueue::new(RX_QUEUE_ADDR, &mem, 8);
+        let tx_vq = VirtQueue::new(TX_QUEUE_ADDR, &mem, 8);
+        let worker = worker(
+            mem.clone(),
+            device_queue(rx_vq.create_queue()),
+            device_queue(tx_vq.create_queue()),
+            Arc::new(Mutex::new(BackendState::default())),
+            RateLimiters::default(),
+            Instant::now(),
+        );
+        let stop_evt = worker.stop_evt.try_clone().unwrap();
+        let handle = worker.run();
+
+        stop_evt.write(1).unwrap();
+        assert!(matches!(
+            handle.join().unwrap(),
+            VirtioNetBackend::Custom(_)
+        ));
     }
 
     #[test]
