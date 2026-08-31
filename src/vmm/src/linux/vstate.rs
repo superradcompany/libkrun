@@ -1102,6 +1102,9 @@ impl Vm {
 }
 
 #[allow(unused)]
+// Keep the kernel ABI structs inline: this state is captured only at checkpoint boundaries, and
+// matching KVM's representation is clearer than adding heap indirection to shrink a rare value.
+#[allow(clippy::large_enum_variant)]
 #[cfg(target_arch = "x86_64")]
 #[derive(Serialize, Deserialize)]
 /// Structure holding VM kvm state.

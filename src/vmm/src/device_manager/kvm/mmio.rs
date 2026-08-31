@@ -288,6 +288,7 @@ impl MMIODeviceManager {
     }
 
     /// Returns a deterministic inventory of every registered MMIO device.
+    #[cfg(feature = "blk")]
     pub fn device_keys(&self) -> Vec<(DeviceType, String)> {
         let mut keys = self.id_to_dev_info.keys().cloned().collect::<Vec<_>>();
         keys.sort_unstable();
