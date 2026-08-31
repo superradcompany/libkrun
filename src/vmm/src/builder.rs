@@ -1769,6 +1769,8 @@ pub fn build_microvm_paused(
         exit_code: exit_code.clone(),
         vm,
         mmio_device_manager,
+        #[cfg(feature = "blk")]
+        quiesced_block_devices: Default::default(),
         #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
         pio_device_manager,
     };

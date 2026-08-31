@@ -29,9 +29,44 @@ const MMIO_MAGIC_VALUE: u32 = 0x7472_6976;
 //current version specified by the mmio standard (legacy devices used 1 here)
 const MMIO_VERSION: u32 = 2;
 
+/// Version of the stable virtio-mmio transport state contract.
+pub const VIRTIO_MMIO_STATE_VERSION: u16 = 1;
+
 #[derive(Debug)]
 pub enum CreateMmioTransportError {
     CreateInterruptEventFd(io::Error),
+}
+
+/// Host-maintained state for a virtio-mmio transport.
+///
+/// Device-specific state is intentionally kept out of this generic envelope. A caller combines
+/// this transport state with the matching typed device state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VirtioMmioState {
+    /// State contract version.
+    pub version: u16,
+    /// Virtio device type expected behind the transport.
+    pub device_type: u32,
+    /// Device feature page selected by the guest.
+    pub features_select: u32,
+    /// Driver feature page selected by the guest.
+    pub acked_features_select: u32,
+    /// Queue selected by the guest.
+    pub queue_select: u32,
+    /// Virtio device lifecycle status bits.
+    pub device_status: u32,
+    /// Configuration generation visible to the guest.
+    pub config_generation: u32,
+    /// Shared-memory region selected by the guest.
+    pub shm_region_select: u32,
+    /// Pending virtio-mmio interrupt bits.
+    pub interrupt_status: usize,
+    /// IRQ line assigned by the destination device manager.
+    pub irq_line: Option<u32>,
+    /// Negotiated feature bits owned by the device.
+    pub acked_features: u64,
+    /// Exact queue cursors and configuration.
+    pub queues: Vec<QueueState>,
 }
 
 impl Display for CreateMmioTransportError {
@@ -258,6 +293,178 @@ impl MmioTransport {
     /// queue notifications with KVM.
     pub fn queue_evts(&self) -> &[Arc<EventFd>] {
         &self.queue_evts
+    }
+
+    /// Stops an activated device and returns its queues to the transport.
+    ///
+    /// This operation is idempotent. A successful return means no descriptor is privately owned
+    /// by the device worker, so [`capture_state`](Self::capture_state) can record an exact queue
+    /// boundary.
+    pub fn quiesce(&mut self) -> Result<(), VirtioStateError> {
+        if self.queues.is_some() {
+            return Ok(());
+        }
+
+        let device_queues = self.locked_device().quiesce()?;
+        if device_queues.len() != self.queue_config.len() {
+            return Err(VirtioStateError::Incompatible(format!(
+                "device returned {} queues, expected {}",
+                device_queues.len(),
+                self.queue_config.len()
+            )));
+        }
+        for (index, device_queue) in device_queues.iter().enumerate() {
+            if !Arc::ptr_eq(&device_queue.event, &self.queue_evts[index]) {
+                return Err(VirtioStateError::Incompatible(format!(
+                    "device returned a foreign event for queue {index}"
+                )));
+            }
+        }
+        self.queues = Some(
+            device_queues
+                .into_iter()
+                .map(|device_queue| device_queue.queue)
+                .collect(),
+        );
+        Ok(())
+    }
+
+    /// Captures the generic transport and queue state of a quiesced device.
+    pub fn capture_state(&self) -> Result<VirtioMmioState, VirtioStateError> {
+        let queues = self
+            .queues
+            .as_ref()
+            .ok_or(VirtioStateError::InvalidLifecycle(
+                "device must be quiesced before transport capture",
+            ))?;
+        let device = self.locked_device();
+        let queue_states = queues
+            .iter()
+            .map(Queue::capture_state)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(VirtioMmioState {
+            version: VIRTIO_MMIO_STATE_VERSION,
+            device_type: device.device_type(),
+            features_select: self.features_select,
+            acked_features_select: self.acked_features_select,
+            queue_select: self.queue_select,
+            device_status: self.device_status,
+            config_generation: self.config_generation,
+            shm_region_select: self.shm_region_select,
+            interrupt_status: self.interrupt.status().load(Ordering::SeqCst),
+            irq_line: self.interrupt.irq_line(),
+            acked_features: device.acked_features(),
+            queues: queue_states,
+        })
+    }
+
+    /// Restores generic transport and queue state before device activation.
+    pub fn restore_state(&mut self, state: &VirtioMmioState) -> Result<(), VirtioStateError> {
+        if state.version != VIRTIO_MMIO_STATE_VERSION {
+            return Err(VirtioStateError::Incompatible(format!(
+                "unsupported virtio-mmio state version {}",
+                state.version
+            )));
+        }
+        if self.locked_device().is_activated() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "device must be inactive before transport restore",
+            ));
+        }
+
+        let queue_count = self
+            .queues
+            .as_ref()
+            .ok_or(VirtioStateError::InvalidLifecycle(
+                "transport does not own its queues during restore",
+            ))?
+            .len();
+        if queue_count != state.queues.len() {
+            return Err(VirtioStateError::Incompatible(format!(
+                "saved state has {} queues, destination has {}",
+                state.queues.len(),
+                queue_count
+            )));
+        }
+
+        {
+            let device = self.locked_device();
+            if device.device_type() != state.device_type {
+                return Err(VirtioStateError::Incompatible(format!(
+                    "saved device type {} does not match destination type {}",
+                    state.device_type,
+                    device.device_type()
+                )));
+            }
+            if state.acked_features & !device.avail_features() != 0 {
+                return Err(VirtioStateError::Incompatible(
+                    "saved acknowledged features are unavailable on the destination".to_string(),
+                ));
+            }
+        }
+
+        let queues = self
+            .queues
+            .as_ref()
+            .expect("queue ownership was checked before device validation");
+        for (queue, queue_state) in queues.iter().zip(&state.queues) {
+            queue.validate_state(queue_state)?;
+            let mut candidate = Queue::new(queue.get_max_size());
+            candidate.apply_state(queue_state);
+            if candidate.ready && !candidate.is_valid(&self.mem) {
+                return Err(VirtioStateError::Incompatible(
+                    "saved queue addresses are invalid for destination guest memory".to_string(),
+                ));
+            }
+        }
+
+        if self.interrupt.irq_line() != state.irq_line {
+            return Err(VirtioStateError::Incompatible(format!(
+                "saved IRQ {:?} does not match destination IRQ {:?}",
+                state.irq_line,
+                self.interrupt.irq_line()
+            )));
+        }
+
+        self.locked_device()
+            .set_acked_features(state.acked_features);
+        let queues = self
+            .queues
+            .as_mut()
+            .expect("queue ownership was checked before state application");
+        for (queue, queue_state) in queues.iter_mut().zip(&state.queues) {
+            // All fallible validation completed above. Applying primitives in place preserves the
+            // queue's memory-access participant and cannot leave a partially restored transport.
+            queue.apply_state(queue_state);
+        }
+
+        self.features_select = state.features_select;
+        self.acked_features_select = state.acked_features_select;
+        self.queue_select = state.queue_select;
+        self.device_status = state.device_status;
+        self.config_generation = state.config_generation;
+        self.shm_region_select = state.shm_region_select;
+        self.interrupt
+            .status()
+            .store(state.interrupt_status, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Reactivates a quiesced transport and forces a queue scan for saved unconsumed work.
+    pub fn resume(&mut self) -> Result<(), VirtioStateError> {
+        if self.queues.is_none() {
+            return Ok(());
+        }
+        if self.device_status & device_status::DRIVER_OK == 0 {
+            return Ok(());
+        }
+
+        self.activate();
+        for event in &self.queue_evts {
+            event.write(1).map_err(VirtioStateError::Device)?;
+        }
+        Ok(())
     }
 
     fn check_device_status(&self, set: u32, clr: u32) -> bool {
@@ -1049,6 +1256,50 @@ pub(crate) mod tests {
     fn test_get_avail_features() {
         let dummy_dev = DummyDevice::new();
         assert_eq!(dummy_dev.avail_features(), dummy_dev.avail_features);
+    }
+
+    #[test]
+    fn inactive_transport_state_round_trip() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10_000)]).unwrap();
+        let mut transport = MmioTransport::new(
+            memory,
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(DummyDevice::new())),
+        )
+        .unwrap();
+        transport.features_select = 1;
+        transport.acked_features_select = 1;
+        transport.queue_select = 1;
+        transport.config_generation = 9;
+        transport.shm_region_select = 1;
+        transport.interrupt.status().store(2, Ordering::SeqCst);
+
+        let state = transport.capture_state().unwrap();
+        transport.features_select = 0;
+        transport.config_generation = 0;
+        transport.restore_state(&state).unwrap();
+        assert_eq!(transport.capture_state().unwrap(), state);
+    }
+
+    #[test]
+    fn rejected_transport_restore_does_not_mutate_device_or_queues() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10_000)]).unwrap();
+        let mut dummy = DummyDevice::new();
+        dummy.set_avail_features(1);
+        dummy.set_acked_features(1);
+        let mut transport = MmioTransport::new(
+            memory,
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(dummy)),
+        )
+        .unwrap();
+        let baseline = transport.capture_state().unwrap();
+        let mut invalid = baseline.clone();
+        invalid.acked_features = 0;
+        invalid.queues[0].size = 3;
+
+        assert!(transport.restore_state(&invalid).is_err());
+        assert_eq!(transport.capture_state().unwrap(), baseline);
     }
 
     #[test]

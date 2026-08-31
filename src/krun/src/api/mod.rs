@@ -43,6 +43,8 @@ pub use builder::VmBuilder;
 pub use builders::DiskBuilder;
 #[cfg(feature = "blk")]
 pub use builders::DiskImageFormat;
+#[cfg(feature = "blk")]
+pub use builders::DiskLayer;
 #[cfg(not(target_os = "windows"))]
 pub use builders::FsBuilder;
 #[cfg(feature = "net")]
@@ -55,6 +57,10 @@ pub use builders::{
     MachineBuilder, MemoryPlacementResult, NumaBuilder, NumaDistance, NumaNodeBuilder,
     NumaNodeConfig, NumaTopology, PlacementReport, VcpuPlacementResult,
 };
+#[cfg(feature = "blk")]
+pub use devices::virtio::block::{ImageType as BlockImageFormat, SyncMode as BlockSyncMode};
+#[cfg(feature = "blk")]
+pub use devices::virtio::{BlockBackendSpec, BlockLayerSpec, PreparedBlockBackend};
 pub use error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use exit_handle::ExitHandle;
 pub use metrics::{
@@ -67,6 +73,8 @@ pub use vm::{
     VmControl, VmCpuState, VmExecutionState, VmMemoryRestoreSource, VmMemoryRestoreTarget,
     VmMemoryState, VmPauseGeneration,
 };
+#[cfg(all(feature = "blk", not(feature = "tee")))]
+pub use vmm::device_state::BlockDeviceState;
 #[cfg(not(feature = "tee"))]
 pub use vmm::execution_state::{
     ExecutionArchitecture, ExecutionBackend, ExecutionState, VcpuExecutionState,

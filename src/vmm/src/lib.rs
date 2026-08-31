@@ -13,9 +13,14 @@
 #[macro_use]
 extern crate log;
 
+#[cfg(feature = "blk")]
+use std::collections::BTreeSet;
+
 /// Handles setup and initialization a `Vmm` object.
 pub mod builder;
 pub(crate) mod device_manager;
+/// Typed reversible state for host-emulated devices.
+pub mod device_state;
 /// Cross-platform exit signal handlers (SIGTERM, SIGUSR1).
 #[cfg(unix)]
 pub mod exit_signal;
@@ -72,6 +77,8 @@ use crate::memory_state::{
 };
 use crate::vstate::VcpuEvent;
 use crate::vstate::{Vcpu, VcpuHandle, VcpuResponse, Vm};
+#[cfg(feature = "blk")]
+use devices::virtio::{Block, MmioTransport, PreparedBlockBackend, TYPE_BLOCK};
 use devices::virtio::{MemoryAccessDomain, MemoryAccessMode};
 
 use crate::resources::VcpuPlacementResult;
@@ -518,6 +525,12 @@ pub enum Error {
     MemoryLengthMismatch,
     /// The host guest-memory access epoch could not transition safely.
     MemoryAccessDomain(devices::virtio::memory_access::Error),
+    /// Device-state work requires a complete VM-wide paused boundary.
+    DeviceStateRequiresPause,
+    /// A typed device-state operation failed.
+    DeviceState(String),
+    /// The requested reversible device does not exist in this VMM.
+    DeviceStateNotFound(String),
     /// Cannot spawn a new Vcpu thread.
     VcpuSpawn(std::io::Error),
     /// Vm error.
@@ -635,6 +648,11 @@ impl Display for Error {
             MemoryAccessDomain(error) => {
                 write!(f, "guest-memory access transition failed: {error}")
             }
+            DeviceStateRequiresPause => {
+                write!(f, "device-state work requires a complete VM-wide pause")
+            }
+            DeviceState(error) => write!(f, "device-state operation failed: {error}"),
+            DeviceStateNotFound(id) => write!(f, "reversible device {id} was not found"),
             VcpuSpawn(e) => write!(f, "Cannot spawn Vcpu thread: {e}"),
             Vm(e) => write!(f, "Vm error: {e}"),
             VmmObserverInit(e) => write!(
@@ -689,6 +707,8 @@ pub struct Vmm {
 
     // Guest VM devices.
     mmio_device_manager: MMIODeviceManager,
+    #[cfg(feature = "blk")]
+    quiesced_block_devices: BTreeSet<String>,
     #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
     pio_device_manager: PortIODeviceManager,
 }
@@ -701,6 +721,179 @@ impl Vmm {
         device_id: &str,
     ) -> Option<&Mutex<dyn BusDevice>> {
         self.mmio_device_manager.get_device(device_type, device_id)
+    }
+
+    /// Captures one virtio-block device and keeps its worker quiesced until VM resume.
+    #[cfg(feature = "blk")]
+    pub fn capture_block_device_state(
+        &mut self,
+        device_id: &str,
+    ) -> Result<device_state::BlockDeviceState> {
+        self.require_paused_device_boundary()?;
+        let pause_generation = match self.execution_state {
+            VmmExecutionState::Paused(generation) => generation.request_id().get(),
+            _ => unreachable!("paused boundary was checked before capture"),
+        };
+        let bus_device = self
+            .mmio_device_manager
+            .get_device(DeviceType::Virtio(TYPE_BLOCK), device_id)
+            .ok_or_else(|| Error::DeviceStateNotFound(device_id.to_string()))?;
+        let mut bus_device = bus_device
+            .lock()
+            .map_err(|_| Error::DeviceState("MMIO device mutex is poisoned".to_string()))?;
+        let transport = bus_device
+            .as_mut_any()
+            .downcast_mut::<MmioTransport>()
+            .ok_or_else(|| Error::DeviceState("block device is not on virtio-mmio".to_string()))?;
+
+        // Record intent immediately before entering the participant. If drain or flush fails after
+        // the worker has stopped, ordinary VM resume must reconcile this device instead of
+        // releasing vCPUs against a silently parked backend.
+        self.quiesced_block_devices.insert(device_id.to_string());
+        transport
+            .quiesce()
+            .map_err(|error| Error::DeviceState(error.to_string()))?;
+        let transport_state = transport
+            .capture_state()
+            .map_err(|error| Error::DeviceState(error.to_string()))?;
+        let device = transport.device();
+        let device = device
+            .lock()
+            .map_err(|_| Error::DeviceState("virtio device mutex is poisoned".to_string()))?;
+        let block = device
+            .as_any()
+            .downcast_ref::<Block>()
+            .ok_or_else(|| Error::DeviceState("virtio device is not block".to_string()))?;
+        let device_state = block
+            .capture_state()
+            .map_err(|error| Error::DeviceState(error.to_string()))?;
+        Ok(device_state::BlockDeviceState {
+            pause_generation,
+            transport: transport_state,
+            device: device_state,
+        })
+    }
+
+    /// Restores one virtio-block device before the paused VM is allowed to run.
+    #[cfg(feature = "blk")]
+    pub fn restore_block_device_state(
+        &mut self,
+        device_id: &str,
+        state: &device_state::BlockDeviceState,
+    ) -> Result<()> {
+        self.require_paused_device_boundary()?;
+        let bus_device = self
+            .mmio_device_manager
+            .get_device(DeviceType::Virtio(TYPE_BLOCK), device_id)
+            .ok_or_else(|| Error::DeviceStateNotFound(device_id.to_string()))?;
+        let mut bus_device = bus_device
+            .lock()
+            .map_err(|_| Error::DeviceState("MMIO device mutex is poisoned".to_string()))?;
+        let transport = bus_device
+            .as_mut_any()
+            .downcast_mut::<MmioTransport>()
+            .ok_or_else(|| Error::DeviceState("block device is not on virtio-mmio".to_string()))?;
+        self.quiesced_block_devices.insert(device_id.to_string());
+        transport
+            .quiesce()
+            .map_err(|error| Error::DeviceState(error.to_string()))?;
+
+        let device = transport.device();
+        {
+            let mut device = device
+                .lock()
+                .map_err(|_| Error::DeviceState("virtio device mutex is poisoned".to_string()))?;
+            let block = device
+                .as_mut_any()
+                .downcast_mut::<Block>()
+                .ok_or_else(|| Error::DeviceState("virtio device is not block".to_string()))?;
+            block
+                .validate_state(&state.device)
+                .map_err(|error| Error::DeviceState(error.to_string()))?;
+        }
+        transport
+            .restore_state(&state.transport)
+            .map_err(|error| Error::DeviceState(error.to_string()))
+    }
+
+    /// Installs an already opened backend behind one quiesced virtio-block device.
+    #[cfg(feature = "blk")]
+    pub fn replace_block_backend(
+        &mut self,
+        device_id: &str,
+        backend: PreparedBlockBackend,
+    ) -> Result<()> {
+        self.require_paused_device_boundary()?;
+        let bus_device = self
+            .mmio_device_manager
+            .get_device(DeviceType::Virtio(TYPE_BLOCK), device_id)
+            .ok_or_else(|| Error::DeviceStateNotFound(device_id.to_string()))?;
+        let mut bus_device = bus_device
+            .lock()
+            .map_err(|_| Error::DeviceState("MMIO device mutex is poisoned".to_string()))?;
+        let transport = bus_device
+            .as_mut_any()
+            .downcast_mut::<MmioTransport>()
+            .ok_or_else(|| Error::DeviceState("block device is not on virtio-mmio".to_string()))?;
+        self.quiesced_block_devices.insert(device_id.to_string());
+        transport
+            .quiesce()
+            .map_err(|error| Error::DeviceState(error.to_string()))?;
+
+        let device = transport.device();
+        {
+            let mut device = device
+                .lock()
+                .map_err(|_| Error::DeviceState("virtio device mutex is poisoned".to_string()))?;
+            let block = device
+                .as_mut_any()
+                .downcast_mut::<Block>()
+                .ok_or_else(|| Error::DeviceState("virtio device is not block".to_string()))?;
+            block
+                .replace_backend(backend)
+                .map_err(|error| Error::DeviceState(error.to_string()))
+        }
+    }
+
+    #[cfg(feature = "blk")]
+    fn require_paused_device_boundary(&self) -> Result<()> {
+        if !matches!(self.execution_state, VmmExecutionState::Paused(_)) {
+            return Err(Error::DeviceStateRequiresPause);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "blk")]
+    fn resume_quiesced_block_devices(&mut self) -> Result<()> {
+        for device_id in self
+            .quiesced_block_devices
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            let bus_device = self
+                .mmio_device_manager
+                .get_device(DeviceType::Virtio(TYPE_BLOCK), &device_id)
+                .ok_or_else(|| Error::DeviceStateNotFound(device_id.clone()))?;
+            let mut bus_device = bus_device
+                .lock()
+                .map_err(|_| Error::DeviceState("MMIO device mutex is poisoned".to_string()))?;
+            let transport = bus_device
+                .as_mut_any()
+                .downcast_mut::<MmioTransport>()
+                .ok_or_else(|| {
+                    Error::DeviceState("block device is not on virtio-mmio".to_string())
+                })?;
+            // Quiesce is idempotent and also reconciles a prior stop whose durability fence failed.
+            transport
+                .quiesce()
+                .map_err(|error| Error::DeviceState(error.to_string()))?;
+            transport
+                .resume()
+                .map_err(|error| Error::DeviceState(error.to_string()))?;
+            self.quiesced_block_devices.remove(&device_id);
+        }
+        Ok(())
     }
 
     /// Starts the microVM vcpus.
@@ -810,6 +1003,11 @@ impl Vmm {
             }
             VmmExecutionState::Indeterminate => return Err(Error::VcpuControlIndeterminate),
         }
+
+        // Device participants reopen before vCPUs so saved queue work cannot race a guest that is
+        // already executing. Any reconciliation failure leaves the VM at the paused generation.
+        #[cfg(feature = "blk")]
+        self.resume_quiesced_block_devices()?;
 
         let request_id = self.next_control_request_id()?;
         self.execution_state = VmmExecutionState::Indeterminate;

@@ -5,6 +5,7 @@ use vm_memory::GuestMemoryError;
 
 use super::QueueConfig;
 
+mod backend;
 pub mod device;
 mod limit;
 #[cfg(windows)]
@@ -13,10 +14,13 @@ mod worker;
 #[cfg(any(target_os = "linux", test))]
 mod writeback;
 
-pub use self::device::{Block, CacheType};
+pub use self::backend::{BlockBackendSpec, BlockLayerSpec, PreparedBlockBackend};
+pub use self::device::{Block, BlockState, CacheType};
 pub use self::limit::WritebackLimit;
 
 pub const CONFIG_SPACE_SIZE: usize = 8;
+/// Version of the stable virtio-block device state contract.
+pub const BLOCK_STATE_VERSION: u16 = 1;
 pub const SECTOR_SHIFT: u8 = 9;
 pub const SECTOR_SIZE: u64 = (0x01_u64) << SECTOR_SHIFT;
 const QUEUE_SIZE: u16 = 256;

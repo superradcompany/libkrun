@@ -72,6 +72,12 @@ pub enum Error {
     GuestMemoryError(GuestMemoryError),
     /// DescriptorChain split is out of bounds.
     SplitOutOfBounds(usize),
+    /// Queue state was captured while a descriptor was owned by the device.
+    QueueBusy,
+    /// Saved queue state does not match this queue's fixed configuration.
+    StateConfigurationMismatch,
+    /// Saved queue state uses an unsupported schema version.
+    UnsupportedStateVersion(u16),
 }
 
 impl Display for Error {
@@ -111,6 +117,16 @@ impl Display for Error {
             FindMemoryRegion => write!(f, "no memory region for this address range"),
             GuestMemoryError(e) => write!(f, "descriptor guest memory error: {e}"),
             SplitOutOfBounds(off) => write!(f, "`DescriptorChain` split is out of bounds: {off}"),
+            QueueBusy => write!(f, "virtio queue still owns consumed descriptor chains"),
+            StateConfigurationMismatch => {
+                write!(
+                    f,
+                    "saved virtio queue state does not match the queue configuration"
+                )
+            }
+            UnsupportedStateVersion(version) => {
+                write!(f, "unsupported virtio queue state version {version}")
+            }
         }
     }
 }
@@ -142,6 +158,40 @@ impl VirtqUsedElem {
 // and all accesses through safe `vm-memory` API will validate any garbage that could be
 // included in there.
 unsafe impl ByteValued for VirtqUsedElem {}
+
+/// Version of the stable virtqueue state contract.
+pub const QUEUE_STATE_VERSION: u16 = 1;
+
+/// Host-maintained state for one split virtqueue.
+///
+/// Descriptor contents and ring indexes written by the guest remain in guest memory. This state
+/// records only the transport-side cursor and configuration needed to continue at the exact
+/// consumed/unconsumed boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueueState {
+    /// State contract version.
+    pub version: u16,
+    /// Maximum queue size advertised by the device.
+    pub max_size: u16,
+    /// Queue size negotiated by the driver.
+    pub size: u16,
+    /// Whether queue configuration completed.
+    pub ready: bool,
+    /// Guest address of the descriptor table.
+    pub desc_table: u64,
+    /// Guest address of the available ring.
+    pub avail_ring: u64,
+    /// Guest address of the used ring.
+    pub used_ring: u64,
+    /// Next available-ring entry to consume.
+    pub next_avail: u16,
+    /// Next used-ring entry to publish.
+    pub next_used: u16,
+    /// Whether `VIRTIO_F_RING_EVENT_IDX` was negotiated.
+    pub event_idx_enabled: bool,
+    /// Used entries added since the last notification decision.
+    pub num_added: u16,
+}
 
 // GuestMemoryMmap::read_obj_from_addr() will be used to fetch the descriptor,
 // which has an explicit constraint that the entire descriptor doesn't
@@ -353,6 +403,7 @@ pub struct Queue {
     num_added: Wrapping<u16>,
     memory_access: Option<MemoryAccessParticipant>,
     active_heads: Vec<bool>,
+    active_positions: Vec<u16>,
     popped_heads: Vec<u16>,
 }
 
@@ -372,6 +423,7 @@ impl Queue {
             num_added: Wrapping(0),
             memory_access: None,
             active_heads: vec![false; max_size as usize],
+            active_positions: vec![u16::MAX; max_size as usize],
             popped_heads: Vec::with_capacity(max_size as usize),
         }
     }
@@ -383,6 +435,76 @@ impl Queue {
 
     pub fn get_max_size(&self) -> u16 {
         self.max_size
+    }
+
+    /// Captures this queue at a terminal descriptor boundary.
+    ///
+    /// A successful capture proves that every descriptor already consumed from the available ring
+    /// is represented in the used ring. Descriptors not yet consumed remain described by guest
+    /// memory and `next_avail`.
+    pub fn capture_state(&self) -> Result<QueueState, Error> {
+        if !self.popped_heads.is_empty() || self.active_heads.iter().any(|active| *active) {
+            return Err(Error::QueueBusy);
+        }
+
+        Ok(QueueState {
+            version: QUEUE_STATE_VERSION,
+            max_size: self.max_size,
+            size: self.size,
+            ready: self.ready,
+            desc_table: self.desc_table.raw_value(),
+            avail_ring: self.avail_ring.raw_value(),
+            used_ring: self.used_ring.raw_value(),
+            next_avail: self.next_avail.0,
+            next_used: self.next_used.0,
+            event_idx_enabled: self.event_idx_enabled,
+            num_added: self.num_added.0,
+        })
+    }
+
+    /// Restores a queue cursor captured by [`capture_state`](Self::capture_state).
+    ///
+    /// The queue must not own any consumed descriptors. The caller validates the restored guest
+    /// addresses against the destination guest-memory topology before activating the device.
+    pub fn restore_state(&mut self, state: &QueueState) -> Result<(), Error> {
+        self.validate_state(state)?;
+        self.apply_state(state);
+        Ok(())
+    }
+
+    /// Validates saved queue state without changing the live queue.
+    pub(super) fn validate_state(&self, state: &QueueState) -> Result<(), Error> {
+        if state.version != QUEUE_STATE_VERSION {
+            return Err(Error::UnsupportedStateVersion(state.version));
+        }
+        if state.max_size != self.max_size
+            || state.size > state.max_size
+            || (state.size != 0 && !state.size.is_power_of_two())
+        {
+            return Err(Error::StateConfigurationMismatch);
+        }
+        if !self.popped_heads.is_empty() || self.active_heads.iter().any(|active| *active) {
+            return Err(Error::QueueBusy);
+        }
+
+        Ok(())
+    }
+
+    /// Applies queue state that was already validated against this queue.
+    pub(super) fn apply_state(&mut self, state: &QueueState) {
+        debug_assert!(self.validate_state(state).is_ok());
+        self.size = state.size;
+        self.ready = state.ready;
+        self.desc_table = GuestAddress(state.desc_table);
+        self.avail_ring = GuestAddress(state.avail_ring);
+        self.used_ring = GuestAddress(state.used_ring);
+        self.next_avail = Wrapping(state.next_avail);
+        self.next_used = Wrapping(state.next_used);
+        self.event_idx_enabled = state.event_idx_enabled;
+        self.num_added = Wrapping(state.num_added);
+        self.active_heads.fill(false);
+        self.active_positions.fill(u16::MAX);
+        self.popped_heads.clear();
     }
 
     /// Return the actual size of the queue, as the driver may not set up a
@@ -540,9 +662,13 @@ impl Queue {
                 // queue boundary until thaw instead of dropping the only wakeup for the work.
                 access.wait_until_thawed();
             }
-            self.active_heads[desc_index as usize] = true;
-            self.popped_heads.push(desc_index);
         }
+        // Queue ownership is tracked even without a memory-access domain. The access participant
+        // adds freeze/dirty semantics, while these fields define the generic consumed/unconsumed
+        // boundary used by reversible transport state.
+        self.active_heads[desc_index as usize] = true;
+        self.active_positions[desc_index as usize] = self.popped_heads.len() as u16;
+        self.popped_heads.push(desc_index);
         self.next_avail += Wrapping(1);
         Some(chain)
     }
@@ -551,9 +677,12 @@ impl Queue {
     /// The caller can use this, if it was unable to consume the last popped descriptor chain.
     pub fn undo_pop(&mut self) {
         self.next_avail -= Wrapping(1);
-        if let (Some(access), Some(head)) = (&self.memory_access, self.popped_heads.pop()) {
+        if let Some(head) = self.popped_heads.pop() {
+            self.active_positions[head as usize] = u16::MAX;
             if std::mem::replace(&mut self.active_heads[head as usize], false) {
-                access.end_request();
+                if let Some(access) = &self.memory_access {
+                    access.end_request();
+                }
             }
         }
     }
@@ -593,15 +722,20 @@ impl Queue {
             )
             .map_err(Error::GuestMemory)
         })();
-        if let Some(access) = &self.memory_access {
-            if std::mem::replace(&mut self.active_heads[head_index as usize], false) {
+        if result.is_ok() && std::mem::replace(&mut self.active_heads[head_index as usize], false) {
+            if let Some(access) = &self.memory_access {
                 access.end_request();
-                if let Some(position) = self
+            }
+            let position =
+                std::mem::replace(&mut self.active_positions[head_index as usize], u16::MAX);
+            if position != u16::MAX {
+                let moved_head = *self
                     .popped_heads
-                    .iter()
-                    .position(|candidate| *candidate == head_index)
-                {
-                    self.popped_heads.remove(position);
+                    .last()
+                    .expect("an active position always names a popped head");
+                self.popped_heads.swap_remove(position as usize);
+                if moved_head != head_index {
+                    self.active_positions[moved_head as usize] = position;
                 }
             }
         }
@@ -1258,6 +1392,55 @@ pub(crate) mod tests {
         let x = vq.used.ring[0].get();
         assert_eq!(x.id, 1);
         assert_eq!(x.len, 0x1000);
+    }
+
+    #[test]
+    fn queue_state_round_trip_preserves_exact_cursors() {
+        let mut queue = Queue::new(256);
+        queue.size = 128;
+        queue.ready = true;
+        queue.desc_table = GuestAddress(0x1000);
+        queue.avail_ring = GuestAddress(0x3000);
+        queue.used_ring = GuestAddress(0x4000);
+        queue.next_avail = Wrapping(65_535);
+        queue.next_used = Wrapping(41);
+        queue.event_idx_enabled = true;
+        queue.num_added = Wrapping(7);
+
+        let state = queue.capture_state().unwrap();
+        let mut restored = Queue::new(256);
+        restored.restore_state(&state).unwrap();
+        assert_eq!(restored.capture_state().unwrap(), state);
+    }
+
+    #[test]
+    fn queue_state_rejects_consumed_unpublished_heads() {
+        let mut queue = Queue::new(8);
+        queue.active_heads[3] = true;
+        queue.popped_heads.push(3);
+        assert!(matches!(queue.capture_state(), Err(Error::QueueBusy)));
+    }
+
+    #[test]
+    fn out_of_order_completions_update_ownership_in_constant_time() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let mut queue = Queue::new(8);
+        queue.size = 8;
+        queue.used_ring = GuestAddress(0x1000);
+        for (position, head) in [1_u16, 2, 3].into_iter().enumerate() {
+            queue.active_heads[head as usize] = true;
+            queue.active_positions[head as usize] = position as u16;
+            queue.popped_heads.push(head);
+        }
+
+        queue.add_used(&memory, 2, 0).unwrap();
+        assert_eq!(queue.popped_heads, vec![1, 3]);
+        assert_eq!(queue.active_positions[3], 1);
+        assert!(matches!(queue.capture_state(), Err(Error::QueueBusy)));
+
+        queue.add_used(&memory, 1, 0).unwrap();
+        queue.add_used(&memory, 3, 0).unwrap();
+        assert!(queue.capture_state().is_ok());
     }
 
     #[test]

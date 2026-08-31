@@ -1338,6 +1338,35 @@ impl VmControl {
         self.with_running_vmm(vmm::Vmm::capture_execution_state)
     }
 
+    /// Captures one virtio-block device and parks it until this VM is resumed.
+    #[cfg(feature = "blk")]
+    pub fn capture_block_device_state(
+        &self,
+        device_id: &str,
+    ) -> Result<vmm::device_state::BlockDeviceState> {
+        self.with_running_vmm(|vmm| vmm.capture_block_device_state(device_id))
+    }
+
+    /// Restores one parked virtio-block device before resuming the paused VM.
+    #[cfg(feature = "blk")]
+    pub fn restore_block_device_state(
+        &self,
+        device_id: &str,
+        state: &vmm::device_state::BlockDeviceState,
+    ) -> Result<()> {
+        self.with_running_vmm(|vmm| vmm.restore_block_device_state(device_id, state))
+    }
+
+    /// Replaces one parked block backend with an already opened, compatible chain.
+    #[cfg(feature = "blk")]
+    pub fn replace_block_backend(
+        &self,
+        device_id: &str,
+        backend: devices::virtio::PreparedBlockBackend,
+    ) -> Result<()> {
+        self.with_running_vmm(|vmm| vmm.replace_block_backend(device_id, backend))
+    }
+
     /// Plans a complete memory generation while the VM is paused.
     pub fn plan_full_memory_capture(&self) -> Result<vmm::memory_state::MemoryCapturePlan> {
         self.with_running_vmm(vmm::Vmm::plan_full_memory_capture)

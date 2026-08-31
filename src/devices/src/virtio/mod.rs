@@ -59,7 +59,10 @@ pub mod vsock;
 #[cfg(not(feature = "tee"))]
 pub use self::balloon::*;
 #[cfg(feature = "blk")]
-pub use self::block::{Block, CacheType};
+pub use self::block::{
+    Block, BlockBackendSpec, BlockLayerSpec, BlockState, CacheType, PreparedBlockBackend,
+    BLOCK_STATE_VERSION,
+};
 pub use self::console::*;
 pub use self::cpu::*;
 pub use self::device::*;
@@ -74,7 +77,7 @@ pub use self::mmio::*;
 pub use self::msb_metrics::*;
 #[cfg(feature = "net")]
 pub use self::net::Net;
-pub use self::queue::{Descriptor, DescriptorChain, Queue};
+pub use self::queue::{Descriptor, DescriptorChain, Queue, QueueState, QUEUE_STATE_VERSION};
 #[cfg(all(not(target_os = "windows"), not(feature = "tee")))]
 pub use self::rng::*;
 #[cfg(feature = "snd")]

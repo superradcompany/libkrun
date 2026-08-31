@@ -742,6 +742,7 @@ impl VmBuilder {
         // Apply block device configuration
         #[cfg(feature = "blk")]
         for (i, configured_disk) in self.disk.configs.into_iter().enumerate() {
+            let explicit_layers = configured_disk.layers;
             let config = configured_disk.config;
             let block_id = config
                 .id
@@ -750,6 +751,19 @@ impl VmBuilder {
             let image_type: ImageType = config.format.into();
             let cache_type: CacheType = config.cache.into();
             let sync_mode: devices::virtio::block::SyncMode = config.sync.into();
+            let explicit_backend = explicit_layers.map(|layers| {
+                devices::virtio::BlockBackendSpec::new(
+                    layers
+                        .into_iter()
+                        .map(|layer| {
+                            devices::virtio::BlockLayerSpec::new(layer.path, layer.format.into())
+                        })
+                        .collect(),
+                )
+                .read_only(config.read_only)
+                .direct_io(config.direct_io)
+                .sync_mode(sync_mode.clone())
+            });
 
             let blk_config = BlockDeviceConfig {
                 block_id,
@@ -759,6 +773,7 @@ impl VmBuilder {
                 is_disk_read_only: config.read_only,
                 direct_io: config.direct_io,
                 sync_mode,
+                backend: explicit_backend,
             };
 
             let writeback_limit = configured_disk.writeback_limit.or_else(|| {

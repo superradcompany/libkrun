@@ -44,6 +44,8 @@ pub use api::builders::CacheMode;
 pub use api::builders::DiskBuilder;
 #[cfg(feature = "blk")]
 pub use api::builders::DiskImageFormat;
+#[cfg(feature = "blk")]
+pub use api::builders::DiskLayer;
 pub use api::builders::FsBuilder;
 #[cfg(feature = "net")]
 pub use api::builders::NetBuilder;
@@ -68,6 +70,12 @@ pub use api::vm::Vm;
 pub use api::vm::{
     VmControl, VmCpuState, VmExecutionState, VmMemoryRestoreSource, VmMemoryRestoreTarget,
     VmMemoryState, VmPauseGeneration,
+};
+#[cfg(all(feature = "blk", not(feature = "tee")))]
+pub use api::BlockDeviceState;
+#[cfg(feature = "blk")]
+pub use api::{
+    BlockBackendSpec, BlockImageFormat, BlockLayerSpec, BlockSyncMode, PreparedBlockBackend,
 };
 #[cfg(not(feature = "tee"))]
 pub use api::{
