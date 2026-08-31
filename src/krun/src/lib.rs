@@ -65,7 +65,10 @@ pub use api::metrics::{
 };
 pub use api::vm::Vm;
 #[cfg(not(feature = "tee"))]
-pub use api::vm::{VmControl, VmCpuState, VmMemoryState};
+pub use api::vm::{
+    VmControl, VmCpuState, VmGenerationId, VmGenerationRequest, VmGenerationState,
+    VmGenerationWaitOutcome, VmMemoryState,
+};
 #[cfg(feature = "net")]
 pub use devices::virtio::net::rate_limit::{
     RateLimiterConfig, RateLimiterConfigError, TokenBucketConfig,
