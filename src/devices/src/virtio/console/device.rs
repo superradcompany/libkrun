@@ -58,6 +58,8 @@ pub struct Console {
     pub(crate) device_state: DeviceState,
     pub(crate) control: Arc<ConsoleControl>,
     pub(crate) ports: Vec<Port>,
+    /// Ports whose host workers were active before reversible quiescence.
+    resume_ports: Vec<bool>,
 
     queue_config: Vec<QueueConfig>,
     // Queues are stored as Option so individual queues can be taken when ports start.
@@ -101,6 +103,7 @@ impl Console {
         let ports: Vec<Port> = zip(0u32.., ports)
             .map(|(port_id, description)| Port::new(port_id, description))
             .collect();
+        let resume_ports = vec![false; ports.len()];
 
         let (cols, rows) = ports[0]
             .terminal()
@@ -111,6 +114,7 @@ impl Console {
         Ok(Console {
             control: ConsoleControl::new(),
             ports,
+            resume_ports,
             queue_config,
             queues: Vec::new(),
             queue_events: Vec::new(),
@@ -138,6 +142,31 @@ impl Console {
         log::debug!("update_console_size {port_id}: {cols} {rows}");
         self.control
             .console_resize(port_id, VirtioConsoleResize { rows, cols });
+    }
+
+    /// Return one guest-opened port to active host I/O with its current queues.
+    fn start_port(&mut self, port_id: usize, mem: GuestMemoryMmap, interrupt: InterruptTransport) {
+        if self.ports[port_id].is_active() {
+            return;
+        }
+
+        let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
+        let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
+        let rx_queue = self.queues[rx_idx]
+            .take()
+            .expect("port rx queue should exist")
+            .queue;
+        let tx_queue = self.queues[tx_idx]
+            .take()
+            .expect("port tx queue should exist")
+            .queue;
+        self.ports[port_id].start(
+            mem,
+            rx_queue,
+            tx_queue,
+            interrupt,
+            Arc::clone(&self.control),
+        );
     }
 
     pub(crate) fn process_control_rx(&mut self) -> bool {
@@ -178,8 +207,9 @@ impl Console {
 
     pub(crate) fn process_control_tx(&mut self) -> bool {
         log::trace!("process_control_tx");
-        let DeviceState::Activated(ref mem, ref interrupt) = self.device_state else {
-            unreachable!()
+        let (mem, interrupt) = match &self.device_state {
+            DeviceState::Activated(mem, interrupt) => (mem.clone(), interrupt.clone()),
+            DeviceState::Inactive => unreachable!(),
         };
 
         let control_tx = self.queues[CONTROL_TXQ_INDEX]
@@ -189,7 +219,7 @@ impl Console {
 
         let mut ports_to_start = Vec::new();
 
-        while let Some(head) = control_tx.queue.pop(mem) {
+        while let Some(head) = control_tx.queue.pop(&mem) {
             raise_irq = true;
 
             let cmd: VirtioConsoleControl = match mem.read_obj(head.addr) {
@@ -205,7 +235,7 @@ impl Console {
             };
             if let Err(e) = control_tx
                 .queue
-                .add_used(mem, head.index, size_of_val(&cmd) as u32)
+                .add_used(&mem, head.index, size_of_val(&cmd) as u32)
             {
                 error!("failed to add used elements to the queue: {e:?}");
             }
@@ -228,7 +258,7 @@ impl Console {
                     }
 
                     if let Some(term) = self.ports[cmd.id as usize].terminal() {
-                        self.control.mark_console_port(mem, cmd.id);
+                        self.control.mark_console_port(&mem, cmd.id);
                         self.control.port_open(cmd.id, true);
                         let (cols, rows) = term.get_win_size();
                         self.control
@@ -266,31 +296,8 @@ impl Console {
         }
 
         for port_id in ports_to_start {
-            if self.ports[port_id].is_active() {
-                continue;
-            }
-
             log::trace!("Starting port io for port {port_id}");
-            let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
-            let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
-
-            // Take ownership of port queues - they are moved to the port.
-            let rx_queue = self.queues[rx_idx]
-                .take()
-                .expect("port rx queue should exist")
-                .queue;
-            let tx_queue = self.queues[tx_idx]
-                .take()
-                .expect("port tx queue should exist")
-                .queue;
-
-            self.ports[port_id].start(
-                mem.clone(),
-                rx_queue,
-                tx_queue,
-                interrupt.clone(),
-                self.control.clone(),
-            );
+            self.start_port(port_id, mem.clone(), interrupt.clone());
         }
 
         raise_irq
@@ -365,7 +372,19 @@ impl VirtioDevice for Console {
 
         self.queue_events = queues.iter().map(|dq| dq.event.clone()).collect();
         self.queues = queues.into_iter().map(Some).collect();
-        self.device_state = DeviceState::Activated(mem, interrupt);
+        self.device_state = DeviceState::Activated(mem.clone(), interrupt.clone());
+
+        // PORT_OPEN is a one-time guest negotiation event. Reversible quiescence must restart
+        // the workers that owned open ports directly or agent traffic remains stalled after thaw.
+        let resume_ports = self
+            .resume_ports
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(port_id, resume)| std::mem::take(resume).then_some(port_id))
+            .collect::<Vec<_>>();
+        for port_id in resume_ports {
+            self.start_port(port_id, mem.clone(), interrupt.clone());
+        }
 
         Ok(())
     }
@@ -381,6 +400,7 @@ impl VirtioDevice for Console {
         }
         self.queues.clear();
         self.queue_events.clear();
+        self.resume_ports.fill(false);
         self.device_state = DeviceState::Inactive;
         true
     }
@@ -403,6 +423,7 @@ impl VirtioDevice for Console {
             if !port.is_active() {
                 continue;
             }
+            self.resume_ports[port_id] = true;
             let (rx, tx) = port
                 .quiesce()
                 .map_err(|message| VirtioStateError::Device(std::io::Error::other(message)))?;
@@ -507,11 +528,21 @@ mod tests {
         let tx_index = port_id_to_queue_idx(QueueDirection::Tx, 0);
         let rx = console.queues[rx_index].take().unwrap().queue;
         let tx = console.queues[tx_index].take().unwrap().queue;
-        console.ports[0].start(mem, rx, tx, interrupt, Arc::clone(&console.control));
+        console.ports[0].start(
+            mem.clone(),
+            rx,
+            tx,
+            interrupt.clone(),
+            Arc::clone(&console.control),
+        );
 
         let queues = console.quiesce().unwrap();
         assert_eq!(queues.len(), console.queue_config().len());
         assert!(!console.is_activated());
         assert!(!console.ports[0].is_active());
+
+        console.activate(mem, interrupt, queues).unwrap();
+        assert!(console.is_activated());
+        assert!(console.ports[0].is_active());
     }
 }
