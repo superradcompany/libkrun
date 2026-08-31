@@ -993,6 +993,7 @@ dependencies = [
 name = "msb_krun_devices"
 version = "0.1.32"
 dependencies = [
+ "bincode",
  "bitflags 1.3.2",
  "capng",
  "caps",
@@ -1015,6 +1016,7 @@ dependencies = [
  "nix 0.30.1",
  "pipewire",
  "rand",
+ "serde",
  "thiserror 2.0.18",
  "tokio",
  "virtio-bindings",

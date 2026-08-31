@@ -64,6 +64,9 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use serde::{Deserialize, Serialize};
+
 #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
@@ -707,10 +710,19 @@ pub struct Vmm {
 
     // Guest VM devices.
     mmio_device_manager: MMIODeviceManager,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    irqchip: IrqChip,
     #[cfg(feature = "blk")]
     quiesced_virtio_devices: BTreeSet<(u32, String)>,
     #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
     pio_device_manager: PortIODeviceManager,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[derive(Serialize, Deserialize)]
+struct LinuxX86VmExecutionState {
+    vm: Vec<u8>,
+    userspace_irqchip: Option<Vec<u8>>,
 }
 
 impl Vmm {
@@ -1188,6 +1200,30 @@ impl Vmm {
                 VcpuExecutionState::new(vcpu_index as u32, bytes).map_err(Error::ExecutionState)?,
             );
         }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        let vm_state = {
+            let userspace_irqchip = self
+                .irqchip
+                .lock()
+                .map_err(|_| {
+                    Error::ExecutionStateBackend("interrupt controller mutex is poisoned".into())
+                })?
+                .capture_state()
+                .map_err(|error| Error::ExecutionStateBackend(format!("{error:?}")))?;
+            let vm = self
+                .vm
+                .capture_execution_state(userspace_irqchip.is_some())
+                .map_err(Error::Vm)?;
+            bincode::serde::encode_to_vec(
+                LinuxX86VmExecutionState {
+                    vm,
+                    userspace_irqchip,
+                },
+                bincode::config::standard(),
+            )
+            .map_err(|error| Error::ExecutionStateBackend(error.to_string()))?
+        };
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         let vm_state = self.vm.capture_execution_state().map_err(Error::Vm)?;
         ExecutionState::new(
             current_execution_architecture(),
@@ -1223,6 +1259,28 @@ impl Vmm {
         }
 
         self.execution_state = VmmExecutionState::Indeterminate;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let (backend, consumed): (LinuxX86VmExecutionState, usize) =
+                bincode::serde::decode_from_slice(state.vm_state(), bincode::config::standard())
+                    .map_err(|error| Error::ExecutionStateBackend(error.to_string()))?;
+            if consumed != state.vm_state().len() {
+                return Err(Error::ExecutionStateBackend(
+                    "trailing Linux x86 VM state bytes".into(),
+                ));
+            }
+            self.vm
+                .restore_execution_state(&backend.vm, backend.userspace_irqchip.is_some())
+                .map_err(Error::Vm)?;
+            self.irqchip
+                .lock()
+                .map_err(|_| {
+                    Error::ExecutionStateBackend("interrupt controller mutex is poisoned".into())
+                })?
+                .restore_state(backend.userspace_irqchip.as_deref())
+                .map_err(|error| Error::ExecutionStateBackend(format!("{error:?}")))?;
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         self.vm
             .restore_execution_state(state.vm_state())
             .map_err(Error::Vm)?;

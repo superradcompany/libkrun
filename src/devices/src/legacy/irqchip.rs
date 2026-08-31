@@ -40,6 +40,18 @@ impl IrqChipDevice {
     ) -> Result<(), DeviceError> {
         self.inner.set_irq(irq_line, interrupt_evt)
     }
+
+    #[cfg(target_arch = "x86_64")]
+    /// Capture state owned by a userspace interrupt controller, if present.
+    pub fn capture_state(&self) -> Result<Option<Vec<u8>>, DeviceError> {
+        self.inner.capture_state()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    /// Restore state owned by a userspace interrupt controller, if present.
+    pub fn restore_state(&mut self, state: Option<&[u8]>) -> Result<(), DeviceError> {
+        self.inner.restore_state(state)
+    }
 }
 
 impl BusDevice for IrqChipDevice {
@@ -127,6 +139,25 @@ pub trait IrqChipT: BusDevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+
+    /// Capture state owned by a userspace interrupt controller.
+    ///
+    /// In-kernel interrupt controllers return `None`; their state belongs to the hypervisor VM
+    /// payload instead.
+    fn capture_state(&self) -> Result<Option<Vec<u8>>, DeviceError> {
+        Ok(None)
+    }
+
+    /// Restore state owned by a userspace interrupt controller.
+    fn restore_state(&mut self, state: Option<&[u8]>) -> Result<(), DeviceError> {
+        if state.is_some() {
+            return Err(DeviceError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "in-kernel interrupt controller received userspace state",
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(target_arch = "aarch64")]

@@ -8,6 +8,7 @@ use kvm_bindings::{
 };
 
 use kvm_ioctls::{Error, VmFd};
+use serde::{Deserialize, Serialize};
 
 use utils::eventfd::EventFd;
 use utils::worker_message::WorkerMessage;
@@ -102,6 +103,15 @@ pub struct IoApic {
     version: u8,
     irq_routes: Vec<kvm_irq_routing_entry>,
     irq_sender: crossbeam_channel::Sender<WorkerMessage>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct IoApicState {
+    id: u8,
+    ioregsel: u8,
+    irr: Vec<u64>,
+    ioredtbl: Vec<u64>,
+    version: u8,
 }
 
 impl IoApic {
@@ -369,6 +379,60 @@ impl IrqChipT for IoApic {
         }
         Ok(())
     }
+
+    fn capture_state(&self) -> Result<Option<Vec<u8>>, DeviceError> {
+        let state = IoApicState {
+            id: self.id,
+            ioregsel: self.ioregsel,
+            irr: self.irr.to_vec(),
+            ioredtbl: self.ioredtbl.to_vec(),
+            version: self.version,
+        };
+        bincode::serde::encode_to_vec(&state, bincode::config::standard())
+            .map(Some)
+            .map_err(|error| {
+                DeviceError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error.to_string(),
+                ))
+            })
+    }
+
+    fn restore_state(&mut self, state: Option<&[u8]>) -> Result<(), DeviceError> {
+        let bytes = state.ok_or_else(|| {
+            DeviceError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "userspace IOAPIC state is missing",
+            ))
+        })?;
+        let (state, consumed): (IoApicState, usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard()).map_err(
+                |error| {
+                    DeviceError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        error.to_string(),
+                    ))
+                },
+            )?;
+        if consumed != bytes.len()
+            || state.irr.len() != IRR_WORDS
+            || state.ioredtbl.len() != IOAPIC_NUM_PINS
+            || state.version != self.version
+        {
+            return Err(DeviceError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "userspace IOAPIC state has an incompatible shape",
+            )));
+        }
+
+        self.id = state.id;
+        self.ioregsel = state.ioregsel;
+        self.irr.copy_from_slice(&state.irr);
+        self.ioredtbl.copy_from_slice(&state.ioredtbl);
+        // Routing is host-derived state, so reconstruct it from the restored guest registers.
+        self.update_routes();
+        Ok(())
+    }
 }
 
 impl BusDevice for IoApic {
@@ -571,5 +635,26 @@ mod tests {
         );
 
         assert_ne!(ioapic.ioredtbl[0] & (1 << IOAPIC_LVT_MASKED_SHIFT), 0);
+    }
+
+    #[test]
+    fn userspace_state_round_trip_preserves_guest_visible_registers() {
+        let mut ioapic = test_ioapic();
+        ioapic.id = 3;
+        ioapic.ioregsel = 0x2a;
+        ioapic.irr[1] = 1 << 9;
+        ioapic.ioredtbl[41] = 0x44 | IOAPIC_LVT_REMOTE_IRR;
+        let state = ioapic.capture_state().unwrap().unwrap();
+
+        ioapic.id = 0;
+        ioapic.ioregsel = 0;
+        ioapic.irr.fill(0);
+        ioapic.ioredtbl.fill(1 << IOAPIC_LVT_MASKED_SHIFT);
+        ioapic.restore_state(Some(&state)).unwrap();
+
+        assert_eq!(ioapic.id, 3);
+        assert_eq!(ioapic.ioregsel, 0x2a);
+        assert_eq!(ioapic.irr[1], 1 << 9);
+        assert_eq!(ioapic.ioredtbl[41], 0x44 | IOAPIC_LVT_REMOTE_IRR);
     }
 }

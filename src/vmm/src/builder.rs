@@ -1779,6 +1779,8 @@ pub fn build_microvm_paused(
         exit_code: exit_code.clone(),
         vm,
         mmio_device_manager,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        irqchip: intc.clone(),
         #[cfg(feature = "blk")]
         quiesced_virtio_devices: Default::default(),
         #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]

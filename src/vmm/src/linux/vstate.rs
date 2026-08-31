@@ -975,12 +975,16 @@ impl Vm {
     #[allow(unused)]
     #[cfg(target_arch = "x86_64")]
     /// Saves and returns the Kvm Vm state.
-    pub fn save_state(&self) -> Result<VmState> {
-        let pitstate = self.fd.get_pit2().map_err(Error::VmGetPit2)?;
-
+    pub fn save_state(&self, split_irqchip: bool) -> Result<VmState> {
         let mut clock = self.fd.get_clock().map_err(Error::VmGetClock)?;
         // This bit is not accepted in SET_CLOCK, clear it.
         clock.flags &= !KVM_CLOCK_TSC_STABLE;
+
+        if split_irqchip {
+            return Ok(VmState::SplitIrqchip { clock });
+        }
+
+        let pitstate = self.fd.get_pit2().map_err(Error::VmGetPit2)?;
 
         let mut pic_master = kvm_irqchip {
             chip_id: KVM_IRQCHIP_PIC_MASTER,
@@ -1006,7 +1010,7 @@ impl Vm {
             .get_irqchip(&mut ioapic)
             .map_err(Error::VmGetIrqChip)?;
 
-        Ok(VmState {
+        Ok(VmState::InKernelIrqchip {
             pitstate,
             clock,
             pic_master,
@@ -1018,41 +1022,58 @@ impl Vm {
     #[allow(unused)]
     #[cfg(target_arch = "x86_64")]
     /// Restores the Kvm Vm state.
-    pub fn restore_state(&self, state: &VmState) -> Result<()> {
-        self.fd
-            .set_pit2(&state.pitstate)
-            .map_err(Error::VmSetPit2)?;
-        self.fd.set_clock(&state.clock).map_err(Error::VmSetClock)?;
-        self.fd
-            .set_irqchip(&state.pic_master)
-            .map_err(Error::VmSetIrqChip)?;
-        self.fd
-            .set_irqchip(&state.pic_slave)
-            .map_err(Error::VmSetIrqChip)?;
-        self.fd
-            .set_irqchip(&state.ioapic)
-            .map_err(Error::VmSetIrqChip)?;
+    pub fn restore_state(&self, state: &VmState, split_irqchip: bool) -> Result<()> {
+        match (state, split_irqchip) {
+            (VmState::SplitIrqchip { clock }, true) => {
+                self.fd.set_clock(clock).map_err(Error::VmSetClock)?;
+            }
+            (
+                VmState::InKernelIrqchip {
+                    pitstate,
+                    clock,
+                    pic_master,
+                    pic_slave,
+                    ioapic,
+                },
+                false,
+            ) => {
+                self.fd.set_pit2(pitstate).map_err(Error::VmSetPit2)?;
+                self.fd.set_clock(clock).map_err(Error::VmSetClock)?;
+                self.fd
+                    .set_irqchip(pic_master)
+                    .map_err(Error::VmSetIrqChip)?;
+                self.fd
+                    .set_irqchip(pic_slave)
+                    .map_err(Error::VmSetIrqChip)?;
+                self.fd.set_irqchip(ioapic).map_err(Error::VmSetIrqChip)?;
+            }
+            _ => {
+                return Err(Error::StateCodec(
+                    "VM state targets a different interrupt-controller model".to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 
     /// Captures VM-global KVM state in the backend ABI payload.
     #[cfg(target_arch = "x86_64")]
-    pub fn capture_execution_state(&self) -> Result<Vec<u8>> {
-        let state = self.save_state()?;
+    pub fn capture_execution_state(&self, split_irqchip: bool) -> Result<Vec<u8>> {
+        let state = self.save_state(split_irqchip)?;
         bincode::serde::encode_to_vec(&state, bincode::config::standard())
             .map_err(|error| Error::StateCodec(error.to_string()))
     }
 
     /// Restores VM-global KVM state from the backend ABI payload.
     #[cfg(target_arch = "x86_64")]
-    pub fn restore_execution_state(&self, bytes: &[u8]) -> Result<()> {
+    pub fn restore_execution_state(&self, bytes: &[u8], split_irqchip: bool) -> Result<()> {
         let (state, consumed): (VmState, usize) =
             bincode::serde::decode_from_slice(bytes, bincode::config::standard())
                 .map_err(|error| Error::StateCodec(error.to_string()))?;
         if consumed != bytes.len() {
             return Err(Error::StateCodec("trailing VM state bytes".to_string()));
         }
-        self.restore_state(&state)
+        self.restore_state(&state, split_irqchip)
     }
 
     #[cfg(not(target_arch = "x86_64"))]
@@ -1084,12 +1105,17 @@ impl Vm {
 #[cfg(target_arch = "x86_64")]
 #[derive(Serialize, Deserialize)]
 /// Structure holding VM kvm state.
-pub struct VmState {
-    pitstate: kvm_pit_state2,
-    clock: kvm_clock_data,
-    pic_master: kvm_irqchip,
-    pic_slave: kvm_irqchip,
-    ioapic: kvm_irqchip,
+pub enum VmState {
+    InKernelIrqchip {
+        pitstate: kvm_pit_state2,
+        clock: kvm_clock_data,
+        pic_master: kvm_irqchip,
+        pic_slave: kvm_irqchip,
+        ioapic: kvm_irqchip,
+    },
+    SplitIrqchip {
+        clock: kvm_clock_data,
+    },
 }
 
 fn host_page_size() -> Result<u64> {
