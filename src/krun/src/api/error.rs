@@ -109,6 +109,9 @@ pub enum RuntimeError {
 
     /// Shutdown error.
     Shutdown(String),
+
+    /// Live VM control error.
+    Control(String),
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -184,6 +187,7 @@ impl fmt::Display for RuntimeError {
             RuntimeError::AlreadyRunning => write!(f, "VM is already running"),
             RuntimeError::NotStarted => write!(f, "VM has not been started"),
             RuntimeError::Shutdown(s) => write!(f, "shutdown: {}", s),
+            RuntimeError::Control(s) => write!(f, "control: {}", s),
         }
     }
 }

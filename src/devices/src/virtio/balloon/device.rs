@@ -5,11 +5,11 @@ use std::time::Duration;
 use utils::eventfd::EventFd;
 use utils::metrics::MetricsWriter;
 use utils::timerfd::TimerFd;
-use vm_memory::{ByteValued, GuestMemoryBackend, GuestMemoryMmap};
+use vm_memory::{Address, ByteValued, GuestMemoryBackend, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, BalloonError, DeviceQueue, DeviceState, QueueConfig,
-    VirtioDevice,
+    ActivateError, ActivateResult, BalloonError, DeviceQueue, DeviceState, HostMemoryRange,
+    QueueConfig, VirtioDevice,
 };
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
@@ -120,6 +120,13 @@ impl Balloon {
             let index = head.index;
             for desc in head.into_iter() {
                 let host_addr = mem.get_host_address(desc.addr).unwrap();
+                if !queues[FRQ_INDEX].queue.mark_host_write(HostMemoryRange {
+                    start: desc.addr.raw_value(),
+                    length: u64::from(desc.len),
+                }) {
+                    error!("balloon: free-page range was not covered by an admitted request");
+                    continue;
+                }
                 debug!(
                     "balloon: should release guest_addr={:?} host_addr={:p} len={}",
                     desc.addr, host_addr, desc.len

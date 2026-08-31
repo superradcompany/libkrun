@@ -5,7 +5,8 @@ use utils::eventfd::EventFd;
 use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, MemError, QueueConfig, VirtioDevice,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, HostMemoryRange, MemError,
+    QueueConfig, VirtioDevice,
 };
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
@@ -238,6 +239,17 @@ impl Mem {
         let DeviceState::Activated(ref mem, _) = self.device_state else {
             return;
         };
+        let Some(queues) = self.queues.as_ref() else {
+            error!("virtio-mem: request queue is unavailable while discarding guest memory");
+            return;
+        };
+        if !queues[REQ_INDEX].queue.mark_host_write(HostMemoryRange {
+            start: guest_addr,
+            length: len,
+        }) {
+            error!("virtio-mem: discard range was not covered by an admitted request");
+            return;
+        }
         let Ok(host_addr) = mem.get_host_address(GuestAddress(guest_addr)) else {
             error!("virtio-mem: no host mapping for guest addr {guest_addr:#x}");
             return;

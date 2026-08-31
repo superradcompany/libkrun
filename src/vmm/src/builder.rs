@@ -37,7 +37,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use super::{Error, Vmm};
+use super::{Error, PauseGeneration, VcpuControlRequestId, Vmm, VmmExecutionState};
+use crate::memory_state::{MemoryGenerationLedger, MemoryTopologyGeneration};
 
 #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 use crate::device_manager::legacy::PortIODeviceManager;
@@ -1753,6 +1754,16 @@ pub fn build_microvm_paused(
         arch_memory_info,
         kernel_cmdline,
         vcpus_handles: Vec::new(),
+        control_request_id: VcpuControlRequestId::INITIAL,
+        execution_state: VmmExecutionState::Paused(PauseGeneration::INITIAL),
+        execution_restore_allowed: true,
+        memory_restore_allowed: true,
+        memory_ledger: MemoryGenerationLedger::new(MemoryTopologyGeneration::new(1)),
+        memory_access: devices::virtio::MemoryAccessDomain::new(),
+        memory_tracking_active: false,
+        pending_dirty_ranges: Vec::new(),
+        carried_dirty_ranges: Vec::new(),
+        pending_access_mode: None,
         exit_evt,
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
@@ -3995,6 +4006,7 @@ fn create_vcpus_aarch64(
             Some(boot_receiver),
             exit_evt.try_clone().map_err(Error::EventFd)?,
             vcpu_list.clone(),
+            _vm.dirty_tracker(),
             nested_enabled,
             metrics.clone(),
         )
@@ -4058,7 +4070,12 @@ fn attach_mmio_device(
     intc: IrqChip,
     device: Arc<Mutex<dyn VirtioDevice>>,
 ) -> std::result::Result<(), device_manager::mmio::Error> {
-    let mmio_device = MmioTransport::new(vmm.guest_memory().clone(), intc, device)?;
+    let mmio_device = MmioTransport::new_with_memory_access(
+        vmm.guest_memory().clone(),
+        intc,
+        device,
+        vmm.memory_access_domain(),
+    )?;
 
     let type_id = mmio_device.locked_device().device_type();
     let _cmdline = &mut vmm.kernel_cmdline;
