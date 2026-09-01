@@ -150,6 +150,9 @@ static WHITELISTED_MSR_RANGES: &[MsrRange] = &[
     SINGLE_MSR!(MSR_TURBO_ACTIVATION_RATIO),
     SINGLE_MSR!(MSR_IA32_TSCDEADLINE),
     MSR_RANGE!(APIC_BASE_MSR, APIC_MSR_INDEXES),
+    // IA32_XSS selects the supervisor xstate components used by XSAVES/XRSTORS. Linux can enable
+    // CET supervisor state even when userspace XCR0 does not contain that component.
+    SINGLE_MSR!(MSR_IA32_XSS),
     SINGLE_MSR!(MSR_IA32_BNDCFGS),
     SINGLE_MSR!(MSR_KVM_WALL_CLOCK_NEW),
     SINGLE_MSR!(MSR_KVM_SYSTEM_TIME_NEW),
@@ -267,6 +270,8 @@ mod tests {
                 assert_eq!(msr_should_serialize(msr), should);
             }
         }
+
+        assert!(msr_should_serialize(MSR_IA32_XSS));
     }
 
     #[test]

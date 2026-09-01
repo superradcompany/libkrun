@@ -20,8 +20,6 @@ use std::os::unix::io::RawFd;
 use std::env;
 use std::result;
 use std::sync::atomic::{fence, Ordering};
-#[cfg(not(test))]
-use std::sync::Barrier;
 use std::thread;
 #[cfg(target_arch = "x86_64")]
 use std::time::Duration;
@@ -85,6 +83,9 @@ use super::tee::amdsnp::launch as snp;
 
 /// Signal number (SIGRTMIN) used to kick Vcpus.
 pub(crate) const VCPU_RTSIG_OFFSET: i32 = 0;
+
+#[cfg(target_arch = "x86_64")]
+const MSR_IA32_XSS: u32 = 0x0000_0da0;
 
 /// Errors associated with the wrappers over KVM ioctls.
 #[derive(Debug)]
@@ -1767,9 +1768,11 @@ impl Vcpu {
         for (target, source) in cpuid.as_mut_slice().iter_mut().zip(&state.cpuid) {
             *target = (*source).into();
         }
-        let mut msrs =
-            Msrs::new(state.msrs.len()).map_err(|error| Error::StateCodec(error.to_string()))?;
-        for (target, source) in msrs.as_mut_slice().iter_mut().zip(&state.msrs) {
+        let destination_supports_xss = self.msr_list.as_slice().contains(&MSR_IA32_XSS);
+        let (xss, generic_msr_states) = split_restored_msrs(&state.msrs, destination_supports_xss)?;
+        let mut msrs = Msrs::new(generic_msr_states.len())
+            .map_err(|error| Error::StateCodec(error.to_string()))?;
+        for (target, source) in msrs.as_mut_slice().iter_mut().zip(&generic_msr_states) {
             *target = (*source).into();
         }
 
@@ -1784,6 +1787,16 @@ impl Vcpu {
         self.fd
             .set_sregs(&state.sregs)
             .map_err(Error::VcpuSetSregs)?;
+        if let Some(xss) = xss {
+            let xss = Msrs::from_entries(&[xss.into()])
+                .map_err(|error| Error::StateCodec(error.to_string()))?;
+            let restored_xss = self.fd.set_msrs(&xss).map_err(Error::VcpuSetMsrs)?;
+            if restored_xss != 1 {
+                return Err(Error::StateCodec(
+                    "KVM did not restore the required IA32_XSS state".to_string(),
+                ));
+            }
+        }
         unsafe {
             self.fd
                 .set_xsave(&state.xsave)
@@ -2038,6 +2051,7 @@ impl Vcpu {
 
         // Break this emulation loop on any transition request/external event.
         match self.event_receiver.try_recv() {
+            Ok(VcpuEvent::Terminate) => return StateMachine::finish(),
             // Running ---- Pause ----> Paused
             Ok(VcpuEvent::Pause { request_id }) => {
                 // Nothing special to do.
@@ -2087,6 +2101,7 @@ impl Vcpu {
     // This is the main loop of the `Paused` state.
     fn paused(&mut self) -> StateMachine<Self> {
         match self.event_receiver.recv() {
+            Ok(VcpuEvent::Terminate) => StateMachine::finish(),
             // Paused ---- Resume ----> Running
             Ok(VcpuEvent::Resume { request_id }) => {
                 // Nothing special to do.
@@ -2147,12 +2162,12 @@ impl Vcpu {
     #[cfg(not(test))]
     // This is the main loop of the `Exited` state.
     fn exited(&mut self) -> StateMachine<Self> {
-        // Wait indefinitely.
-        // The VMM thread will kill the entire process.
-        let barrier = Barrier::new(2);
-        barrier.wait();
-
-        StateMachine::finish()
+        // Guest shutdown still reports through the exit event, but an embedding runtime may keep
+        // the process alive while it drops this VM. Keep the vCPU joinable in that case.
+        match self.event_receiver.recv() {
+            Ok(VcpuEvent::Terminate) | Err(_) => StateMachine::finish(),
+            Ok(_) => StateMachine::next(Self::exited),
+        }
     }
 
     #[cfg(feature = "tdx")]
@@ -2168,6 +2183,36 @@ impl Vcpu {
     fn exit(&mut self, _: u8) -> StateMachine<Self> {
         // State machine reached its end.
         StateMachine::finish()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn split_restored_msrs(
+    saved: &[KvmMsrEntryState],
+    destination_supports_xss: bool,
+) -> Result<(Option<KvmMsrEntryState>, Vec<KvmMsrEntryState>)> {
+    let mut xss = None;
+    let mut generic = Vec::with_capacity(saved.len());
+    for entry in saved {
+        if entry.index == MSR_IA32_XSS {
+            if xss.replace(*entry).is_some() {
+                return Err(Error::StateCodec(
+                    "KVM execution state contains duplicate IA32_XSS entries".to_string(),
+                ));
+            }
+        } else {
+            generic.push(*entry);
+        }
+    }
+
+    match (destination_supports_xss, xss) {
+        (true, None) => Err(Error::StateCodec(
+            "KVM execution state is missing required IA32_XSS state".to_string(),
+        )),
+        (false, Some(_)) => Err(Error::StateCodec(
+            "destination KVM does not support saved IA32_XSS state".to_string(),
+        )),
+        (_, xss) => Ok((xss, generic)),
     }
 }
 
@@ -2331,6 +2376,8 @@ impl From<KvmMsrEntryState> for kvm_msr_entry {
 #[derive(Debug)]
 /// List of events that the Vcpu can receive.
 pub enum VcpuEvent {
+    /// Stop the vCPU thread without reporting a guest exit.
+    Terminate,
     /// Pause the Vcpu.
     Pause {
         /// Correlates this command with its acknowledgement.
@@ -2433,13 +2480,11 @@ impl VcpuHandle {
 
 impl Drop for VcpuHandle {
     fn drop(&mut self) {
-        // A startup barrier may abort after earlier vCPU threads reached Paused. Close their
-        // control channels and join them before the owning VM is destroyed.
-        let _ = self.send_event(VcpuEvent::Pause {
-            request_id: VcpuControlRequestId::TEARDOWN,
-        });
-        let (event_sender, _event_receiver) = unbounded();
-        self.event_sender = event_sender;
+        // Construction and restore can fail while this thread is either blocked in Paused or
+        // executing KVM_RUN. Termination is distinct from a guest pause/exit, and the kick makes
+        // the running case observe it before the owning VM disappears.
+        let _ = self.event_sender.send(VcpuEvent::Terminate);
+        let _ = self.kick();
         if let Some(thread) = self.vcpu_thread.take() {
             let _ = thread.join();
         }
@@ -2468,6 +2513,66 @@ mod tests {
     use devices::legacy::KvmIoapic;
 
     use utils::signal::validate_signal_num;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restored_msrs_require_and_separate_xss_when_supported() {
+        let generic = KvmMsrEntryState {
+            index: 0x10,
+            reserved: 0,
+            data: 7,
+        };
+        let xss = KvmMsrEntryState {
+            index: MSR_IA32_XSS,
+            reserved: 0,
+            data: 0x800,
+        };
+
+        let (resolved_xss, resolved_generic) = split_restored_msrs(&[generic, xss], true).unwrap();
+        assert_eq!(resolved_xss.unwrap().data, 0x800);
+        assert_eq!(resolved_generic.len(), 1);
+        assert_eq!(resolved_generic[0].index, generic.index);
+
+        let error = match split_restored_msrs(&[generic], true) {
+            Err(error) => error,
+            Ok(_) => panic!("missing IA32_XSS state was accepted"),
+        };
+        assert!(error.to_string().contains("missing required IA32_XSS"));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restored_msrs_reject_xss_when_destination_lacks_it() {
+        let xss = KvmMsrEntryState {
+            index: MSR_IA32_XSS,
+            reserved: 0,
+            data: 0x800,
+        };
+
+        let error = match split_restored_msrs(&[xss], false) {
+            Err(error) => error,
+            Ok(_) => panic!("unsupported IA32_XSS state was accepted"),
+        };
+        assert!(error
+            .to_string()
+            .contains("destination KVM does not support saved IA32_XSS"));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restored_msrs_reject_duplicate_xss_entries() {
+        let xss = KvmMsrEntryState {
+            index: MSR_IA32_XSS,
+            reserved: 0,
+            data: 0x800,
+        };
+
+        let error = match split_restored_msrs(&[xss, xss], true) {
+            Err(error) => error,
+            Ok(_) => panic!("duplicate IA32_XSS state was accepted"),
+        };
+        assert!(error.to_string().contains("duplicate IA32_XSS"));
+    }
 
     #[test]
     fn best_effort_host_affinity_reports_os_rejection_as_inherited() {

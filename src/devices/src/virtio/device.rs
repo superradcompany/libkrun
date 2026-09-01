@@ -222,6 +222,32 @@ pub trait VirtioDevice: AsAny + Send {
         ))
     }
 
+    /// Captures bounded device-specific state after queue ownership returns to the transport.
+    ///
+    /// Most devices reconstruct their configuration from the destination resource plan and need
+    /// no additional bytes. Devices with protocol state that survives in guest memory can override
+    /// this hook so their host-side half advances from the same boundary after restore.
+    fn capture_device_state(&self) -> Result<Vec<u8>, VirtioStateError> {
+        Ok(Vec::new())
+    }
+
+    /// Validates device-specific bytes without changing the constructed destination device.
+    fn validate_device_state(&self, state: &[u8]) -> Result<(), VirtioStateError> {
+        if state.is_empty() {
+            Ok(())
+        } else {
+            Err(VirtioStateError::Incompatible(format!(
+                "{} does not accept device-specific state",
+                self.device_name()
+            )))
+        }
+    }
+
+    /// Restores previously validated device-specific bytes before device activation.
+    fn restore_device_state(&mut self, state: &[u8]) -> Result<(), VirtioStateError> {
+        self.validate_device_state(state)
+    }
+
     /// Get base and size of the SHM region
     fn shm_region(&self) -> Option<&VirtioShmRegion> {
         None

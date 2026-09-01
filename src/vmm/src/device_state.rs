@@ -8,8 +8,8 @@ use std::fmt::{Display, Formatter};
 
 #[cfg(feature = "blk")]
 use devices::virtio::{
-    BlockState, CacheType, QueueState, VirtioMmioState, BLOCK_STATE_VERSION, QUEUE_STATE_VERSION,
-    VIRTIO_MMIO_STATE_VERSION,
+    fs::TYPE_FS, BlockState, CacheType, QueueState, VirtioMmioState, BLOCK_STATE_VERSION,
+    QUEUE_STATE_VERSION, VIRTIO_MMIO_STATE_VERSION,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -23,7 +23,15 @@ const VIRTIO_DEVICE_STATE_MAGIC: &[u8; 9] = b"MSBKVIO\0\0";
 #[cfg(feature = "blk")]
 const BLOCK_DEVICE_STATE_SCHEMA: u16 = 1;
 #[cfg(feature = "blk")]
+const VIRTIO_DEVICE_STATE_SCHEMA: u16 = 2;
+#[cfg(feature = "blk")]
 const MAX_DEVICE_STATE_BYTES: usize = 1024 * 1024;
+#[cfg(feature = "blk")]
+const MAX_DEVICE_SPECIFIC_STATE_BYTES: usize = 64 * 1024;
+#[cfg(feature = "blk")]
+const MAX_FS_DEVICE_STATE_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(feature = "blk")]
+const MAX_FS_DEVICE_SPECIFIC_STATE_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(feature = "blk")]
 const MAX_DEVICE_STRING_BYTES: usize = 4096;
 #[cfg(feature = "blk")]
@@ -60,6 +68,8 @@ pub struct VirtioDeviceState {
     pub device_id: String,
     /// Generic virtio-mmio registers and exact queue cursors.
     pub transport: VirtioMmioState,
+    /// Bounded device-specific protocol state interpreted only by the matching device.
+    pub device_state: Vec<u8>,
 }
 
 /// Framing and compatibility errors for virtio-block state artifacts.
@@ -253,11 +263,16 @@ impl VirtioDeviceState {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut writer = Writer { bytes: Vec::new() };
         writer.bytes(VIRTIO_DEVICE_STATE_MAGIC);
-        writer.u16(BLOCK_DEVICE_STATE_SCHEMA);
+        writer.u16(VIRTIO_DEVICE_STATE_SCHEMA);
         writer.u64(self.pause_generation);
         writer.string(&self.device_id, MAX_DEVICE_STRING_BYTES)?;
         encode_transport(&mut writer, &self.transport)?;
-        if writer.bytes.len() > MAX_DEVICE_STATE_BYTES {
+        let max_device_state = max_device_state_bytes(self.transport.device_type);
+        writer.sized_bytes(
+            &self.device_state,
+            max_device_specific_state_bytes(self.transport.device_type),
+        )?;
+        if writer.bytes.len() > max_device_state {
             return Err(Error::InvalidLength);
         }
         Ok(writer.bytes)
@@ -265,18 +280,24 @@ impl VirtioDeviceState {
 
     /// Decodes and validates one generic virtio state artifact.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() > MAX_DEVICE_STATE_BYTES {
+        if bytes.len() > MAX_FS_DEVICE_STATE_BYTES {
             return Err(Error::InvalidLength);
         }
         let mut reader = Reader { bytes, offset: 0 };
         if reader.take(VIRTIO_DEVICE_STATE_MAGIC.len())? != VIRTIO_DEVICE_STATE_MAGIC
-            || reader.u16()? != BLOCK_DEVICE_STATE_SCHEMA
+            || reader.u16()? != VIRTIO_DEVICE_STATE_SCHEMA
         {
             return Err(Error::UnsupportedFormat);
         }
         let pause_generation = reader.u64()?;
         let device_id = reader.string(MAX_DEVICE_STRING_BYTES)?;
         let transport = decode_transport(&mut reader)?;
+        if bytes.len() > max_device_state_bytes(transport.device_type) {
+            return Err(Error::InvalidLength);
+        }
+        let device_state = reader
+            .sized_bytes(max_device_specific_state_bytes(transport.device_type))?
+            .to_vec();
         if reader.offset != bytes.len() {
             return Err(Error::TrailingBytes);
         }
@@ -284,6 +305,7 @@ impl VirtioDeviceState {
             pause_generation,
             device_id,
             transport,
+            device_state,
         })
     }
 }
@@ -444,6 +466,24 @@ impl<'a> Reader<'a> {
 //--------------------------------------------------------------------------------------------------
 
 #[cfg(feature = "blk")]
+fn max_device_state_bytes(device_type: u32) -> usize {
+    if device_type == TYPE_FS {
+        MAX_FS_DEVICE_STATE_BYTES
+    } else {
+        MAX_DEVICE_STATE_BYTES
+    }
+}
+
+#[cfg(feature = "blk")]
+fn max_device_specific_state_bytes(device_type: u32) -> usize {
+    if device_type == TYPE_FS {
+        MAX_FS_DEVICE_SPECIFIC_STATE_BYTES
+    } else {
+        MAX_DEVICE_SPECIFIC_STATE_BYTES
+    }
+}
+
+#[cfg(feature = "blk")]
 fn encode_transport(writer: &mut Writer, transport: &VirtioMmioState) -> Result<()> {
     writer.u16(transport.version);
     writer.u32(transport.device_type);
@@ -587,6 +627,7 @@ mod tests {
                 device_type: 3,
                 ..block.transport
             },
+            device_state: vec![1, 2, 3, 4],
         }
     }
 
@@ -631,6 +672,37 @@ mod tests {
         assert_eq!(
             VirtioDeviceState::decode(&encoded),
             Err(Error::TrailingBytes)
+        );
+    }
+
+    #[test]
+    fn generic_virtio_state_rejects_the_old_schema() {
+        let mut encoded = generic_state().encode().unwrap();
+        encoded[VIRTIO_DEVICE_STATE_MAGIC.len()
+            ..VIRTIO_DEVICE_STATE_MAGIC.len() + std::mem::size_of::<u16>()]
+            .copy_from_slice(&1_u16.to_le_bytes());
+
+        assert_eq!(
+            VirtioDeviceState::decode(&encoded),
+            Err(Error::UnsupportedFormat)
+        );
+    }
+
+    #[test]
+    fn generic_virtio_state_bounds_device_specific_bytes() {
+        let mut state = generic_state();
+        state.device_state = vec![0; MAX_DEVICE_SPECIFIC_STATE_BYTES + 1];
+
+        assert_eq!(state.encode(), Err(Error::InvalidLength));
+
+        state.transport.device_type = TYPE_FS;
+        let encoded = state.encode().unwrap();
+        assert_eq!(
+            VirtioDeviceState::decode(&encoded)
+                .unwrap()
+                .device_state
+                .len(),
+            MAX_DEVICE_SPECIFIC_STATE_BYTES + 1
         );
     }
 }

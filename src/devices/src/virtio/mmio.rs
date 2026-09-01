@@ -364,8 +364,8 @@ impl MmioTransport {
         })
     }
 
-    /// Restores generic transport and queue state before device activation.
-    pub fn restore_state(&mut self, state: &VirtioMmioState) -> Result<(), VirtioStateError> {
+    /// Validates generic transport and queue state without mutating the destination.
+    pub fn validate_state(&self, state: &VirtioMmioState) -> Result<(), VirtioStateError> {
         if state.version != VIRTIO_MMIO_STATE_VERSION {
             return Err(VirtioStateError::Incompatible(format!(
                 "unsupported virtio-mmio state version {}",
@@ -431,6 +431,13 @@ impl MmioTransport {
                 self.interrupt.irq_line()
             )));
         }
+
+        Ok(())
+    }
+
+    /// Restores generic transport and queue state before device activation.
+    pub fn restore_state(&mut self, state: &VirtioMmioState) -> Result<(), VirtioStateError> {
+        self.validate_state(state)?;
 
         self.locked_device()
             .set_acked_features(state.acked_features);
@@ -1304,6 +1311,27 @@ pub(crate) mod tests {
         invalid.queues[0].size = 3;
 
         assert!(transport.restore_state(&invalid).is_err());
+        assert_eq!(transport.capture_state().unwrap(), baseline);
+    }
+
+    #[test]
+    fn restore_rejects_negotiated_features_missing_on_destination() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10_000)]).unwrap();
+        let mut dummy = DummyDevice::new();
+        dummy.set_avail_features(1);
+        dummy.set_acked_features(1);
+        let mut transport = MmioTransport::new(
+            memory,
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(dummy)),
+        )
+        .unwrap();
+        let baseline = transport.capture_state().unwrap();
+        let mut invalid = baseline.clone();
+        invalid.acked_features = 2;
+
+        let error = transport.restore_state(&invalid).unwrap_err();
+        assert!(error.to_string().contains("unavailable on the destination"));
         assert_eq!(transport.capture_state().unwrap(), baseline);
     }
 

@@ -1,5 +1,8 @@
 use std::sync::{Arc, Mutex};
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use kvm_ioctls::VmFd;
+
 use crate::bus::BusDevice;
 #[cfg(target_arch = "riscv64")]
 use crate::legacy::aia::AIADevice;
@@ -51,6 +54,16 @@ impl IrqChipDevice {
     /// Restore state owned by a userspace interrupt controller, if present.
     pub fn restore_state(&mut self, state: Option<&[u8]>) -> Result<(), DeviceError> {
         self.inner.restore_state(state)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    /// Restore userspace interrupt-controller state before the VMM worker is available.
+    pub fn restore_state_before_activation(
+        &mut self,
+        state: Option<&[u8]>,
+        vm: &VmFd,
+    ) -> Result<(), DeviceError> {
+        self.inner.restore_state_before_activation(state, vm)
     }
 }
 
@@ -157,6 +170,16 @@ pub trait IrqChipT: BusDevice {
             )));
         }
         Ok(())
+    }
+
+    /// Restore state while the VMM is still under construction and no IRQ worker is running.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn restore_state_before_activation(
+        &mut self,
+        state: Option<&[u8]>,
+        _vm: &VmFd,
+    ) -> Result<(), DeviceError> {
+        self.restore_state(state)
     }
 }
 

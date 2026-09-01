@@ -110,6 +110,14 @@ impl Port {
         self.terminal.as_deref()
     }
 
+    pub(crate) fn has_input(&self) -> bool {
+        self.input.is_some()
+    }
+
+    pub(crate) fn has_output(&self) -> bool {
+        self.output.is_some()
+    }
+
     pub fn notify_rx(&self) {
         if let PortState::Active(state) = &self.state {
             if let Some(handle) = &state.rx_thread {

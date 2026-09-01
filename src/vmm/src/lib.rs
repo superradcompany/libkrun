@@ -400,6 +400,24 @@ fn current_execution_backend() -> ExecutionBackend {
     ExecutionBackend::Whp
 }
 
+#[cfg(target_os = "macos")]
+fn current_execution_backend_state_abi() -> u32 {
+    // ABI 2 adds the per-vCPU GIC CPU-interface state that is separate from the process-wide HVF
+    // distributor artifact. ABI 1 cannot safely deliver interrupts after construction restore.
+    2
+}
+
+#[cfg(not(target_os = "macos"))]
+fn current_execution_backend_state_abi() -> u32 {
+    1
+}
+
+fn execution_state_backend_is_compatible(state: &ExecutionState) -> bool {
+    state.architecture() == current_execution_architecture()
+        && state.backend() == current_execution_backend()
+        && state.backend_state_abi() == current_execution_backend_state_abi()
+}
+
 fn incremental_capture_is_not_beneficial(
     dirty_bytes: u64,
     memory_bytes: u64,
@@ -815,6 +833,10 @@ impl Vmm {
         transport
             .quiesce()
             .map_err(|error| Error::DeviceState(error.to_string()))?;
+        let device_state = transport
+            .locked_device()
+            .capture_device_state()
+            .map_err(|error| Error::DeviceState(error.to_string()))?;
         let transport = transport
             .capture_state()
             .map_err(|error| Error::DeviceState(error.to_string()))?;
@@ -822,6 +844,7 @@ impl Vmm {
             pause_generation,
             device_id: device_id.to_string(),
             transport,
+            device_state,
         })
     }
 
@@ -863,8 +886,17 @@ impl Vmm {
             .quiesce()
             .map_err(|error| Error::DeviceState(error.to_string()))?;
         transport
+            .locked_device()
+            .validate_device_state(&state.device_state)
+            .map_err(|error| Error::DeviceState(error.to_string()))?;
+        transport
             .restore_state(&state.transport)
-            .map_err(|error| Error::DeviceState(error.to_string()))
+            .map_err(|error| Error::DeviceState(error.to_string()))?;
+        let result = transport
+            .locked_device()
+            .restore_device_state(&state.device_state)
+            .map_err(|error| Error::DeviceState(error.to_string()));
+        result
     }
 
     /// Captures one virtio-block device and keeps its worker quiesced until VM resume.
@@ -944,7 +976,32 @@ impl Vmm {
             .quiesce()
             .map_err(|error| Error::DeviceState(error.to_string()))?;
 
+        if state.transport.acked_features & !state.device.avail_features != 0 {
+            return Err(Error::DeviceState(
+                "saved negotiated block features exceed the saved offered feature contract"
+                    .to_string(),
+            ));
+        }
+
         let device = transport.device();
+        {
+            let device = device
+                .lock()
+                .map_err(|_| Error::DeviceState("virtio device mutex is poisoned".to_string()))?;
+            let block = device
+                .as_any()
+                .downcast_ref::<Block>()
+                .ok_or_else(|| Error::DeviceState("virtio device is not block".to_string()))?;
+            block
+                .validate_state(&state.device)
+                .map_err(|error| Error::DeviceState(error.to_string()))?;
+        }
+        // Validate the transport while the destination still exposes its full capability set.
+        // Only after every fallible check succeeds may the source's narrower offered mask replace
+        // it, keeping rejected restore attempts free of partial device mutation.
+        transport
+            .validate_state(&state.transport)
+            .map_err(|error| Error::DeviceState(error.to_string()))?;
         {
             let mut device = device
                 .lock()
@@ -954,7 +1011,7 @@ impl Vmm {
                 .downcast_mut::<Block>()
                 .ok_or_else(|| Error::DeviceState("virtio device is not block".to_string()))?;
             block
-                .validate_state(&state.device)
+                .restore_state(&state.device)
                 .map_err(|error| Error::DeviceState(error.to_string()))?;
         }
         transport
@@ -1233,7 +1290,7 @@ impl Vmm {
         ExecutionState::new(
             current_execution_architecture(),
             current_execution_backend(),
-            1,
+            current_execution_backend_state_abi(),
             pause_generation.request_id().get(),
             vm_state,
             vcpus,
@@ -1247,10 +1304,7 @@ impl Vmm {
         if !self.execution_restore_allowed {
             return Err(Error::ExecutionRestoreAfterActivation);
         }
-        if state.architecture() != current_execution_architecture()
-            || state.backend() != current_execution_backend()
-            || state.backend_state_abi() != 1
-        {
+        if !execution_state_backend_is_compatible(state) {
             return Err(Error::ExecutionStateIncompatible);
         }
         if state.vcpus().len() != self.vcpus_handles.len()
@@ -1282,7 +1336,7 @@ impl Vmm {
                 .map_err(|_| {
                     Error::ExecutionStateBackend("interrupt controller mutex is poisoned".into())
                 })?
-                .restore_state(backend.userspace_irqchip.as_deref())
+                .restore_state_before_activation(backend.userspace_irqchip.as_deref(), self.vm.fd())
                 .map_err(|error| Error::ExecutionStateBackend(format!("{error:?}")))?;
         }
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -2038,5 +2092,36 @@ mod tests {
     #[test]
     fn incremental_policy_allows_callers_to_force_complete_capture() {
         assert!(incremental_capture_is_not_beneficial(0, 1 << 30, 0));
+    }
+
+    #[test]
+    fn execution_backend_rejects_an_old_abi() {
+        let current_abi = current_execution_backend_state_abi();
+        let state = ExecutionState::new(
+            current_execution_architecture(),
+            current_execution_backend(),
+            current_abi.saturating_sub(1),
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(!execution_state_backend_is_compatible(&state));
+    }
+
+    #[test]
+    fn execution_backend_accepts_the_current_abi() {
+        let state = ExecutionState::new(
+            current_execution_architecture(),
+            current_execution_backend(),
+            current_execution_backend_state_abi(),
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(execution_state_backend_is_compatible(&state));
     }
 }

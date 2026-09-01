@@ -230,7 +230,7 @@ impl IoApic {
         }
     }
 
-    fn update_routes(&mut self) {
+    fn rebuild_routes(&mut self) {
         for i in 0..IOAPIC_NUM_PINS {
             let info = self.parse_entry(&self.ioredtbl[i]);
 
@@ -243,6 +243,10 @@ impl IoApic {
                 self.update_msi_route(i, &msg);
             }
         }
+    }
+
+    fn update_routes(&mut self) {
+        self.rebuild_routes();
 
         let (response_sender, response_receiver) = unbounded();
         if self
@@ -261,6 +265,53 @@ impl IoApic {
             Ok(false) => error!("unable to set GSI routes for IO APIC"),
             Err(_) => error!("IRQ worker stopped while setting GSI routes"),
         }
+    }
+
+    fn restore_guest_state(&mut self, state: Option<&[u8]>) -> Result<(), DeviceError> {
+        let bytes = state.ok_or_else(|| {
+            DeviceError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "userspace IOAPIC state is missing",
+            ))
+        })?;
+        let (state, consumed): (IoApicState, usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard()).map_err(
+                |error| {
+                    DeviceError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        error.to_string(),
+                    ))
+                },
+            )?;
+        if consumed != bytes.len()
+            || state.irr.len() != IRR_WORDS
+            || state.ioredtbl.len() != IOAPIC_NUM_PINS
+            || state.version != self.version
+        {
+            return Err(DeviceError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "userspace IOAPIC state has an incompatible shape",
+            )));
+        }
+
+        self.id = state.id;
+        self.ioregsel = state.ioregsel;
+        self.irr.copy_from_slice(&state.irr);
+        self.ioredtbl.copy_from_slice(&state.ioredtbl);
+        Ok(())
+    }
+
+    fn restore_before_activation_with<F>(
+        &mut self,
+        state: Option<&[u8]>,
+        install_routes: F,
+    ) -> Result<(), DeviceError>
+    where
+        F: FnOnce(&[kvm_irq_routing_entry]) -> Result<(), DeviceError>,
+    {
+        self.restore_guest_state(state)?;
+        self.rebuild_routes();
+        install_routes(&self.irq_routes)
     }
 
     fn irr_is_set(&self, index: usize) -> bool {
@@ -399,39 +450,24 @@ impl IrqChipT for IoApic {
     }
 
     fn restore_state(&mut self, state: Option<&[u8]>) -> Result<(), DeviceError> {
-        let bytes = state.ok_or_else(|| {
-            DeviceError::IoError(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "userspace IOAPIC state is missing",
-            ))
-        })?;
-        let (state, consumed): (IoApicState, usize) =
-            bincode::serde::decode_from_slice(bytes, bincode::config::standard()).map_err(
-                |error| {
-                    DeviceError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        error.to_string(),
-                    ))
-                },
-            )?;
-        if consumed != bytes.len()
-            || state.irr.len() != IRR_WORDS
-            || state.ioredtbl.len() != IOAPIC_NUM_PINS
-            || state.version != self.version
-        {
-            return Err(DeviceError::IoError(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "userspace IOAPIC state has an incompatible shape",
-            )));
-        }
-
-        self.id = state.id;
-        self.ioregsel = state.ioregsel;
-        self.irr.copy_from_slice(&state.irr);
-        self.ioredtbl.copy_from_slice(&state.ioredtbl);
+        self.restore_guest_state(state)?;
         // Routing is host-derived state, so reconstruct it from the restored guest registers.
         self.update_routes();
         Ok(())
+    }
+
+    fn restore_state_before_activation(
+        &mut self,
+        state: Option<&[u8]>,
+        vm: &VmFd,
+    ) -> Result<(), DeviceError> {
+        self.restore_before_activation_with(state, |routes| {
+            let mut routing = KvmIrqRouting::new(routes.len())
+                .map_err(|error| DeviceError::IoError(std::io::Error::other(error.to_string())))?;
+            routing.as_mut_slice().copy_from_slice(routes);
+            vm.set_gsi_routing(&routing)
+                .map_err(|error| DeviceError::IoError(std::io::Error::other(error.to_string())))
+        })
     }
 }
 
@@ -563,7 +599,7 @@ mod tests {
 
     fn test_ioapic() -> IoApic {
         let (irq_sender, _irq_receiver) = unbounded();
-        IoApic {
+        let mut ioapic = IoApic {
             id: 0,
             ioregsel: 0,
             irr: [0; IRR_WORDS],
@@ -571,7 +607,9 @@ mod tests {
             version: 0x20,
             irq_routes: Vec::new(),
             irq_sender,
-        }
+        };
+        (0..IOAPIC_NUM_PINS).for_each(|pin| ioapic.add_msi_route(pin));
+        ioapic
     }
 
     #[test]
@@ -650,11 +688,21 @@ mod tests {
         ioapic.ioregsel = 0;
         ioapic.irr.fill(0);
         ioapic.ioredtbl.fill(1 << IOAPIC_LVT_MASKED_SHIFT);
-        ioapic.restore_state(Some(&state)).unwrap();
+        let mut installed_routes = Vec::new();
+        ioapic
+            .restore_before_activation_with(Some(&state), |routes| {
+                installed_routes.extend_from_slice(routes);
+                Ok(())
+            })
+            .unwrap();
 
         assert_eq!(ioapic.id, 3);
         assert_eq!(ioapic.ioregsel, 0x2a);
         assert_eq!(ioapic.irr[1], 1 << 9);
         assert_eq!(ioapic.ioredtbl[41], 0x44 | IOAPIC_LVT_REMOTE_IRR);
+        assert_eq!(installed_routes.len(), IOAPIC_NUM_PINS);
+        assert_eq!(installed_routes[41].gsi, 41);
+        let restored_msi = unsafe { installed_routes[41].u.msi };
+        assert_eq!(restored_msi.data & IOAPIC_VECTOR_MASK as u32, 0x44);
     }
 }

@@ -48,12 +48,14 @@ pub struct FsWorker<F: FileSystem + Sync + 'static> {
 pub struct FsWorkerState {
     pub queues: Vec<Queue>,
     pub queue_evts: Vec<Arc<EventFd>>,
+    /// Negotiated FUSE session options retained across worker reconstruction.
+    pub session_options: u64,
 }
 
 impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        fs: F,
+        fs: Arc<F>,
         queues: Vec<Queue>,
         queue_evts: Vec<Arc<EventFd>>,
         interrupt: InterruptTransport,
@@ -64,6 +66,7 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
         #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: Option<
             Sender<WorkerMessage>,
         >,
+        session_options: u64,
     ) -> Self {
         Self {
             queues,
@@ -71,7 +74,7 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
             interrupt,
             mem,
             shm_region,
-            server: Server::new(fs),
+            server: Server::new(fs, session_options),
             stop_fd,
             exit_code,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -153,6 +156,7 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
         FsWorkerState {
             queues: self.queues,
             queue_evts: self.queue_evts,
+            session_options: self.server.session_options(),
         }
     }
 

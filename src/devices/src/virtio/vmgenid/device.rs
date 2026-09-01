@@ -21,6 +21,12 @@ const CONFIG_PROCESSED_ID_OFFSET: u64 = 40;
 const CONFIG_WORD_SIZE: usize = 4;
 const DRIVER_STATUS_READY: u32 = 1;
 const DRIVER_STATUS_ERROR: u32 = 2;
+const GENERATION_STATE_MAGIC: &[u8; 8] = b"MSBVGID\0";
+const GENERATION_STATE_SCHEMA: u16 = 1;
+const GENERATION_CONFIG_WORDS: usize = 14;
+const GENERATION_STATE_BYTES: usize = GENERATION_STATE_MAGIC.len()
+    + std::mem::size_of::<u16>()
+    + GENERATION_CONFIG_WORDS * CONFIG_WORD_SIZE;
 
 /// A VM generation identifier mixed into the guest kernel CRNG after clone or rollback.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -392,6 +398,27 @@ impl VirtioDevice for Generation {
         self.device_state = DeviceState::Inactive;
         Ok(queues)
     }
+
+    fn capture_device_state(&self) -> Result<Vec<u8>, VirtioStateError> {
+        Ok(encode_generation_state(&self.config))
+    }
+
+    fn validate_device_state(&self, state: &[u8]) -> Result<(), VirtioStateError> {
+        decode_generation_state(state).map(|_| ())
+    }
+
+    fn restore_device_state(&mut self, state: &[u8]) -> Result<(), VirtioStateError> {
+        if self.device_state.is_activated() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "msb-vmgenid must be inactive during device-state restore",
+            ));
+        }
+        self.config = decode_generation_state(state)?;
+        // The wait handle is constructed with a fresh observation on the destination. Publish the
+        // restored request and acknowledgement before callers install or wait on another request.
+        self.publish_observation();
+        Ok(())
+    }
 }
 
 fn split_sequence(sequence: u64) -> [u32; 2] {
@@ -418,6 +445,95 @@ fn words_to_id(words: [u32; 4]) -> GenerationId {
         bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
     }
     GenerationId(bytes)
+}
+
+fn encode_generation_state(config: &VirtioGenerationConfig) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(GENERATION_STATE_BYTES);
+    bytes.extend_from_slice(GENERATION_STATE_MAGIC);
+    bytes.extend_from_slice(&GENERATION_STATE_SCHEMA.to_le_bytes());
+    for word in generation_config_words(config) {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes
+}
+
+fn decode_generation_state(state: &[u8]) -> Result<VirtioGenerationConfig, VirtioStateError> {
+    if state.len() != GENERATION_STATE_BYTES
+        || state.get(..GENERATION_STATE_MAGIC.len()) != Some(GENERATION_STATE_MAGIC)
+    {
+        return Err(VirtioStateError::Incompatible(
+            "invalid msb-vmgenid device-state framing".to_string(),
+        ));
+    }
+    let schema_offset = GENERATION_STATE_MAGIC.len();
+    let schema = u16::from_le_bytes(
+        state[schema_offset..schema_offset + std::mem::size_of::<u16>()]
+            .try_into()
+            .expect("generation state length was checked"),
+    );
+    if schema != GENERATION_STATE_SCHEMA {
+        return Err(VirtioStateError::Incompatible(format!(
+            "unsupported msb-vmgenid device-state schema {schema}"
+        )));
+    }
+
+    let mut words = [0_u32; GENERATION_CONFIG_WORDS];
+    let words_offset = schema_offset + std::mem::size_of::<u16>();
+    for (index, word) in words.iter_mut().enumerate() {
+        let offset = words_offset + index * CONFIG_WORD_SIZE;
+        let bytes = &state[offset..offset + CONFIG_WORD_SIZE];
+        *word = u32::from_le_bytes(
+            bytes
+                .try_into()
+                .expect("generation state words have fixed width"),
+        );
+    }
+    if words[0] != 1 {
+        return Err(VirtioStateError::Incompatible(format!(
+            "unsupported msb-vmgenid protocol version {}",
+            words[0]
+        )));
+    }
+    if words[1] & !(DRIVER_STATUS_READY | DRIVER_STATUS_ERROR) != 0 {
+        return Err(VirtioStateError::Incompatible(format!(
+            "invalid msb-vmgenid driver status {:#x}",
+            words[1]
+        )));
+    }
+
+    // Request and processed fields are independent guest-visible words. A stopped vCPU can be
+    // between acknowledgement writes, so preserve that exact intermediate state rather than
+    // imposing cross-field relationships that are not atomic in the protocol.
+
+    Ok(VirtioGenerationConfig {
+        version: words[0],
+        driver_status: words[1],
+        request_sequence_low: words[2],
+        request_sequence_high: words[3],
+        generation_id: [words[4], words[5], words[6], words[7]],
+        processed_sequence_low: words[8],
+        processed_sequence_high: words[9],
+        processed_id: [words[10], words[11], words[12], words[13]],
+    })
+}
+
+fn generation_config_words(config: &VirtioGenerationConfig) -> [u32; GENERATION_CONFIG_WORDS] {
+    [
+        config.version,
+        config.driver_status,
+        config.request_sequence_low,
+        config.request_sequence_high,
+        config.generation_id[0],
+        config.generation_id[1],
+        config.generation_id[2],
+        config.generation_id[3],
+        config.processed_sequence_low,
+        config.processed_sequence_high,
+        config.processed_id[0],
+        config.processed_id[1],
+        config.processed_id[2],
+        config.processed_id[3],
+    ]
 }
 
 #[cfg(test)]
@@ -546,5 +662,52 @@ mod tests {
         acknowledge(&mut device, sequence, id(9));
 
         assert_eq!(waiter.join().unwrap(), GenerationWaitOutcome::Processed);
+    }
+
+    #[test]
+    fn device_state_round_trip_preserves_protocol_and_tracker_state() {
+        let mut source = Generation::new().unwrap();
+        source.write_config(
+            CONFIG_DRIVER_STATUS_OFFSET,
+            &DRIVER_STATUS_READY.to_le_bytes(),
+        );
+        let sequence = source.install(id(10)).unwrap();
+        acknowledge(&mut source, sequence, id(10));
+        let encoded = source.capture_device_state().unwrap();
+
+        let mut restored = Generation::new().unwrap();
+        restored.validate_device_state(&encoded).unwrap();
+        restored.restore_device_state(&encoded).unwrap();
+
+        assert_eq!(restored.capture_device_state().unwrap(), encoded);
+        assert_eq!(restored.state_snapshot(), source.state_snapshot());
+        assert_eq!(restored.install(id(11)), Some(sequence + 1));
+    }
+
+    #[test]
+    fn device_state_rejects_bad_schema_truncation_and_trailing_bytes() {
+        let source = Generation::new().unwrap();
+        let encoded = source.capture_device_state().unwrap();
+
+        let mut bad_schema = encoded.clone();
+        bad_schema[GENERATION_STATE_MAGIC.len()
+            ..GENERATION_STATE_MAGIC.len() + std::mem::size_of::<u16>()]
+            .copy_from_slice(&(GENERATION_STATE_SCHEMA + 1).to_le_bytes());
+        assert!(source.validate_device_state(&bad_schema).is_err());
+        assert!(source
+            .validate_device_state(&encoded[..encoded.len() - 1])
+            .is_err());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(source.validate_device_state(&trailing).is_err());
+
+        let mut unknown_driver_status = source.capture_device_state().unwrap();
+        let driver_status_offset =
+            GENERATION_STATE_MAGIC.len() + std::mem::size_of::<u16>() + CONFIG_WORD_SIZE;
+        unknown_driver_status[driver_status_offset..driver_status_offset + CONFIG_WORD_SIZE]
+            .copy_from_slice(&4_u32.to_le_bytes());
+        assert!(source
+            .validate_device_state(&unknown_driver_status)
+            .is_err());
     }
 }

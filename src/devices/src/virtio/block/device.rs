@@ -1247,8 +1247,8 @@ impl Block {
 
     /// Validates saved block identity and policy without mutating the device.
     ///
-    /// Negotiated features belong to the generic transport envelope and are applied only after
-    /// every block and transport field has passed validation.
+    /// A destination may implement more features than the source offered, but it must implement
+    /// every saved feature before the source contract can be restored.
     pub fn validate_state(&self, state: &BlockState) -> Result<(), VirtioStateError> {
         if state.version != BLOCK_STATE_VERSION {
             return Err(VirtioStateError::Incompatible(format!(
@@ -1265,15 +1265,28 @@ impl Block {
             || self.partuuid != state.partuuid
             || self.config.capacity != state.capacity_sectors
             || self.disk_image_id != state.disk_image_id
-            || self.avail_features != state.avail_features
             || self.cache_type != state.cache_type
             || self.is_read_only() != state.read_only
         {
             return Err(VirtioStateError::Incompatible(
-                "saved block identity, capacity, features, or cache policy differs from the destination"
+                "saved block identity, capacity, or cache policy differs from the destination"
                     .to_string(),
             ));
         }
+        if state.avail_features & !self.avail_features != 0 {
+            return Err(VirtioStateError::Incompatible(
+                "saved block features are unavailable on the destination".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Restores the exact guest-visible feature contract after compatibility validation.
+    pub fn restore_state(&mut self, state: &BlockState) -> Result<(), VirtioStateError> {
+        self.validate_state(state)?;
+        // Destination-only features must remain hidden from the restored guest. The driver may
+        // reread feature pages after resume, and a reset must not silently widen its device ABI.
+        self.avail_features = state.avail_features;
         Ok(())
     }
 }
@@ -1703,6 +1716,62 @@ mod tests {
         assert!(!block.disk.as_ref().unwrap().has_writeback_limit());
         std::fs::remove_file(original).unwrap();
         std::fs::remove_file(replacement).unwrap();
+    }
+
+    #[test]
+    fn restore_masks_destination_only_block_features() {
+        let image = temp_image_path("restore-feature-superset");
+        let file = File::create(&image).unwrap();
+        file.set_len(4 * 1024 * 1024).unwrap();
+        drop(file);
+        let mut block = Block::new(
+            "vdb".to_string(),
+            None,
+            CacheType::Writeback,
+            image.to_string_lossy().into_owned(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            MetricsWriter::default().register_block_device("vdb".to_string()),
+        )
+        .unwrap();
+        let destination_features = block.avail_features;
+        let mut saved = block.capture_state().unwrap();
+        saved.avail_features &= !(1u64 << VIRTIO_BLK_F_DISCARD);
+
+        assert_ne!(destination_features, saved.avail_features);
+        block.restore_state(&saved).unwrap();
+        assert_eq!(block.avail_features, saved.avail_features);
+        std::fs::remove_file(image).unwrap();
+    }
+
+    #[test]
+    fn restore_rejects_block_features_missing_on_destination() {
+        let image = temp_image_path("restore-feature-missing");
+        let file = File::create(&image).unwrap();
+        file.set_len(4 * 1024 * 1024).unwrap();
+        drop(file);
+        let mut block = Block::new(
+            "vdb".to_string(),
+            None,
+            CacheType::Writeback,
+            image.to_string_lossy().into_owned(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            MetricsWriter::default().register_block_device("vdb".to_string()),
+        )
+        .unwrap();
+        let destination_features = block.avail_features;
+        let mut saved = block.capture_state().unwrap();
+        saved.avail_features |= 1u64 << 63;
+
+        let error = block.restore_state(&saved).unwrap_err();
+        assert!(error.to_string().contains("unavailable on the destination"));
+        assert_eq!(block.avail_features, destination_features);
+        std::fs::remove_file(image).unwrap();
     }
 
     #[cfg(not(target_os = "linux"))]

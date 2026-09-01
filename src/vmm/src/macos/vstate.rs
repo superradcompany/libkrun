@@ -963,6 +963,7 @@ impl Vcpu {
 
     fn handle_control_event(&mut self, hvf_vcpu: &mut HvfVcpu, event: VcpuEvent) -> bool {
         match event {
+            VcpuEvent::Terminate => false,
             VcpuEvent::Pause { request_id } => {
                 self.response_sender
                     .send(VcpuResponse::Paused { request_id })
@@ -995,6 +996,7 @@ impl Vcpu {
     fn wait_for_resume(&mut self, hvf_vcpu: &mut HvfVcpu) -> bool {
         loop {
             match self.event_receiver.recv() {
+                Ok(VcpuEvent::Terminate) => return false,
                 Ok(VcpuEvent::Resume { request_id }) => {
                     self.response_sender
                         .send(VcpuResponse::Resumed { request_id })
@@ -1075,6 +1077,8 @@ impl Drop for Vcpu {
 #[derive(Debug)]
 /// List of events that the Vcpu can receive.
 pub enum VcpuEvent {
+    /// Stop the vCPU thread without reporting a guest exit.
+    Terminate,
     /// Pause the Vcpu.
     Pause {
         /// Correlates this command with its acknowledgement.
@@ -1135,7 +1139,7 @@ pub struct VcpuHandle {
     hvf_vcpuid: u64,
     event_sender: Sender<VcpuEvent>,
     response_receiver: Receiver<VcpuResponse>,
-    _vcpu_thread: thread::JoinHandle<()>,
+    vcpu_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl VcpuHandle {
@@ -1149,12 +1153,12 @@ impl VcpuHandle {
             hvf_vcpuid,
             event_sender,
             response_receiver,
-            _vcpu_thread: vcpu_thread,
+            vcpu_thread: Some(vcpu_thread),
         }
     }
 
     pub fn send_event(&self, event: VcpuEvent) -> Result<()> {
-        let should_interrupt = matches!(event, VcpuEvent::Pause { .. });
+        let should_interrupt = matches!(event, VcpuEvent::Pause { .. } | VcpuEvent::Terminate);
         // Use expect() to crash if the other thread closed this channel.
         self.event_sender
             .send(event)
@@ -1171,6 +1175,18 @@ impl VcpuHandle {
 
     pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
         &self.response_receiver
+    }
+}
+
+impl Drop for VcpuHandle {
+    fn drop(&mut self) {
+        // Restore/startup failure can unwind while the vCPU is at the initial pause boundary or
+        // running in HVF. Explicit termination avoids detaching a thread that still owns a vCPU.
+        let _ = self.event_sender.send(VcpuEvent::Terminate);
+        let _ = self.kick();
+        if let Some(thread) = self.vcpu_thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -1627,5 +1643,54 @@ mod tests {
         assert!(vcpu.init_thread_local_data().is_err());
         assert!(vcpu.reset_thread_local_data().is_ok());
         assert!(vcpu.reset_thread_local_data().is_err());
+    }
+
+    fn fake_vcpu_handle(paused: bool) -> (VcpuHandle, Receiver<()>) {
+        let (event_sender, event_receiver) = unbounded();
+        let (_response_sender, response_receiver) = unbounded();
+        let (ready_sender, ready_receiver) = unbounded();
+        let (stopped_sender, stopped_receiver) = unbounded();
+        let vcpu_thread = thread::spawn(move || {
+            ready_sender.send(()).unwrap();
+            if paused {
+                assert!(matches!(event_receiver.recv(), Ok(VcpuEvent::Terminate)));
+            } else {
+                loop {
+                    match event_receiver.try_recv() {
+                        Ok(VcpuEvent::Terminate) => break,
+                        Ok(_) | Err(crossbeam_channel::TryRecvError::Empty) => {
+                            thread::yield_now();
+                        }
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            panic!("vCPU control channel disconnected before termination")
+                        }
+                    }
+                }
+            }
+            stopped_sender.send(()).unwrap();
+        });
+        ready_receiver.recv().unwrap();
+        (
+            VcpuHandle::new(u64::MAX, event_sender, response_receiver, vcpu_thread),
+            stopped_receiver,
+        )
+    }
+
+    #[test]
+    fn failed_startup_unwind_terminates_initially_paused_vcpu() {
+        let (handle, stopped) = fake_vcpu_handle(true);
+
+        drop(handle);
+
+        assert_eq!(stopped.recv_timeout(Duration::from_secs(1)), Ok(()));
+    }
+
+    #[test]
+    fn failed_restore_unwind_terminates_running_vcpu() {
+        let (handle, stopped) = fake_vcpu_handle(false);
+
+        drop(handle);
+
+        assert_eq!(stopped.recv_timeout(Duration::from_secs(1)), Ok(()));
     }
 }
