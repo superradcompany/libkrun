@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::io;
 use std::result;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -117,6 +117,16 @@ pub type Result<T> = result::Result<T, Error>;
 pub struct Vm {
     hvf_vm: HvfVm,
     dirty_tracker: Arc<HvfDirtyTracker>,
+    restore_counter_displacement: AtomicU64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct MacVmExecutionState {
+    magic: [u8; 8],
+    counter: u64,
+    timebase_numer: u32,
+    timebase_denom: u32,
+    gic: Vec<u8>,
 }
 
 pub(crate) struct HvfDirtyTracker {
@@ -134,6 +144,7 @@ impl Vm {
         let page_size = host_page_size()?;
         Ok(Vm {
             hvf_vm,
+            restore_counter_displacement: AtomicU64::new(0),
             dirty_tracker: Arc::new(HvfDirtyTracker {
                 regions: Mutex::new(Vec::new()),
                 dirty_pages: Mutex::new(BTreeSet::new()),
@@ -197,14 +208,47 @@ impl Vm {
         self.dirty_tracker.stop()
     }
 
-    /// Captures the process-wide in-kernel interrupt-controller state.
+    /// Captures the VM-wide counter reference and in-kernel interrupt-controller state.
     pub fn capture_execution_state(&self) -> Result<Vec<u8>> {
-        self.hvf_vm.capture_gic_state().map_err(Error::VmSetup)
+        let (numer, denom) = hvf::counter_timebase()
+            .ok_or_else(|| Error::StateCodec("HVF counter frequency unavailable".into()))?;
+        let state = MacVmExecutionState {
+            magic: *b"MSBTIME1",
+            counter: unsafe { hvf::mach_absolute_time() },
+            timebase_numer: numer,
+            timebase_denom: denom,
+            gic: self.hvf_vm.capture_gic_state().map_err(Error::VmSetup)?,
+        };
+        bincode::serde::encode_to_vec(state, bincode::config::standard())
+            .map_err(|error| Error::StateCodec(error.to_string()))
     }
 
-    /// Restores the process-wide in-kernel interrupt-controller state.
+    /// Restores the interrupt controller and establishes one counter displacement for all vCPUs.
     pub fn restore_execution_state(&self, bytes: &[u8]) -> Result<()> {
-        self.hvf_vm.restore_gic_state(bytes).map_err(Error::VmSetup)
+        let (state, consumed): (MacVmExecutionState, usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|error| Error::StateCodec(error.to_string()))?;
+        let (numer, denom) = hvf::counter_timebase()
+            .ok_or_else(|| Error::StateCodec("HVF counter frequency unavailable".into()))?;
+        if consumed != bytes.len()
+            || state.magic != *b"MSBTIME1"
+            || state.timebase_numer != numer
+            || state.timebase_denom != denom
+        {
+            return Err(Error::StateCodec(
+                "incompatible HVF counter state or frequency".into(),
+            ));
+        }
+        self.hvf_vm
+            .restore_gic_state(&state.gic)
+            .map_err(Error::VmSetup)?;
+        // One displacement for the entire VM, not separately sampled per vCPU. Different
+        // offsets would make the shared ARM clocksource jump when a task changes CPUs.
+        self.restore_counter_displacement.store(
+            unsafe { hvf::mach_absolute_time() }.wrapping_sub(state.counter),
+            Ordering::Relaxed,
+        );
+        Ok(())
     }
 
     /// Completes a vCPU artifact on the VMM controller thread.
@@ -214,7 +258,17 @@ impl Vm {
 
     /// Prepares a vCPU artifact for restoration on its owning thread.
     pub fn prepare_vcpu_execution_restore(&self, _id: u32, bytes: &[u8]) -> Result<Vec<u8>> {
-        Ok(bytes.to_vec())
+        let (mut state, consumed): (MacVcpuExecutionState, usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|error| Error::StateCodec(error.to_string()))?;
+        if consumed != bytes.len() {
+            return Err(Error::StateCodec("trailing HVF vCPU state".into()));
+        }
+        state
+            .hvf
+            .rebase_timer_offset(self.restore_counter_displacement.load(Ordering::Relaxed));
+        bincode::serde::encode_to_vec(state, bincode::config::standard())
+            .map_err(|error| Error::StateCodec(error.to_string()))
     }
 
     pub fn add_mapping(

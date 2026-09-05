@@ -225,6 +225,9 @@ pub struct VmGenerationState {
     /// Whether the guest driver rejected the device protocol.
     pub driver_error: bool,
 
+    /// Whether the bound guest kernel can correct wall time before activation acknowledgement.
+    pub clock_sync_supported: bool,
+
     /// Request currently published by the host, if one has been installed.
     pub requested: Option<VmGenerationRequest>,
 
@@ -244,6 +247,9 @@ pub enum VmGenerationWaitOutcome {
 
     /// The deadline elapsed without an exact acknowledgement.
     TimedOut,
+
+    /// The guest kernel rejected activation without acknowledging it.
+    Failed,
 }
 
 /// Point-in-time CPU sizing of a running VM as seen through [`VmControl`].
@@ -1701,6 +1707,19 @@ impl VmControl {
         Some(VmGenerationRequest { sequence, id })
     }
 
+    /// Publish one identity-and-clock activation; unsupported guest kernels return `None`.
+    ///
+    /// The guest reads fresh host time during processing, not the time when this request was
+    /// installed. A processed acknowledgement covers both the identity and the clock update.
+    pub fn install_vm_generation_and_clock(
+        &self,
+        id: VmGenerationId,
+    ) -> Option<VmGenerationRequest> {
+        let generation = self.generation.as_ref()?;
+        let sequence = generation.lock().unwrap().install_with_clock(id)?;
+        Some(VmGenerationRequest { sequence, id })
+    }
+
     /// Wait without polling for the guest kernel to process one exact generation request.
     pub fn wait_vm_generation_processed(
         &self,
@@ -1716,6 +1735,7 @@ impl VmControl {
                 VmGenerationWaitOutcome::Superseded
             }
             devices::virtio::GenerationWaitOutcome::TimedOut => VmGenerationWaitOutcome::TimedOut,
+            devices::virtio::GenerationWaitOutcome::Failed => VmGenerationWaitOutcome::Failed,
         })
     }
 
@@ -1726,6 +1746,7 @@ impl VmControl {
         Some(VmGenerationState {
             driver_ready: snapshot.driver_ready,
             driver_error: snapshot.driver_error,
+            clock_sync_supported: snapshot.clock_sync_supported,
             requested: (snapshot.request_sequence != 0).then_some(VmGenerationRequest {
                 sequence: snapshot.request_sequence,
                 id: snapshot.requested_id,

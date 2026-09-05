@@ -1,7 +1,8 @@
 use std::cmp;
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use utils::eventfd::EventFd;
 use vm_memory::{ByteValued, GuestMemoryMmap};
@@ -21,9 +22,12 @@ const CONFIG_PROCESSED_ID_OFFSET: u64 = 40;
 const CONFIG_WORD_SIZE: usize = 4;
 const DRIVER_STATUS_READY: u32 = 1;
 const DRIVER_STATUS_ERROR: u32 = 2;
+const DRIVER_STATUS_CLOCK: u32 = 4;
+const REQUEST_SYNC_CLOCK: u32 = 1;
+const CONFIG_CLOCK_LOW_OFFSET: u64 = 60;
 const GENERATION_STATE_MAGIC: &[u8; 8] = b"MSBVGID\0";
 const GENERATION_STATE_SCHEMA: u16 = 1;
-const GENERATION_CONFIG_WORDS: usize = 14;
+const GENERATION_CONFIG_WORDS: usize = 17;
 const GENERATION_STATE_BYTES: usize = GENERATION_STATE_MAGIC.len()
     + std::mem::size_of::<u16>()
     + GENERATION_CONFIG_WORDS * CONFIG_WORD_SIZE;
@@ -59,6 +63,9 @@ pub struct GenerationStateSnapshot {
     /// Whether the guest driver rejected the device protocol.
     pub driver_error: bool,
 
+    /// The bound kernel supports clock correction before activation acknowledgement.
+    pub clock_sync_supported: bool,
+
     /// Sequence of the request currently published by the host.
     pub request_sequence: u64,
 
@@ -83,6 +90,9 @@ pub enum GenerationWaitOutcome {
 
     /// The deadline elapsed before the exact request was acknowledged.
     TimedOut,
+
+    /// The kernel reported an activation failure without acknowledging the request.
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -96,6 +106,9 @@ struct VirtioGenerationConfig {
     processed_sequence_low: u32,
     processed_sequence_high: u32,
     processed_id: [u32; 4],
+    request_flags: u32,
+    clock_low: u32,
+    clock_high: u32,
 }
 
 // Safe because every field is a u32 and the C layout therefore has no implicit padding.
@@ -129,6 +142,9 @@ pub struct Generation {
     device_state: DeviceState,
     config: VirtioGenerationConfig,
     tracker: Arc<GenerationTracker>,
+    // Low-word reads latch host time; high-word reads use that exact sample, even at rollover.
+    // This observation is not checkpoint state and is never restored from an artifact.
+    clock_sample: AtomicU64,
 }
 
 impl Generation {
@@ -149,6 +165,7 @@ impl Generation {
             device_state: DeviceState::Inactive,
             config,
             tracker,
+            clock_sample: AtomicU64::new(0),
         })
     }
 
@@ -161,10 +178,28 @@ impl Generation {
     /// The caller supplies the identifier from its operating-system CSPRNG. The returned sequence
     /// identifies this request when waiting for the guest kernel acknowledgement.
     pub fn install(&mut self, id: GenerationId) -> Option<u64> {
+        self.install_request(id, 0)
+    }
+
+    /// Install one activation requiring both identity processing and kernel wall-clock correction.
+    pub fn install_with_clock(&mut self, id: GenerationId) -> Option<u64> {
+        if self.config.driver_status & (DRIVER_STATUS_READY | DRIVER_STATUS_CLOCK)
+            != DRIVER_STATUS_READY | DRIVER_STATUS_CLOCK
+            || self.config.driver_status & DRIVER_STATUS_ERROR != 0
+        {
+            return None;
+        }
+        self.install_request(id, REQUEST_SYNC_CLOCK)
+    }
+
+    fn install_request(&mut self, id: GenerationId, flags: u32) -> Option<u64> {
         // A retry of one restore attempt reuses both its persisted identifier and its device-local
         // sequence. Re-signal it instead of manufacturing a second logical request or reseeding
         // the guest twice with the same attempt value.
-        if self.request_sequence() != 0 && words_to_id(self.config.generation_id) == id {
+        if self.request_sequence() != 0
+            && words_to_id(self.config.generation_id) == id
+            && self.config.request_flags == flags
+        {
             if let DeviceState::Activated(_, ref interrupt) = self.device_state {
                 interrupt.signal_config_change();
             }
@@ -174,6 +209,7 @@ impl Generation {
         let sequence = self.request_sequence().checked_add(1)?;
         let [low, high] = split_sequence(sequence);
         self.config.generation_id = id_to_words(id);
+        self.config.request_flags = flags;
         self.config.request_sequence_high = high;
         self.config.request_sequence_low = low;
         self.publish_observation();
@@ -207,6 +243,7 @@ impl Generation {
         let state = GenerationStateSnapshot {
             driver_ready: self.config.driver_status & DRIVER_STATUS_READY != 0,
             driver_error: self.config.driver_status & DRIVER_STATUS_ERROR != 0,
+            clock_sync_supported: self.config.driver_status & DRIVER_STATUS_CLOCK != 0,
             request_sequence: self.request_sequence(),
             requested_id: words_to_id(self.config.generation_id),
             processed_sequence: join_sequence(
@@ -255,6 +292,9 @@ impl GenerationProcessingHandle {
             let state = observation.state;
             if state.request_sequence != sequence || state.requested_id != id {
                 return GenerationWaitOutcome::Superseded;
+            }
+            if state.driver_error {
+                return GenerationWaitOutcome::Failed;
             }
             if state.processed_sequence == sequence && state.processed_id == id {
                 return GenerationWaitOutcome::Processed;
@@ -306,7 +346,21 @@ impl VirtioDevice for Generation {
     }
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
-        let config = self.config.as_slice();
+        let mut sampled = self.config;
+        if offset <= CONFIG_CLOCK_LOW_OFFSET
+            && offset.saturating_add(data.len() as u64) > CONFIG_CLOCK_LOW_OFFSET
+        {
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+                .unwrap_or(0);
+            self.clock_sample.store(now, Ordering::Relaxed);
+        }
+        let [low, high] = split_sequence(self.clock_sample.load(Ordering::Relaxed));
+        sampled.clock_low = low;
+        sampled.clock_high = high;
+        let config = sampled.as_slice();
         let config_len = config.len() as u64;
         if offset >= config_len {
             error!("virtio-msb-vmgenid: failed to read config space");
@@ -494,11 +548,16 @@ fn decode_generation_state(state: &[u8]) -> Result<VirtioGenerationConfig, Virti
             words[0]
         )));
     }
-    if words[1] & !(DRIVER_STATUS_READY | DRIVER_STATUS_ERROR) != 0 {
+    if words[1] & !(DRIVER_STATUS_READY | DRIVER_STATUS_ERROR | DRIVER_STATUS_CLOCK) != 0 {
         return Err(VirtioStateError::Incompatible(format!(
             "invalid msb-vmgenid driver status {:#x}",
             words[1]
         )));
+    }
+    if words[14] & !REQUEST_SYNC_CLOCK != 0 || words[15] != 0 || words[16] != 0 {
+        return Err(VirtioStateError::Incompatible(
+            "invalid msb-vmgenid clock state".into(),
+        ));
     }
 
     // Request and processed fields are independent guest-visible words. A stopped vCPU can be
@@ -514,6 +573,9 @@ fn decode_generation_state(state: &[u8]) -> Result<VirtioGenerationConfig, Virti
         processed_sequence_low: words[8],
         processed_sequence_high: words[9],
         processed_id: [words[10], words[11], words[12], words[13]],
+        request_flags: words[14],
+        clock_low: 0,
+        clock_high: 0,
     })
 }
 
@@ -533,6 +595,9 @@ fn generation_config_words(config: &VirtioGenerationConfig) -> [u32; GENERATION_
         config.processed_id[1],
         config.processed_id[2],
         config.processed_id[3],
+        config.request_flags,
+        0,
+        0,
     ]
 }
 
@@ -542,6 +607,66 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn clock_activation_requires_capability_and_waits_for_kernel_completion() {
+        let mut device = Generation::new().unwrap();
+        assert!(device.install_with_clock(id(8)).is_none());
+        device.write_config(
+            CONFIG_DRIVER_STATUS_OFFSET,
+            &(DRIVER_STATUS_READY | DRIVER_STATUS_CLOCK).to_le_bytes(),
+        );
+        let sequence = device.install_with_clock(id(8)).unwrap();
+        assert_eq!(device.install_with_clock(id(8)), Some(sequence));
+        let wait = device.processing_handle();
+        assert_eq!(
+            wait.wait_processed(sequence, id(8), Duration::ZERO),
+            GenerationWaitOutcome::TimedOut
+        );
+        acknowledge(&mut device, sequence, id(8));
+        assert_eq!(
+            wait.wait_processed(sequence, id(8), Duration::ZERO),
+            GenerationWaitOutcome::Processed
+        );
+        device.write_config(
+            CONFIG_DRIVER_STATUS_OFFSET,
+            &(DRIVER_STATUS_READY | DRIVER_STATUS_CLOCK | DRIVER_STATUS_ERROR).to_le_bytes(),
+        );
+        assert_eq!(
+            wait.wait_processed(sequence, id(8), Duration::ZERO),
+            GenerationWaitOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn host_time_is_latched_and_not_captured_as_checkpoint_time() {
+        let device = Generation::new().unwrap();
+        let before = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let mut low = [0; 4];
+        let mut high = [0; 4];
+        device.read_config(CONFIG_CLOCK_LOW_OFFSET, &mut low);
+        device.read_config(CONFIG_CLOCK_LOW_OFFSET + 4, &mut high);
+        let sample = join_sequence(u32::from_le_bytes(low), u32::from_le_bytes(high));
+        let after = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        assert!((before..=after).contains(&sample));
+        let state = decode_generation_state(&device.capture_device_state().unwrap()).unwrap();
+        assert_eq!((state.clock_low, state.clock_high), (0, 0));
+        device
+            .clock_sample
+            .store(0x1234_5678_ffff_ffff, Ordering::Relaxed);
+        device.read_config(CONFIG_CLOCK_LOW_OFFSET + 4, &mut high);
+        assert_eq!(u32::from_le_bytes(high), 0x1234_5678);
+        let old_length = GENERATION_STATE_MAGIC.len() + 2 + 14 * 4;
+        assert!(
+            decode_generation_state(&device.capture_device_state().unwrap()[..old_length]).is_err()
+        );
+    }
 
     fn id(byte: u8) -> GenerationId {
         GenerationId::new([byte; 16])
@@ -705,7 +830,7 @@ mod tests {
         let driver_status_offset =
             GENERATION_STATE_MAGIC.len() + std::mem::size_of::<u16>() + CONFIG_WORD_SIZE;
         unknown_driver_status[driver_status_offset..driver_status_offset + CONFIG_WORD_SIZE]
-            .copy_from_slice(&4_u32.to_le_bytes());
+            .copy_from_slice(&8_u32.to_le_bytes());
         assert!(source
             .validate_device_state(&unknown_driver_status)
             .is_err());

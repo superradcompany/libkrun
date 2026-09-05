@@ -355,6 +355,13 @@ fn mach_absolute_time_to_ns(ticks: u64) -> u64 {
     ns.min(u128::from(u64::MAX)) as u64
 }
 
+/// Host virtual-counter tick ratio, checked rather than defaulted for execution-state admission.
+pub fn counter_timebase() -> Option<(u32, u32)> {
+    let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
+    let ret = unsafe { mach_timebase_info(&mut info) };
+    (ret == 0 && info.numer != 0 && info.denom != 0).then_some((info.numer, info.denom))
+}
+
 pub fn vcpu_set_pending_irq(
     vcpuid: u64,
     irq_type: InterruptType,
@@ -599,6 +606,12 @@ pub struct HvfVcpuState {
 }
 
 impl HvfVcpuState {
+    /// Rebase the saved virtual counter by the VM-wide host-counter displacement.
+    /// Every vCPU must receive the same displacement before any of them resumes.
+    pub fn rebase_timer_offset(&mut self, displacement: u64) {
+        self.vtimer_offset = self.vtimer_offset.wrapping_add(displacement);
+    }
+
     fn has_register_topology(&self, nested_enabled: bool) -> bool {
         self.nested_enabled == nested_enabled
             && self
@@ -1317,6 +1330,19 @@ mod tests {
             pending_advance_pc: false,
             nested_enabled,
         }
+    }
+
+    #[test]
+    fn timer_rebase_uses_the_same_wrapping_displacement_for_every_vcpu() {
+        let mut first = state(false);
+        let mut second = state(false);
+        first.vtimer_offset = 9;
+        second.vtimer_offset = 9;
+        let displacement = u64::MAX - 3;
+        first.rebase_timer_offset(displacement);
+        second.rebase_timer_offset(displacement);
+        assert_eq!(first.vtimer_offset, 5);
+        assert_eq!(first.vtimer_offset, second.vtimer_offset);
     }
 
     #[test]

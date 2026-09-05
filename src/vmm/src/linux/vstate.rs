@@ -983,7 +983,9 @@ impl Vm {
     pub fn save_state(&self, split_irqchip: bool) -> Result<VmState> {
         let mut clock = self.fd.get_clock().map_err(Error::VmGetClock)?;
         // This bit is not accepted in SET_CLOCK, clear it.
-        clock.flags &= !KVM_CLOCK_TSC_STABLE;
+        // Planned interruption freezes virtual elapsed time. SET_CLOCK must not add host
+        // downtime through REALTIME; wall time is reconciled separately by kernel activation.
+        clock.flags &= !(KVM_CLOCK_TSC_STABLE | kvm_bindings::KVM_CLOCK_REALTIME);
 
         if split_irqchip {
             return Ok(VmState::SplitIrqchip { clock });
