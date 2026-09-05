@@ -6,7 +6,7 @@ use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemory
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, HostMemoryRange, MemError,
-    QueueConfig, VirtioDevice,
+    QueueConfig, VirtioDevice, VirtioStateError,
 };
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
@@ -421,5 +421,31 @@ impl VirtioDevice for Mem {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    fn reset(&mut self) -> bool {
+        self.queues = None;
+        self.device_state = DeviceState::Inactive;
+        true
+    }
+
+    fn supports_quiesce(&self) -> bool {
+        true
+    }
+
+    fn quiesce(&mut self) -> Result<Vec<DeviceQueue>, VirtioStateError> {
+        if !self.device_state.is_activated() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "virtio-mem must be activated before quiescence",
+            ));
+        }
+        let queues = self
+            .queues
+            .take()
+            .ok_or(VirtioStateError::InvalidLifecycle(
+                "virtio-mem is activated without queues",
+            ))?;
+        self.device_state = DeviceState::Inactive;
+        Ok(queues)
     }
 }

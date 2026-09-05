@@ -9,7 +9,7 @@ use vm_memory::{Address, ByteValued, GuestMemoryBackend, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, BalloonError, DeviceQueue, DeviceState, HostMemoryRange,
-    QueueConfig, VirtioDevice,
+    QueueConfig, VirtioDevice, VirtioStateError,
 };
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
@@ -246,5 +246,38 @@ impl VirtioDevice for Balloon {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    fn reset(&mut self) -> bool {
+        self.stats_desc_index = None;
+        let _ = self.stats_timer.disarm();
+        self.queues = None;
+        self.device_state = DeviceState::Inactive;
+        true
+    }
+
+    fn supports_quiesce(&self) -> bool {
+        true
+    }
+
+    fn quiesce(&mut self) -> Result<Vec<DeviceQueue>, VirtioStateError> {
+        if !self.device_state.is_activated() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "balloon must be activated before quiescence",
+            ));
+        }
+
+        // The stats queue deliberately retains one consumed descriptor between samples. Return it
+        // through the used ring so the captured queue satisfies consumed-or-terminal ownership.
+        self.trigger_stats_update();
+        self.stats_timer.disarm()?;
+        let queues = self
+            .queues
+            .take()
+            .ok_or(VirtioStateError::InvalidLifecycle(
+                "balloon is activated without queues",
+            ))?;
+        self.device_state = DeviceState::Inactive;
+        Ok(queues)
     }
 }

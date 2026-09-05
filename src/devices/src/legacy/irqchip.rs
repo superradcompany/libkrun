@@ -1,5 +1,8 @@
 use std::sync::{Arc, Mutex};
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use kvm_ioctls::VmFd;
+
 use crate::bus::BusDevice;
 #[cfg(target_arch = "riscv64")]
 use crate::legacy::aia::AIADevice;
@@ -39,6 +42,28 @@ impl IrqChipDevice {
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError> {
         self.inner.set_irq(irq_line, interrupt_evt)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    /// Capture state owned by a userspace interrupt controller, if present.
+    pub fn capture_state(&self) -> Result<Option<Vec<u8>>, DeviceError> {
+        self.inner.capture_state()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    /// Restore state owned by a userspace interrupt controller, if present.
+    pub fn restore_state(&mut self, state: Option<&[u8]>) -> Result<(), DeviceError> {
+        self.inner.restore_state(state)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    /// Restore userspace interrupt-controller state before the VMM worker is available.
+    pub fn restore_state_before_activation(
+        &mut self,
+        state: Option<&[u8]>,
+        vm: &VmFd,
+    ) -> Result<(), DeviceError> {
+        self.inner.restore_state_before_activation(state, vm)
     }
 }
 
@@ -127,6 +152,35 @@ pub trait IrqChipT: BusDevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+
+    /// Capture state owned by a userspace interrupt controller.
+    ///
+    /// In-kernel interrupt controllers return `None`; their state belongs to the hypervisor VM
+    /// payload instead.
+    fn capture_state(&self) -> Result<Option<Vec<u8>>, DeviceError> {
+        Ok(None)
+    }
+
+    /// Restore state owned by a userspace interrupt controller.
+    fn restore_state(&mut self, state: Option<&[u8]>) -> Result<(), DeviceError> {
+        if state.is_some() {
+            return Err(DeviceError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "in-kernel interrupt controller received userspace state",
+            )));
+        }
+        Ok(())
+    }
+
+    /// Restore state while the VMM is still under construction and no IRQ worker is running.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn restore_state_before_activation(
+        &mut self,
+        state: Option<&[u8]>,
+        _vm: &VmFd,
+    ) -> Result<(), DeviceError> {
+        self.restore_state(state)
+    }
 }
 
 #[cfg(target_arch = "aarch64")]

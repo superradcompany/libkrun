@@ -7,6 +7,7 @@ pub mod fuse;
 mod multikey;
 #[cfg_attr(target_os = "windows", allow(dead_code))]
 mod server;
+mod state;
 mod worker;
 
 #[cfg(target_os = "linux")]

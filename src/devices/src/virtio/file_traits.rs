@@ -740,7 +740,7 @@ mod tests {
 
         let raw = Raw::<Box<dyn DynStorage>>::open_path_sync(&path, true).unwrap();
         let disk_image = Arc::new(Mutex::new(SyncFormatAccess::new(raw).unwrap()));
-        let disk = DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe).unwrap();
+        let disk = DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe, false).unwrap();
 
         let mem: GuestMemoryMmap<()> =
             GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
@@ -769,7 +769,7 @@ mod tests {
 
         let raw = Raw::<Box<dyn DynStorage>>::open_path_sync(&path, true).unwrap();
         let disk_image = Arc::new(Mutex::new(SyncFormatAccess::new(raw).unwrap()));
-        let disk = DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe).unwrap();
+        let disk = DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe, false).unwrap();
 
         let mem: GuestMemoryMmap<()> =
             GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
@@ -931,7 +931,7 @@ mod tests {
             })
             .unwrap();
         let disk_image = Arc::new(Mutex::new(SyncFormatAccess::new(qcow2).unwrap()));
-        DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe).unwrap()
+        DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe, false).unwrap()
     }
 
     fn create_vmdk_disk(path: &std::path::Path) -> DiskProperties {
@@ -939,7 +939,7 @@ mod tests {
             .open_sync(PermissiveImplicitOpenGate::default())
             .unwrap();
         let disk_image = Arc::new(Mutex::new(SyncFormatAccess::new(vmdk).unwrap()));
-        DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe).unwrap()
+        DiskProperties::new(disk_image, Vec::new(), CacheType::Unsafe, false).unwrap()
     }
 
     fn temp_image_path(test_name: &str) -> std::path::PathBuf {

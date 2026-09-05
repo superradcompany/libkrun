@@ -389,6 +389,27 @@ pub trait FileSystem {
     /// Represents a file or directory that is open for reading/writing.
     type Handle: From<u64> + Into<u64>;
 
+    /// Capture portable backend state after request processing has quiesced.
+    fn capture_state(&self) -> io::Result<Vec<u8>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "filesystem backend does not support durable state",
+        ))
+    }
+
+    /// Validate portable backend state without mutating this backend.
+    fn validate_state(&self, _state: &[u8]) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "filesystem backend does not support durable state",
+        ))
+    }
+
+    /// Restore validated backend state before request processing resumes.
+    fn restore_state(&self, state: &[u8]) -> io::Result<()> {
+        self.validate_state(state)
+    }
+
     /// Initialize the file system.
     ///
     /// This method is called when a connection to the FUSE kernel module is first established. The

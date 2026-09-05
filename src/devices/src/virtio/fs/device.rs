@@ -3,7 +3,7 @@ use crossbeam_channel::Sender;
 use std::cmp;
 use std::io::Write;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
@@ -16,7 +16,9 @@ use super::super::{
     ActivateResult, DeviceQueue, DeviceState, FsError, QueueConfig, VirtioDevice, VirtioShmRegion,
 };
 use super::dyn_filesystem::{DynFileSystem, DynFileSystemAdapter};
+use super::filesystem::{FileSystem, FsOptions};
 use super::passthrough::{self, PassthroughFs};
+use super::state::FsDeviceState;
 use super::worker::FsWorker;
 use super::ExportTable;
 use super::{defs, defs::uapi};
@@ -41,7 +43,10 @@ impl Default for VirtioFsConfig {
 unsafe impl ByteValued for VirtioFsConfig {}
 
 enum FsBackend {
-    Passthrough(passthrough::Config),
+    Passthrough {
+        config: passthrough::Config,
+        filesystem: OnceLock<Arc<PassthroughFs>>,
+    },
     Custom(Arc<dyn DynFileSystem>),
 }
 
@@ -52,7 +57,8 @@ pub struct Fs {
     config: VirtioFsConfig,
     shm_region: Option<VirtioShmRegion>,
     backend: FsBackend,
-    worker_thread: Option<JoinHandle<()>>,
+    session_options: u64,
+    worker_thread: Option<JoinHandle<super::worker::FsWorkerState>>,
     worker_stopfd: EventFd,
     exit_code: Arc<AtomicI32>,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -85,7 +91,11 @@ impl Fs {
             device_state: DeviceState::Inactive,
             config,
             shm_region: None,
-            backend: FsBackend::Passthrough(fs_cfg),
+            backend: FsBackend::Passthrough {
+                config: fs_cfg,
+                filesystem: OnceLock::new(),
+            },
+            session_options: 0,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
             exit_code,
@@ -113,6 +123,7 @@ impl Fs {
             config,
             shm_region: None,
             backend: FsBackend::Custom(backend),
+            session_options: 0,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
             exit_code,
@@ -131,11 +142,15 @@ impl Fs {
 
     pub fn set_export_table(&mut self, export_table: ExportTable) -> u64 {
         match &mut self.backend {
-            FsBackend::Passthrough(cfg) => {
+            FsBackend::Passthrough { config, filesystem } => {
+                assert!(
+                    filesystem.get().is_none(),
+                    "virtio-fs export table must be configured before activation"
+                );
                 static FS_UNIQUE_ID: AtomicU64 = AtomicU64::new(0);
-                cfg.export_fsid = FS_UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
-                cfg.export_table = Some(export_table);
-                cfg.export_fsid
+                config.export_fsid = FS_UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
+                config.export_table = Some(export_table);
+                config.export_fsid
             }
             FsBackend::Custom(_) => 0,
         }
@@ -213,9 +228,22 @@ impl VirtioDevice for Fs {
         }
 
         let join_handle = match &self.backend {
-            FsBackend::Passthrough(cfg) => {
+            FsBackend::Passthrough { config, filesystem } => {
+                if filesystem.get().is_none() {
+                    let backend =
+                        Arc::new(PassthroughFs::new(config.clone()).map_err(|error| {
+                            error!("failed to construct virtio-fs passthrough backend: {error:?}");
+                            super::super::ActivateError::BadActivate
+                        })?);
+                    let _ = filesystem.set(backend);
+                }
+                let backend = Arc::clone(
+                    filesystem
+                        .get()
+                        .expect("virtio-fs passthrough backend initialized above"),
+                );
                 let worker = FsWorker::new(
-                    PassthroughFs::new(cfg.clone()).unwrap(),
+                    backend,
                     worker_queues,
                     queue_evts,
                     interrupt.clone(),
@@ -225,12 +253,13 @@ impl VirtioDevice for Fs {
                     self.exit_code.clone(),
                     #[cfg(any(target_os = "macos", target_os = "windows"))]
                     self.map_sender.clone(),
+                    self.session_options,
                 );
                 worker.run()
             }
             FsBackend::Custom(dyn_fs) => {
                 let worker = FsWorker::new(
-                    DynFileSystemAdapter::new(Arc::clone(dyn_fs)),
+                    Arc::new(DynFileSystemAdapter::new(Arc::clone(dyn_fs))),
                     worker_queues,
                     queue_evts,
                     interrupt.clone(),
@@ -240,6 +269,7 @@ impl VirtioDevice for Fs {
                     self.exit_code.clone(),
                     #[cfg(any(target_os = "macos", target_os = "windows"))]
                     self.map_sender.clone(),
+                    self.session_options,
                 );
                 worker.run()
             }
@@ -267,5 +297,162 @@ impl VirtioDevice for Fs {
         }
         self.device_state = DeviceState::Inactive;
         true
+    }
+
+    fn supports_quiesce(&self) -> bool {
+        true
+    }
+
+    fn quiesce(&mut self) -> Result<Vec<DeviceQueue>, super::super::VirtioStateError> {
+        if !self.device_state.is_activated() {
+            return Err(super::super::VirtioStateError::InvalidLifecycle(
+                "virtio-fs must be activated before quiescence",
+            ));
+        }
+        let worker =
+            self.worker_thread
+                .take()
+                .ok_or(super::super::VirtioStateError::InvalidLifecycle(
+                    "virtio-fs worker is missing while activated",
+                ))?;
+        self.worker_stopfd
+            .write(1)
+            .map_err(super::super::VirtioStateError::Device)?;
+        let state = worker.join().map_err(|_| {
+            super::super::VirtioStateError::Device(std::io::Error::other(
+                "virtio-fs worker panicked during quiescence",
+            ))
+        })?;
+        if state.queues.len() != state.queue_evts.len() {
+            return Err(super::super::VirtioStateError::InvalidLifecycle(
+                "virtio-fs worker returned mismatched queues and events",
+            ));
+        }
+        self.session_options = state.session_options;
+        self.device_state = DeviceState::Inactive;
+        Ok(state
+            .queues
+            .into_iter()
+            .zip(state.queue_evts)
+            .map(|(queue, event)| DeviceQueue::new(queue, event))
+            .collect())
+    }
+
+    fn capture_device_state(&self) -> Result<Vec<u8>, super::super::VirtioStateError> {
+        if self.device_state.is_activated() {
+            return Err(super::super::VirtioStateError::InvalidLifecycle(
+                "virtio-fs must be quiesced before state capture",
+            ));
+        }
+        let backend_state = match &self.backend {
+            FsBackend::Passthrough { filesystem, .. } => filesystem
+                .get()
+                .ok_or_else(|| {
+                    std::io::Error::other("virtio-fs passthrough backend is not initialized")
+                })?
+                .capture_state(),
+            FsBackend::Custom(fs) => fs.capture_state(),
+        }
+        .map_err(super::super::VirtioStateError::Device)?;
+        FsDeviceState {
+            session_options: self.session_options,
+            backend_state,
+        }
+        .encode()
+        .map_err(super::super::VirtioStateError::Device)
+    }
+
+    fn validate_device_state(&self, bytes: &[u8]) -> Result<(), super::super::VirtioStateError> {
+        let state = FsDeviceState::decode(bytes).map_err(super::super::VirtioStateError::Device)?;
+        if FsOptions::from_bits(state.session_options).is_none() {
+            return Err(super::super::VirtioStateError::Incompatible(
+                "virtio-fs state contains unknown negotiated FUSE options".into(),
+            ));
+        }
+        match &self.backend {
+            FsBackend::Passthrough { filesystem, .. } => filesystem
+                .get()
+                .ok_or_else(|| {
+                    std::io::Error::other("virtio-fs passthrough backend is not initialized")
+                })?
+                .validate_state(&state.backend_state),
+            FsBackend::Custom(fs) => fs.validate_state(&state.backend_state),
+        }
+        .map_err(super::super::VirtioStateError::Device)
+    }
+
+    fn restore_device_state(&mut self, bytes: &[u8]) -> Result<(), super::super::VirtioStateError> {
+        self.validate_device_state(bytes)?;
+        let state = FsDeviceState::decode(bytes).map_err(super::super::VirtioStateError::Device)?;
+        match &self.backend {
+            FsBackend::Passthrough { filesystem, .. } => filesystem
+                .get()
+                .expect("virtio-fs passthrough backend validated above")
+                .restore_state(&state.backend_state),
+            FsBackend::Custom(fs) => fs.restore_state(&state.backend_state),
+        }
+        .map_err(super::super::VirtioStateError::Device)?;
+        self.session_options = state.session_options;
+        Ok(())
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use utils::eventfd::EventFd;
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::{DeviceQueue, InterruptTransport, Queue, VirtioDevice};
+
+    use super::*;
+
+    #[test]
+    fn fs_quiesce_returns_queues_and_can_reactivate() {
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+        let directory = std::env::temp_dir().join(format!(
+            "msb-krun-fs-quiesce-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+
+        let mut fs = Fs::new(
+            "test-fs".into(),
+            directory.to_string_lossy().into_owned(),
+            Arc::new(AtomicI32::new(0)),
+            false,
+        )
+        .unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap();
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "test-fs".into()).unwrap();
+        let make_queues = || {
+            fs.queue_config()
+                .iter()
+                .map(|config| {
+                    DeviceQueue::new(Queue::new(config.size), Arc::new(EventFd::new(0).unwrap()))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        fs.activate(mem.clone(), interrupt.clone(), make_queues())
+            .unwrap();
+        let queues = fs.quiesce().unwrap();
+        assert_eq!(queues.len(), fs.queue_config().len());
+        assert!(!fs.is_activated());
+
+        fs.activate(mem, interrupt, queues).unwrap();
+        assert!(fs.is_activated());
+        assert_eq!(fs.quiesce().unwrap().len(), fs.queue_config().len());
+
+        std::fs::remove_dir(directory).unwrap();
     }
 }

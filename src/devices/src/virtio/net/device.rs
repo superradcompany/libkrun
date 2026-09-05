@@ -9,13 +9,13 @@ use crate::virtio::net::{NUM_QUEUES, QUEUE_CONFIG};
 use crate::virtio::queue::Error as QueueError;
 use crate::virtio::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
-    VirtioDevice, TYPE_NET,
+    VirtioDevice, VirtioStateError, TYPE_NET,
 };
 use crate::Error as DeviceError;
 
 use super::backend::{NetBackend, ReadError, WriteError};
 use super::rate_limit::RateLimiters;
-use super::worker::NetWorker;
+use super::worker::{NetWorker, NetWorkerContinuation};
 
 use std::cmp;
 use std::io::Write;
@@ -23,6 +23,8 @@ use std::io::Write;
 use std::os::fd::RawFd;
 #[cfg(unix)]
 use std::path::PathBuf;
+use std::thread::JoinHandle;
+use utils::eventfd::EventFd;
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
@@ -88,6 +90,11 @@ pub struct Net {
 
     pub(crate) device_state: DeviceState,
 
+    worker_stop_evt: Option<EventFd>,
+    worker_thread: Option<JoinHandle<NetWorker>>,
+    continuation: Option<NetWorkerContinuation>,
+    quiesce_supported: bool,
+
     config: VirtioNetConfig,
 }
 
@@ -132,6 +139,18 @@ impl Net {
             max_virtqueue_pairs: 0,
         };
 
+        let quiesce_supported = match &cfg_backend {
+            #[cfg(unix)]
+            VirtioNetBackend::UnixstreamFd(_) | VirtioNetBackend::UnixstreamPath(_) => false,
+            #[cfg(unix)]
+            VirtioNetBackend::UnixgramFd(_) | VirtioNetBackend::UnixgramPath(_, _) => true,
+            #[cfg(target_os = "linux")]
+            VirtioNetBackend::Tap(_) => true,
+            #[cfg(windows)]
+            VirtioNetBackend::NamedPipe(_) => true,
+            VirtioNetBackend::Custom(backend) => backend.supports_quiesce(),
+        };
+
         Ok(Net {
             id,
             cfg_backend: Some(cfg_backend),
@@ -141,6 +160,10 @@ impl Net {
             acked_features: 0u64,
 
             device_state: DeviceState::Inactive,
+            worker_stop_evt: None,
+            worker_thread: None,
+            continuation: None,
+            quiesce_supported,
             config,
         })
     }
@@ -209,35 +232,99 @@ impl VirtioDevice for Net {
             ActivateError::BadActivate
         })?;
 
-        let cfg_backend = self.cfg_backend.take().ok_or_else(|| {
-            error!("Cannot activate net device: backend already taken");
-            ActivateError::BadActivate
-        })?;
-        match NetWorker::new(
-            rx_q,
-            tx_q,
-            interrupt.clone(),
-            mem.clone(),
-            self.acked_features,
-            cfg_backend,
-            &self.rate_limiters,
-        ) {
-            Ok(worker) => {
-                worker.run();
-                self.device_state = DeviceState::Activated(mem, interrupt);
-                Ok(())
-            }
-            Err(err) => {
+        let worker = if let Some(continuation) = self.continuation.take() {
+            Ok(NetWorker::from_continuation(
+                continuation,
+                rx_q,
+                tx_q,
+                interrupt.clone(),
+                mem.clone(),
+            ))
+        } else {
+            let cfg_backend = self.cfg_backend.take().ok_or_else(|| {
+                error!("Cannot activate net device: backend already taken");
+                ActivateError::BadActivate
+            })?;
+            NetWorker::new(
+                rx_q,
+                tx_q,
+                interrupt.clone(),
+                mem.clone(),
+                self.acked_features,
+                cfg_backend,
+                &self.rate_limiters,
+            )
+            .map_err(|err| {
                 error!(
                     "Error activating virtio-net ({}) backend: {err:?}",
                     self.id()
                 );
-                Err(ActivateError::BadActivate)
+                ActivateError::BadActivate
+            })
+        };
+        match worker {
+            Ok(worker) => {
+                let (stop_evt, thread) = worker.run();
+                self.worker_stop_evt = Some(stop_evt);
+                self.worker_thread = Some(thread);
+                self.device_state = DeviceState::Activated(mem, interrupt);
+                Ok(())
             }
+            Err(err) => Err(err),
         }
     }
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    fn reset(&mut self) -> bool {
+        match self.quiesce() {
+            Ok(_) => {
+                self.continuation = None;
+                true
+            }
+            Err(error) => {
+                error!("failed to reset virtio-net {}: {error}", self.id());
+                false
+            }
+        }
+    }
+
+    fn supports_quiesce(&self) -> bool {
+        self.quiesce_supported
+    }
+
+    fn quiesce(&mut self) -> std::result::Result<Vec<DeviceQueue>, VirtioStateError> {
+        if !self.device_state.is_activated() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "virtio-net must be activated before quiescence",
+            ));
+        }
+
+        self.worker_stop_evt
+            .as_ref()
+            .ok_or(VirtioStateError::InvalidLifecycle(
+                "virtio-net stop event is missing",
+            ))?
+            .write(1)?;
+        let worker = self
+            .worker_thread
+            .take()
+            .ok_or(VirtioStateError::InvalidLifecycle(
+                "virtio-net worker is missing",
+            ))?
+            .join()
+            .map_err(|_| {
+                VirtioStateError::Device(std::io::Error::other(
+                    "virtio-net worker panicked during quiescence",
+                ))
+            })?;
+        self.worker_stop_evt = None;
+
+        let (rx_q, tx_q, continuation) = worker.into_quiesced();
+        self.continuation = Some(continuation);
+        self.device_state = DeviceState::Inactive;
+        Ok(vec![rx_q, tx_q])
     }
 }

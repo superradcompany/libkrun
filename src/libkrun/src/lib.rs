@@ -787,6 +787,7 @@ pub unsafe extern "C" fn krun_add_disk(
                 sync_mode: SyncMode::Full,
                 #[cfg(target_os = "macos")]
                 sync_mode: SyncMode::Relaxed,
+                backend: None,
             };
             cfg.add_block_cfg(block_device_config);
         }
@@ -838,6 +839,7 @@ pub unsafe extern "C" fn krun_add_disk2(
                 sync_mode: SyncMode::Full,
                 #[cfg(target_os = "macos")]
                 sync_mode: SyncMode::Relaxed,
+                backend: None,
             };
             cfg.add_block_cfg(block_device_config);
         }
@@ -893,6 +895,7 @@ pub unsafe extern "C" fn krun_add_disk3(
                 is_disk_read_only: read_only,
                 direct_io,
                 sync_mode,
+                backend: None,
             };
             cfg.add_block_cfg(block_device_config);
         }
@@ -925,6 +928,7 @@ pub unsafe extern "C" fn krun_set_root_disk(ctx_id: u32, c_disk_path: *const c_c
                 sync_mode: SyncMode::Full,
                 #[cfg(target_os = "macos")]
                 sync_mode: SyncMode::Relaxed,
+                backend: None,
             };
             cfg.set_root_block_cfg(block_device_config);
         }
@@ -957,6 +961,7 @@ pub unsafe extern "C" fn krun_set_data_disk(ctx_id: u32, c_disk_path: *const c_c
                 sync_mode: SyncMode::Full,
                 #[cfg(target_os = "macos")]
                 sync_mode: SyncMode::Relaxed,
+                backend: None,
             };
             cfg.set_data_block_cfg(block_device_config);
         }

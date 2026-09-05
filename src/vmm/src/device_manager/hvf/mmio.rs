@@ -343,6 +343,14 @@ impl MMIODeviceManager {
         }
         None
     }
+
+    /// Returns a deterministic inventory of every registered MMIO device.
+    #[cfg(feature = "blk")]
+    pub fn device_keys(&self) -> Vec<(DeviceType, String)> {
+        let mut keys = self.id_to_dev_info.keys().cloned().collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys
+    }
 }
 
 /// Private structure for storing information about the MMIO device registered at some address on the bus.

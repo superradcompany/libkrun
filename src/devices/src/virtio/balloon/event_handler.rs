@@ -197,7 +197,7 @@ impl Balloon {
         }
     }
 
-    fn trigger_stats_update(&mut self) {
+    pub(crate) fn trigger_stats_update(&mut self) {
         let Some(index) = self.stats_desc_index.take() else {
             debug!("balloon: stats timer fired without a retained descriptor");
             return;

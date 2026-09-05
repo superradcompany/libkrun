@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -16,6 +16,7 @@ use crate::virtio::InterruptTransport;
 use crossbeam_channel::Sender;
 use rand::{rng, rngs::ThreadRng, Rng};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
 
 pub struct MuxerThread {
@@ -28,6 +29,7 @@ pub struct MuxerThread {
     interrupt: InterruptTransport,
     reaper_sender: Sender<u64>,
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+    stop_evt: EventFd,
 }
 
 impl MuxerThread {
@@ -42,6 +44,7 @@ impl MuxerThread {
         interrupt: InterruptTransport,
         reaper_sender: Sender<u64>,
         unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+        stop_evt: EventFd,
     ) -> Self {
         MuxerThread {
             cid,
@@ -53,14 +56,15 @@ impl MuxerThread {
             interrupt,
             reaper_sender,
             unix_ipc_port_map,
+            stop_evt,
         }
     }
 
-    pub fn run(self) {
+    pub fn run(self) -> thread::JoinHandle<()> {
         thread::Builder::new()
             .name("vsock muxer".into())
             .spawn(|| self.work())
-            .unwrap();
+            .unwrap()
     }
 
     fn send_credit_request(&self, credit_rx: MuxerRx) {
@@ -173,8 +177,15 @@ impl MuxerThread {
     }
 
     fn work(self) {
+        const STOP_EVENT: u64 = u64::MAX;
         let mut thread_rng = rng();
         self.create_lisening_ipc_sockets();
+        let stop_fd = self.stop_evt.as_raw_fd();
+        let _ = self.epoll.ctl(
+            ControlOperation::Add,
+            stop_fd,
+            &EpollEvent::new(EventSet::IN, STOP_EVENT),
+        );
         loop {
             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match self
@@ -182,6 +193,21 @@ impl MuxerThread {
                 .wait(epoll_events.len(), -1, epoll_events.as_mut_slice())
             {
                 Ok(ev_cnt) => {
+                    // Stop has priority over backend readiness from the same wait batch. Once the
+                    // owner asks for quiescence, no additional proxy event may consume a queue or
+                    // write guest memory.
+                    if epoll_events[..ev_cnt]
+                        .iter()
+                        .any(|event| event.data() == STOP_EVENT)
+                    {
+                        let _ = self.stop_evt.read();
+                        let _ = self.epoll.ctl(
+                            ControlOperation::Delete,
+                            stop_fd,
+                            &EpollEvent::default(),
+                        );
+                        return;
+                    }
                     for ev in &epoll_events[0..ev_cnt] {
                         debug!("Event: ev.data={} ev.fd={}", ev.data(), ev.fd());
                         let evset = EventSet::from_bits(ev.events).unwrap();

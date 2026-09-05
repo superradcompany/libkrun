@@ -11,6 +11,7 @@ use vm_memory::{ByteValued, Bytes, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
+    VirtioStateError,
 };
 use super::{defs, defs::control_event, defs::uapi};
 use crate::virtio::console::console_control::{
@@ -25,6 +26,12 @@ use crate::virtio::{InterruptTransport, PortDescription, VmmExitObserver};
 
 pub(crate) const CONTROL_RXQ_INDEX: usize = 2;
 pub(crate) const CONTROL_TXQ_INDEX: usize = 3;
+const CONSOLE_STATE_MAGIC: &[u8; 8] = b"MSBCON1\0";
+const CONSOLE_STATE_SCHEMA: u16 = 1;
+const MAX_CONSOLE_DEVICE_STATE_BYTES: usize = 64 * 1024;
+const PORT_TOPOLOGY_INPUT: u8 = 1;
+const PORT_TOPOLOGY_OUTPUT: u8 = 2;
+const PORT_TOPOLOGY_TERMINAL: u8 = 4;
 
 pub(crate) const AVAIL_FEATURES: u64 = (1 << uapi::VIRTIO_CONSOLE_F_SIZE as u64)
     | (1 << uapi::VIRTIO_CONSOLE_F_MULTIPORT as u64)
@@ -57,6 +64,8 @@ pub struct Console {
     pub(crate) device_state: DeviceState,
     pub(crate) control: Arc<ConsoleControl>,
     pub(crate) ports: Vec<Port>,
+    /// Ports whose host workers were active before reversible quiescence.
+    resume_ports: Vec<bool>,
 
     queue_config: Vec<QueueConfig>,
     // Queues are stored as Option so individual queues can be taken when ports start.
@@ -100,6 +109,7 @@ impl Console {
         let ports: Vec<Port> = zip(0u32.., ports)
             .map(|(port_id, description)| Port::new(port_id, description))
             .collect();
+        let resume_ports = vec![false; ports.len()];
 
         let (cols, rows) = ports[0]
             .terminal()
@@ -110,6 +120,7 @@ impl Console {
         Ok(Console {
             control: ConsoleControl::new(),
             ports,
+            resume_ports,
             queue_config,
             queues: Vec::new(),
             queue_events: Vec::new(),
@@ -137,6 +148,31 @@ impl Console {
         log::debug!("update_console_size {port_id}: {cols} {rows}");
         self.control
             .console_resize(port_id, VirtioConsoleResize { rows, cols });
+    }
+
+    /// Return one guest-opened port to active host I/O with its current queues.
+    fn start_port(&mut self, port_id: usize, mem: GuestMemoryMmap, interrupt: InterruptTransport) {
+        if self.ports[port_id].is_active() {
+            return;
+        }
+
+        let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
+        let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
+        let rx_queue = self.queues[rx_idx]
+            .take()
+            .expect("port rx queue should exist")
+            .queue;
+        let tx_queue = self.queues[tx_idx]
+            .take()
+            .expect("port tx queue should exist")
+            .queue;
+        self.ports[port_id].start(
+            mem,
+            rx_queue,
+            tx_queue,
+            interrupt,
+            Arc::clone(&self.control),
+        );
     }
 
     pub(crate) fn process_control_rx(&mut self) -> bool {
@@ -177,8 +213,9 @@ impl Console {
 
     pub(crate) fn process_control_tx(&mut self) -> bool {
         log::trace!("process_control_tx");
-        let DeviceState::Activated(ref mem, ref interrupt) = self.device_state else {
-            unreachable!()
+        let (mem, interrupt) = match &self.device_state {
+            DeviceState::Activated(mem, interrupt) => (mem.clone(), interrupt.clone()),
+            DeviceState::Inactive => unreachable!(),
         };
 
         let control_tx = self.queues[CONTROL_TXQ_INDEX]
@@ -188,7 +225,7 @@ impl Console {
 
         let mut ports_to_start = Vec::new();
 
-        while let Some(head) = control_tx.queue.pop(mem) {
+        while let Some(head) = control_tx.queue.pop(&mem) {
             raise_irq = true;
 
             let cmd: VirtioConsoleControl = match mem.read_obj(head.addr) {
@@ -204,7 +241,7 @@ impl Console {
             };
             if let Err(e) = control_tx
                 .queue
-                .add_used(mem, head.index, size_of_val(&cmd) as u32)
+                .add_used(&mem, head.index, size_of_val(&cmd) as u32)
             {
                 error!("failed to add used elements to the queue: {e:?}");
             }
@@ -227,7 +264,7 @@ impl Console {
                     }
 
                     if let Some(term) = self.ports[cmd.id as usize].terminal() {
-                        self.control.mark_console_port(mem, cmd.id);
+                        self.control.mark_console_port(&mem, cmd.id);
                         self.control.port_open(cmd.id, true);
                         let (cols, rows) = term.get_win_size();
                         self.control
@@ -265,35 +302,170 @@ impl Console {
         }
 
         for port_id in ports_to_start {
-            if self.ports[port_id].is_active() {
-                continue;
-            }
-
             log::trace!("Starting port io for port {port_id}");
-            let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
-            let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
-
-            // Take ownership of port queues - they are moved to the port.
-            let rx_queue = self.queues[rx_idx]
-                .take()
-                .expect("port rx queue should exist")
-                .queue;
-            let tx_queue = self.queues[tx_idx]
-                .take()
-                .expect("port tx queue should exist")
-                .queue;
-
-            self.ports[port_id].start(
-                mem.clone(),
-                rx_queue,
-                tx_queue,
-                interrupt.clone(),
-                self.control.clone(),
-            );
+            self.start_port(port_id, mem.clone(), interrupt.clone());
         }
 
         raise_irq
     }
+}
+
+fn encode_console_state(console: &Console) -> Result<Vec<u8>, VirtioStateError> {
+    let port_count = u32::try_from(console.ports.len()).map_err(|_| {
+        VirtioStateError::Incompatible("console port count exceeds u32".to_string())
+    })?;
+    let bitmap_bytes = console.resume_ports.len().div_ceil(u8::BITS as usize);
+    let mut encoded_len = CONSOLE_STATE_MAGIC.len()
+        + std::mem::size_of::<u16>()
+        + std::mem::size_of::<u32>()
+        + bitmap_bytes;
+    for (port_id, port) in console.ports.iter().enumerate() {
+        let name_len = u16::try_from(port.name().len()).map_err(|_| {
+            VirtioStateError::Incompatible(format!(
+                "console port {port_id} name exceeds u16 framing"
+            ))
+        })?;
+        encoded_len = encoded_len
+            .checked_add(1 + std::mem::size_of::<u16>() * 2)
+            .and_then(|len| len.checked_add(name_len as usize))
+            .ok_or_else(|| {
+                VirtioStateError::Incompatible("console device-state length overflow".to_string())
+            })?;
+    }
+    if encoded_len > MAX_CONSOLE_DEVICE_STATE_BYTES {
+        return Err(VirtioStateError::Incompatible(format!(
+            "console device state exceeds {MAX_CONSOLE_DEVICE_STATE_BYTES} bytes"
+        )));
+    }
+
+    let mut state = Vec::with_capacity(encoded_len);
+    state.extend_from_slice(CONSOLE_STATE_MAGIC);
+    state.extend_from_slice(&CONSOLE_STATE_SCHEMA.to_le_bytes());
+    state.extend_from_slice(&port_count.to_le_bytes());
+
+    for (port_id, port) in console.ports.iter().enumerate() {
+        let name = port.name().as_bytes();
+        let name_len = u16::try_from(name.len()).map_err(|_| {
+            VirtioStateError::Incompatible(format!(
+                "console port {port_id} name exceeds u16 framing"
+            ))
+        })?;
+        let queue_size =
+            console.queue_config[port_id_to_queue_idx(QueueDirection::Rx, port_id)].size;
+        state.push(port_topology_flags(port));
+        state.extend_from_slice(&queue_size.to_le_bytes());
+        state.extend_from_slice(&name_len.to_le_bytes());
+        state.extend_from_slice(name);
+    }
+
+    state.resize(state.len() + bitmap_bytes, 0);
+    let bitmap_offset = state.len() - bitmap_bytes;
+    for (port_id, active) in console.resume_ports.iter().copied().enumerate() {
+        if active {
+            state[bitmap_offset + port_id / u8::BITS as usize] |=
+                1 << (port_id % u8::BITS as usize);
+        }
+    }
+    debug_assert_eq!(state.len(), encoded_len);
+    Ok(state)
+}
+
+fn decode_console_state(console: &Console, state: &[u8]) -> Result<Vec<bool>, VirtioStateError> {
+    if state.len() > MAX_CONSOLE_DEVICE_STATE_BYTES {
+        return Err(VirtioStateError::Incompatible(format!(
+            "console device state exceeds {MAX_CONSOLE_DEVICE_STATE_BYTES} bytes"
+        )));
+    }
+    let mut cursor = 0;
+    if take_console_state(state, &mut cursor, CONSOLE_STATE_MAGIC.len())? != CONSOLE_STATE_MAGIC {
+        return Err(VirtioStateError::Incompatible(
+            "invalid console device-state magic".to_string(),
+        ));
+    }
+    let schema = u16::from_le_bytes(
+        take_console_state(state, &mut cursor, std::mem::size_of::<u16>())?
+            .try_into()
+            .expect("console schema has fixed width"),
+    );
+    if schema != CONSOLE_STATE_SCHEMA {
+        return Err(VirtioStateError::Incompatible(format!(
+            "unsupported console device-state schema {schema}"
+        )));
+    }
+    let port_count = u32::from_le_bytes(
+        take_console_state(state, &mut cursor, std::mem::size_of::<u32>())?
+            .try_into()
+            .expect("console port count has fixed width"),
+    ) as usize;
+    if port_count != console.ports.len() {
+        return Err(VirtioStateError::Incompatible(format!(
+            "console port topology has {port_count} ports, destination has {}",
+            console.ports.len()
+        )));
+    }
+
+    for (port_id, port) in console.ports.iter().enumerate() {
+        let flags = take_console_state(state, &mut cursor, 1)?[0];
+        let queue_size = u16::from_le_bytes(
+            take_console_state(state, &mut cursor, std::mem::size_of::<u16>())?
+                .try_into()
+                .expect("console queue size has fixed width"),
+        );
+        let name_len = u16::from_le_bytes(
+            take_console_state(state, &mut cursor, std::mem::size_of::<u16>())?
+                .try_into()
+                .expect("console name length has fixed width"),
+        ) as usize;
+        let name = take_console_state(state, &mut cursor, name_len)?;
+        let expected_queue_size =
+            console.queue_config[port_id_to_queue_idx(QueueDirection::Rx, port_id)].size;
+        if flags != port_topology_flags(port)
+            || queue_size != expected_queue_size
+            || name != port.name().as_bytes()
+        {
+            return Err(VirtioStateError::Incompatible(format!(
+                "console port {port_id} topology does not match the destination"
+            )));
+        }
+    }
+
+    let bitmap_bytes = port_count.div_ceil(u8::BITS as usize);
+    let bitmap = take_console_state(state, &mut cursor, bitmap_bytes)?;
+    if cursor != state.len() {
+        return Err(VirtioStateError::Incompatible(
+            "console device state has trailing bytes".to_string(),
+        ));
+    }
+    let used_bits = port_count % u8::BITS as usize;
+    if used_bits != 0 && bitmap.last().is_some_and(|byte| byte >> used_bits != 0) {
+        return Err(VirtioStateError::Incompatible(
+            "console active-port bitmap has non-zero reserved bits".to_string(),
+        ));
+    }
+    Ok((0..port_count)
+        .map(|port_id| (bitmap[port_id / u8::BITS as usize] & (1 << (port_id % 8))) != 0)
+        .collect())
+}
+
+fn take_console_state<'a>(
+    state: &'a [u8],
+    cursor: &mut usize,
+    len: usize,
+) -> Result<&'a [u8], VirtioStateError> {
+    let end = cursor.checked_add(len).ok_or_else(|| {
+        VirtioStateError::Incompatible("console device state length overflow".to_string())
+    })?;
+    let bytes = state.get(*cursor..end).ok_or_else(|| {
+        VirtioStateError::Incompatible("truncated console device state".to_string())
+    })?;
+    *cursor = end;
+    Ok(bytes)
+}
+
+fn port_topology_flags(port: &Port) -> u8 {
+    (u8::from(port.has_input()) * PORT_TOPOLOGY_INPUT)
+        | (u8::from(port.has_output()) * PORT_TOPOLOGY_OUTPUT)
+        | (u8::from(port.terminal().is_some()) * PORT_TOPOLOGY_TERMINAL)
 }
 
 impl VirtioDevice for Console {
@@ -349,6 +521,14 @@ impl VirtioDevice for Console {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
+        if queues.len() != self.queue_config.len() {
+            error!(
+                "Cannot activate console. Expected {} queue(s), got {}",
+                self.queue_config.len(),
+                queues.len()
+            );
+            return Err(ActivateError::BadActivate);
+        }
         if self.activate_evt.write(1).is_err() {
             error!("Cannot write to activate_evt");
             return Err(ActivateError::BadActivate);
@@ -356,7 +536,19 @@ impl VirtioDevice for Console {
 
         self.queue_events = queues.iter().map(|dq| dq.event.clone()).collect();
         self.queues = queues.into_iter().map(Some).collect();
-        self.device_state = DeviceState::Activated(mem, interrupt);
+        self.device_state = DeviceState::Activated(mem.clone(), interrupt.clone());
+
+        // PORT_OPEN is a one-time guest negotiation event. Reversible quiescence must restart
+        // the workers that owned open ports directly or agent traffic remains stalled after thaw.
+        let resume_ports = self
+            .resume_ports
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(port_id, resume)| std::mem::take(resume).then_some(port_id))
+            .collect::<Vec<_>>();
+        for port_id in resume_ports {
+            self.start_port(port_id, mem.clone(), interrupt.clone());
+        }
 
         Ok(())
     }
@@ -372,8 +564,73 @@ impl VirtioDevice for Console {
         }
         self.queues.clear();
         self.queue_events.clear();
+        self.resume_ports.fill(false);
         self.device_state = DeviceState::Inactive;
         true
+    }
+
+    fn supports_quiesce(&self) -> bool {
+        true
+    }
+
+    fn quiesce(&mut self) -> Result<Vec<DeviceQueue>, VirtioStateError> {
+        if !self.device_state.is_activated() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "console must be activated before quiescence",
+            ));
+        }
+
+        // Port workers own their RX/TX queues independently of the event-manager-owned control
+        // queues. Join every active port first so no host I/O or guest-memory access can outlive
+        // the returned queue boundary.
+        for (port_id, port) in self.ports.iter_mut().enumerate() {
+            if !port.is_active() {
+                continue;
+            }
+            self.resume_ports[port_id] = true;
+            let (rx, tx) = port
+                .quiesce()
+                .map_err(|message| VirtioStateError::Device(std::io::Error::other(message)))?;
+            let rx_index = port_id_to_queue_idx(QueueDirection::Rx, port_id);
+            let tx_index = port_id_to_queue_idx(QueueDirection::Tx, port_id);
+            self.queues[rx_index] = Some(DeviceQueue::new(rx, self.queue_events[rx_index].clone()));
+            self.queues[tx_index] = Some(DeviceQueue::new(tx, self.queue_events[tx_index].clone()));
+        }
+
+        let queues = self
+            .queues
+            .iter_mut()
+            .map(|queue| {
+                queue.take().ok_or(VirtioStateError::InvalidLifecycle(
+                    "console queue is missing after worker drain",
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.device_state = DeviceState::Inactive;
+        Ok(queues)
+    }
+
+    fn capture_device_state(&self) -> Result<Vec<u8>, VirtioStateError> {
+        if self.device_state.is_activated() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "console must be inactive during device-state capture",
+            ));
+        }
+        encode_console_state(self)
+    }
+
+    fn validate_device_state(&self, state: &[u8]) -> Result<(), VirtioStateError> {
+        decode_console_state(self, state).map(|_| ())
+    }
+
+    fn restore_device_state(&mut self, state: &[u8]) -> Result<(), VirtioStateError> {
+        if self.device_state.is_activated() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "console must be inactive during device-state restore",
+            ));
+        }
+        self.resume_ports = decode_console_state(self, state)?;
+        Ok(())
     }
 }
 
@@ -390,6 +647,15 @@ impl VmmExitObserver for Console {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use utils::eventfd::EventFd;
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::console::port_io;
+    use crate::virtio::{DeviceQueue, InterruptTransport, Queue};
+
     use super::*;
 
     fn port(name: &'static str, queue_size: u16) -> PortDescription {
@@ -425,5 +691,129 @@ mod tests {
                 _ => panic!("queue size {queue_size} should be rejected"),
             }
         }
+    }
+
+    #[test]
+    fn console_quiesce_stops_blocked_port_workers_and_returns_every_queue() {
+        let description = PortDescription::input_pipe("agent", port_io::input_empty().unwrap());
+        let mut console = Console::new(vec![description]).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap();
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "test-console".into()).unwrap();
+        let queues = console
+            .queue_config()
+            .iter()
+            .map(|config| {
+                DeviceQueue::new(Queue::new(config.size), Arc::new(EventFd::new(0).unwrap()))
+            })
+            .collect();
+        console
+            .activate(mem.clone(), interrupt.clone(), queues)
+            .unwrap();
+
+        let rx_index = port_id_to_queue_idx(QueueDirection::Rx, 0);
+        let tx_index = port_id_to_queue_idx(QueueDirection::Tx, 0);
+        let rx = console.queues[rx_index].take().unwrap().queue;
+        let tx = console.queues[tx_index].take().unwrap().queue;
+        console.ports[0].start(
+            mem.clone(),
+            rx,
+            tx,
+            interrupt.clone(),
+            Arc::clone(&console.control),
+        );
+
+        let queues = console.quiesce().unwrap();
+        assert_eq!(queues.len(), console.queue_config().len());
+        assert!(!console.is_activated());
+        assert!(!console.ports[0].is_active());
+
+        console.activate(mem, interrupt, queues).unwrap();
+        assert!(console.is_activated());
+        assert!(console.ports[0].is_active());
+    }
+
+    #[test]
+    fn console_device_state_restarts_only_captured_active_ports() {
+        let mut source = Console::new(vec![
+            port("agent", 32),
+            port("agent-bulk", 256),
+            port("telemetry", 64),
+        ])
+        .unwrap();
+        source.resume_ports = vec![true, false, true];
+        let state = source.capture_device_state().unwrap();
+
+        let mut restored = Console::new(vec![
+            port("agent", 32),
+            port("agent-bulk", 256),
+            port("telemetry", 64),
+        ])
+        .unwrap();
+        restored.validate_device_state(&state).unwrap();
+        restored.restore_device_state(&state).unwrap();
+        assert_eq!(restored.resume_ports, [true, false, true]);
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x2_0000)]).unwrap();
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "restored-console".into()).unwrap();
+        let queues = restored
+            .queue_config()
+            .iter()
+            .map(|config| {
+                DeviceQueue::new(Queue::new(config.size), Arc::new(EventFd::new(0).unwrap()))
+            })
+            .collect();
+        restored.activate(mem, interrupt, queues).unwrap();
+
+        assert!(restored.ports[0].is_active());
+        assert!(!restored.ports[1].is_active());
+        assert!(restored.ports[2].is_active());
+        assert!(restored.resume_ports.iter().all(|active| !active));
+    }
+
+    #[test]
+    fn console_device_state_rejects_incompatible_port_topology_without_mutation() {
+        let mut source = Console::new(vec![port("agent", 32), port("bulk", 64)]).unwrap();
+        source.resume_ports = vec![true, false];
+        let state = source.capture_device_state().unwrap();
+
+        let mut wrong_name = Console::new(vec![port("agent", 32), port("different", 64)]).unwrap();
+        assert!(wrong_name.restore_device_state(&state).is_err());
+        assert_eq!(wrong_name.resume_ports, [false, false]);
+
+        let mut wrong_count = Console::new(vec![port("agent", 32)]).unwrap();
+        assert!(wrong_count.restore_device_state(&state).is_err());
+        assert_eq!(wrong_count.resume_ports, [false]);
+
+        let mut wrong_direction = Console::new(vec![
+            PortDescription::output_pipe("agent", port_io::output_to_log_as_err()),
+            port("bulk", 64),
+        ])
+        .unwrap();
+        assert!(wrong_direction.restore_device_state(&state).is_err());
+        assert_eq!(wrong_direction.resume_ports, [false, false]);
+    }
+
+    #[test]
+    fn console_device_state_rejects_bad_framing_and_reserved_bitmap_bits() {
+        let mut source = Console::new(vec![port("agent", 32)]).unwrap();
+        source.resume_ports[0] = true;
+        let state = source.capture_device_state().unwrap();
+
+        let mut bad_schema = state.clone();
+        bad_schema
+            [CONSOLE_STATE_MAGIC.len()..CONSOLE_STATE_MAGIC.len() + std::mem::size_of::<u16>()]
+            .copy_from_slice(&(CONSOLE_STATE_SCHEMA + 1).to_le_bytes());
+        assert!(source.validate_device_state(&bad_schema).is_err());
+        assert!(source
+            .validate_device_state(&state[..state.len() - 1])
+            .is_err());
+        let mut trailing = state.clone();
+        trailing.push(0);
+        assert!(source.validate_device_state(&trailing).is_err());
+        let mut reserved = state;
+        *reserved.last_mut().unwrap() |= 0x80;
+        assert!(source.validate_device_state(&reserved).is_err());
     }
 }

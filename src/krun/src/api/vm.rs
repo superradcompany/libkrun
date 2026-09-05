@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+#[cfg(not(feature = "tee"))]
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
@@ -91,6 +92,22 @@ pub struct Vm {
     execution_restore: Option<vmm::execution_state::ExecutionState>,
     #[cfg(not(feature = "tee"))]
     memory_restore: Option<Box<dyn VmMemoryRestoreSource>>,
+    /// Device state installed after memory/execution reconstruction and before first activation.
+    #[cfg(all(not(feature = "tee"), feature = "blk"))]
+    device_restores: Vec<VmDeviceRestore>,
+    /// Leave the constructed VMM at its initial paused boundary for an external activation gate.
+    #[cfg(not(feature = "tee"))]
+    start_paused: bool,
+}
+
+/// One construction-only device restore requested before [`Vm::enter`].
+#[cfg(all(not(feature = "tee"), feature = "blk"))]
+enum VmDeviceRestore {
+    Virtio(vmm::device_state::VirtioDeviceState),
+    Block {
+        device_id: String,
+        state: vmm::device_state::BlockDeviceState,
+    },
 }
 
 /// Streams a complete memory image into a newly constructed, never-activated VM.
@@ -152,6 +169,7 @@ pub struct VmControl {
     mem: Option<Arc<std::sync::Mutex<devices::virtio::Mem>>>,
     cpu: Option<Arc<std::sync::Mutex<devices::virtio::Cpu>>>,
     vmm: Arc<VmControlRegistry>,
+    generation: Option<Arc<std::sync::Mutex<devices::virtio::Generation>>>,
 }
 
 /// Runtime-local generation of one completed VM-wide pause barrier.
@@ -159,6 +177,7 @@ pub struct VmControl {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VmPauseGeneration(vmm::PauseGeneration);
 
+#[cfg(not(feature = "tee"))]
 impl VmPauseGeneration {
     /// Returns the request id that established this pause boundary.
     pub fn get(self) -> u64 {
@@ -179,6 +198,58 @@ pub enum VmExecutionState {
     },
     /// A partial or timed-out control barrier makes the execution boundary uncertain.
     Indeterminate,
+}
+
+/// Opaque 16-byte value mixed into the guest kernel CRNG after clone or rollback.
+#[cfg(not(feature = "tee"))]
+pub type VmGenerationId = devices::virtio::GenerationId;
+
+/// One exact VM-generation request installed by the host.
+#[cfg(not(feature = "tee"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmGenerationRequest {
+    /// Device-local sequence used to reject delayed acknowledgements.
+    pub sequence: u64,
+
+    /// Identifier the guest kernel must process for this request.
+    pub id: VmGenerationId,
+}
+
+/// Point-in-time state of the VM-generation device.
+#[cfg(not(feature = "tee"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmGenerationState {
+    /// Whether the guest driver completed probing.
+    pub driver_ready: bool,
+
+    /// Whether the guest driver rejected the device protocol.
+    pub driver_error: bool,
+
+    /// Whether the bound guest kernel can correct wall time before activation acknowledgement.
+    pub clock_sync_supported: bool,
+
+    /// Request currently published by the host, if one has been installed.
+    pub requested: Option<VmGenerationRequest>,
+
+    /// Request last reported as processed by the guest kernel, if any.
+    pub processed: Option<VmGenerationRequest>,
+}
+
+/// Result of waiting for one exact VM-generation request.
+#[cfg(not(feature = "tee"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmGenerationWaitOutcome {
+    /// The guest kernel processed the exact sequence and identifier.
+    Processed,
+
+    /// A newer request replaced this request before it was acknowledged.
+    Superseded,
+
+    /// The deadline elapsed without an exact acknowledgement.
+    TimedOut,
+
+    /// The guest kernel rejected activation without acknowledging it.
+    Failed,
 }
 
 /// Point-in-time CPU sizing of a running VM as seen through [`VmControl`].
@@ -282,6 +353,10 @@ impl Vm {
             execution_restore: None,
             #[cfg(not(feature = "tee"))]
             memory_restore: None,
+            #[cfg(all(not(feature = "tee"), feature = "blk"))]
+            device_restores: Vec::new(),
+            #[cfg(not(feature = "tee"))]
+            start_paused: false,
         }
     }
 
@@ -298,6 +373,42 @@ impl Vm {
         S: VmMemoryRestoreSource + 'static,
     {
         self.memory_restore = Some(Box::new(source));
+    }
+
+    /// Supplies one destination-recreated virtio device state for construction-only restore.
+    ///
+    /// Device restores run after memory and execution reconstruction but before the first guest
+    /// instruction. The restored device remains quiesced until the VM is activated.
+    #[cfg(all(not(feature = "tee"), feature = "blk"))]
+    pub fn add_virtio_device_restore(&mut self, state: vmm::device_state::VirtioDeviceState) {
+        self.device_restores.push(VmDeviceRestore::Virtio(state));
+    }
+
+    /// Supplies one virtio-block state for construction-only restore.
+    ///
+    /// `device_id` names the already-configured destination block device. Its backend must be
+    /// resolved by the caller before [`enter()`](Self::enter); captured host handles are never
+    /// reopened from device-state bytes.
+    #[cfg(all(not(feature = "tee"), feature = "blk"))]
+    pub fn add_block_device_restore(
+        &mut self,
+        device_id: impl Into<String>,
+        state: vmm::device_state::BlockDeviceState,
+    ) {
+        self.device_restores.push(VmDeviceRestore::Block {
+            device_id: device_id.into(),
+            state,
+        });
+    }
+
+    /// Select whether initial activation remains paused after construction and restore.
+    ///
+    /// The default is `false`, preserving ordinary boot behavior. Restore coordinators set this
+    /// to `true`, wait for [`VmControl::wait_until_paused`], complete freshness/ownership gates,
+    /// and resume with the returned generation token.
+    #[cfg(not(feature = "tee"))]
+    pub fn set_start_paused(&mut self, start_paused: bool) {
+        self.start_paused = start_paused;
     }
 
     /// Get a cloneable handle that triggers VM exit from any thread.
@@ -343,6 +454,7 @@ impl Vm {
             mem: self.vmr.mem_device.clone(),
             cpu: self.vmr.cpu_device.clone(),
             vmm: Arc::clone(&self.vmm_control),
+            generation: self.vmr.generation_device.clone(),
         }
     }
 
@@ -440,6 +552,26 @@ impl Vm {
                     )))
                 })?;
             }
+            #[cfg(feature = "blk")]
+            for restore in self.device_restores.drain(..) {
+                match restore {
+                    VmDeviceRestore::Virtio(state) => {
+                        vmm.restore_virtio_device_state(&state).map_err(|error| {
+                            Error::Build(BuildError::Start(format!(
+                                "restore virtio device {}: {error}",
+                                state.device_id
+                            )))
+                        })?
+                    }
+                    VmDeviceRestore::Block { device_id, state } => vmm
+                        .restore_block_device_state(&device_id, &state)
+                        .map_err(|error| {
+                            Error::Build(BuildError::Start(format!(
+                                "restore block device {device_id}: {error}"
+                            )))
+                        })?,
+                }
+            }
         }
         trace.mark("restore.ready");
 
@@ -451,8 +583,10 @@ impl Vm {
         #[cfg(not(feature = "tee"))]
         let initial_execution_state = {
             let mut vmm = _vmm.lock().expect("Poisoned VMM mutex");
-            vmm.resume_vcpus()
-                .map_err(|e| Error::Build(BuildError::Start(format!("resume_vcpus: {e:?}"))))?;
+            if !self.start_paused {
+                vmm.resume_vcpus()
+                    .map_err(|e| Error::Build(BuildError::Start(format!("resume_vcpus: {e:?}"))))?;
+            }
             public_execution_state(vmm.execution_state())
         };
         #[cfg(feature = "tee")]
@@ -460,6 +594,13 @@ impl Vm {
             .expect("Poisoned VMM mutex")
             .resume_vcpus()
             .map_err(|e| Error::Build(BuildError::Start(format!("resume_vcpus: {e:?}"))))?;
+        #[cfg(not(feature = "tee"))]
+        trace.mark(if self.start_paused {
+            "vcpus.activation_gated"
+        } else {
+            "vcpus.resumed"
+        });
+        #[cfg(feature = "tee")]
         trace.mark("vcpus.resumed");
 
         #[cfg(not(feature = "tee"))]
@@ -829,6 +970,47 @@ impl VmControlRegistry {
             }
         }
     }
+
+    fn wait_until_paused(&self, timeout: Duration) -> Result<VmExecutionState> {
+        let started = Instant::now();
+        let mut state = self.state.lock().map_err(|_| {
+            Error::Runtime(RuntimeError::Control(
+                "VMM control registry is poisoned".to_string(),
+            ))
+        })?;
+
+        loop {
+            match state.execution {
+                Some(paused @ VmExecutionState::Paused(_)) => return Ok(paused),
+                Some(VmExecutionState::Indeterminate) if !state.transitioning => {
+                    return Err(Error::Runtime(RuntimeError::Control(
+                        "VM execution state became indeterminate while waiting for Paused"
+                            .to_string(),
+                    )));
+                }
+                Some(VmExecutionState::Running { .. })
+                | Some(VmExecutionState::Indeterminate)
+                | None => {}
+            }
+
+            let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                return Err(wait_until_paused_timeout(timeout, state.execution));
+            };
+            let (next_state, wait) =
+                self.state_changed
+                    .wait_timeout(state, remaining)
+                    .map_err(|_| {
+                        Error::Runtime(RuntimeError::Control(
+                            "VMM control registry is poisoned".to_string(),
+                        ))
+                    })?;
+            state = next_state;
+
+            if wait.timed_out() && !matches!(state.execution, Some(VmExecutionState::Paused(_))) {
+                return Err(wait_until_paused_timeout(timeout, state.execution));
+            }
+        }
+    }
 }
 
 struct BootTrace {
@@ -887,6 +1069,13 @@ fn public_execution_state(state: vmm::VmmExecutionState) -> VmExecutionState {
 fn wait_until_running_timeout(timeout: Duration, state: Option<VmExecutionState>) -> Error {
     Error::Runtime(RuntimeError::Control(format!(
         "timed out after {timeout:?} waiting for VM to reach Running; last state: {state:?}"
+    )))
+}
+
+#[cfg(not(feature = "tee"))]
+fn wait_until_paused_timeout(timeout: Duration, state: Option<VmExecutionState>) -> Error {
+    Error::Runtime(RuntimeError::Control(format!(
+        "timed out after {timeout:?} waiting for VM to reach Paused; last state: {state:?}"
     )))
 }
 
@@ -1002,6 +1191,33 @@ mod tests {
             Error::Runtime(RuntimeError::Control(message))
                 if message.contains("timed out") && message.contains("last state: None")
         ));
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn waiting_for_paused_times_out_before_vmm_startup() {
+        let control = make_vm().control_handle();
+
+        let error = control
+            .wait_until_paused(Duration::from_millis(1))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Runtime(RuntimeError::Control(message))
+                if message.contains("timed out") && message.contains("last state: None")
+        ));
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn initial_pause_gate_is_explicit_and_disabled_by_default() {
+        let mut vm = make_vm();
+        assert!(!vm.start_paused);
+
+        vm.set_start_paused(true);
+
+        assert!(vm.start_paused);
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -1333,9 +1549,81 @@ impl VmControl {
         self.vmm.wait_until_running(timeout)
     }
 
+    /// Blocks until the constructed VMM publishes a confirmed paused boundary.
+    ///
+    /// Restore coordinators use this with [`Vm::set_start_paused`] to finish activation work
+    /// without polling or allowing a guest instruction to run first.
+    pub fn wait_until_paused(&self, timeout: Duration) -> Result<VmExecutionState> {
+        self.vmm.wait_until_paused(timeout)
+    }
+
     /// Captures the exact backend execution state at the current paused boundary.
     pub fn capture_execution_state(&self) -> Result<vmm::execution_state::ExecutionState> {
         self.with_running_vmm(vmm::Vmm::capture_execution_state)
+    }
+
+    /// Captures one virtio-block device and parks it until this VM is resumed.
+    #[cfg(feature = "blk")]
+    pub fn capture_block_device_state(
+        &self,
+        device_id: &str,
+    ) -> Result<vmm::device_state::BlockDeviceState> {
+        self.with_running_vmm(|vmm| vmm.capture_block_device_state(device_id))
+    }
+
+    /// Returns the deterministic logical inventory of registered virtio-mmio devices.
+    #[cfg(feature = "blk")]
+    pub fn virtio_device_inventory(&self) -> Result<Vec<(u32, String)>> {
+        self.with_running_vmm(|vmm| Ok(vmm.virtio_device_inventory()))
+    }
+
+    /// Reports whether one configured virtio device supports reversible queue quiescence.
+    #[cfg(feature = "blk")]
+    pub fn virtio_device_supports_quiesce(
+        &self,
+        device_type: u32,
+        device_id: &str,
+    ) -> Result<bool> {
+        self.with_running_vmm(|vmm| vmm.virtio_device_supports_quiesce(device_type, device_id))
+    }
+
+    /// Captures one quiesce-capable destination-recreated virtio device.
+    #[cfg(feature = "blk")]
+    pub fn capture_virtio_device_state(
+        &self,
+        device_type: u32,
+        device_id: &str,
+    ) -> Result<vmm::device_state::VirtioDeviceState> {
+        self.with_running_vmm(|vmm| vmm.capture_virtio_device_state(device_type, device_id))
+    }
+
+    /// Restores one destination-recreated virtio device before resuming the paused VM.
+    #[cfg(feature = "blk")]
+    pub fn restore_virtio_device_state(
+        &self,
+        state: &vmm::device_state::VirtioDeviceState,
+    ) -> Result<()> {
+        self.with_running_vmm(|vmm| vmm.restore_virtio_device_state(state))
+    }
+
+    /// Restores one parked virtio-block device before resuming the paused VM.
+    #[cfg(feature = "blk")]
+    pub fn restore_block_device_state(
+        &self,
+        device_id: &str,
+        state: &vmm::device_state::BlockDeviceState,
+    ) -> Result<()> {
+        self.with_running_vmm(|vmm| vmm.restore_block_device_state(device_id, state))
+    }
+
+    /// Replaces one parked block backend with an already opened, compatible chain.
+    #[cfg(feature = "blk")]
+    pub fn replace_block_backend(
+        &self,
+        device_id: &str,
+        backend: devices::virtio::PreparedBlockBackend,
+    ) -> Result<()> {
+        self.with_running_vmm(|vmm| vmm.replace_block_backend(device_id, backend))
     }
 
     /// Plans a complete memory generation while the VM is paused.
@@ -1398,6 +1686,76 @@ impl VmControl {
         let vmm = self.vmm.running_vmm().ok()?;
         let baseline = vmm.lock().ok()?.retained_memory_baseline();
         baseline
+    }
+
+    /// Whether this VM was constructed with the VM-generation transport.
+    ///
+    /// Use [`vm_generation_state`](Self::vm_generation_state) after boot to distinguish transport
+    /// presence from a bundled or custom kernel that actually bound the guest driver.
+    pub fn vm_generation_transport_present(&self) -> bool {
+        self.generation.is_some()
+    }
+
+    /// Publish a fresh VM generation and signal the guest driver.
+    ///
+    /// The caller must generate `id` with its operating-system CSPRNG and persist it with the
+    /// restore attempt. Returning `None` means the transport is absent or its sequence space was
+    /// exhausted. Clone/rollback activation must fail closed in either case.
+    pub fn install_vm_generation_id(&self, id: VmGenerationId) -> Option<VmGenerationRequest> {
+        let generation = self.generation.as_ref()?;
+        let sequence = generation.lock().unwrap().install(id)?;
+        Some(VmGenerationRequest { sequence, id })
+    }
+
+    /// Publish one identity-and-clock activation; unsupported guest kernels return `None`.
+    ///
+    /// The guest reads fresh host time during processing, not the time when this request was
+    /// installed. A processed acknowledgement covers both the identity and the clock update.
+    pub fn install_vm_generation_and_clock(
+        &self,
+        id: VmGenerationId,
+    ) -> Option<VmGenerationRequest> {
+        let generation = self.generation.as_ref()?;
+        let sequence = generation.lock().unwrap().install_with_clock(id)?;
+        Some(VmGenerationRequest { sequence, id })
+    }
+
+    /// Wait without polling for the guest kernel to process one exact generation request.
+    pub fn wait_vm_generation_processed(
+        &self,
+        request: VmGenerationRequest,
+        timeout: Duration,
+    ) -> Option<VmGenerationWaitOutcome> {
+        let generation = self.generation.as_ref()?;
+        let processing = generation.lock().unwrap().processing_handle();
+        let outcome = processing.wait_processed(request.sequence, request.id, timeout);
+        Some(match outcome {
+            devices::virtio::GenerationWaitOutcome::Processed => VmGenerationWaitOutcome::Processed,
+            devices::virtio::GenerationWaitOutcome::Superseded => {
+                VmGenerationWaitOutcome::Superseded
+            }
+            devices::virtio::GenerationWaitOutcome::TimedOut => VmGenerationWaitOutcome::TimedOut,
+            devices::virtio::GenerationWaitOutcome::Failed => VmGenerationWaitOutcome::Failed,
+        })
+    }
+
+    /// Return the latest request and guest-kernel acknowledgement.
+    pub fn vm_generation_state(&self) -> Option<VmGenerationState> {
+        let generation = self.generation.as_ref()?;
+        let snapshot = generation.lock().unwrap().state_snapshot();
+        Some(VmGenerationState {
+            driver_ready: snapshot.driver_ready,
+            driver_error: snapshot.driver_error,
+            clock_sync_supported: snapshot.clock_sync_supported,
+            requested: (snapshot.request_sequence != 0).then_some(VmGenerationRequest {
+                sequence: snapshot.request_sequence,
+                id: snapshot.requested_id,
+            }),
+            processed: (snapshot.processed_sequence != 0).then_some(VmGenerationRequest {
+                sequence: snapshot.processed_sequence,
+                id: snapshot.processed_id,
+            }),
+        })
     }
 
     /// Whether the running VM can resize memory live.

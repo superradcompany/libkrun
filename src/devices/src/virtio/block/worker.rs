@@ -20,6 +20,8 @@ use std::os::fd::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::result;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
@@ -89,7 +91,9 @@ pub struct BlockWorker {
     mem: GuestMemoryMmap,
     disk: DiskProperties,
     stop_fd: EventFd,
+    stopping: Arc<AtomicBool>,
     metrics: BlockMetricsWriter,
+    shutdown_error: Option<io::Error>,
 }
 
 #[cfg(windows)]
@@ -121,6 +125,7 @@ impl BlockWorker {
         mem: GuestMemoryMmap,
         disk: DiskProperties,
         stop_fd: EventFd,
+        stopping: Arc<AtomicBool>,
         metrics: BlockMetricsWriter,
     ) -> Self {
         Self {
@@ -129,19 +134,26 @@ impl BlockWorker {
             mem,
             disk,
             stop_fd,
+            stopping,
             metrics,
+            shutdown_error: None,
         }
     }
 
-    pub fn run(self) -> thread::JoinHandle<()> {
+    pub fn run(self) -> thread::JoinHandle<Self> {
         thread::Builder::new()
             .name("block worker".into())
             .spawn(|| self.work())
             .unwrap()
     }
 
+    /// Splits a stopped worker into the queue, backend, and terminal flush result.
+    pub fn into_stopped_parts(self) -> (DeviceQueue, DiskProperties, Option<io::Error>) {
+        (self.device_queue, self.disk, self.shutdown_error)
+    }
+
     #[cfg(not(windows))]
-    fn work(mut self) {
+    fn work(mut self) -> Self {
         let virtq_ev = eventfd_pollable(&self.device_queue.event);
         let stop_ev = eventfd_pollable(&self.stop_fd);
 
@@ -173,7 +185,8 @@ impl BlockWorker {
                             STOP_EVENT if event_set.contains(EventSet::IN) => {
                                 debug!("stopping worker thread");
                                 let _ = self.stop_fd.read();
-                                return;
+                                self.shutdown_error = self.disk.flush_to_disk().err();
+                                return self;
                             }
                             _ => {
                                 log::warn!(
@@ -191,7 +204,7 @@ impl BlockWorker {
     }
 
     #[cfg(windows)]
-    fn work(mut self) {
+    fn work(mut self) -> Self {
         let virtq_ev = eventfd_pollable(&self.device_queue.event);
         let stop_ev = eventfd_pollable(&self.stop_fd);
 
@@ -213,7 +226,21 @@ impl BlockWorker {
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
             if !pending_raw.is_empty() {
+                // Stop admitting descriptors before waiting out the operations already owned by
+                // this worker. Anything not yet popped remains represented by the queue cursor.
+                if self.stopping.load(Ordering::Acquire) {
+                    let _ = self.stop_fd.read();
+                    self.complete_all_windows_raw_requests(&mut pending_raw);
+                    self.shutdown_error = self.disk.flush_to_disk().err();
+                    return self;
+                }
                 self.complete_one_windows_raw_request(&mut pending_raw);
+                if self.stopping.load(Ordering::Acquire) {
+                    let _ = self.stop_fd.read();
+                    self.complete_all_windows_raw_requests(&mut pending_raw);
+                    self.shutdown_error = self.disk.flush_to_disk().err();
+                    return self;
+                }
                 self.process_virtio_queues(&mut pending_raw);
                 continue;
             }
@@ -230,7 +257,13 @@ impl BlockWorker {
                             STOP_EVENT if event_set.contains(EventSet::IN) => {
                                 debug!("stopping worker thread");
                                 let _ = self.stop_fd.read();
-                                return;
+                                // Once a descriptor has been consumed, its IOCP operation must
+                                // reach a guest-visible used-ring completion. Retrying a failed
+                                // completion-port wait deliberately prefers unavailability over
+                                // dropping an operation that may still write guest memory.
+                                self.complete_all_windows_raw_requests(&mut pending_raw);
+                                self.shutdown_error = self.disk.flush_to_disk().err();
+                                return self;
                             }
                             _ => {
                                 log::warn!(
@@ -273,11 +306,16 @@ impl BlockWorker {
     fn process_virtio_queues(&mut self) {
         let mem = self.mem.clone();
         loop {
+            if self.stopping.load(Ordering::Acquire) {
+                break;
+            }
             self.device_queue.queue.disable_notification(&mem).unwrap();
 
             self.process_queue(&mem);
 
-            if !self.device_queue.queue.enable_notification(&mem).unwrap() {
+            let queue_needs_more_processing =
+                self.device_queue.queue.enable_notification(&mem).unwrap();
+            if self.stopping.load(Ordering::Acquire) || !queue_needs_more_processing {
                 break;
             }
         }
@@ -291,6 +329,9 @@ impl BlockWorker {
     ) {
         let mem = self.mem.clone();
         loop {
+            if self.stopping.load(Ordering::Acquire) {
+                break;
+            }
             self.device_queue.queue.disable_notification(&mem).unwrap();
 
             self.process_queue(&mem, pending_raw);
@@ -298,6 +339,9 @@ impl BlockWorker {
             let queue_needs_more_processing =
                 self.device_queue.queue.enable_notification(&mem).unwrap();
 
+            if self.stopping.load(Ordering::Acquire) {
+                break;
+            }
             if pending_raw.len() >= MAX_PENDING_WINDOWS_RAW_REQUESTS {
                 break;
             }
@@ -310,11 +354,15 @@ impl BlockWorker {
 
     #[cfg(not(windows))]
     fn process_queue(&mut self, mem: &GuestMemoryMmap) {
-        while let Some(head) = self.device_queue.queue.pop(mem) {
+        while !self.stopping.load(Ordering::Acquire) {
+            let Some(head) = self.device_queue.queue.pop(mem) else {
+                break;
+            };
             let mut reader = match Reader::new(mem, head.clone()) {
                 Ok(r) => r,
                 Err(e) => {
                     error!("invalid descriptor chain: {e:?}");
+                    self.complete_queue_head(mem, head.index, 0);
                     continue;
                 }
             };
@@ -322,6 +370,7 @@ impl BlockWorker {
                 Ok(r) => r,
                 Err(e) => {
                     error!("invalid descriptor chain: {e:?}");
+                    self.complete_queue_head(mem, head.index, 0);
                     continue;
                 }
             };
@@ -329,6 +378,8 @@ impl BlockWorker {
                 Ok(h) => h,
                 Err(e) => {
                     error!("invalid request header: {e:?}");
+                    let _ = writer.write_obj(VIRTIO_BLK_S_IOERR as u8);
+                    self.complete_queue_head(mem, head.index, 0);
                     continue;
                 }
             };
@@ -368,7 +419,9 @@ impl BlockWorker {
         mem: &GuestMemoryMmap,
         pending_raw: &mut HashMap<usize, PendingWindowsBlockRequest>,
     ) {
-        while pending_raw.len() < MAX_PENDING_WINDOWS_RAW_REQUESTS {
+        while pending_raw.len() < MAX_PENDING_WINDOWS_RAW_REQUESTS
+            && !self.stopping.load(Ordering::Acquire)
+        {
             let Some(head) = self.device_queue.queue.pop(mem) else {
                 break;
             };
@@ -377,6 +430,7 @@ impl BlockWorker {
                 Ok(r) => r,
                 Err(e) => {
                     error!("invalid descriptor chain: {e:?}");
+                    self.complete_queue_head(mem, head.index, 0);
                     continue;
                 }
             };
@@ -384,6 +438,7 @@ impl BlockWorker {
                 Ok(r) => r,
                 Err(e) => {
                     error!("invalid descriptor chain: {e:?}");
+                    self.complete_queue_head(mem, head.index, 0);
                     continue;
                 }
             };
@@ -391,6 +446,13 @@ impl BlockWorker {
                 Ok(h) => h,
                 Err(e) => {
                     error!("invalid request header: {e:?}");
+                    self.complete_sync_request(
+                        mem,
+                        head.index,
+                        &mut writer,
+                        VIRTIO_BLK_S_IOERR as u8,
+                        0,
+                    );
                     continue;
                 }
             };
@@ -459,6 +521,23 @@ impl BlockWorker {
         if self.device_queue.queue.needs_notification(mem).unwrap() {
             if let Err(e) = self.interrupt.try_signal_used_queue() {
                 error!("error signalling queue: {e:?}");
+            }
+        }
+    }
+
+    fn complete_queue_head(&mut self, mem: &GuestMemoryMmap, head_index: u16, len: u32) {
+        if let Err(e) = self.device_queue.queue.add_used(mem, head_index, len) {
+            error!("failed to add malformed request to the used queue: {e:?}");
+            return;
+        }
+        if self
+            .device_queue
+            .queue
+            .needs_notification(mem)
+            .unwrap_or(true)
+        {
+            if let Err(e) = self.interrupt.try_signal_used_queue() {
+                error!("error signalling malformed request completion: {e:?}");
             }
         }
     }
@@ -656,11 +735,7 @@ impl BlockWorker {
         pending_raw: &mut HashMap<usize, PendingWindowsBlockRequest>,
     ) {
         while !pending_raw.is_empty() {
-            let pending_count = pending_raw.len();
             self.complete_one_windows_raw_request(pending_raw);
-            if pending_raw.len() == pending_count {
-                break;
-            }
         }
     }
 

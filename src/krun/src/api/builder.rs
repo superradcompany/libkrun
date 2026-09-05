@@ -622,6 +622,18 @@ impl VmBuilder {
             })?;
             vmr.mem_device = Some(std::sync::Arc::new(std::sync::Mutex::new(mem)));
         }
+        // Every resumable guest needs the generation device present before its memory can be
+        // captured. A custom kernel may leave it unbound; restore admission then observes that
+        // the driver never became ready instead of discovering the missing capability too late.
+        #[cfg(not(feature = "tee"))]
+        {
+            let generation = devices::virtio::Generation::new().map_err(|error| {
+                Error::Build(BuildError::DeviceRegistration(format!(
+                    "virtio-msb-vmgenid: {error:?}"
+                )))
+            })?;
+            vmr.generation_device = Some(std::sync::Arc::new(std::sync::Mutex::new(generation)));
+        }
         vmr.nested_enabled = self.machine.nested_virt;
         vmr.split_irqchip = self.machine.split_irqchip;
         vmr.enable_balloon = self.machine.balloon;
@@ -742,6 +754,7 @@ impl VmBuilder {
         // Apply block device configuration
         #[cfg(feature = "blk")]
         for (i, configured_disk) in self.disk.configs.into_iter().enumerate() {
+            let explicit_layers = configured_disk.layers;
             let config = configured_disk.config;
             let block_id = config
                 .id
@@ -750,6 +763,19 @@ impl VmBuilder {
             let image_type: ImageType = config.format.into();
             let cache_type: CacheType = config.cache.into();
             let sync_mode: devices::virtio::block::SyncMode = config.sync.into();
+            let explicit_backend = explicit_layers.map(|layers| {
+                devices::virtio::BlockBackendSpec::new(
+                    layers
+                        .into_iter()
+                        .map(|layer| {
+                            devices::virtio::BlockLayerSpec::new(layer.path, layer.format.into())
+                        })
+                        .collect(),
+                )
+                .read_only(config.read_only)
+                .direct_io(config.direct_io)
+                .sync_mode(sync_mode.clone())
+            });
 
             let blk_config = BlockDeviceConfig {
                 block_id,
@@ -759,6 +785,7 @@ impl VmBuilder {
                 is_disk_read_only: config.read_only,
                 direct_io: config.direct_io,
                 sync_mode,
+                backend: explicit_backend,
             };
 
             let writeback_limit = configured_disk.writeback_limit.or_else(|| {
@@ -1414,6 +1441,31 @@ mod tests {
             })
             .build()
             .expect("consistent one-node topology should build");
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn build_attaches_vm_generation_control_before_boot() {
+        let vm = VmBuilder::new()
+            .build()
+            .expect("ordinary VMs should carry generation support from boot");
+        let control = vm.control_handle();
+        let id = devices::virtio::GenerationId::new([0x2a; 16]);
+
+        assert!(control.vm_generation_transport_present());
+        assert!(!control.vm_generation_state().unwrap().driver_ready);
+
+        let request = control
+            .install_vm_generation_id(id)
+            .expect("the initial generation request should fit");
+        assert_eq!(
+            control.vm_generation_state().unwrap().requested,
+            Some(request)
+        );
+        assert_eq!(
+            control.wait_vm_generation_processed(request, std::time::Duration::ZERO),
+            Some(super::super::vm::VmGenerationWaitOutcome::TimedOut)
+        );
     }
 
     #[cfg(not(feature = "tee"))]

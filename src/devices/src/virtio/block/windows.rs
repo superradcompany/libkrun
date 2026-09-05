@@ -40,7 +40,7 @@ const ZERO_WRITE_CHUNK_SIZE: usize = 1024 * 1024;
 // Types
 //--------------------------------------------------------------------------------------------------
 
-pub(super) struct WindowsRawFile {
+pub(crate) struct WindowsRawFile {
     file: File,
     completion_port: CompletionPort,
     size: AtomicU64,

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use devices::virtio::{
     block::{ImageType, SyncMode},
-    Block, CacheType,
+    Block, BlockBackendSpec, CacheType,
 };
 use utils::metrics::MetricsWriter;
 
@@ -34,6 +34,8 @@ pub struct BlockDeviceConfig {
     pub is_disk_read_only: bool,
     pub direct_io: bool,
     pub sync_mode: SyncMode,
+    /// Caller-resolved dependency chain; `None` retains legacy path/header resolution.
+    pub backend: Option<BlockBackendSpec>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,6 +117,22 @@ impl BlockBuilder {
         metrics: MetricsWriter,
     ) -> Result<Block> {
         let device_metrics = metrics.register_block_device(config.block_id.clone());
+        if let Some(backend) = config.backend {
+            if writeback_limit.is_some() {
+                return Err(BlockConfigError::CreateBlockDevice(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "bounded writeback is unavailable for explicit block dependency chains",
+                )));
+            }
+            return devices::virtio::Block::new_with_backend(
+                config.block_id,
+                None,
+                config.cache_type,
+                backend,
+                device_metrics,
+            )
+            .map_err(BlockConfigError::CreateBlockDevice);
+        }
         devices::virtio::Block::new_with_writeback_limit_handle(
             config.block_id,
             None,

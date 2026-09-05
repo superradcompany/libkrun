@@ -20,7 +20,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, RawHandle};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
@@ -38,6 +38,9 @@ const RX_QUEUE_EVENT: u64 = 0;
 const TX_QUEUE_EVENT: u64 = 1;
 const BACKEND_EVENT: u64 = 2;
 const RATE_LIMIT_TIMER_EVENT: u64 = 3;
+// The Windows epoll shim reserves `u64::MAX` for its internal control wakeup. Keep the worker's
+// stop token distinct so quiescence can always register and observe its wake event.
+const STOP_EVENT: u64 = u64::MAX - 1;
 
 pub struct NetWorker {
     rx_q: DeviceQueue,
@@ -47,7 +50,7 @@ pub struct NetWorker {
     mem: GuestMemoryMmap,
     backend: Box<dyn NetBackend + Send>,
 
-    rx_frame_buf: [u8; MAX_BUFFER_SIZE],
+    rx_frame_buf: Box<[u8; MAX_BUFFER_SIZE]>,
     rx_frame_buf_len: usize,
     rx_has_deferred_frame: bool,
     rx_has_rate_limit_permit: bool,
@@ -55,7 +58,35 @@ pub struct NetWorker {
     rx_resume_at: Option<Instant>,
 
     tx_iovec: Vec<(GuestAddress, usize)>,
-    tx_frame_buf: [u8; MAX_BUFFER_SIZE],
+    tx_frame_buf: Box<[u8; MAX_BUFFER_SIZE]>,
+    tx_frame_len: usize,
+    tx_has_rate_limit_permit: bool,
+    tx_rate_limiter: Option<RateLimiter>,
+    tx_resume_at: Option<Instant>,
+
+    rate_limit_timer: Option<TimerFd>,
+    armed_rate_limit_deadline: Option<Instant>,
+
+    stop_evt: EventFd,
+}
+
+/// Runtime-local state retained only so an aborted checkpoint can resume the original backend.
+///
+/// Destination restore deliberately constructs a fresh backend. Frames accepted by the guest or
+/// host before this boundary remain represented in the virtqueue or this continuation until the
+/// source is either resumed or retired.
+pub(crate) struct NetWorkerContinuation {
+    backend: Box<dyn NetBackend + Send>,
+
+    rx_frame_buf: Box<[u8; MAX_BUFFER_SIZE]>,
+    rx_frame_buf_len: usize,
+    rx_has_deferred_frame: bool,
+    rx_has_rate_limit_permit: bool,
+    rx_rate_limiter: Option<RateLimiter>,
+    rx_resume_at: Option<Instant>,
+
+    tx_iovec: Vec<(GuestAddress, usize)>,
+    tx_frame_buf: Box<[u8; MAX_BUFFER_SIZE]>,
     tx_frame_len: usize,
     tx_has_rate_limit_permit: bool,
     tx_rate_limiter: Option<RateLimiter>,
@@ -132,14 +163,14 @@ impl NetWorker {
             backend,
             interrupt,
 
-            rx_frame_buf: [0u8; MAX_BUFFER_SIZE],
+            rx_frame_buf: Box::new([0u8; MAX_BUFFER_SIZE]),
             rx_frame_buf_len: 0,
             rx_has_deferred_frame: false,
             rx_has_rate_limit_permit: false,
             rx_rate_limiter,
             rx_resume_at: None,
 
-            tx_frame_buf: [0u8; MAX_BUFFER_SIZE],
+            tx_frame_buf: Box::new([0u8; MAX_BUFFER_SIZE]),
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_rate_limit_permit: false,
@@ -148,17 +179,24 @@ impl NetWorker {
 
             rate_limit_timer,
             armed_rate_limit_deadline: None,
+            stop_evt: EventFd::new(0).map_err(ConnectError::WorkerEvent)?,
         })
     }
 
-    pub fn run(self) {
-        thread::Builder::new()
+    /// Starts the worker and returns a wake handle plus ownership of the eventual stopped worker.
+    pub fn run(self) -> (EventFd, JoinHandle<Self>) {
+        let stop_evt = self
+            .stop_evt
+            .try_clone()
+            .expect("failed to clone virtio-net stop event");
+        let thread = thread::Builder::new()
             .name("virtio-net worker".into())
             .spawn(|| self.work())
             .unwrap();
+        (stop_evt, thread)
     }
 
-    fn work(mut self) {
+    fn work(mut self) -> Self {
         let virtq_rx_ev = eventfd_pollable(&self.rx_q.event);
         let virtq_tx_ev = eventfd_pollable(&self.tx_q.event);
         let backend_source = self.backend.event_source(BACKEND_EVENT);
@@ -166,9 +204,10 @@ impl NetWorker {
             Ok(pollable) => pollable,
             Err(err) => {
                 log::error!("virtio-net backend event source is unsupported: {err}");
-                return;
+                return self;
             }
         };
+        let stop_pollable = eventfd_pollable(&self.stop_evt);
 
         let epoll = Epoll::new().unwrap();
 
@@ -197,11 +236,25 @@ impl NetWorker {
                 &EpollEvent::new(EventSet::IN, RATE_LIMIT_TIMER_EVENT),
             );
         }
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            stop_pollable,
+            &EpollEvent::new(EventSet::IN, STOP_EVENT),
+        );
 
         loop {
             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
+                    // Stop wins over data-plane events observed in the same batch. This bounds the
+                    // final cut without adding a branch to ordinary packet processing.
+                    if epoll_events[..ev_cnt]
+                        .iter()
+                        .any(|event| event.data() == STOP_EVENT)
+                    {
+                        let _ = self.stop_evt.read();
+                        return self;
+                    }
                     for event in &epoll_events[0..ev_cnt] {
                         let source = event.data();
                         let event_set = event.event_set();
@@ -243,6 +296,62 @@ impl NetWorker {
                     debug!("vsock: failed to consume muxer epoll event: {e}");
                 }
             }
+        }
+    }
+
+    /// Separates transport-owned queues from source-local backend continuation state.
+    pub(crate) fn into_quiesced(mut self) -> (DeviceQueue, DeviceQueue, NetWorkerContinuation) {
+        self.backend.quiesce();
+        let continuation = NetWorkerContinuation {
+            backend: self.backend,
+            rx_frame_buf: self.rx_frame_buf,
+            rx_frame_buf_len: self.rx_frame_buf_len,
+            rx_has_deferred_frame: self.rx_has_deferred_frame,
+            rx_has_rate_limit_permit: self.rx_has_rate_limit_permit,
+            rx_rate_limiter: self.rx_rate_limiter,
+            rx_resume_at: self.rx_resume_at,
+            tx_iovec: self.tx_iovec,
+            tx_frame_buf: self.tx_frame_buf,
+            tx_frame_len: self.tx_frame_len,
+            tx_has_rate_limit_permit: self.tx_has_rate_limit_permit,
+            tx_rate_limiter: self.tx_rate_limiter,
+            tx_resume_at: self.tx_resume_at,
+            rate_limit_timer: self.rate_limit_timer,
+            armed_rate_limit_deadline: self.armed_rate_limit_deadline,
+        };
+        (self.rx_q, self.tx_q, continuation)
+    }
+
+    /// Reattaches a source-local continuation to restored queue and guest-memory ownership.
+    pub(crate) fn from_continuation(
+        mut continuation: NetWorkerContinuation,
+        rx_q: DeviceQueue,
+        tx_q: DeviceQueue,
+        interrupt: InterruptTransport,
+        mem: GuestMemoryMmap,
+    ) -> Self {
+        continuation.backend.resume();
+        Self {
+            rx_q,
+            tx_q,
+            interrupt,
+            mem,
+            backend: continuation.backend,
+            rx_frame_buf: continuation.rx_frame_buf,
+            rx_frame_buf_len: continuation.rx_frame_buf_len,
+            rx_has_deferred_frame: continuation.rx_has_deferred_frame,
+            rx_has_rate_limit_permit: continuation.rx_has_rate_limit_permit,
+            rx_rate_limiter: continuation.rx_rate_limiter,
+            rx_resume_at: continuation.rx_resume_at,
+            tx_iovec: continuation.tx_iovec,
+            tx_frame_buf: continuation.tx_frame_buf,
+            tx_frame_len: continuation.tx_frame_len,
+            tx_has_rate_limit_permit: continuation.tx_has_rate_limit_permit,
+            tx_rate_limiter: continuation.tx_rate_limiter,
+            tx_resume_at: continuation.tx_resume_at,
+            rate_limit_timer: continuation.rate_limit_timer,
+            armed_rate_limit_deadline: continuation.armed_rate_limit_deadline,
+            stop_evt: EventFd::new(0).expect("failed to recreate virtio-net stop event"),
         }
     }
 
@@ -658,7 +767,7 @@ impl NetWorker {
 
     /// Fills self.rx_frame_buf with an ethernet frame from backend and prepends virtio_net_hdr to it
     fn read_into_rx_frame_buf_from_backend(&mut self) -> result::Result<(), ReadError> {
-        self.rx_frame_buf_len = self.backend.read_frame(&mut self.rx_frame_buf)?;
+        self.rx_frame_buf_len = self.backend.read_frame(&mut self.rx_frame_buf[..])?;
         Ok(())
     }
 }
@@ -805,7 +914,7 @@ mod tests {
                 .unwrap(),
             mem,
             backend: Box::new(backend),
-            rx_frame_buf: [0; MAX_BUFFER_SIZE],
+            rx_frame_buf: Box::new([0; MAX_BUFFER_SIZE]),
             rx_frame_buf_len: 0,
             rx_has_deferred_frame: false,
             rx_has_rate_limit_permit: false,
@@ -815,7 +924,7 @@ mod tests {
                 .map(|config| RateLimiter::new(config, now).unwrap()),
             rx_resume_at: None,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
-            tx_frame_buf: [0; MAX_BUFFER_SIZE],
+            tx_frame_buf: Box::new([0; MAX_BUFFER_SIZE]),
             tx_frame_len: 0,
             tx_has_rate_limit_permit: false,
             tx_rate_limiter: rate_limiters
@@ -825,6 +934,7 @@ mod tests {
             tx_resume_at: None,
             rate_limit_timer: None,
             armed_rate_limit_deadline: None,
+            stop_evt: EventFd::new(0).unwrap(),
         }
     }
 
@@ -941,6 +1051,42 @@ mod tests {
                 .unwrap();
             assert_eq!(&actual, expected);
         }
+    }
+
+    #[test]
+    fn stop_returns_queues_and_runtime_local_continuation() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), QUEUE_MEMORY_SIZE)]).unwrap();
+        let rx_vq = VirtQueue::new(RX_QUEUE_ADDR, &mem, 8);
+        let tx_vq = VirtQueue::new(TX_QUEUE_ADDR, &mem, 8);
+        let state = Arc::new(Mutex::new(BackendState::default()));
+        let worker = worker(
+            mem.clone(),
+            device_queue(rx_vq.create_queue()),
+            device_queue(tx_vq.create_queue()),
+            state,
+            RateLimiters::default(),
+            Instant::now(),
+        );
+
+        let (stop_evt, thread) = worker.run();
+        stop_evt.write(1).unwrap();
+        let worker = thread.join().expect("virtio-net worker panicked");
+        let (rx_q, tx_q, continuation) = worker.into_quiesced();
+
+        assert_eq!(rx_q.queue.next_avail.0, 0);
+        assert_eq!(tx_q.queue.next_avail.0, 0);
+        assert_eq!(continuation.rx_frame_buf_len, 0);
+        assert_eq!(continuation.tx_frame_len, 0);
+
+        let resumed = NetWorker::from_continuation(
+            continuation,
+            rx_q,
+            tx_q,
+            InterruptTransport::new(DummyIrqChip::new().into(), "test-net".into()).unwrap(),
+            mem,
+        );
+        assert_eq!(resumed.rx_q.queue.next_avail.0, 0);
+        assert_eq!(resumed.tx_q.queue.next_avail.0, 0);
     }
 }
 

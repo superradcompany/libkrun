@@ -84,16 +84,21 @@ impl io::Write for ZCWriter<'_> {
 }
 
 pub struct Server<F: FileSystem + Sync> {
-    fs: F,
+    fs: Arc<F>,
     options: AtomicU64,
 }
 
 impl<F: FileSystem + Sync> Server<F> {
-    pub fn new(fs: F) -> Server<F> {
+    pub fn new(fs: Arc<F>, options: u64) -> Server<F> {
         Server {
             fs,
-            options: AtomicU64::new(FsOptions::empty().bits()),
+            options: AtomicU64::new(options),
         }
+    }
+
+    /// Return the negotiated FUSE session options at a quiesced boundary.
+    pub fn session_options(&self) -> u64 {
+        self.options.load(Ordering::Acquire)
     }
 
     #[allow(clippy::cognitive_complexity)]

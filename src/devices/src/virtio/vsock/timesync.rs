@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time;
 
@@ -18,6 +18,7 @@ pub struct TimesyncThread {
     mem: GuestMemoryMmap,
     queue_mutex: Arc<Mutex<VirtQueue>>,
     interrupt: InterruptTransport,
+    stop: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl TimesyncThread {
@@ -26,12 +27,14 @@ impl TimesyncThread {
         mem: GuestMemoryMmap,
         queue_mutex: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
+        stop: Arc<(Mutex<bool>, Condvar)>,
     ) -> Self {
         Self {
             cid,
             mem,
             queue_mutex,
             interrupt,
+            stop,
         }
     }
 
@@ -75,14 +78,21 @@ impl TimesyncThread {
             }
 
             last_awake = utils::time::get_time(utils::time::ClockType::Real);
-            thread::sleep(time::Duration::from_nanos(SLEEP_NSECS));
+            let (stopped, changed) = &*self.stop;
+            let guard = stopped.lock().unwrap();
+            let (guard, _) = changed
+                .wait_timeout(guard, time::Duration::from_nanos(SLEEP_NSECS))
+                .unwrap();
+            if *guard {
+                return;
+            }
         }
     }
 
-    pub fn run(mut self) {
+    pub fn run(mut self) -> thread::JoinHandle<()> {
         thread::Builder::new()
             .name("vsock timesync".into())
             .spawn(move || self.work())
-            .unwrap();
+            .unwrap()
     }
 }

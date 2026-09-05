@@ -19,6 +19,7 @@ use std::os::macos::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::result;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -47,8 +48,12 @@ use super::writeback::{
     MINIMUM_WRITEBACK_BUDGET_BYTES,
 };
 use super::{
-    super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice, TYPE_BLOCK},
-    Error, WritebackLimit, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
+    super::{
+        ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice, VirtioStateError,
+        TYPE_BLOCK,
+    },
+    BlockBackendSpec, Error, PreparedBlockBackend, WritebackLimit, BLOCK_STATE_VERSION, NUM_QUEUES,
+    QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
 };
 
 use crate::virtio::{
@@ -87,6 +92,7 @@ impl CacheType {
 /// Helper object for setting up all `Block` fields derived from its backing file.
 pub(crate) struct DiskProperties {
     cache_type: CacheType,
+    read_only: bool,
     pub(crate) file: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
     #[cfg(target_os = "linux")]
     // One block worker owns each DiskProperties instance. RefCell preserves the `&self` volatile
@@ -127,6 +133,7 @@ impl DiskProperties {
         disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
         disk_image_id: Vec<u8>,
         cache_type: CacheType,
+        read_only: bool,
     ) -> io::Result<Self> {
         let disk_size = disk_image.lock().unwrap().size();
 
@@ -141,6 +148,7 @@ impl DiskProperties {
 
         Ok(Self {
             cache_type,
+            read_only,
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id: disk_image_id,
             file: disk_image,
@@ -208,6 +216,13 @@ impl DiskProperties {
     }
 
     pub(crate) fn flush_to_disk(&self) -> io::Result<()> {
+        // A read-only backend cannot contain guest or device mutations. Treat its durability
+        // fence as already satisfied instead of asking platforms such as Windows to flush a
+        // handle that intentionally lacks write access.
+        if self.read_only {
+            return Ok(());
+        }
+
         #[cfg(target_os = "linux")]
         let quiesce_error = self
             .writeback_controller
@@ -666,8 +681,12 @@ pub struct Block {
     #[cfg(windows)]
     windows_raw_file: Option<Arc<WindowsRawFile>>,
     metrics: BlockMetricsWriter,
-    worker_thread: Option<JoinHandle<()>>,
+    worker_thread: Option<JoinHandle<BlockWorker>>,
     worker_stopfd: EventFd,
+    // The event wakes a sleeping worker; this flag also closes dequeue admission while the worker
+    // is inside an existing request or waiting for an IOCP completion.
+    worker_stopping: Arc<AtomicBool>,
+    quiesced_queue: Option<DeviceQueue>,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
@@ -710,6 +729,33 @@ impl Block {
             None,
             metrics,
         )
+    }
+
+    /// Creates one virtio-block device over a caller-resolved raw/qcow2 dependency chain.
+    ///
+    /// Layers are composed base-to-head and header-provided dependency paths are ignored. This is
+    /// the preferred constructor when artifacts were resolved by a snapshot or checkpoint store.
+    pub fn new_with_backend(
+        id: String,
+        partuuid: Option<String>,
+        cache_type: CacheType,
+        backend: BlockBackendSpec,
+        metrics: BlockMetricsWriter,
+    ) -> io::Result<Block> {
+        let head_path = backend
+            .layers
+            .last()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing block head"))?
+            .path
+            .clone();
+        let head_file = OpenOptions::new().read(true).open(&head_path)?;
+        let disk_image_id = if id.is_empty() {
+            DiskProperties::build_disk_image_id(&head_file)
+        } else {
+            Self::padded_disk_image_id(&id)
+        };
+        let prepared = PreparedBlockBackend::open(&backend)?;
+        Self::from_prepared_backend(id, partuuid, cache_type, disk_image_id, prepared, metrics)
     }
 
     /// Create a virtio block device with an optional hard buffered-writeback budget.
@@ -898,8 +944,12 @@ impl Block {
         let disk_image = Arc::new(Mutex::new(disk_image));
 
         let disk_properties = {
-            let disk_properties =
-                DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
+            let disk_properties = DiskProperties::new(
+                disk_image.clone(),
+                disk_image_id.clone(),
+                cache_type,
+                is_disk_read_only,
+            )?;
             #[cfg(windows)]
             {
                 let mut disk_properties = disk_properties;
@@ -977,6 +1027,8 @@ impl Block {
             device_state: DeviceState::Inactive,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
+            worker_stopping: Arc::new(AtomicBool::new(false)),
+            quiesced_queue: None,
         })
     }
 
@@ -995,25 +1047,275 @@ impl Block {
         self.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0
     }
 
-    fn stop_worker(&mut self) {
-        if let Some(worker) = self.worker_thread.take() {
-            if let Err(error) = self.worker_stopfd.write(1) {
-                error!("error signaling block worker to stop: {error}");
-            }
-            if let Err(error) = worker.join() {
-                error!("error waiting for block worker thread: {error:?}");
-            }
+    /// Replaces the backing chain while this device is inactive at a terminal queue boundary.
+    ///
+    /// The replacement must preserve guest-visible capacity and read-only policy. The virtio
+    /// transport, queues, feature negotiation, and serial remain unchanged.
+    pub fn replace_backend(
+        &mut self,
+        backend: PreparedBlockBackend,
+    ) -> Result<(), VirtioStateError> {
+        if self.worker_thread.is_some() || self.device_state.is_activated() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "block backend replacement requires a quiesced device",
+            ));
         }
+        #[cfg(target_os = "linux")]
+        let leaving_bounded_writeback = self.writeback_config.is_some() && backend.direct_io;
+        #[cfg(target_os = "linux")]
+        if self.writeback_config.is_some() && !leaving_bounded_writeback {
+            return Err(VirtioStateError::Incompatible(
+                "bounded writeback backend replacement requires direct I/O".to_string(),
+            ));
+        }
+        let configured_capacity = self.config.capacity;
+        if backend.capacity_sectors != configured_capacity {
+            return Err(VirtioStateError::Incompatible(format!(
+                "replacement capacity {} differs from guest-visible capacity {}",
+                backend.capacity_sectors, configured_capacity
+            )));
+        }
+        if backend.read_only != self.is_read_only() {
+            return Err(VirtioStateError::Incompatible(
+                "replacement read-only policy differs from the active device".to_string(),
+            ));
+        }
+        let flush_advertised = self.avail_features & (1u64 << VIRTIO_BLK_F_FLUSH) != 0;
+        if (backend.sync_mode != SyncMode::None) != flush_advertised {
+            return Err(VirtioStateError::Incompatible(
+                "replacement synchronization policy would change advertised flush support"
+                    .to_string(),
+            ));
+        }
+        let replacement_discard_alignment = backend.discard_alignment as u32 / SECTOR_SIZE as u32;
+        let configured_discard_alignment = self.config.discard_sector_alignment;
+        #[cfg(target_os = "linux")]
+        let discard_alignment_is_compatible = leaving_bounded_writeback
+            || replacement_discard_alignment == configured_discard_alignment;
+        #[cfg(not(target_os = "linux"))]
+        let discard_alignment_is_compatible =
+            replacement_discard_alignment == configured_discard_alignment;
+        if !discard_alignment_is_compatible {
+            return Err(VirtioStateError::Incompatible(format!(
+                "replacement discard alignment {replacement_discard_alignment} differs from guest-visible alignment {configured_discard_alignment}",
+            )));
+        }
+
+        #[allow(unused_mut)]
+        let mut disk = DiskProperties::new(
+            Arc::clone(&backend.disk_image),
+            self.disk_image_id.clone(),
+            self.cache_type,
+            backend.read_only,
+        )?;
+        #[cfg(windows)]
+        disk.set_windows_raw_file(backend.windows_raw_file.clone());
+        #[cfg(target_os = "linux")]
+        if leaving_bounded_writeback {
+            // Guest-visible discard/unmap remains conservatively disabled, but the new direct-I/O
+            // backend bypasses the host page cache and no longer needs raw-offset accounting.
+            self.writeback_config = None;
+        }
+        self.disk_image = backend.disk_image;
+        #[cfg(windows)]
+        {
+            self.windows_raw_file = backend.windows_raw_file;
+        }
+        self.disk = Some(disk);
+        Ok(())
     }
+
+    fn padded_disk_image_id(id: &str) -> Vec<u8> {
+        let mut padded = vec![0u8; VIRTIO_BLK_ID_BYTES as usize];
+        let bytes = id.as_bytes();
+        let n = cmp::min(bytes.len(), padded.len());
+        padded[..n].copy_from_slice(&bytes[..n]);
+        padded
+    }
+
+    fn from_prepared_backend(
+        id: String,
+        partuuid: Option<String>,
+        cache_type: CacheType,
+        disk_image_id: Vec<u8>,
+        backend: PreparedBlockBackend,
+        metrics: BlockMetricsWriter,
+    ) -> io::Result<Block> {
+        let disk_image = backend.disk_image;
+        #[allow(unused_mut)]
+        let mut disk = DiskProperties::new(
+            Arc::clone(&disk_image),
+            disk_image_id.clone(),
+            cache_type,
+            backend.read_only,
+        )?;
+        #[cfg(windows)]
+        disk.set_windows_raw_file(backend.windows_raw_file.clone());
+
+        let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
+            | (1u64 << VIRTIO_BLK_F_SEG_MAX)
+            | (1u64 << VIRTIO_BLK_F_WRITE_ZEROES)
+            | (1u64 << VIRTIO_BLK_F_DISCARD)
+            | (1u64 << VIRTIO_RING_F_EVENT_IDX);
+        if backend.sync_mode != SyncMode::None {
+            avail_features |= 1u64 << VIRTIO_BLK_F_FLUSH;
+        }
+        if backend.read_only {
+            avail_features |= 1u64 << VIRTIO_BLK_F_RO;
+        }
+
+        let config = VirtioBlkConfig {
+            capacity: backend.capacity_sectors,
+            size_max: 0,
+            seg_max: 254,
+            max_discard_sectors: u32::MAX,
+            max_discard_seg: 1,
+            discard_sector_alignment: backend.discard_alignment as u32 / 512,
+            max_write_zeroes_sectors: u32::MAX,
+            max_write_zeroes_seg: 1,
+            write_zeroes_may_unmap: 1,
+            ..Default::default()
+        };
+
+        Ok(Block {
+            id,
+            partuuid,
+            disk: Some(disk),
+            cache_type,
+            disk_image,
+            disk_image_id,
+            #[cfg(target_os = "linux")]
+            writeback_config: None,
+            #[cfg(windows)]
+            windows_raw_file: backend.windows_raw_file,
+            metrics,
+            worker_thread: None,
+            worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
+            worker_stopping: Arc::new(AtomicBool::new(false)),
+            quiesced_queue: None,
+            avail_features,
+            acked_features: 0,
+            config,
+            device_state: DeviceState::Inactive,
+        })
+    }
+
+    fn stop_worker(&mut self) -> io::Result<()> {
+        if self.worker_thread.is_some() {
+            self.worker_stopping.store(true, Ordering::Release);
+            self.worker_stopfd.write(1)?;
+            let worker = self
+                .worker_thread
+                .take()
+                .expect("worker presence was checked before signalling");
+            let worker = worker
+                .join()
+                .map_err(|error| io::Error::other(format!("block worker panicked: {error:?}")))?;
+            let (queue, disk, shutdown_error) = worker.into_stopped_parts();
+            self.quiesced_queue = Some(queue);
+            self.disk = Some(disk);
+            if let Some(error) = shutdown_error {
+                return Err(error);
+            }
+        } else if let Some(disk) = &self.disk {
+            // A previous stop may have reached the queue boundary but failed its durability
+            // fence. Let a later attempt retry the flush without reactivating the worker.
+            disk.flush_to_disk()?;
+        }
+        Ok(())
+    }
+
+    /// Captures device-specific block state after the transport has quiesced the worker.
+    pub fn capture_state(&self) -> Result<BlockState, VirtioStateError> {
+        if self.worker_thread.is_some() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "block worker must be quiesced before state capture",
+            ));
+        }
+
+        Ok(BlockState {
+            version: BLOCK_STATE_VERSION,
+            id: self.id.clone(),
+            partuuid: self.partuuid.clone(),
+            capacity_sectors: self.config.capacity,
+            disk_image_id: self.disk_image_id.clone(),
+            avail_features: self.avail_features,
+            cache_type: self.cache_type,
+            read_only: self.is_read_only(),
+        })
+    }
+
+    /// Validates saved block identity and policy without mutating the device.
+    ///
+    /// A destination may implement more features than the source offered, but it must implement
+    /// every saved feature before the source contract can be restored.
+    pub fn validate_state(&self, state: &BlockState) -> Result<(), VirtioStateError> {
+        if state.version != BLOCK_STATE_VERSION {
+            return Err(VirtioStateError::Incompatible(format!(
+                "unsupported block state version {}",
+                state.version
+            )));
+        }
+        if self.worker_thread.is_some() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "block worker must be inactive before state restore",
+            ));
+        }
+        if self.id != state.id
+            || self.partuuid != state.partuuid
+            || self.config.capacity != state.capacity_sectors
+            || self.disk_image_id != state.disk_image_id
+            || self.cache_type != state.cache_type
+            || self.is_read_only() != state.read_only
+        {
+            return Err(VirtioStateError::Incompatible(
+                "saved block identity, capacity, or cache policy differs from the destination"
+                    .to_string(),
+            ));
+        }
+        if state.avail_features & !self.avail_features != 0 {
+            return Err(VirtioStateError::Incompatible(
+                "saved block features are unavailable on the destination".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Restores the exact guest-visible feature contract after compatibility validation.
+    pub fn restore_state(&mut self, state: &BlockState) -> Result<(), VirtioStateError> {
+        self.validate_state(state)?;
+        // Destination-only features must remain hidden from the restored guest. The driver may
+        // reread feature pages after resume, and a reset must not silently widen its device ABI.
+        self.avail_features = state.avail_features;
+        Ok(())
+    }
+}
+
+/// Device-specific state that must accompany a virtio-block transport snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockState {
+    /// State contract version.
+    pub version: u16,
+    /// Stable virtio device identifier.
+    pub id: String,
+    /// Optional partition UUID exposed by the VMM configuration.
+    pub partuuid: Option<String>,
+    /// Guest-visible capacity in 512-byte sectors.
+    pub capacity_sectors: u64,
+    /// Guest-visible virtio block serial bytes.
+    pub disk_image_id: Vec<u8>,
+    /// Features offered by the source device.
+    pub avail_features: u64,
+    /// Guest-visible cache policy.
+    pub cache_type: CacheType,
+    /// Whether writes are prohibited.
+    pub read_only: bool,
 }
 
 impl Drop for Block {
     fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
-        if self.writeback_config.is_some() {
-            // Dropping a JoinHandle detaches it. A detached bounded-writeback worker would retain
-            // DiskProperties indefinitely, skipping its final sync and shared health update.
-            self.stop_worker();
+        if let Err(error) = self.stop_worker() {
+            error!("error stopping block worker during drop: {error}");
         }
     }
 }
@@ -1074,6 +1376,8 @@ impl VirtioDevice for Block {
         if self.worker_thread.is_some() {
             panic!("virtio_blk: worker thread already exists");
         }
+        self.worker_stopping.store(false, Ordering::Release);
+        self.quiesced_queue = None;
 
         let [blk_q]: [_; NUM_QUEUES] = queues.try_into().map_err(|_| {
             error!("Cannot perform activate. Expected {} queue(s)", NUM_QUEUES);
@@ -1087,6 +1391,7 @@ impl VirtioDevice for Block {
                     Arc::clone(&self.disk_image),
                     self.disk_image_id.clone(),
                     self.cache_type,
+                    self.is_read_only(),
                 )
                 .map_err(|_| ActivateError::BadActivate)?;
                 #[cfg(windows)]
@@ -1119,6 +1424,7 @@ impl VirtioDevice for Block {
             mem.clone(),
             disk,
             self.worker_stopfd.try_clone().unwrap(),
+            Arc::clone(&self.worker_stopping),
             self.metrics.clone(),
         );
         self.worker_thread = Some(worker.run());
@@ -1128,9 +1434,38 @@ impl VirtioDevice for Block {
     }
 
     fn reset(&mut self) -> bool {
-        self.stop_worker();
+        if let Err(error) = self.stop_worker() {
+            error!("error stopping block worker during reset: {error}");
+            return false;
+        }
+        self.quiesced_queue = None;
         self.device_state = DeviceState::Inactive;
         true
+    }
+
+    fn supports_quiesce(&self) -> bool {
+        true
+    }
+
+    fn quiesce(&mut self) -> Result<Vec<DeviceQueue>, VirtioStateError> {
+        if !self.device_state.is_activated() && self.quiesced_queue.is_none() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "block device is not activated",
+            ));
+        }
+        self.stop_worker()?;
+        let queue = self
+            .quiesced_queue
+            .take()
+            .ok_or(VirtioStateError::InvalidLifecycle(
+                "block worker did not return its queue",
+            ))?;
+        if let Err(error) = queue.queue.capture_state() {
+            self.quiesced_queue = Some(queue);
+            return Err(error.into());
+        }
+        self.device_state = DeviceState::Inactive;
+        Ok(vec![queue])
     }
 }
 
@@ -1140,11 +1475,40 @@ impl VirtioDevice for Block {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use utils::metrics::MetricsWriter;
     #[cfg(target_os = "linux")]
     use utils::tempfile::TempFile;
 
+    #[cfg(target_os = "linux")]
+    use crate::virtio::block::BlockLayerSpec;
+
     use super::*;
+
+    #[test]
+    fn read_only_disk_durability_fence_is_already_satisfied() {
+        let image = temp_image_path("read-only-flush");
+        let file = File::create(&image).unwrap();
+        file.set_len(4 * 1024 * 1024).unwrap();
+        drop(file);
+        let block = Block::new(
+            "read-only".to_string(),
+            None,
+            CacheType::Writeback,
+            image.to_string_lossy().into_owned(),
+            ImageType::Raw,
+            true,
+            false,
+            SyncMode::Full,
+            MetricsWriter::default().register_block_device("read-only".to_string()),
+        )
+        .unwrap();
+
+        block.disk.as_ref().unwrap().flush_to_disk().unwrap();
+        drop(block);
+        std::fs::remove_file(image).unwrap();
+    }
 
     #[test]
     fn writable_vmdk_is_rejected() {
@@ -1309,6 +1673,107 @@ mod tests {
         assert!(error.to_string().contains("buffered I/O"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_writeback_can_transition_to_a_direct_backend() {
+        let original = temp_image_path("bounded-rebind-original");
+        let replacement = temp_image_path("bounded-rebind-replacement");
+        for path in [&original, &replacement] {
+            let file = File::create(path).unwrap();
+            file.set_len(4 * 1024 * 1024).unwrap();
+        }
+        let mut block = Block::new_with_writeback_limit(
+            "raw".to_string(),
+            None,
+            CacheType::Writeback,
+            original.to_string_lossy().into_owned(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            Some(MINIMUM_WRITEBACK_BUDGET_BYTES),
+            MetricsWriter::default().register_block_device("raw".to_string()),
+        )
+        .unwrap();
+
+        let buffered =
+            PreparedBlockBackend::open(&BlockBackendSpec::new(vec![BlockLayerSpec::new(
+                &replacement,
+                ImageType::Raw,
+            )]))
+            .unwrap();
+        assert!(block.replace_backend(buffered).is_err());
+        assert!(block.writeback_config.is_some());
+
+        let direct = PreparedBlockBackend::open(
+            &BlockBackendSpec::new(vec![BlockLayerSpec::new(&replacement, ImageType::Raw)])
+                .direct_io(true),
+        )
+        .unwrap();
+        block.replace_backend(direct).unwrap();
+
+        assert!(block.writeback_config.is_none());
+        assert!(!block.disk.as_ref().unwrap().has_writeback_limit());
+        std::fs::remove_file(original).unwrap();
+        std::fs::remove_file(replacement).unwrap();
+    }
+
+    #[test]
+    fn restore_masks_destination_only_block_features() {
+        let image = temp_image_path("restore-feature-superset");
+        let file = File::create(&image).unwrap();
+        file.set_len(4 * 1024 * 1024).unwrap();
+        drop(file);
+        let mut block = Block::new(
+            "vdb".to_string(),
+            None,
+            CacheType::Writeback,
+            image.to_string_lossy().into_owned(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            MetricsWriter::default().register_block_device("vdb".to_string()),
+        )
+        .unwrap();
+        let destination_features = block.avail_features;
+        let mut saved = block.capture_state().unwrap();
+        saved.avail_features &= !(1u64 << VIRTIO_BLK_F_DISCARD);
+
+        assert_ne!(destination_features, saved.avail_features);
+        block.restore_state(&saved).unwrap();
+        assert_eq!(block.avail_features, saved.avail_features);
+        std::fs::remove_file(image).unwrap();
+    }
+
+    #[test]
+    fn restore_rejects_block_features_missing_on_destination() {
+        let image = temp_image_path("restore-feature-missing");
+        let file = File::create(&image).unwrap();
+        file.set_len(4 * 1024 * 1024).unwrap();
+        drop(file);
+        let mut block = Block::new(
+            "vdb".to_string(),
+            None,
+            CacheType::Writeback,
+            image.to_string_lossy().into_owned(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            MetricsWriter::default().register_block_device("vdb".to_string()),
+        )
+        .unwrap();
+        let destination_features = block.avail_features;
+        let mut saved = block.capture_state().unwrap();
+        saved.avail_features |= 1u64 << 63;
+
+        let error = block.restore_state(&saved).unwrap_err();
+        assert!(error.to_string().contains("unavailable on the destination"));
+        assert_eq!(block.avail_features, destination_features);
+        std::fs::remove_file(image).unwrap();
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn bounded_writeback_is_rejected_on_unsupported_hosts() {
@@ -1330,5 +1795,16 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    fn temp_image_path(test_name: &str) -> PathBuf {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "libkrun-block-{test_name}-{}-{timestamp}.img",
+            std::process::id()
+        ))
     }
 }

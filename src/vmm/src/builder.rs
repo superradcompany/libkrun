@@ -288,6 +288,8 @@ pub enum StartMicrovmError {
     RegisterNetDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO microsandbox metrics device or add it to the MMIO Bus.
     RegisterMsbMetricsDevice(device_manager::mmio::Error),
+    /// Cannot initialize the private VM-generation device or add it to the MMIO Bus.
+    RegisterGenerationDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Rng device or add a device to the MMIO Bus.
     RegisterRngDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Snd device or add a device to the MMIO Bus.
@@ -614,6 +616,14 @@ impl Display for StartMicrovmError {
                 write!(
                     f,
                     "Cannot initialize a MMIO microsandbox metrics Device or add a device to the MMIO Bus. {err_msg}"
+                )
+            }
+            RegisterGenerationDevice(ref err) => {
+                let mut err_msg = format!("{err}");
+                err_msg = err_msg.replace('\"', "");
+                write!(
+                    f,
+                    "Cannot initialize the VM-generation Device or add it to the MMIO Bus. {err_msg}"
                 )
             }
             RegisterRngDevice(ref err) => {
@@ -1769,6 +1779,10 @@ pub fn build_microvm_paused(
         exit_code: exit_code.clone(),
         vm,
         mmio_device_manager,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        irqchip: intc.clone(),
+        #[cfg(feature = "blk")]
+        quiesced_virtio_devices: Default::default(),
         #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
         pio_device_manager,
     };
@@ -1956,6 +1970,14 @@ pub fn build_microvm_paused(
     #[cfg(feature = "snd")]
     if vm_resources.snd_device {
         attach_snd_device(&mut vmm, intc.clone())?;
+    }
+
+    // Keep this appended after established devices so enabling generation support does not
+    // renumber their MMIO addresses or interrupt assignments.
+    #[cfg(not(feature = "tee"))]
+    if let Some(generation_device) = vm_resources.generation_device.clone() {
+        attach_generation_device(&mut vmm, event_manager, intc.clone(), generation_device)?;
+        trace.mark("vmgenid.attached");
     }
 
     if let Some(s) = &vm_resources.kernel_cmdline.epilog {
@@ -4624,6 +4646,27 @@ fn attach_cpu_device(
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc.clone(), cpu_device).map_err(RegisterBalloonDevice)?;
+
+    Ok(())
+}
+
+#[cfg(not(feature = "tee"))]
+fn attach_generation_device(
+    vmm: &mut Vmm,
+    event_manager: &mut EventManager,
+    intc: IrqChip,
+    generation_device: Arc<Mutex<devices::virtio::Generation>>,
+) -> std::result::Result<(), StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    event_manager
+        .add_subscriber(generation_device.clone())
+        .map_err(RegisterEvent)?;
+
+    let id = String::from(generation_device.lock().unwrap().id());
+
+    // The device mutex must not be held while the transport takes ownership of the device.
+    attach_mmio_device(vmm, id, intc, generation_device).map_err(RegisterGenerationDevice)?;
 
     Ok(())
 }

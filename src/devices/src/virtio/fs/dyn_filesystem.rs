@@ -43,6 +43,27 @@ pub type AddDirEntryPlus<'a> =
 /// implementations to only override the methods they need.
 #[allow(unused_variables)]
 pub trait DynFileSystem: Send + Sync {
+    /// Capture portable backend state after request processing has quiesced.
+    fn capture_state(&self) -> io::Result<Vec<u8>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "dynamic filesystem backend does not support durable state",
+        ))
+    }
+
+    /// Validate portable backend state without mutating this backend.
+    fn validate_state(&self, _state: &[u8]) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "dynamic filesystem backend does not support durable state",
+        ))
+    }
+
+    /// Restore validated backend state before request processing resumes.
+    fn restore_state(&self, state: &[u8]) -> io::Result<()> {
+        self.validate_state(state)
+    }
+
     /// Initialize the file system.
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         Ok(FsOptions::empty())
@@ -542,6 +563,18 @@ impl DynFileSystemAdapter {
 impl FileSystem for DynFileSystemAdapter {
     type Inode = u64;
     type Handle = u64;
+
+    fn capture_state(&self) -> io::Result<Vec<u8>> {
+        self.0.capture_state()
+    }
+
+    fn validate_state(&self, state: &[u8]) -> io::Result<()> {
+        self.0.validate_state(state)
+    }
+
+    fn restore_state(&self, state: &[u8]) -> io::Result<()> {
+        self.0.restore_state(state)
+    }
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         self.0.init(capable)

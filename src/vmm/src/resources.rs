@@ -368,6 +368,10 @@ pub struct VmResources {
     /// enforcement state every vCPU run loop consults.
     #[cfg(not(feature = "tee"))]
     pub cpu_device: Option<std::sync::Arc<std::sync::Mutex<devices::virtio::Cpu>>>,
+    /// The private VM-generation device used to reseed a restored guest kernel before workload
+    /// activation. It is present from boot so its driver state survives memory checkpoints.
+    #[cfg(not(feature = "tee"))]
+    pub generation_device: Option<std::sync::Arc<std::sync::Mutex<devices::virtio::Generation>>>,
     /// Guest memory stats polling interval for the virtio-balloon device.
     pub balloon_stats_interval: Option<Duration>,
     /// Whether to attach the virtio-rng device.
@@ -432,6 +436,8 @@ impl Default for VmResources {
             mem_device: None,
             #[cfg(not(feature = "tee"))]
             cpu_device: None,
+            #[cfg(not(feature = "tee"))]
+            generation_device: None,
             balloon_stats_interval: Some(Duration::from_secs(1)),
             enable_rng: true,
             enable_msb_metrics: true,

@@ -21,7 +21,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::Pipes::{
     SetNamedPipeHandleState, WaitNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_WAIT,
 };
-use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects,
+};
 use windows_sys::Win32::System::IO::{
     CancelIoEx, CancelSynchronousIo, GetOverlappedResult, OVERLAPPED,
 };
@@ -153,10 +155,8 @@ impl NetBackend for NamedPipe {
     fn event_source(&self, token: EventToken) -> EventSource {
         EventSource::waitable_handle(self.rx_event.as_raw_handle(), token)
     }
-}
 
-impl Drop for NamedPipe {
-    fn drop(&mut self) {
+    fn quiesce(&mut self) {
         // The reader may be waiting on an overlapped pipe read. Wake the cooperative stop path and
         // also ask the kernel to cancel any still-pending operation before joining the thread.
         let _ = unsafe { CancelIoEx(self.handle.as_raw_handle() as HANDLE, ptr::null()) };
@@ -165,6 +165,28 @@ impl Drop for NamedPipe {
             let _ = unsafe { CancelSynchronousIo(reader.as_raw_handle() as HANDLE) };
             let _ = reader.join();
         }
+    }
+
+    fn resume(&mut self) {
+        let reset = unsafe { ResetEvent(self.stop_event.as_raw_handle() as HANDLE) };
+        if reset == 0 {
+            log::error!(
+                "failed to reset virtio-net named-pipe stop event: {}",
+                io::Error::last_os_error()
+            );
+            return;
+        }
+        self.spawn_reader();
+    }
+
+    fn supports_quiesce(&self) -> bool {
+        true
+    }
+}
+
+impl Drop for NamedPipe {
+    fn drop(&mut self) {
+        self.quiesce();
     }
 }
 

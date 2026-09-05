@@ -418,6 +418,7 @@ pub enum SyncMode {
 pub struct DiskBuilder {
     pub(crate) configs: Vec<ConfiguredDisk>,
     current_path: Option<PathBuf>,
+    current_layers: Option<Vec<DiskLayer>>,
     current_id: Option<String>,
     current_read_only: bool,
     current_format: DiskImageFormat,
@@ -443,11 +444,22 @@ pub struct DiskConfig {
     pub sync: SyncMode,
 }
 
+/// One caller-resolved layer in a base-to-head block chain.
+#[cfg(feature = "blk")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskLayer {
+    /// Exact local artifact path.
+    pub path: PathBuf,
+    /// On-disk format of this layer.
+    pub format: DiskImageFormat,
+}
+
 /// Internal disk configuration paired with host-only tuning state.
 #[cfg(feature = "blk")]
 #[derive(Debug, Clone)]
 pub(crate) struct ConfiguredDisk {
     pub(crate) config: DiskConfig,
+    pub(crate) layers: Option<Vec<DiskLayer>>,
     pub(crate) writeback_limit_bytes: Option<u64>,
     pub(crate) writeback_limit: Option<WritebackLimit>,
 }
@@ -1344,6 +1356,7 @@ impl DiskBuilder {
         Self {
             configs: Vec::new(),
             current_path: None,
+            current_layers: None,
             current_id: None,
             current_read_only: false,
             current_format: DiskImageFormat::Raw,
@@ -1375,31 +1388,21 @@ impl DiskBuilder {
 
     /// Set the path for a block device.
     pub fn path(mut self, path: impl AsRef<Path>) -> Self {
-        // Finalize any pending config
-        if let Some(pending_path) = self.current_path.take() {
-            self.configs.push(ConfiguredDisk {
-                config: DiskConfig {
-                    path: pending_path,
-                    id: self.current_id.take(),
-                    read_only: self.current_read_only,
-                    format: self.current_format,
-                    cache: self.current_cache,
-                    direct_io: self.current_direct_io,
-                    sync: self.current_sync,
-                },
-                writeback_limit_bytes: self.current_writeback_limit_bytes,
-                writeback_limit: self.current_writeback_limit.clone(),
-            });
-            self.current_read_only = false;
-            self.current_format = DiskImageFormat::Raw;
-            self.current_cache = CacheMode::Writeback;
-            self.current_direct_io = false;
-            self.current_sync = SyncMode::Full;
-            self.current_writeback_limit_bytes = None;
-            self.current_writeback_limit = None;
-        }
-
+        self.finish_current();
         self.current_path = Some(path.as_ref().to_path_buf());
+        self.current_layers = None;
+        self
+    }
+
+    /// Sets an explicit base-to-head raw/qcow2 dependency chain for the current disk.
+    ///
+    /// The runtime opens only these paths. Qcow2 header references are overridden, so the caller
+    /// remains responsible for resolving every predecessor artifact.
+    pub fn layers(mut self, layers: impl IntoIterator<Item = DiskLayer>) -> Self {
+        self.finish_current();
+        let layers = layers.into_iter().collect::<Vec<_>>();
+        self.current_path = layers.last().map(|layer| layer.path.clone());
+        self.current_layers = Some(layers);
         self
     }
 
@@ -1458,22 +1461,47 @@ impl DiskBuilder {
 
     /// Finalize the builder (called internally).
     pub(crate) fn finalize(mut self) -> Self {
-        if let Some(path) = self.current_path.take() {
-            self.configs.push(ConfiguredDisk {
-                config: DiskConfig {
-                    path,
-                    id: self.current_id.take(),
-                    read_only: self.current_read_only,
-                    format: self.current_format,
-                    cache: self.current_cache,
-                    direct_io: self.current_direct_io,
-                    sync: self.current_sync,
-                },
-                writeback_limit_bytes: self.current_writeback_limit_bytes,
-                writeback_limit: self.current_writeback_limit.take(),
-            });
-        }
+        self.finish_current();
         self
+    }
+
+    fn finish_current(&mut self) {
+        if self.current_path.is_none() && self.current_layers.is_none() {
+            return;
+        }
+        let path = self.current_path.take().unwrap_or_default();
+        self.configs.push(ConfiguredDisk {
+            config: DiskConfig {
+                path,
+                id: self.current_id.take(),
+                read_only: self.current_read_only,
+                format: self.current_format,
+                cache: self.current_cache,
+                direct_io: self.current_direct_io,
+                sync: self.current_sync,
+            },
+            layers: self.current_layers.take(),
+            writeback_limit_bytes: self.current_writeback_limit_bytes,
+            writeback_limit: self.current_writeback_limit.take(),
+        });
+        self.current_read_only = false;
+        self.current_format = DiskImageFormat::Raw;
+        self.current_cache = CacheMode::Writeback;
+        self.current_direct_io = false;
+        self.current_sync = SyncMode::Full;
+        self.current_writeback_limit_bytes = None;
+        self.current_writeback_limit = None;
+    }
+}
+
+#[cfg(feature = "blk")]
+impl DiskLayer {
+    /// Creates one resolved block layer.
+    pub fn new(path: impl AsRef<Path>, format: DiskImageFormat) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+            format,
+        }
     }
 }
 
@@ -1622,6 +1650,30 @@ mod tests {
         assert!(MachineBuilder::new().msb_metrics);
         assert!(!MachineBuilder::new().msb_metrics(false).msb_metrics);
         assert!(MachineBuilder::new().msb_metrics(true).msb_metrics);
+    }
+
+    #[cfg(feature = "blk")]
+    #[test]
+    fn disk_builder_keeps_resolved_layers_with_one_device() {
+        let builder = DiskBuilder::new()
+            .layers([
+                DiskLayer::new("base.raw", DiskImageFormat::Raw),
+                DiskLayer::new("delta.qcow2", DiskImageFormat::Qcow2),
+            ])
+            .id("root")
+            .finalize();
+
+        assert_eq!(builder.configs.len(), 1);
+        let configured = &builder.configs[0];
+        assert_eq!(configured.config.path, PathBuf::from("delta.qcow2"));
+        assert_eq!(configured.config.id.as_deref(), Some("root"));
+        assert_eq!(
+            configured.layers.as_ref().unwrap(),
+            &vec![
+                DiskLayer::new("base.raw", DiskImageFormat::Raw),
+                DiskLayer::new("delta.qcow2", DiskImageFormat::Qcow2),
+            ]
+        );
     }
 
     #[cfg(all(feature = "net", unix))]

@@ -1,12 +1,14 @@
+use std::os::windows::io::AsRawHandle;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crossbeam_channel::Sender;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
 
 use super::super::Queue as VirtQueue;
-use super::muxer::ProxyMap;
+use super::muxer::{ProxyMap, MUXER_STOP_TOKEN};
 use super::muxer_rxq::MuxerRxQ;
 use super::proxy::{ProxyRemoval, ProxyUpdate};
 use super::VsockPollable;
@@ -25,6 +27,7 @@ pub struct MuxerThread {
     queue: Arc<Mutex<VirtQueue>>,
     interrupt: InterruptTransport,
     reaper_sender: Sender<u64>,
+    stop_evt: EventFd,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -42,6 +45,7 @@ impl MuxerThread {
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
         reaper_sender: Sender<u64>,
+        stop_evt: EventFd,
     ) -> Self {
         Self {
             cid,
@@ -52,14 +56,15 @@ impl MuxerThread {
             queue,
             interrupt,
             reaper_sender,
+            stop_evt,
         }
     }
 
-    pub fn run(self) {
+    pub fn run(self) -> thread::JoinHandle<()> {
         thread::Builder::new()
             .name("vsock muxer".into())
             .spawn(|| self.work())
-            .unwrap();
+            .unwrap()
     }
 
     fn update_polling(&self, id: u64, pollable: VsockPollable, events: EventSet) {
@@ -99,10 +104,23 @@ impl MuxerThread {
     }
 
     fn work(self) {
+        let stop_handle = self.stop_evt.as_raw_handle();
         loop {
             let mut events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match self.epoll.wait(events.len(), -1, &mut events) {
                 Ok(count) => {
+                    if events[..count]
+                        .iter()
+                        .any(|event| event.data() == MUXER_STOP_TOKEN)
+                    {
+                        let _ = self.stop_evt.read();
+                        let _ = self.epoll.ctl(
+                            ControlOperation::Delete,
+                            stop_handle,
+                            &EpollEvent::default(),
+                        );
+                        return;
+                    }
                     for event in events.iter().take(count) {
                         let id = event.data();
                         let update =

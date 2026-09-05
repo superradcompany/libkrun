@@ -104,6 +104,48 @@ const EL2_SYSTEM_REGISTERS: &[hv_sys_reg_t] = &[
     hv_sys_reg_t_HV_SYS_REG_VTTBR_EL2,
 ];
 
+// Hypervisor.framework exposes the GIC CPU interface separately from ordinary vCPU system
+// registers. Keep only architecturally writable state here; RPR_EL1 is read-only.
+const ICC_REGISTERS: &[hv_gic_icc_reg_t] = &[
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_CTLR_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_PMR_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_BPR0_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_BPR1_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP0R0_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP1R0_EL1,
+    // Restore interface and interrupt-group enables only after priority and active state.
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_SRE_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_IGRPEN0_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_IGRPEN1_EL1,
+];
+
+// The EL2 system-register interface and virtual interrupt controller exist only for nested VMs.
+const NESTED_ICC_REGISTERS: &[hv_gic_icc_reg_t] = &[hv_gic_icc_reg_t_HV_GIC_ICC_REG_SRE_EL2];
+const NESTED_ICH_REGISTERS: &[hv_gic_ich_reg_t] = &[
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_AP0R0_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_AP1R0_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_VMCR_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR0_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR1_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR2_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR3_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR4_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR5_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR6_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR7_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR8_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR9_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR10_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR11_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR12_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR13_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR14_EL2,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR15_EL2,
+    // Enable the virtual interface only after its active-priority, control, and list registers are
+    // restored, so a pending virtual interrupt cannot become visible through partial state.
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_HCR_EL2,
+];
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct MachTimebaseInfo {
@@ -212,12 +254,14 @@ pub enum Error {
     VcpuInitialRegisters,
     VcpuReadRegister,
     VcpuReadPendingInterrupt,
+    VcpuReadGicRegister(&'static str, u16),
     VcpuReadSimdRegister,
     VcpuReadSystemRegister,
     VcpuReadVtimer,
     VcpuRequestExit,
     VcpuRun,
     VcpuSetPendingIrq,
+    VcpuSetGicRegister(&'static str, u16, u64),
     VcpuSetRegister,
     VcpuSetSimdRegister,
     VcpuSetSystemRegister(u16, u64),
@@ -249,12 +293,19 @@ impl Display for Error {
             VcpuInitialRegisters => write!(f, "Error setting up initial HVF vCPU registers"),
             VcpuReadRegister => write!(f, "Error reading HVF vCPU register"),
             VcpuReadPendingInterrupt => write!(f, "Error reading HVF vCPU interrupt state"),
+            VcpuReadGicRegister(kind, reg) => {
+                write!(f, "Error reading HVF vCPU GIC {kind} register {reg:#x}")
+            }
             VcpuReadSimdRegister => write!(f, "Error reading HVF vCPU SIMD register"),
             VcpuReadSystemRegister => write!(f, "Error reading HVF vCPU system register"),
             VcpuReadVtimer => write!(f, "Error reading HVF vCPU virtual timer state"),
             VcpuRequestExit => write!(f, "Error requesting HVF vCPU exit"),
             VcpuRun => write!(f, "Error running HVF vCPU"),
             VcpuSetPendingIrq => write!(f, "Error setting HVF vCPU pending irq"),
+            VcpuSetGicRegister(kind, reg, value) => write!(
+                f,
+                "Error setting HVF vCPU GIC {kind} register {reg:#x} to {value:#x}"
+            ),
             VcpuSetRegister => write!(f, "Error setting HVF vCPU register"),
             VcpuSetSimdRegister => write!(f, "Error setting HVF vCPU SIMD register"),
             VcpuSetSystemRegister(reg, val) => write!(
@@ -302,6 +353,13 @@ fn mach_absolute_time_to_ns(ticks: u64) -> u64 {
     let timebase = *MACH_TIMEBASE_INFO;
     let ns = (u128::from(ticks) * u128::from(timebase.numer)) / u128::from(timebase.denom);
     ns.min(u128::from(u64::MAX)) as u64
+}
+
+/// Host virtual-counter tick ratio, checked rather than defaulted for execution-state admission.
+pub fn counter_timebase() -> Option<(u32, u32)> {
+    let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
+    let ret = unsafe { mach_timebase_info(&mut info) };
+    (ret == 0 && info.numer != 0 && info.denom != 0).then_some((info.numer, info.denom))
 }
 
 pub fn vcpu_set_pending_irq(
@@ -537,12 +595,51 @@ pub struct HvfVcpuState {
     general: Vec<(hv_reg_t, u64)>,
     simd: Vec<(hv_simd_fp_reg_t, u128)>,
     system: Vec<(hv_sys_reg_t, u64)>,
+    icc: Vec<(hv_gic_icc_reg_t, u64)>,
+    ich: Vec<(hv_gic_ich_reg_t, u64)>,
     pending_irq: bool,
     pending_fiq: bool,
     vtimer_mask: bool,
     vtimer_offset: u64,
     pending_advance_pc: bool,
     nested_enabled: bool,
+}
+
+impl HvfVcpuState {
+    /// Rebase the saved virtual counter by the VM-wide host-counter displacement.
+    /// Every vCPU must receive the same displacement before any of them resumes.
+    pub fn rebase_timer_offset(&mut self, displacement: u64) {
+        self.vtimer_offset = self.vtimer_offset.wrapping_add(displacement);
+    }
+
+    fn has_register_topology(&self, nested_enabled: bool) -> bool {
+        self.nested_enabled == nested_enabled
+            && self
+                .general
+                .iter()
+                .map(|(register, _)| *register)
+                .eq(0..GENERAL_REGISTER_COUNT as hv_reg_t)
+            && self
+                .simd
+                .iter()
+                .map(|(register, _)| *register)
+                .eq(0..SIMD_REGISTER_COUNT as hv_simd_fp_reg_t)
+            && self
+                .system
+                .iter()
+                .map(|(register, _)| *register)
+                .eq(state_system_registers(nested_enabled))
+            && self
+                .icc
+                .iter()
+                .map(|(register, _)| *register)
+                .eq(state_icc_registers(nested_enabled))
+            && self
+                .ich
+                .iter()
+                .map(|(register, _)| *register)
+                .eq(state_ich_registers(nested_enabled))
+    }
 }
 
 pub struct HvfVcpu<'a> {
@@ -761,10 +858,21 @@ impl HvfVcpu<'_> {
             simd.push((register, value));
         }
 
-        let system_registers = self.state_system_registers();
+        let system_registers = state_system_registers(self.nested_enabled);
         let mut system = Vec::with_capacity(system_registers.len());
         for register in system_registers {
             system.push((register, self.read_sys_reg(register)?));
+        }
+
+        let icc_registers = state_icc_registers(self.nested_enabled);
+        let mut icc = Vec::with_capacity(icc_registers.len());
+        for register in icc_registers {
+            icc.push((register, self.read_icc_reg(register)?));
+        }
+        let ich_registers = state_ich_registers(self.nested_enabled);
+        let mut ich = Vec::with_capacity(ich_registers.len());
+        for register in ich_registers {
+            ich.push((register, self.read_ich_reg(register)?));
         }
 
         let pending_irq = self.read_pending_interrupt(hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ)?;
@@ -781,6 +889,8 @@ impl HvfVcpu<'_> {
             general,
             simd,
             system,
+            icc,
+            ich,
             pending_irq,
             pending_fiq,
             vtimer_mask,
@@ -792,29 +902,7 @@ impl HvfVcpu<'_> {
 
     /// Restores this vCPU on its owning thread before the first guest instruction executes.
     pub fn restore_state(&mut self, state: &HvfVcpuState) -> Result<(), Error> {
-        let expected_general = (0..GENERAL_REGISTER_COUNT as hv_reg_t).collect::<Vec<_>>();
-        let expected_simd = (0..SIMD_REGISTER_COUNT as hv_simd_fp_reg_t).collect::<Vec<_>>();
-        let expected_system = self.state_system_registers();
-        if state.nested_enabled != self.nested_enabled
-            || state
-                .general
-                .iter()
-                .map(|(register, _)| *register)
-                .collect::<Vec<_>>()
-                != expected_general
-            || state
-                .simd
-                .iter()
-                .map(|(register, _)| *register)
-                .collect::<Vec<_>>()
-                != expected_simd
-            || state
-                .system
-                .iter()
-                .map(|(register, _)| *register)
-                .collect::<Vec<_>>()
-                != expected_system
-        {
+        if !state.has_register_topology(self.nested_enabled) {
             return Err(Error::VcpuStateTopology);
         }
 
@@ -832,6 +920,12 @@ impl HvfVcpu<'_> {
             if result != HV_SUCCESS {
                 return Err(Error::VcpuSetSystemRegister(register, value));
             }
+        }
+        for &(register, value) in &state.icc {
+            self.write_icc_reg(register, value)?;
+        }
+        for &(register, value) in &state.ich {
+            self.write_ich_reg(register, value)?;
         }
         if unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, state.vtimer_offset) } != HV_SUCCESS {
             return Err(Error::VcpuSetVtimerOffset);
@@ -856,20 +950,42 @@ impl HvfVcpu<'_> {
         }
     }
 
-    fn state_system_registers(&self) -> Vec<hv_sys_reg_t> {
-        let mut registers = Vec::with_capacity(
-            EL1_SYSTEM_REGISTERS.len()
-                + if self.nested_enabled {
-                    EL2_SYSTEM_REGISTERS.len()
-                } else {
-                    0
-                },
-        );
-        registers.extend_from_slice(EL1_SYSTEM_REGISTERS);
-        if self.nested_enabled {
-            registers.extend_from_slice(EL2_SYSTEM_REGISTERS);
+    fn read_icc_reg(&self, register: hv_gic_icc_reg_t) -> Result<u64, Error> {
+        let mut value = 0_u64;
+        let result = unsafe { hv_gic_get_icc_reg(self.vcpuid, register, &mut value) };
+        if result == HV_SUCCESS {
+            Ok(value)
+        } else {
+            Err(Error::VcpuReadGicRegister("ICC", register))
         }
-        registers
+    }
+
+    fn write_icc_reg(&self, register: hv_gic_icc_reg_t, value: u64) -> Result<(), Error> {
+        let result = unsafe { hv_gic_set_icc_reg(self.vcpuid, register, value) };
+        if result == HV_SUCCESS {
+            Ok(())
+        } else {
+            Err(Error::VcpuSetGicRegister("ICC", register, value))
+        }
+    }
+
+    fn read_ich_reg(&self, register: hv_gic_ich_reg_t) -> Result<u64, Error> {
+        let mut value = 0_u64;
+        let result = unsafe { hv_gic_get_ich_reg(self.vcpuid, register, &mut value) };
+        if result == HV_SUCCESS {
+            Ok(value)
+        } else {
+            Err(Error::VcpuReadGicRegister("ICH", register))
+        }
+    }
+
+    fn write_ich_reg(&self, register: hv_gic_ich_reg_t, value: u64) -> Result<(), Error> {
+        let result = unsafe { hv_gic_set_ich_reg(self.vcpuid, register, value) };
+        if result == HV_SUCCESS {
+            Ok(())
+        } else {
+            Err(Error::VcpuSetGicRegister("ICH", register, value))
+        }
     }
 
     pub fn write_reg(&self, rt: u32, val: u64) -> Result<(), Error> {
@@ -1140,5 +1256,147 @@ impl HvfVcpu<'_> {
             }
             _ => panic!("unexpected exception: 0x{ec:x}"),
         }
+    }
+}
+
+fn state_system_registers(nested_enabled: bool) -> Vec<hv_sys_reg_t> {
+    let mut registers = Vec::with_capacity(
+        EL1_SYSTEM_REGISTERS.len()
+            + if nested_enabled {
+                EL2_SYSTEM_REGISTERS.len()
+            } else {
+                0
+            },
+    );
+    registers.extend_from_slice(EL1_SYSTEM_REGISTERS);
+    if nested_enabled {
+        registers.extend_from_slice(EL2_SYSTEM_REGISTERS);
+    }
+    registers
+}
+
+fn state_icc_registers(nested_enabled: bool) -> Vec<hv_gic_icc_reg_t> {
+    let mut registers = Vec::with_capacity(
+        ICC_REGISTERS.len()
+            + if nested_enabled {
+                NESTED_ICC_REGISTERS.len()
+            } else {
+                0
+            },
+    );
+    if nested_enabled {
+        registers.extend_from_slice(NESTED_ICC_REGISTERS);
+    }
+    registers.extend_from_slice(ICC_REGISTERS);
+    registers
+}
+
+fn state_ich_registers(nested_enabled: bool) -> Vec<hv_gic_ich_reg_t> {
+    if nested_enabled {
+        NESTED_ICH_REGISTERS.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(nested_enabled: bool) -> HvfVcpuState {
+        HvfVcpuState {
+            general: (0..GENERAL_REGISTER_COUNT as hv_reg_t)
+                .map(|register| (register, 0))
+                .collect(),
+            simd: (0..SIMD_REGISTER_COUNT as hv_simd_fp_reg_t)
+                .map(|register| (register, 0))
+                .collect(),
+            system: state_system_registers(nested_enabled)
+                .into_iter()
+                .map(|register| (register, 0))
+                .collect(),
+            icc: state_icc_registers(nested_enabled)
+                .into_iter()
+                .map(|register| (register, 0))
+                .collect(),
+            ich: state_ich_registers(nested_enabled)
+                .into_iter()
+                .map(|register| (register, 0))
+                .collect(),
+            pending_irq: false,
+            pending_fiq: false,
+            vtimer_mask: false,
+            vtimer_offset: 0,
+            pending_advance_pc: false,
+            nested_enabled,
+        }
+    }
+
+    #[test]
+    fn timer_rebase_uses_the_same_wrapping_displacement_for_every_vcpu() {
+        let mut first = state(false);
+        let mut second = state(false);
+        first.vtimer_offset = 9;
+        second.vtimer_offset = 9;
+        let displacement = u64::MAX - 3;
+        first.rebase_timer_offset(displacement);
+        second.rebase_timer_offset(displacement);
+        assert_eq!(first.vtimer_offset, 5);
+        assert_eq!(first.vtimer_offset, second.vtimer_offset);
+    }
+
+    #[test]
+    fn physical_gic_cpu_interface_topology_is_exact() {
+        let state = state(false);
+
+        assert!(state.has_register_topology(false));
+        assert_eq!(state.icc.len(), ICC_REGISTERS.len());
+        assert!(state.ich.is_empty());
+        assert!(!state
+            .icc
+            .iter()
+            .any(|(register, _)| *register == hv_gic_icc_reg_t_HV_GIC_ICC_REG_RPR_EL1));
+        assert_eq!(
+            state
+                .icc
+                .iter()
+                .rev()
+                .take(2)
+                .map(|(register, _)| *register)
+                .collect::<Vec<_>>(),
+            [
+                hv_gic_icc_reg_t_HV_GIC_ICC_REG_IGRPEN1_EL1,
+                hv_gic_icc_reg_t_HV_GIC_ICC_REG_IGRPEN0_EL1,
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_gic_cpu_interface_topology_is_explicit() {
+        let state = state(true);
+
+        assert!(state.has_register_topology(true));
+        assert_eq!(
+            state.icc.len(),
+            ICC_REGISTERS.len() + NESTED_ICC_REGISTERS.len()
+        );
+        assert_eq!(state.ich.len(), NESTED_ICH_REGISTERS.len());
+        assert_eq!(
+            state.ich.last().map(|(register, _)| *register),
+            Some(hv_gic_ich_reg_t_HV_GIC_ICH_REG_HCR_EL2)
+        );
+    }
+
+    #[test]
+    fn gic_cpu_interface_topology_rejects_missing_or_reordered_state() {
+        let mut missing = state(false);
+        missing.icc.pop();
+        assert!(!missing.has_register_topology(false));
+
+        let mut reordered = state(false);
+        reordered.icc.swap(0, 1);
+        assert!(!reordered.has_register_topology(false));
+
+        assert!(!state(true).has_register_topology(false));
     }
 }

@@ -6,6 +6,7 @@
 // found in the THIRD-PARTY file.
 
 use std::sync::Arc;
+use std::{fmt, io};
 
 use super::{ActivateResult, InterruptTransport, Queue};
 use crate::virtio::AsAny;
@@ -32,6 +33,49 @@ impl QueueConfig {
 pub struct DeviceQueue {
     pub queue: Queue,
     pub event: Arc<EventFd>,
+}
+
+/// Errors returned while moving a virtio device across a reversible state boundary.
+#[derive(Debug)]
+pub enum VirtioStateError {
+    /// The device does not implement reversible state.
+    Unsupported(String),
+    /// The device is not in the lifecycle state required by the operation.
+    InvalidLifecycle(&'static str),
+    /// A queue is not at a terminal descriptor boundary.
+    Queue(super::queue::Error),
+    /// Device-specific quiescence or durability work failed.
+    Device(io::Error),
+    /// Saved state is incompatible with the constructed device.
+    Incompatible(String),
+}
+
+impl fmt::Display for VirtioStateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported(device) => {
+                write!(f, "{device} does not support reversible virtio state")
+            }
+            Self::InvalidLifecycle(message) => write!(f, "invalid virtio lifecycle: {message}"),
+            Self::Queue(error) => write!(f, "virtio queue state error: {error}"),
+            Self::Device(error) => write!(f, "virtio device state error: {error}"),
+            Self::Incompatible(message) => write!(f, "incompatible virtio state: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for VirtioStateError {}
+
+impl From<super::queue::Error> for VirtioStateError {
+    fn from(error: super::queue::Error) -> Self {
+        Self::Queue(error)
+    }
+}
+
+impl From<io::Error> for VirtioStateError {
+    fn from(error: io::Error) -> Self {
+        Self::Device(error)
+    }
 }
 
 impl DeviceQueue {
@@ -158,6 +202,50 @@ pub trait VirtioDevice: AsAny + Send {
     /// After reset, the transport will recreate queues from queue_config().
     fn reset(&mut self) -> bool {
         false
+    }
+
+    /// Reports whether the device can establish a reversible queue-ownership boundary.
+    ///
+    /// Resource admission uses this before pausing vCPUs. Implementations must return `true` only
+    /// when [`quiesce`](Self::quiesce) either succeeds or leaves enough local state for retry/resume.
+    fn supports_quiesce(&self) -> bool {
+        false
+    }
+
+    /// Stops dequeuing new work and returns every queue after consumed work is terminal.
+    ///
+    /// Devices that implement this operation must leave themselves inactive. The transport owns
+    /// the returned queues until it activates the device again.
+    fn quiesce(&mut self) -> Result<Vec<DeviceQueue>, VirtioStateError> {
+        Err(VirtioStateError::Unsupported(
+            self.device_name().to_string(),
+        ))
+    }
+
+    /// Captures bounded device-specific state after queue ownership returns to the transport.
+    ///
+    /// Most devices reconstruct their configuration from the destination resource plan and need
+    /// no additional bytes. Devices with protocol state that survives in guest memory can override
+    /// this hook so their host-side half advances from the same boundary after restore.
+    fn capture_device_state(&self) -> Result<Vec<u8>, VirtioStateError> {
+        Ok(Vec::new())
+    }
+
+    /// Validates device-specific bytes without changing the constructed destination device.
+    fn validate_device_state(&self, state: &[u8]) -> Result<(), VirtioStateError> {
+        if state.is_empty() {
+            Ok(())
+        } else {
+            Err(VirtioStateError::Incompatible(format!(
+                "{} does not accept device-specific state",
+                self.device_name()
+            )))
+        }
+    }
+
+    /// Restores previously validated device-specific bytes before device activation.
+    fn restore_device_state(&mut self, state: &[u8]) -> Result<(), VirtioStateError> {
+        self.validate_device_state(state)
     }
 
     /// Get base and size of the SHM region

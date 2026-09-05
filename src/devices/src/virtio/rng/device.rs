@@ -4,6 +4,7 @@ use vm_memory::{Bytes, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, RngError, VirtioDevice,
+    VirtioStateError,
 };
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
@@ -154,5 +155,28 @@ impl VirtioDevice for Rng {
         self.queues = None;
         self.device_state = DeviceState::Inactive;
         true
+    }
+
+    fn supports_quiesce(&self) -> bool {
+        true
+    }
+
+    fn quiesce(&mut self) -> Result<Vec<DeviceQueue>, VirtioStateError> {
+        if !self.device_state.is_activated() {
+            return self.queues.take().ok_or(VirtioStateError::InvalidLifecycle(
+                "rng queues are unavailable while inactive",
+            ));
+        }
+
+        // The event-manager callback and this method are serialized by the device mutex. Once the
+        // queues move back to the transport, no RNG descriptor or guest-memory write remains owned.
+        let queues = self
+            .queues
+            .take()
+            .ok_or(VirtioStateError::InvalidLifecycle(
+                "rng is activated without queues",
+            ))?;
+        self.device_state = DeviceState::Inactive;
+        Ok(queues)
     }
 }
