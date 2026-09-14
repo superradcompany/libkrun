@@ -1,6 +1,6 @@
 [package]
 name = "msb_krun_hvf"
-version = "0.1.38"
+version = "0.1.39"
 authors = ["Sergio Lopez <slp@sinrega.org>"]
 edition = "2021"
 build = "build.rs"
@@ -14,4 +14,4 @@ libloading = "0.8"
 log = "0.4.0"
 serde = { version = "1.0", features = ["derive"] }
 
-arch = { package = "msb_krun_arch", version = "0.1.38", path = "../arch" }
+arch = { package = "msb_krun_arch", version = "0.1.39", path = "../arch" }
