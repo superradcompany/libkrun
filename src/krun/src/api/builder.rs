@@ -643,33 +643,7 @@ impl VmBuilder {
 
         // Apply filesystem configuration
         #[cfg(not(feature = "tee"))]
-        for config in self.fs.configs {
-            match config {
-                FsConfig::Path {
-                    tag,
-                    path,
-                    shm_size,
-                } => {
-                    let fs_config = FsDeviceConfig {
-                        fs_id: tag,
-                        shared_dir: path.to_string_lossy().to_string(),
-                        shm_size,
-                        allow_root_dir_delete: false,
-                    };
-                    vmr.fs.push(fs_config);
-                }
-                #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-                FsConfig::Custom { tag, backend } => {
-                    let backend: Box<dyn devices::virtio::fs::DynFileSystem> = backend;
-                    let custom_config = CustomFsDeviceConfig {
-                        fs_id: tag,
-                        backend: Arc::from(backend),
-                        shm_size: None,
-                    };
-                    vmr.custom_fs.push(custom_config);
-                }
-            }
-        }
+        apply_fs_configs(&mut vmr, self.fs.configs);
 
         // Apply console configuration
         if let Some(output) = self.console.output {
@@ -1149,6 +1123,41 @@ fn validate_cmdline_env(key: &str, value: &str) -> std::result::Result<(), &'sta
         return Err("the key contains whitespace");
     }
     Ok(())
+}
+
+#[cfg(not(feature = "tee"))]
+fn apply_fs_configs(vmr: &mut VmResources, configs: Vec<FsConfig>) {
+    for config in configs {
+        match config {
+            FsConfig::Path {
+                tag,
+                path,
+                shm_size,
+            } => {
+                let fs_config = FsDeviceConfig {
+                    fs_id: tag,
+                    shared_dir: path.to_string_lossy().to_string(),
+                    shm_size,
+                    allow_root_dir_delete: false,
+                };
+                vmr.fs.push(fs_config);
+            }
+            #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+            FsConfig::Custom {
+                tag,
+                backend,
+                shm_size,
+            } => {
+                let backend: Box<dyn devices::virtio::fs::DynFileSystem> = backend;
+                let custom_config = CustomFsDeviceConfig {
+                    fs_id: tag,
+                    backend: Arc::from(backend),
+                    shm_size,
+                };
+                vmr.custom_fs.push(custom_config);
+            }
+        }
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1828,5 +1837,26 @@ mod tests {
 
         limit.set_target_bytes(128 * 1024 * 1024).unwrap();
         assert_eq!(configured.target_bytes(), 128 * 1024 * 1024);
+    }
+
+    #[test]
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    fn custom_fs_dax_size_is_applied_to_vm_resources() {
+        struct DummyFs;
+        impl devices::virtio::fs::DynFileSystem for DummyFs {}
+
+        let mut vmr = VmResources::default();
+        apply_fs_configs(
+            &mut vmr,
+            vec![FsConfig::Custom {
+                tag: "share".to_string(),
+                backend: Box::new(DummyFs),
+                shm_size: Some(64 << 20),
+            }],
+        );
+
+        assert_eq!(vmr.custom_fs.len(), 1);
+        assert_eq!(vmr.custom_fs[0].fs_id, "share");
+        assert_eq!(vmr.custom_fs[0].shm_size, Some(64 << 20));
     }
 }

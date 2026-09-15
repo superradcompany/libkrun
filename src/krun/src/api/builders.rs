@@ -213,6 +213,7 @@ pub enum FsConfig {
     Custom {
         tag: String,
         backend: Box<dyn DynFileSystem + Send + Sync>,
+        shm_size: Option<usize>,
     },
 }
 
@@ -986,8 +987,13 @@ impl FsBuilder {
             .current_tag
             .take()
             .unwrap_or_else(|| format!("fs{}", self.configs.len()));
+        let shm_size = self.current_shm_size.take();
 
-        self.configs.push(FsConfig::Custom { tag, backend });
+        self.configs.push(FsConfig::Custom {
+            tag,
+            backend,
+            shm_size,
+        });
         self
     }
 }
@@ -1581,6 +1587,26 @@ impl From<SyncMode> for devices::virtio::block::SyncMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    fn fs_builder_records_dax_size_for_custom_backend() {
+        struct DummyFs;
+        impl DynFileSystem for DummyFs {}
+
+        let builder = FsBuilder::new()
+            .tag("share")
+            .shm_size(64 << 20)
+            .custom(Box::new(DummyFs));
+
+        match &builder.configs[0] {
+            FsConfig::Custom { tag, shm_size, .. } => {
+                assert_eq!(tag, "share");
+                assert_eq!(*shm_size, Some(64 << 20));
+            }
+            _ => panic!("expected a custom filesystem config"),
+        }
+    }
 
     #[test]
     fn host_cpu_id_defaults_to_group_zero() {
