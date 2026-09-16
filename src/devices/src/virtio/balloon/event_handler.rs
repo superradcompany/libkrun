@@ -19,8 +19,6 @@ impl Balloon {
     }
 
     pub(crate) fn handle_ifq_event(&mut self, event: &EpollEvent) {
-        error!("balloon: unsupported inflate queue event");
-
         let event_set = event.event_set();
         if event_set != EventSet::IN {
             warn!("balloon: inflate unexpected event {event_set:?}");
@@ -29,12 +27,12 @@ impl Balloon {
 
         if let Err(e) = self.queue_event(IFQ_INDEX).read() {
             error!("Failed to read balloon inflate queue event: {e:?}");
+        } else if self.unsupported_queue_has_work(IFQ_INDEX) {
+            error!("balloon: unsupported inflate queue event");
         }
     }
 
     pub(crate) fn handle_dfq_event(&mut self, event: &EpollEvent) {
-        error!("balloon: unsupported deflate queue event");
-
         let event_set = event.event_set();
         if event_set != EventSet::IN {
             warn!("balloon: deflate unexpected event {event_set:?}");
@@ -42,7 +40,9 @@ impl Balloon {
         }
 
         if let Err(e) = self.queue_event(DFQ_INDEX).read() {
-            error!("Failed to read balloon inflate queue event: {e:?}");
+            error!("Failed to read balloon deflate queue event: {e:?}");
+        } else if self.unsupported_queue_has_work(DFQ_INDEX) {
+            error!("balloon: unsupported deflate queue event");
         }
     }
 
@@ -79,8 +79,6 @@ impl Balloon {
     }
 
     pub(crate) fn handle_phq_event(&mut self, event: &EpollEvent) {
-        error!("balloon: unsupported page-hinting queue event");
-
         let event_set = event.event_set();
         if event_set != EventSet::IN {
             warn!("balloon: page-hinting unexpected event {event_set:?}");
@@ -89,6 +87,8 @@ impl Balloon {
 
         if let Err(e) = self.queue_event(PHQ_INDEX).read() {
             error!("Failed to read balloon page-hinting queue event: {e:?}");
+        } else if self.unsupported_queue_has_work(PHQ_INDEX) {
+            error!("balloon: unsupported page-hinting queue event");
         }
     }
 
@@ -105,6 +105,20 @@ impl Balloon {
             error!("Failed to read balloon free-page reporting queue event: {e:?}");
         } else if self.process_frq() {
             self.device_state.signal_used_queue();
+        }
+    }
+
+    fn unsupported_queue_has_work(&self, index: usize) -> bool {
+        let queue = &self.queues.as_ref().expect("queues should exist")[index].queue;
+        // Transport resume signals every queue to rescan pending work. A wakeup
+        // alone is not a guest request; unconfigured queues have no valid ring
+        // to inspect. Do not consume descriptors just to classify the event.
+        if !queue.ready {
+            return false;
+        }
+        match &self.device_state {
+            crate::virtio::DeviceState::Activated(mem, _) => !queue.is_empty(mem),
+            crate::virtio::DeviceState::Inactive => false,
         }
     }
 
@@ -361,4 +375,114 @@ fn stats_descriptor_len(head: &crate::virtio::DescriptorChain<'_>) -> Option<u32
         len = len.checked_add(desc.len)?;
     }
     Some(len)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::num::Wrapping;
+    use std::sync::{Arc, Once};
+
+    use utils::eventfd::{EventFd, EFD_NONBLOCK};
+    use utils::metrics::MetricsWriter;
+    use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::device::DeviceQueue;
+    use crate::virtio::{InterruptTransport, Queue};
+
+    struct TestLogger;
+    static LOGGER: TestLogger = TestLogger;
+    static INIT: Once = Once::new();
+    thread_local! {
+        // Keep parallel device tests from mixing their diagnostics into ours.
+        static LOGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    impl log::Log for TestLogger {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            LOGS.with(|logs| logs.borrow_mut().push(record.args().to_string()));
+        }
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn unsupported_queues_ignore_empty_wakeups_but_report_real_work() {
+        INIT.call_once(|| {
+            log::set_logger(&LOGGER).unwrap();
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut balloon = Balloon::new(MetricsWriter::default(), None).unwrap();
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "balloon-test".into()).unwrap();
+        let queues = balloon
+            .queue_config()
+            .iter()
+            .map(|config| {
+                DeviceQueue::new(
+                    Queue::new(config.size),
+                    Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+                )
+            })
+            .collect();
+        balloon.activate(mem.clone(), interrupt, queues).unwrap();
+
+        type Handler = fn(&mut Balloon, &EpollEvent);
+        for (index, name, handler) in [
+            (IFQ_INDEX, "inflate", Balloon::handle_ifq_event as Handler),
+            (DFQ_INDEX, "deflate", Balloon::handle_dfq_event as Handler),
+            (
+                PHQ_INDEX,
+                "page-hinting",
+                Balloon::handle_phq_event as Handler,
+            ),
+        ] {
+            // Include wrapping ring indices: equality, not a nonzero index,
+            // determines whether the guest has submitted new work.
+            for (ready, consumed, available, expected) in [
+                (false, 0, 1, false),
+                (true, 0, 0, false),
+                (true, u16::MAX, u16::MAX, false),
+                (true, u16::MAX, 0, true),
+                (true, 0, 1, true),
+            ] {
+                let queue = &mut balloon.queues.as_mut().unwrap()[index].queue;
+                queue.ready = ready;
+                queue.avail_ring = GuestAddress(0x1000);
+                queue.next_avail = Wrapping(consumed);
+                mem.write_obj(available, GuestAddress(0x1002)).unwrap();
+                LOGS.with(|logs| logs.borrow_mut().clear());
+                balloon.queue_event(index).write(1).unwrap();
+                handler(&mut balloon, &EpollEvent::new(EventSet::IN, 0));
+                let logs = LOGS.with(|logs| logs.borrow().clone());
+                assert_eq!(
+                    logs,
+                    if expected {
+                        vec![format!("balloon: unsupported {name} queue event")]
+                    } else {
+                        vec![]
+                    }
+                );
+                assert!(
+                    balloon.queue_event(index).read().is_err(),
+                    "wakeup must be drained"
+                );
+                assert_eq!(
+                    balloon.queues.as_ref().unwrap()[index].queue.next_avail.0,
+                    consumed
+                );
+            }
+
+            LOGS.with(|logs| logs.borrow_mut().clear());
+            handler(&mut balloon, &EpollEvent::new(EventSet::IN, 0));
+            assert!(LOGS.with(|logs| logs.borrow().iter().any(
+                |line| line.starts_with(&format!("Failed to read balloon {name} queue event:"))
+            )));
+        }
+    }
 }
