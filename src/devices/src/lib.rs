@@ -20,6 +20,8 @@ mod bus;
 ))]
 pub mod fdt;
 pub mod legacy;
+#[cfg(feature = "pci")]
+pub mod pci;
 pub mod virtio;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows;
