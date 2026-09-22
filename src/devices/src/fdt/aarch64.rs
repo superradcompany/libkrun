@@ -103,6 +103,8 @@ pub fn create_fdt<T: DeviceInfoForFDT + Clone + Debug>(
     create_clock_node(&mut fdt)?;
     create_psci_node(&mut fdt)?;
     create_devices_node(&mut fdt, device_info)?;
+    #[cfg(feature = "pci")]
+    create_pcie_node(&mut fdt)?;
 
     // End Header node.
     fdt.end_node(root_node)?;
@@ -410,6 +412,61 @@ fn create_gpio_node<T: DeviceInfoForFDT + Clone + Debug>(
     fdt.property_array_u32("gpios", &gpios)?;
     fdt.end_node(gpio_keys_poweroff_node)?;
     fdt.end_node(gpio_keys_node)?;
+
+    Ok(())
+}
+
+/// Emits a generic ECAM PCIe host-bridge node so the guest kernel probes the
+/// bus described by libkrun's `pci` transport. The MSI (`msi-map`/`msi-parent`)
+/// and legacy `interrupt-map` properties are added with the GIC ITS in a later
+/// step; enumeration and BAR assignment need only the ECAM `reg` + `ranges`.
+#[cfg(feature = "pci")]
+fn create_pcie_node(fdt: &mut FdtWriter) -> Result<()> {
+    use arch::aarch64::layout::{
+        PCIE_ECAM_BASE, PCIE_ECAM_SIZE, PCIE_MMIO32_BASE, PCIE_MMIO32_SIZE, PCIE_MMIO64_BASE,
+        PCIE_MMIO64_SIZE,
+    };
+
+    // PCI address-space codes for a range entry's "phys.hi" cell.
+    const PCI_SPACE_MEM32: u32 = 0x0200_0000;
+    const PCI_SPACE_MEM64: u32 = 0x0300_0000;
+
+    // reg: the ECAM window, in parent cells (#address-cells=2, #size-cells=2).
+    let reg_prop = generate_prop64(&[PCIE_ECAM_BASE, PCIE_ECAM_SIZE]);
+
+    // ranges: each entry is <pci-addr(3 cells)> <cpu-addr(2 cells)> <size(2 cells)>.
+    // Both apertures are identity-mapped (guest PCI address == guest physical).
+    let ranges: Vec<u32> = vec![
+        // 32-bit non-prefetchable memory window.
+        PCI_SPACE_MEM32,
+        (PCIE_MMIO32_BASE >> 32) as u32,
+        PCIE_MMIO32_BASE as u32,
+        (PCIE_MMIO32_BASE >> 32) as u32,
+        PCIE_MMIO32_BASE as u32,
+        (PCIE_MMIO32_SIZE >> 32) as u32,
+        PCIE_MMIO32_SIZE as u32,
+        // 64-bit memory window (holds large 64-bit BARs incl. resizable-BAR GPUs).
+        PCI_SPACE_MEM64,
+        (PCIE_MMIO64_BASE >> 32) as u32,
+        PCIE_MMIO64_BASE as u32,
+        (PCIE_MMIO64_BASE >> 32) as u32,
+        PCIE_MMIO64_BASE as u32,
+        (PCIE_MMIO64_SIZE >> 32) as u32,
+        PCIE_MMIO64_SIZE as u32,
+    ];
+    let ranges_prop = generate_prop32(&ranges);
+
+    let node = fdt.begin_node(&format!("pci@{PCIE_ECAM_BASE:x}"))?;
+    fdt.property_string("compatible", "pci-host-ecam-generic")?;
+    fdt.property_string("device_type", "pci")?;
+    fdt.property("reg", &reg_prop)?;
+    fdt.property("ranges", &ranges_prop)?;
+    fdt.property_array_u32("bus-range", &[0, 0])?;
+    fdt.property_u32("#address-cells", 3)?;
+    fdt.property_u32("#size-cells", 2)?;
+    fdt.property_u32("#interrupt-cells", 1)?;
+    fdt.property_null("dma-coherent")?;
+    fdt.end_node(node)?;
 
     Ok(())
 }

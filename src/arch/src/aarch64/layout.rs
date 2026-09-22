@@ -88,6 +88,22 @@ pub const VTIMER_IRQ: u32 = GTIMER_VIRT + 16;
 /// Below this address will reside the GIC, above this address will reside the MMIO devices.
 pub const MAPPED_IO_START: u64 = 0x0a00_0000;
 
+// ==== PCIe host bridge (feature = "pci"/"vfio") ====
+// QEMU-virt / Cloud-Hypervisor-compatible layout. All windows sit below EFI RAM
+// (0x4000_0000) or high above guest RAM, so they are valid for both the EFI and
+// direct-kernel boot modes and clear of the GIC (<0x0a00_0000) and the
+// virtio-MMIO band (grows up from MAPPED_IO_START).
+/// 32-bit PCI MMIO / BAR aperture (holds small 32-bit BARs + the MSI-X table page).
+pub const PCIE_MMIO32_BASE: u64 = 0x1000_0000;
+pub const PCIE_MMIO32_SIZE: u64 = 0x2000_0000; // 512 MiB, ends at PCIE_ECAM_BASE
+/// PCIe ECAM (enhanced config access) window — bus 0, 256 devices x 4 KiB = 1 MiB.
+pub const PCIE_ECAM_BASE: u64 = 0x3000_0000;
+pub const PCIE_ECAM_SIZE: u64 = 0x0010_0000;
+/// 64-bit high PCI MMIO / BAR aperture — above any realistic guest RAM+shm, holds
+/// large 64-bit prefetchable BARs (incl. resizable-BAR datacenter GPUs).
+pub const PCIE_MMIO64_BASE: u64 = 0x40_0000_0000; // 256 GiB
+pub const PCIE_MMIO64_SIZE: u64 = 0x40_0000_0000; // 256 GiB
+
 /// The address to put the SMBIOS contents, if present.
 pub const SMBIOS_START: u64 = 0x4000_F000;
 
