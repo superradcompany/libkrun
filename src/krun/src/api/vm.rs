@@ -84,7 +84,7 @@ pub struct Vm {
     #[cfg(not(target_os = "windows"))]
     vsock_host_port_map: Option<HashMap<u16, u16>>,
     /// Keeps the libkrunfw library loaded so kernel memory pointers remain valid.
-    _krunfw_library: Option<libloading::Library>,
+    _krunfw_library: Option<KrunfwLibrary>,
     /// Keeps an explicit initramfs allocation alive until it is copied to guest memory.
     _initramfs_data: Option<Vec<u8>>,
     /// Receives the VMM reference and execution-state notifications after startup begins.
@@ -716,13 +716,47 @@ impl Vm {
         let mut kernel_entry_addr: u64 = 0;
         let mut kernel_size: usize = 0;
 
+        // The dynamically loaded libkrunfw owns one image, so it takes no path.
+        // A `static-krunfw` embedder selects the image by `krunfw_path` (null
+        // when it is unset).
+        #[cfg(feature = "static-krunfw")]
+        let path = self
+            .krunfw_path
+            .as_deref()
+            .map(|p| std::ffi::CString::new(p.as_os_str().as_encoded_bytes()))
+            .transpose()
+            .map_err(|_| {
+                Error::Build(BuildError::Krunfw(
+                    "the krunfw path contains a NUL byte".to_string(),
+                ))
+            })?;
+
         let kernel_host_addr = unsafe {
-            (krunfw.get_kernel)(
-                &mut kernel_guest_addr as *mut u64,
-                &mut kernel_entry_addr as *mut u64,
-                &mut kernel_size as *mut usize,
-            )
+            #[cfg(feature = "static-krunfw")]
+            {
+                (krunfw.get_kernel)(
+                    path.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+                    &mut kernel_guest_addr as *mut u64,
+                    &mut kernel_entry_addr as *mut u64,
+                    &mut kernel_size as *mut usize,
+                )
+            }
+            #[cfg(not(feature = "static-krunfw"))]
+            {
+                (krunfw.get_kernel)(
+                    &mut kernel_guest_addr as *mut u64,
+                    &mut kernel_entry_addr as *mut u64,
+                    &mut kernel_size as *mut usize,
+                )
+            }
         };
+
+        #[cfg(feature = "static-krunfw")]
+        if kernel_host_addr.is_null() {
+            return Err(Error::Build(BuildError::Krunfw(
+                "no krunfw image for the requested path".to_string(),
+            )));
+        }
 
         let kernel_bundle = KernelBundle {
             host_addr: kernel_host_addr as u64,
@@ -1142,24 +1176,48 @@ fn wait_until_paused_timeout(timeout: Duration, state: Option<VmExecutionState>)
     )))
 }
 
+/// Handle that keeps a dynamically loaded libkrunfw mapping alive.
+///
+/// With the `static-krunfw` feature the kernel accessor is provided by the
+/// embedding program, so there is nothing to keep alive.
+#[cfg(not(feature = "static-krunfw"))]
+type KrunfwLibrary = libloading::Library;
+#[cfg(feature = "static-krunfw")]
+type KrunfwLibrary = ();
+
 /// Bindings to libkrunfw functions.
 struct KrunfwBindings {
+    /// Fills `guest_addr`/`entry_addr`/`size` and returns the selected kernel
+    /// image's host address (null if none was selected).
+    ///
+    /// The dynamically loaded libkrunfw owns a single image and takes no path;
+    /// a `static-krunfw` embedder receives the requested `path` as its first
+    /// argument (a NUL-terminated string, or null for the default image).
+    #[cfg(feature = "static-krunfw")]
+    get_kernel: unsafe extern "C" fn(
+        *const std::ffi::c_char,
+        *mut u64,
+        *mut u64,
+        *mut usize,
+    ) -> *mut std::ffi::c_char,
+    #[cfg(not(feature = "static-krunfw"))]
     get_kernel: unsafe extern "C" fn(*mut u64, *mut u64, *mut usize) -> *mut std::ffi::c_char,
-    library: libloading::Library,
+    library: KrunfwLibrary,
 }
 
 /// Library name for libkrunfw.
-#[cfg(target_os = "linux")]
+#[cfg(all(not(feature = "static-krunfw"), target_os = "linux"))]
 const KRUNFW_NAME: &str = "libkrunfw.so.5";
-#[cfg(target_os = "macos")]
+#[cfg(all(not(feature = "static-krunfw"), target_os = "macos"))]
 const KRUNFW_NAME: &str = "libkrunfw.5.dylib";
-#[cfg(target_os = "windows")]
+#[cfg(all(not(feature = "static-krunfw"), target_os = "windows"))]
 const KRUNFW_NAME: &str = "libkrunfw.dll";
 
 /// Load the libkrunfw library.
 ///
 /// If `path` is provided, loads from that exact path. Otherwise falls back to the
 /// default library name, which lets the OS dynamic linker search standard paths.
+#[cfg(not(feature = "static-krunfw"))]
 fn load_krunfw_library(path: Option<&std::path::Path>) -> Result<KrunfwBindings> {
     let name = path
         .map(|p| p.as_os_str().to_os_string())
@@ -1182,6 +1240,30 @@ fn load_krunfw_library(path: Option<&std::path::Path>) -> Result<KrunfwBindings>
     Ok(KrunfwBindings {
         get_kernel,
         library,
+    })
+}
+
+/// Return the statically linked libkrunfw accessor.
+///
+/// The embedding program provides `krunfw_get_kernel`, which receives the
+/// requested krunfw `path` (a NUL-terminated string, or null for the default),
+/// fills the guest address, entry point and size of the selected image, and
+/// returns its host address (or null if the path selects no image), so one
+/// embedder can provide several kernel images.
+#[cfg(feature = "static-krunfw")]
+fn load_krunfw_library(_path: Option<&std::path::Path>) -> Result<KrunfwBindings> {
+    extern "C" {
+        fn krunfw_get_kernel(
+            path: *const std::ffi::c_char,
+            guest_addr: *mut u64,
+            entry_addr: *mut u64,
+            size: *mut usize,
+        ) -> *mut std::ffi::c_char;
+    }
+
+    Ok(KrunfwBindings {
+        get_kernel: krunfw_get_kernel,
+        library: (),
     })
 }
 

@@ -896,9 +896,17 @@ impl KernelBuilder {
         self
     }
 
-    /// Set an explicit path to the libkrunfw shared library.
+    /// Select the kernel image, or the `libkrunfw` shared library to load.
     ///
-    /// When not set, the OS dynamic linker's default search path is used.
+    /// Without the `static-krunfw` feature this is the path of the `libkrunfw`
+    /// shared library to `dlopen`; when unset, the OS dynamic linker's default
+    /// search path is used.
+    ///
+    /// With the `static-krunfw` feature the value is passed as the
+    /// NUL-terminated `path` argument to the embedder's `krunfw_get_kernel`
+    /// callback (see the crate docs); `None` passes `NULL` to select the
+    /// default image. An embedder that ships several kernel images can map the
+    /// path to one of them here.
     pub fn krunfw_path(mut self, path: impl AsRef<Path>) -> Self {
         self.krunfw_path = Some(path.as_ref().to_path_buf());
         self

@@ -9,6 +9,13 @@ license = "Apache-2.0"
 
 [features]
 default = []
+# Link the krunfw kernel accessor into the embedding program instead of
+# loading libkrunfw with `dlopen`. The embedder must provide a
+# `krunfw_get_kernel(const char *path, uint64_t *guest_addr,
+# uint64_t *entry_addr, size_t *size)` C function; see the crate documentation
+# for the callback signature, a minimal implementation and the kernel-memory
+# lifetime.
+static-krunfw = []
 net = ["devices/net", "vmm/net"]
 blk = ["devices/blk", "vmm/blk"]
 gpu = ["krun_display", "devices/gpu", "vmm/gpu"]
