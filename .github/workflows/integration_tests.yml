@@ -58,6 +58,7 @@ jobs:
           sudo mv tmp/lib/x86_64-linux-gnu/* /lib/x86_64-linux-gnu
       
       - name: Integration tests
+        timeout-minutes: 10
         run: KRUN_ENOMEM_WORKAROUND=1 KRUN_NO_UNSHARE=1 KRUN_TEST_BASE_DIR=/tmp/libkrun-tests make test TEST_FLAGS="--keep-all --github-summary"
 
       - name: Upload test logs
