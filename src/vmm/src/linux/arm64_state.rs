@@ -91,7 +91,7 @@ impl VcpuControl {
             id,
             addr: &mut value as *mut u64 as u64,
         };
-        let result = unsafe { libc::ioctl(self.0.as_raw_fd(), GET_ONE_REG, &reg) };
+        let result = unsafe { libc::ioctl(self.0.as_raw_fd(), GET_ONE_REG as _, &reg) };
         if result < 0 {
             return Err(codec(format!(
                 "read register {id:#x}: {}",
@@ -106,7 +106,7 @@ impl VcpuControl {
             id,
             addr: &value as *const u64 as u64,
         };
-        let result = unsafe { libc::ioctl(self.0.as_raw_fd(), SET_ONE_REG, &reg) };
+        let result = unsafe { libc::ioctl(self.0.as_raw_fd(), SET_ONE_REG as _, &reg) };
         if result < 0 {
             return Err(codec(format!(
                 "write register {id:#x}: {}",
@@ -333,7 +333,7 @@ fn register_ids(fd: &VcpuFd) -> Result<Vec<u64>> {
     // so feature-rich CPUs are captured without truncating their state.
     let mut list = vec![0_u64; MAX_REGISTERS + 1];
     list[0] = MAX_REGISTERS as u64;
-    let result = unsafe { libc::ioctl(fd.as_raw_fd(), GET_REG_LIST, list.as_mut_ptr()) };
+    let result = unsafe { libc::ioctl(fd.as_raw_fd(), GET_REG_LIST as _, list.as_mut_ptr()) };
     if result < 0 {
         return Err(codec(format!(
             "enumerate registers: {}",
