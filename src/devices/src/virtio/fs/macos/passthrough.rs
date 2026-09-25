@@ -2313,7 +2313,8 @@ impl FileSystem for PassthroughFs {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
         }
 
-        let prot_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
+        let writable = (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0;
+        let prot_flags = if writable {
             libc::PROT_READ | libc::PROT_WRITE
         } else {
             libc::PROT_READ
@@ -2327,7 +2328,16 @@ impl FileSystem for PassthroughFs {
 
         debug!("setupmapping: ino {inode:?} guest_addr={guest_addr:x} len={len}");
 
-        let file = self.open_inode(inode, libc::O_RDWR)?;
+        // Open read-only for a read-only mapping: an `O_RDWR` open would fail on
+        // a read-only file or mount even though only read access is needed.
+        let file = self.open_inode(
+            inode,
+            if writable {
+                libc::O_RDWR
+            } else {
+                libc::O_RDONLY
+            },
+        )?;
         let fd = file.as_raw_fd();
 
         let host_addr = unsafe {
@@ -2353,11 +2363,12 @@ impl FileSystem for PassthroughFs {
         let sender = map_sender.as_ref().unwrap();
         let (reply_sender, reply_receiver) = unbounded();
         sender
-            .send(WorkerMessage::GpuAddMapping(
+            .send(WorkerMessage::DaxAddMapping(
                 reply_sender,
                 host_addr as u64,
                 guest_addr,
                 len,
+                writable,
             ))
             .unwrap();
         if !reply_receiver.recv().unwrap() {

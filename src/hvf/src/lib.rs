@@ -462,12 +462,26 @@ impl HvfVm {
         guest_start_addr: u64,
         size: u64,
     ) -> Result<(), Error> {
+        self.map_memory_with_writable(host_start_addr, guest_start_addr, size, true)
+    }
+
+    pub fn map_memory_with_writable(
+        &self,
+        host_start_addr: u64,
+        guest_start_addr: u64,
+        size: u64,
+        writable: bool,
+    ) -> Result<(), Error> {
+        let mut flags = HV_MEMORY_READ | HV_MEMORY_EXEC;
+        if writable {
+            flags |= HV_MEMORY_WRITE;
+        }
         let ret = unsafe {
             hv_vm_map(
                 host_start_addr as *mut core::ffi::c_void,
                 guest_start_addr,
                 size.try_into().unwrap(),
-                (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
+                flags.into(),
             )
         };
         if ret != HV_SUCCESS {

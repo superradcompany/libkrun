@@ -278,12 +278,26 @@ impl Vm {
         guest_addr: u64,
         len: u64,
     ) {
+        self.add_mapping_with_writable(reply_sender, host_addr, guest_addr, len, true);
+    }
+
+    pub fn add_mapping_with_writable(
+        &self,
+        reply_sender: Sender<bool>,
+        host_addr: u64,
+        guest_addr: u64,
+        len: u64,
+        writable: bool,
+    ) {
         debug!("add_mapping: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
         if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {
             error!("Error removing memory map: {e:?}");
         }
 
-        if let Err(e) = self.hvf_vm.map_memory(host_addr, guest_addr, len) {
+        if let Err(e) = self
+            .hvf_vm
+            .map_memory_with_writable(host_addr, guest_addr, len, writable)
+        {
             error!("Error adding memory map: {e:?}");
             reply_sender.send(false).unwrap();
         } else {
