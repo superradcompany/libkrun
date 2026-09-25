@@ -706,14 +706,11 @@ impl RutabagaComponent for VirglRenderer {
     ) -> RutabagaResult<()> {
         #[cfg(feature = "virgl_resource_map2")]
         {
+            // resource_map_fixed derives size/prot from the resource; the
+            // caller-provided _size/_prot/_flags are validated by the device
+            // layer before this call and are intentionally unused here.
             let ret = unsafe {
-                virgl_renderer_resource_map2(
-                    _resource_id,
-                    _addr as *mut libc::c_void,
-                    _size,
-                    _prot,
-                    _flags,
-                )
+                virgl_renderer_resource_map_fixed(_resource_id, _addr as *mut libc::c_void)
             };
             if ret != 0 {
                 return Err(RutabagaError::MappingFailed(ret));
