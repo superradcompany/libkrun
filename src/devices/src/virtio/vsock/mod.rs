@@ -93,9 +93,9 @@ mod defs {
     /// Size of the muxer RX packet queue.
     pub const MUXER_RXQ_SIZE: usize = 256;
 
-    // Kernel side doesn't play nice with us supporting so many bytes
-    //pub const CONN_TX_BUF_SIZE: usize = i32::MAX as usize;
-    pub const CONN_TX_BUF_SIZE: usize = 8 * 1024 * 1024;
+    // Credit updates happen at half this window. Keep that below the guest's
+    // transmit buffer so a one-way upload cannot stall before its first update.
+    pub const CONN_TX_BUF_SIZE: usize = 64 * 1024;
     #[cfg(unix)]
     pub const SOCK_STREAM: u16 = 1;
     #[cfg(unix)]

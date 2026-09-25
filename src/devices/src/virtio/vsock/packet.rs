@@ -2,19 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-/// `VsockPacket` provides a thin wrapper over the buffers exchanged via virtio queues.
-/// There are two components to a vsock packet, each using its own descriptor in a
-/// virtio queue:
-/// - the packet header; and
-/// - the packet data/buffer.
-///
-/// There is a 1:1 relation between descriptor chains and packets: the first (chain head) holds
-/// the header, and an optional second descriptor holds the data. The second descriptor is only
-/// present for data packets (VSOCK_OP_RW).
-///
-/// `VsockPacket` wraps these two buffers and provides direct access to the data stored
-/// in guest memory. This is done to avoid unnecessarily copying data from guest memory
-/// to temporary buffers, before passing it on to the vsock backend.
+/// `VsockPacket` wraps a virtqueue packet header and its optional payload.
+/// Single-descriptor payloads reference guest memory directly; fragmented TX
+/// payloads are gathered into a bounded buffer for the vsock backend.
 use std::convert::TryInto;
 use std::ffi::CStr;
 #[cfg(unix)]
@@ -198,13 +188,14 @@ pub struct TsiReleaseReq {
     pub local_port: u32,
 }
 
-/// The vsock packet, implemented as a wrapper over a virtq descriptor chain:
-/// - the chain head, holding the packet header; and
-/// - (an optional) data/buffer descriptor, only present for data packets (VSOCK_OP_RW).
+/// The vsock packet wraps a virtq descriptor chain.
+/// Fragmented TX payloads are gathered; single-descriptor payloads stay zero-copy.
 pub struct VsockPacket {
     hdr: *mut u8,
     buf: Option<*mut u8>,
     buf_size: usize,
+    // Keeps the backing allocation alive when TX data spans descriptors.
+    owned_buf: Option<Vec<u8>>,
 }
 
 fn get_host_address<T: GuestMemory + vm_memory::GuestMemoryBackend>(
@@ -218,9 +209,8 @@ fn get_host_address<T: GuestMemory + vm_memory::GuestMemoryBackend>(
 impl VsockPacket {
     /// Create the packet wrapper from a TX virtq chain head.
     ///
-    /// The chain head is expected to hold valid packet header data. A following packet buffer
-    /// descriptor can optionally end the chain. Bounds and pointer checks are performed when
-    /// creating the wrapper.
+    /// The chain head holds the header, followed by readable payload descriptors.
+    /// Bounds and pointer checks are performed when creating the wrapper.
     pub fn from_tx_virtq_head(head: &DescriptorChain) -> Result<Self> {
         // All buffers in the TX queue must be readable.
         //
@@ -238,17 +228,19 @@ impl VsockPacket {
                 .map_err(VsockError::GuestMemoryMmap)?,
             buf: None,
             buf_size: 0,
+            owned_buf: None,
         };
 
+        let payload_len = pkt.len() as usize;
         // No point looking for a data/buffer descriptor, if the packet is zero-lengthed.
-        if pkt.len() == 0 {
+        if payload_len == 0 {
             return Ok(pkt);
         }
 
         // Reject weirdly-sized packets.
         //
-        if pkt.len() > defs::MAX_PKT_BUF_SIZE as u32 {
-            return Err(VsockError::InvalidPktLen(pkt.len()));
+        if payload_len > defs::MAX_PKT_BUF_SIZE {
+            return Err(VsockError::InvalidPktLen(payload_len as u32));
         }
 
         // If the packet header showed a non-zero length, there should be a data descriptor here.
@@ -259,10 +251,28 @@ impl VsockPacket {
             return Err(VsockError::UnreadableDescriptor);
         }
 
-        // The data buffer should be large enough to fit the size of the data, as described by
-        // the header descriptor.
-        if buf_desc.len < pkt.len() {
-            return Err(VsockError::BufDescTooSmall);
+        // Linux can scatter a large TX payload across multiple descriptors.
+        if (buf_desc.len as usize) < payload_len {
+            let mut data = Vec::with_capacity(payload_len);
+            let mut desc = buf_desc;
+            loop {
+                if desc.is_write_only() {
+                    return Err(VsockError::UnreadableDescriptor);
+                }
+                let count = (desc.len as usize).min(payload_len - data.len());
+                let ptr = get_host_address(desc.mem, desc.addr, count)
+                    .map_err(VsockError::GuestMemoryMmap)?;
+                // The guest range was checked above; copy only declared payload bytes.
+                data.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, count) });
+                if data.len() == payload_len {
+                    break;
+                }
+                desc = desc.next_descriptor().ok_or(VsockError::BufDescTooSmall)?;
+            }
+            pkt.buf_size = data.len();
+            pkt.buf = Some(data.as_mut_ptr());
+            pkt.owned_buf = Some(data);
+            return Ok(pkt);
         }
 
         pkt.buf_size = buf_desc.len as usize;
@@ -295,6 +305,7 @@ impl VsockPacket {
                 .map_err(VsockError::GuestMemoryMmap)?,
             buf: None,
             buf_size: 0,
+            owned_buf: None,
         };
 
         // Starting from Linux 6.2 the virtio-vsock driver can use a single descriptor for both
@@ -739,5 +750,93 @@ impl VsockPacket {
                 byte_order::write_le_u64(&mut buf[0..], time);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::virtio::Descriptor;
+    use vm_memory::{Bytes, GuestMemoryMmap};
+
+    fn fragmented_packet(
+        mem: &GuestMemoryMmap,
+        declared_len: u32,
+        tail_flags: u16,
+    ) -> Result<VsockPacket> {
+        for (index, descriptor) in [
+            Descriptor {
+                addr: 0x2000,
+                len: VSOCK_PKT_HDR_SIZE as u32,
+                flags: 1,
+                next: 1,
+            },
+            Descriptor {
+                addr: 0x3000,
+                len: 32768,
+                flags: 1,
+                next: 2,
+            },
+            Descriptor {
+                addr: 0x13000,
+                len: 32768,
+                flags: tail_flags,
+                next: 0,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            mem.write_obj(descriptor, GuestAddress(0x1000 + index as u64 * 16))
+                .unwrap();
+        }
+        let mut header = [0u8; VSOCK_PKT_HDR_SIZE];
+        header[24..28].copy_from_slice(&declared_len.to_le_bytes());
+        mem.write_slice(&header, GuestAddress(0x2000)).unwrap();
+        mem.write_slice(&vec![b'a'; 32768], GuestAddress(0x3000))
+            .unwrap();
+        mem.write_slice(&vec![b'b'; 32768], GuestAddress(0x13000))
+            .unwrap();
+        let head = DescriptorChain::checked_new(mem, GuestAddress(0x1000), 3, 0).unwrap();
+        VsockPacket::from_tx_virtq_head(&head)
+    }
+
+    #[test]
+    fn gathers_fragmented_tx_without_forwarding_descriptor_padding() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let packet = fragmented_packet(&mem, 65535, 0).unwrap();
+        let mut expected = vec![b'a'; 32768];
+        expected.extend_from_slice(&vec![b'b'; 32767]);
+        assert_eq!(packet.payload().unwrap(), expected);
+    }
+
+    #[test]
+    fn rejects_writable_fragment() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        assert!(matches!(
+            fragmented_packet(&mem, 65535, 2),
+            Err(VsockError::UnreadableDescriptor)
+        ));
+    }
+
+    #[test]
+    fn rejects_truncated_fragment_chain() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let _ = fragmented_packet(&mem, 65535, 0).unwrap();
+        mem.write_obj(
+            Descriptor {
+                addr: 0x13000,
+                len: 1,
+                flags: 0,
+                next: 0,
+            },
+            GuestAddress(0x1020),
+        )
+        .unwrap();
+        let head = DescriptorChain::checked_new(&mem, GuestAddress(0x1000), 3, 0).unwrap();
+        assert!(matches!(
+            VsockPacket::from_tx_virtq_head(&head),
+            Err(VsockError::BufDescTooSmall)
+        ));
     }
 }

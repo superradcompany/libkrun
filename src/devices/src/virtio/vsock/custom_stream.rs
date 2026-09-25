@@ -660,6 +660,28 @@ mod tests {
     }
 
     #[test]
+    fn returns_credit_before_a_small_sender_exhausts_its_buffer() {
+        let state = Arc::new(TestStreamState {
+            blocked: AtomicBool::new(false),
+            written: Mutex::new(Vec::new()),
+        });
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let pkt = tx_packet(&mem, 4096, &[b'x'; 4096]);
+        let mut proxy = test_proxy(Arc::clone(&state), mem.clone());
+
+        // A guest must not need megabytes of outstanding data to get its first
+        // credit update: ordinary socket transmit buffers are much smaller.
+        for _ in 0..32 {
+            proxy.sendmsg(&pkt);
+            if let Some(MuxerRx::CreditUpdate { fwd_cnt, .. }) = proxy.rxq.lock().unwrap().pop() {
+                assert_eq!(fwd_cnt as usize, state.written.lock().unwrap().len());
+                return;
+            }
+        }
+        panic!("no credit returned after 128 KiB of a one-way upload");
+    }
+
+    #[test]
     fn rejects_writes_beyond_the_bounded_receive_window() {
         let state = Arc::new(TestStreamState {
             blocked: AtomicBool::new(true),
