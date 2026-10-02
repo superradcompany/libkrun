@@ -145,7 +145,7 @@ pub struct VsockMuxer {
     queue: Option<Arc<Mutex<VirtQueue>>>,
     mem: Option<GuestMemoryMmap>,
     rxq: Arc<Mutex<MuxerRxQ>>,
-    epoll: Epoll,
+    epoll: Arc<Epoll>,
     interrupt: Option<InterruptTransport>,
     proxy_map: ProxyMap,
     reaper_sender: Option<Sender<u64>>,
@@ -180,7 +180,7 @@ impl VsockMuxer {
             queue: None,
             mem: None,
             rxq: Arc::new(Mutex::new(MuxerRxQ::new())),
-            epoll: Epoll::new().unwrap(),
+            epoll: Arc::new(Epoll::new().unwrap()),
             interrupt: None,
             proxy_map: Arc::new(RwLock::new(HashMap::new())),
             reaper_sender: None,
@@ -231,7 +231,7 @@ impl VsockMuxer {
 
         let thread = MuxerThread::new(
             self.cid,
-            self.epoll.clone(),
+            Arc::clone(&self.epoll),
             self.rxq.clone(),
             self.proxy_map.clone(),
             mem,
@@ -915,7 +915,7 @@ impl VsockMuxer {
                         pkt.src_port(),
                         backend,
                         notifier,
-                        Arc::new(self.epoll.clone()),
+                        Arc::clone(&self.epoll),
                         mem.clone(),
                         queue.clone(),
                         self.rxq.clone(),
@@ -1296,6 +1296,84 @@ mod tests {
                 peer_port: 1234
             })
         ));
+    }
+
+    #[test]
+    fn closing_custom_stream_keeps_other_stream_events_alive() {
+        use std::io;
+
+        use super::super::packet::VSOCK_PKT_HDR_SIZE;
+        use super::super::{VsockShutdown, VsockStreamBackend};
+        use crate::virtio::{Descriptor, DescriptorChain};
+        use vm_memory::{Bytes, GuestAddress};
+
+        #[derive(Default)]
+        struct Service(Mutex<Vec<VsockNotifier>>);
+
+        struct Stream;
+
+        impl VsockPortBackend for Service {
+            fn connect(
+                &self,
+                _request: VsockConnectRequest,
+                notifier: VsockNotifier,
+            ) -> io::Result<Box<dyn VsockStreamBackend>> {
+                self.0.lock().unwrap().push(notifier);
+                Ok(Box::new(Stream))
+            }
+        }
+
+        impl VsockStreamBackend for Stream {
+            fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+
+            fn write(&self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn shutdown(&self, _how: VsockShutdown) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let service = Arc::new(Service::default());
+        let routes = HashMap::from([(5000, service.clone() as Arc<dyn VsockPortBackend>)]);
+        let mut muxer = VsockMuxer::new(3, None, None, Some(routes), None, TsiFlags::empty());
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        mem.write_obj(
+            Descriptor {
+                addr: 0x2000,
+                len: VSOCK_PKT_HDR_SIZE as u32,
+                flags: 0,
+                next: 0,
+            },
+            GuestAddress(0x1000),
+        )
+        .unwrap();
+        let head = DescriptorChain::checked_new(&mem, GuestAddress(0x1000), 1, 0).unwrap();
+        let mut packet = VsockPacket::from_tx_virtq_head(&head).unwrap();
+        packet
+            .set_src_cid(3)
+            .set_dst_port(5000)
+            .set_op(uapi::VSOCK_OP_REQUEST);
+        muxer.mem = Some(mem.clone());
+        muxer.queue = Some(Arc::new(Mutex::new(VirtQueue::new(8))));
+
+        for port in [4000, 4001] {
+            packet.set_src_port(port);
+            muxer.process_op_request(&packet);
+        }
+        assert_eq!(muxer.proxy_map.read().unwrap().len(), 2);
+
+        packet.set_src_port(4000).set_op(uapi::VSOCK_OP_RST);
+        muxer.process_stream_rst(&packet);
+        assert_eq!(muxer.proxy_map.read().unwrap().len(), 1);
+
+        service.0.lock().unwrap()[1].notify().unwrap();
+        let mut events = vec![EpollEvent::new(EventSet::empty(), 0); 2];
+        assert_eq!(muxer.epoll.wait(2, 1000, &mut events).unwrap(), 1);
+        assert_eq!(events[0].data(), (4001u64 << 32) | 5000);
     }
 
     #[test]
