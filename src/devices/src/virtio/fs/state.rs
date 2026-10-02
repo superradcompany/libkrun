@@ -167,6 +167,6 @@ mod tests {
             assert!(state.encode(too_large).is_err());
             assert!(FsDeviceState::decode(&encoded, too_large).is_err());
         }
-        assert!(max_device_state_bytes(u32::MAX as usize).is_ok());
+        assert!(max_device_state_bytes(u32::MAX as usize - FS_DEVICE_STATE_HEADER_BYTES).is_ok());
     }
 }
