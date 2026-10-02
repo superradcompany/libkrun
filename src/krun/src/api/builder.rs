@@ -91,7 +91,7 @@ pub struct VmBuilder {
     #[cfg(not(feature = "tee"))]
     fs: FsBuilder,
     #[cfg(not(feature = "tee"))]
-    fs_state_limit: usize,
+    device_state_limits: devices::virtio::DeviceStateLimits,
     console: ConsoleBuilder,
     exec: ExecBuilder,
     #[cfg(feature = "net")]
@@ -122,7 +122,7 @@ impl VmBuilder {
             #[cfg(not(feature = "tee"))]
             fs: FsBuilder::new(),
             #[cfg(not(feature = "tee"))]
-            fs_state_limit: devices::virtio::DEFAULT_MAX_FS_BACKEND_STATE_BYTES,
+            device_state_limits: devices::virtio::DeviceStateLimits::default(),
             console: ConsoleBuilder::new(),
             exec: ExecBuilder::new(),
             #[cfg(feature = "net")]
@@ -220,9 +220,38 @@ impl VmBuilder {
     /// Applies to every filesystem device, including custom backends. Defaults to
     /// [`DEFAULT_MAX_FS_BACKEND_STATE_BYTES`](crate::DEFAULT_MAX_FS_BACKEND_STATE_BYTES). The
     /// limit must fit a `u32`; larger values make state capture and restore fail.
+    /// With `blk` enabled, use the built VM's `device_state_codec()` so encoding
+    /// and decoding automatically use this budget too. Standalone
+    /// `VirtioDeviceState::encode()` and `decode()` still use the default budget.
     #[cfg(not(feature = "tee"))]
     pub fn fs_state_limit(mut self, bytes: usize) -> Self {
-        self.fs_state_limit = bytes;
+        self.device_state_limits = self.device_state_limits.with_fs_state_limit(bytes);
+        self
+    }
+
+    /// Use limits shared with standalone device-state codecs.
+    ///
+    /// The built VM exposes a codec using these limits through `device_state_codec()`
+    /// when the `blk` feature is enabled. Later calls to `fs_state_limit()` override
+    /// the filesystem budget in this value.
+    ///
+    /// ```no_run
+    /// # #[cfg(all(feature = "blk", not(feature = "tee")))]
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// use msb_krun::{DeviceStateCodec, DeviceStateLimits, VmBuilder};
+    ///
+    /// let limits = DeviceStateLimits::default().with_fs_state_limit(64 << 20);
+    /// let standalone = DeviceStateCodec::new(limits);
+    /// let vm = VmBuilder::new().device_state_limits(limits).build()?;
+    /// let codec = vm.device_state_codec();
+    /// // Use codec.encode(&state) and codec.decode(&bytes) for this VM.
+    /// // standalone uses the same budget for imports before VM creation.
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(not(feature = "tee"))]
+    pub fn device_state_limits(mut self, limits: devices::virtio::DeviceStateLimits) -> Self {
+        self.device_state_limits = limits;
         self
     }
 
@@ -661,7 +690,7 @@ impl VmBuilder {
         apply_fs_configs(&mut vmr, self.fs.configs);
         #[cfg(not(feature = "tee"))]
         {
-            vmr.fs_backend_state_limit = self.fs_state_limit;
+            vmr.device_state_limits = self.device_state_limits;
         }
 
         // Apply console configuration
@@ -1880,15 +1909,56 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "tee"))]
-    fn fs_state_limit_defaults_and_can_be_set() {
-        assert_eq!(
-            VmBuilder::new().fs_state_limit,
-            devices::virtio::DEFAULT_MAX_FS_BACKEND_STATE_BYTES
-        );
-        assert_eq!(
-            VmBuilder::new().fs_state_limit(8 << 20).fs_state_limit,
-            8 << 20
-        );
+    #[cfg(all(feature = "blk", not(feature = "tee")))]
+    fn fs_state_limit_is_used_by_the_vm_codec() {
+        use devices::virtio::{DeviceStateLimits, VirtioMmioState, VIRTIO_MMIO_STATE_VERSION};
+        use vmm::device_state::{DeviceStateCodec, VirtioDeviceState};
+
+        let limits = DeviceStateLimits::default().with_fs_state_limit(8 << 20);
+        let state = VirtioDeviceState {
+            pause_generation: 1,
+            device_id: "fs0".into(),
+            transport: VirtioMmioState {
+                version: VIRTIO_MMIO_STATE_VERSION,
+                device_type: 26,
+                features_select: 0,
+                acked_features_select: 0,
+                queue_select: 0,
+                device_status: 0,
+                config_generation: 0,
+                shm_region_select: 0,
+                interrupt_status: 0,
+                irq_line: None,
+                acked_features: 0,
+                queues: vec![],
+            },
+            device_state: vec![7; 5 << 20],
+        };
+        let standalone = DeviceStateCodec::new(limits);
+        let encoded = standalone.encode(&state).unwrap();
+        let default_vm = VmBuilder::new().build().unwrap();
+        assert!(default_vm.device_state_codec().decode(&encoded).is_err());
+        assert!(default_vm.device_state_codec().encode(&state).is_err());
+
+        for builder in [
+            VmBuilder::new().fs_state_limit(8 << 20),
+            VmBuilder::new().device_state_limits(limits),
+        ] {
+            let vm = builder.build().unwrap();
+            let codec = vm.device_state_codec();
+            assert_eq!(codec.decode(&encoded).unwrap(), state);
+            assert_eq!(
+                standalone.decode(&codec.encode(&state).unwrap()).unwrap(),
+                state
+            );
+            assert!(encoded.len() <= codec.max_state_bytes(26));
+            assert_eq!(codec.limits(), limits);
+        }
+        let vm = VmBuilder::new()
+            .device_state_limits(limits)
+            .fs_state_limit(1024)
+            .build()
+            .unwrap();
+        assert!(vm.device_state_codec().decode(&encoded).is_err());
     }
 }

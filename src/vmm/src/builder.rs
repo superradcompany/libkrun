@@ -1998,7 +1998,7 @@ pub fn build_microvm_paused(
     attach_fs_devices(
         &mut vmm,
         &vm_resources.fs,
-        vm_resources.fs_backend_state_limit,
+        vm_resources.device_state_limits.fs_state_limit(),
         &mut _shm_manager,
         #[cfg(not(feature = "tee"))]
         export_table,
@@ -2012,7 +2012,7 @@ pub fn build_microvm_paused(
     attach_custom_fs_devices(
         &mut vmm,
         &vm_resources.custom_fs,
-        vm_resources.fs_backend_state_limit,
+        vm_resources.device_state_limits.fs_state_limit(),
         &mut _shm_manager,
         vm_resources.fs.len(),
         intc.clone(),

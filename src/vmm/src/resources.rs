@@ -325,9 +325,9 @@ pub struct VmResources {
     /// The fs device.
     #[cfg(not(feature = "tee"))]
     pub fs: Vec<FsDeviceConfig>,
-    /// Largest backend state each virtio-fs device captures or restores.
+    /// Limits shared by device capture, restore, and standalone state codecs.
     #[cfg(not(feature = "tee"))]
-    pub fs_backend_state_limit: usize,
+    pub device_state_limits: devices::virtio::DeviceStateLimits,
     /// Custom filesystem devices.
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     pub custom_fs: Vec<CustomFsDeviceConfig>,
@@ -426,7 +426,7 @@ impl Default for VmResources {
             #[cfg(not(feature = "tee"))]
             fs: Vec::new(),
             #[cfg(not(feature = "tee"))]
-            fs_backend_state_limit: devices::virtio::DEFAULT_MAX_FS_BACKEND_STATE_BYTES,
+            device_state_limits: devices::virtio::DeviceStateLimits::default(),
             #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
             custom_fs: Vec::new(),
             vsock: VsockBuilder::default(),

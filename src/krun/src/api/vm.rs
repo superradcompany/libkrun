@@ -303,6 +303,16 @@ pub struct VmMemoryState {
 //--------------------------------------------------------------------------------------------------
 
 impl Vm {
+    /// Return a codec using the limits configured on this VM's builder.
+    ///
+    /// Use this for states returned by `capture_virtio_device_state`, and for
+    /// decoding states before `restore_virtio_device_state`. It is available
+    /// before VM startup and can be retained independently of the VM.
+    #[cfg(all(feature = "blk", not(feature = "tee")))]
+    pub fn device_state_codec(&self) -> vmm::device_state::DeviceStateCodec {
+        vmm::device_state::DeviceStateCodec::new(self.vmr.device_state_limits)
+    }
+
     /// Create a new Vm instance.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(

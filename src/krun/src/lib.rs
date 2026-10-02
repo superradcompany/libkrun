@@ -232,10 +232,16 @@ pub use api::vm::{
     VmMemoryState, VmPauseGeneration,
 };
 #[cfg(all(feature = "blk", not(feature = "tee")))]
-pub use api::{max_virtio_device_state_bytes, BlockDeviceState, VirtioDeviceState};
+pub use api::{
+    max_virtio_device_state_bytes, BlockDeviceState, DeviceStateCodec, VirtioDeviceState,
+};
 #[cfg(feature = "blk")]
 pub use api::{
     BlockBackendSpec, BlockImageFormat, BlockLayerSpec, BlockSyncMode, PreparedBlockBackend,
+};
+#[cfg(not(feature = "tee"))]
+pub use api::{
+    DeviceStateLimits, DEFAULT_MAX_FS_BACKEND_STATE_BYTES, FS_DEVICE_STATE_HEADER_BYTES,
 };
 #[cfg(not(feature = "tee"))]
 pub use api::{
@@ -246,8 +252,6 @@ pub use api::{
 };
 #[cfg(not(feature = "tee"))]
 pub use api::{PrivateMemoryBacking, PrivateMemoryRegion};
-#[cfg(not(feature = "tee"))]
-pub use api::{DEFAULT_MAX_FS_BACKEND_STATE_BYTES, FS_DEVICE_STATE_HEADER_BYTES};
 #[cfg(feature = "net")]
 pub use devices::virtio::net::rate_limit::{
     RateLimiterConfig, RateLimiterConfigError, TokenBucketConfig,
