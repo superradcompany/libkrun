@@ -5,16 +5,14 @@
 
 use std::io;
 
+use super::super::FS_DEVICE_STATE_HEADER_BYTES;
+
 //--------------------------------------------------------------------------------------------------
 // Constants
 //--------------------------------------------------------------------------------------------------
 
 const MAGIC: &[u8; 8] = b"MSBKFS\0\0";
 const VERSION: u16 = 1;
-/// Default maximum size of the backend state carried by one virtio-fs device.
-pub const DEFAULT_MAX_FS_BACKEND_STATE_BYTES: usize = 4 * 1024 * 1024;
-/// Size of the fixed header preceding the backend state in a virtio-fs device state.
-pub const FS_DEVICE_STATE_HEADER_BYTES: usize = 22;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -99,6 +97,8 @@ fn invalid_data(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use super::super::super::DEFAULT_MAX_FS_BACKEND_STATE_BYTES;
 
     const DEFAULT_LIMIT: usize = DEFAULT_MAX_FS_BACKEND_STATE_BYTES;
 

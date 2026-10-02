@@ -14,11 +14,12 @@ use vm_memory::{ByteValued, GuestMemoryMmap};
 
 use super::super::{
     ActivateResult, DeviceQueue, DeviceState, FsError, QueueConfig, VirtioDevice, VirtioShmRegion,
+    DEFAULT_MAX_FS_BACKEND_STATE_BYTES,
 };
 use super::dyn_filesystem::{DynFileSystem, DynFileSystemAdapter};
 use super::filesystem::{FileSystem, FsOptions};
 use super::passthrough::{self, PassthroughFs};
-use super::state::{FsDeviceState, DEFAULT_MAX_FS_BACKEND_STATE_BYTES};
+use super::state::FsDeviceState;
 use super::worker::FsWorker;
 use super::ExportTable;
 use super::{defs, defs::uapi};
