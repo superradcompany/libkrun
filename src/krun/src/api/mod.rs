@@ -61,6 +61,8 @@ pub use builders::{
 pub use devices::virtio::block::{ImageType as BlockImageFormat, SyncMode as BlockSyncMode};
 #[cfg(feature = "blk")]
 pub use devices::virtio::{BlockBackendSpec, BlockLayerSpec, PreparedBlockBackend};
+#[cfg(not(feature = "tee"))]
+pub use devices::virtio::{DEFAULT_MAX_FS_BACKEND_STATE_BYTES, FS_DEVICE_STATE_HEADER_BYTES};
 pub use error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use exit_handle::ExitHandle;
 pub use metrics::{
@@ -75,7 +77,7 @@ pub use vm::{
     VmMemoryState, VmPauseGeneration,
 };
 #[cfg(all(feature = "blk", not(feature = "tee")))]
-pub use vmm::device_state::{BlockDeviceState, VirtioDeviceState};
+pub use vmm::device_state::{max_virtio_device_state_bytes, BlockDeviceState, VirtioDeviceState};
 #[cfg(not(feature = "tee"))]
 pub use vmm::execution_state::{
     ExecutionArchitecture, ExecutionBackend, ExecutionState, VcpuExecutionState,

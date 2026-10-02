@@ -90,6 +90,8 @@ pub struct VmBuilder {
     #[cfg_attr(feature = "tee", allow(dead_code))]
     #[cfg(not(feature = "tee"))]
     fs: FsBuilder,
+    #[cfg(not(feature = "tee"))]
+    fs_state_limit: usize,
     console: ConsoleBuilder,
     exec: ExecBuilder,
     #[cfg(feature = "net")]
@@ -119,6 +121,8 @@ impl VmBuilder {
             kernel: KernelBuilder::new(),
             #[cfg(not(feature = "tee"))]
             fs: FsBuilder::new(),
+            #[cfg(not(feature = "tee"))]
+            fs_state_limit: devices::virtio::DEFAULT_MAX_FS_BACKEND_STATE_BYTES,
             console: ConsoleBuilder::new(),
             exec: ExecBuilder::new(),
             #[cfg(feature = "net")]
@@ -208,6 +212,17 @@ impl VmBuilder {
     pub fn fs(mut self, f: impl FnOnce(FsBuilder) -> FsBuilder) -> Self {
         let new_fs = f(FsBuilder::new());
         self.fs.configs.extend(new_fs.configs);
+        self
+    }
+
+    /// Set the largest backend state, in bytes, that each virtio-fs device captures or restores.
+    ///
+    /// Applies to every filesystem device, including custom backends. Defaults to
+    /// [`DEFAULT_MAX_FS_BACKEND_STATE_BYTES`](crate::DEFAULT_MAX_FS_BACKEND_STATE_BYTES). The
+    /// limit must fit a `u32`; larger values make state capture and restore fail.
+    #[cfg(not(feature = "tee"))]
+    pub fn fs_state_limit(mut self, bytes: usize) -> Self {
+        self.fs_state_limit = bytes;
         self
     }
 
@@ -644,6 +659,10 @@ impl VmBuilder {
         // Apply filesystem configuration
         #[cfg(not(feature = "tee"))]
         apply_fs_configs(&mut vmr, self.fs.configs);
+        #[cfg(not(feature = "tee"))]
+        {
+            vmr.fs_backend_state_limit = self.fs_state_limit;
+        }
 
         // Apply console configuration
         if let Some(output) = self.console.output {
@@ -1858,5 +1877,18 @@ mod tests {
         assert_eq!(vmr.custom_fs.len(), 1);
         assert_eq!(vmr.custom_fs[0].fs_id, "share");
         assert_eq!(vmr.custom_fs[0].shm_size, Some(64 << 20));
+    }
+
+    #[test]
+    #[cfg(not(feature = "tee"))]
+    fn fs_state_limit_defaults_and_can_be_set() {
+        assert_eq!(
+            VmBuilder::new().fs_state_limit,
+            devices::virtio::DEFAULT_MAX_FS_BACKEND_STATE_BYTES
+        );
+        assert_eq!(
+            VmBuilder::new().fs_state_limit(8 << 20).fs_state_limit,
+            8 << 20
+        );
     }
 }

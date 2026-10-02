@@ -36,6 +36,7 @@ pub use self::defs::uapi::VIRTIO_ID_FS as TYPE_FS;
 pub use self::device::Fs;
 pub use self::dyn_filesystem::{AddDirEntry, AddDirEntryPlus, DynFileSystem, DynFileSystemAdapter};
 pub use self::filesystem::ExportTable;
+pub use self::state::{DEFAULT_MAX_FS_BACKEND_STATE_BYTES, FS_DEVICE_STATE_HEADER_BYTES};
 
 #[cfg_attr(target_os = "windows", allow(dead_code))]
 mod defs {

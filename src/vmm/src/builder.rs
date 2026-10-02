@@ -1998,6 +1998,7 @@ pub fn build_microvm_paused(
     attach_fs_devices(
         &mut vmm,
         &vm_resources.fs,
+        vm_resources.fs_backend_state_limit,
         &mut _shm_manager,
         #[cfg(not(feature = "tee"))]
         export_table,
@@ -2011,6 +2012,7 @@ pub fn build_microvm_paused(
     attach_custom_fs_devices(
         &mut vmm,
         &vm_resources.custom_fs,
+        vm_resources.fs_backend_state_limit,
         &mut _shm_manager,
         vm_resources.fs.len(),
         intc.clone(),
@@ -4296,9 +4298,11 @@ fn attach_mmio_device(
 }
 
 #[cfg(not(feature = "tee"))]
+#[allow(clippy::too_many_arguments)]
 fn attach_fs_devices(
     vmm: &mut Vmm,
     fs_devs: &[FsDeviceConfig],
+    backend_state_limit: usize,
     shm_manager: &mut ShmManager,
     #[cfg(not(feature = "tee"))] export_table: Option<ExportTable>,
     intc: IrqChip,
@@ -4317,6 +4321,10 @@ fn attach_fs_devices(
             )
             .unwrap(),
         ));
+
+        fs.lock()
+            .unwrap()
+            .set_max_backend_state_bytes(backend_state_limit);
 
         let id = format!("{}{}", String::from(fs.lock().unwrap().id()), i);
 
@@ -4347,9 +4355,11 @@ fn attach_fs_devices(
 }
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[allow(clippy::too_many_arguments)]
 fn attach_custom_fs_devices(
     vmm: &mut Vmm,
     custom_fs_devs: &[CustomFsDeviceConfig],
+    backend_state_limit: usize,
     shm_manager: &mut ShmManager,
     index_offset: usize,
     intc: IrqChip,
@@ -4367,6 +4377,10 @@ fn attach_custom_fs_devices(
             )
             .unwrap(),
         ));
+
+        fs.lock()
+            .unwrap()
+            .set_max_backend_state_bytes(backend_state_limit);
 
         let id = format!(
             "{}{}",
