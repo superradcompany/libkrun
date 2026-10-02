@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(unix)]
 use std::collections::HashMap;
 
-use utils::epoll::EventSet;
+use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
 
 use super::super::Queue as VirtQueue;
@@ -29,6 +29,8 @@ pub struct CustomStreamProxy {
     cid: u64,
     backend: Box<dyn VsockStreamBackend>,
     notifier: VsockNotifier,
+    epoll: Arc<Epoll>,
+    waiting_rx: bool,
     status: ProxyStatus,
     mem: GuestMemoryMmap,
     queue: Arc<Mutex<VirtQueue>>,
@@ -56,6 +58,7 @@ impl CustomStreamProxy {
         peer_port: u32,
         backend: Box<dyn VsockStreamBackend>,
         notifier: VsockNotifier,
+        epoll: Arc<Epoll>,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
@@ -70,6 +73,8 @@ impl CustomStreamProxy {
             cid,
             backend,
             notifier,
+            epoll,
+            waiting_rx: false,
             status,
             mem,
             queue,
@@ -124,9 +129,49 @@ impl CustomStreamProxy {
     }
 
     fn clear_notification(&self) {
-        if self.uses_notifier() {
-            if let Err(err) = self.notifier.clear() {
-                warn!("failed to clear custom vsock notification: {err}");
+        if let Err(err) = self.notifier.clear() {
+            warn!("failed to clear custom vsock notification: {err}");
+        }
+    }
+
+    // Apply interest changes while the proxy lock still protects its state.
+    // Returning a polling update for later application could overwrite a newer
+    // pause/resume decision from the guest thread with stale socket interests.
+    fn update_polling(&self) {
+        let mut events = match self.status {
+            ProxyStatus::Connecting => self.connecting_poll_events(),
+            ProxyStatus::Connected => self.connected_poll_events(),
+            _ => EventSet::empty(),
+        };
+        if self.waiting_rx && !self.uses_notifier() {
+            events.remove(EventSet::IN);
+        }
+        self.poll(self.event_pollable(), events);
+
+        // A socket's hang-up is level-triggered. Stop watching it when RX is
+        // full, but retain the notifier so a guest buffer kick can resume reads.
+        if !self.uses_notifier() {
+            self.poll(
+                self.notifier.pollable(),
+                if self.waiting_rx && self.status == ProxyStatus::Connected {
+                    EventSet::IN
+                } else {
+                    EventSet::empty()
+                },
+            );
+        }
+    }
+
+    fn poll(&self, fd: VsockPollable, events: EventSet) {
+        let _ = self
+            .epoll
+            .ctl(ControlOperation::Delete, fd, &EpollEvent::default());
+        if !events.is_empty() {
+            if let Err(err) =
+                self.epoll
+                    .ctl(ControlOperation::Add, fd, &EpollEvent::new(events, self.id))
+            {
+                warn!("failed to update custom vsock polling: {err}");
             }
         }
     }
@@ -202,7 +247,12 @@ impl CustomStreamProxy {
         let mut wait_credit = false;
         let mut queue = self.queue.lock().unwrap();
 
-        while let Some(head) = queue.pop(&self.mem) {
+        self.waiting_rx = false;
+        loop {
+            let Some(head) = queue.pop(&self.mem) else {
+                self.waiting_rx = true;
+                break;
+            };
             let len = match VsockPacket::from_rx_virtq_head(&head) {
                 Ok(mut pkt) => match self.recv_to_pkt(&mut pkt) {
                     Err(err) => {
@@ -308,7 +358,7 @@ impl CustomStreamProxy {
         self.status = ProxyStatus::Closed;
         update.signal_queue = true;
         update.remove_proxy = ProxyRemoval::Deferred;
-        update.polling = Some((self.id, self.event_pollable(), EventSet::empty()));
+        self.update_polling();
     }
 }
 
@@ -385,7 +435,7 @@ impl Proxy for CustomStreamProxy {
             self.fail(&mut update, "custom vsock backend write failed", &err);
             return update;
         }
-        update.polling = Some((self.id, self.event_pollable(), self.connected_poll_events()));
+        self.update_polling();
         self.maybe_push_credit_update(&mut update);
 
         update
@@ -417,20 +467,16 @@ impl Proxy for CustomStreamProxy {
         self.status = ProxyStatus::Connected;
         self.kick();
 
-        ProxyUpdate {
-            polling: Some((self.id, self.event_pollable(), self.connected_poll_events())),
-            ..Default::default()
-        }
+        self.update_polling();
+        ProxyUpdate::default()
     }
 
     fn process_op_response(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
         self.peer_buf_alloc = pkt.buf_alloc();
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
         self.status = ProxyStatus::Connected;
-        ProxyUpdate {
-            polling: Some((self.id, self.event_pollable(), self.connected_poll_events())),
-            ..Default::default()
-        }
+        self.update_polling();
+        ProxyUpdate::default()
     }
 
     fn shutdown(&mut self, pkt: &VsockPacket) {
@@ -448,8 +494,8 @@ impl Proxy for CustomStreamProxy {
 
     fn release(&mut self) -> ProxyUpdate {
         self.status = ProxyStatus::Closed;
+        self.update_polling();
         ProxyUpdate {
-            polling: Some((self.id, self.event_pollable(), EventSet::empty())),
             remove_proxy: ProxyRemoval::Immediate,
             ..Default::default()
         }
@@ -462,11 +508,7 @@ impl Proxy for CustomStreamProxy {
             self.clear_notification();
             match self.backend.connect_state() {
                 Ok(VsockConnectState::Connecting) => {
-                    update.polling = Some((
-                        self.id,
-                        self.event_pollable(),
-                        self.connecting_poll_events(),
-                    ));
+                    self.update_polling();
                     return update;
                 }
                 Ok(VsockConnectState::Connected) => {
@@ -517,21 +559,13 @@ impl Proxy for CustomStreamProxy {
             if self.status == ProxyStatus::Closed {
                 self.push_reset();
                 update.signal_queue = true;
-                update.polling = Some((self.id, self.event_pollable(), EventSet::empty()));
+                self.update_polling();
                 update.remove_proxy = ProxyRemoval::Immediate;
                 return update;
             }
         }
 
-        update.polling = Some((
-            self.id,
-            self.event_pollable(),
-            if self.status == ProxyStatus::WaitingCreditUpdate {
-                EventSet::empty()
-            } else {
-                self.connected_poll_events()
-            },
-        ));
+        self.update_polling();
         update
     }
 
@@ -632,6 +666,7 @@ mod tests {
             4000,
             Box::new(TestStream { state }),
             VsockNotifier::new().unwrap(),
+            Arc::new(Epoll::new().unwrap()),
             mem,
             Arc::new(Mutex::new(VirtQueue::new(256))),
             Arc::new(Mutex::new(MuxerRxQ::new())),
@@ -779,6 +814,7 @@ mod tests {
                         GuestAddress(AVAIL + 2),
                     )
                     .unwrap();
+                    let epoll = Arc::new(Epoll::new().unwrap());
                     let mut proxy = CustomStreamProxy::new(
                         1,
                         3,
@@ -786,6 +822,7 @@ mod tests {
                         4000,
                         Box::new(SocketBackend(backend)),
                         VsockNotifier::new().unwrap(),
+                        epoll.clone(),
                         mem.clone(),
                         Arc::new(Mutex::new(queue)),
                         Arc::new(Mutex::new(MuxerRxQ::new())),
@@ -816,9 +853,28 @@ mod tests {
                             credit.set_buf_alloc(CHUNK as u32).set_fwd_cnt(CHUNK as u32);
                             proxy.update_peer_credit(&credit);
                         } else {
+                            let mut ready = vec![EpollEvent::new(EventSet::empty(), 0); 2];
+                            assert_eq!(
+                                epoll.wait(2, 0, &mut ready).unwrap(),
+                                0,
+                                "socket must not remain ready while guest RX buffers are exhausted"
+                            );
+                            // A kick for another connection must not leave this
+                            // socket spinning if its RX queue is still empty.
+                            proxy.kick();
+                            assert_eq!(epoll.wait(2, 1000, &mut ready).unwrap(), 1);
+                            proxy.process_event(ready[0].event_set());
+                            assert_eq!(epoll.wait(2, 0, &mut ready).unwrap(), 0);
+
                             mem.write_obj(3u16, GuestAddress(AVAIL + 2)).unwrap();
+                            proxy.kick();
+                            assert_eq!(
+                                epoll.wait(2, 1000, &mut ready).unwrap(),
+                                1,
+                                "new guest RX buffers must wake the paused proxy"
+                            );
                         }
-                        update = proxy.process_event(event);
+                        update = proxy.process_event(EventSet::IN);
                         // At an exact credit boundary the EOF read needs fresh credit too.
                         if pause == "credit" {
                             let credit_mem =
@@ -853,6 +909,13 @@ mod tests {
                         }
                     }
                     assert_eq!(received, payload);
+                    proxy.kick();
+                    let mut ready = vec![EpollEvent::new(EventSet::empty(), 0); 2];
+                    assert_eq!(
+                        epoll.wait(2, 0, &mut ready).unwrap(),
+                        0,
+                        "closed proxies must unregister the socket and notifier"
+                    );
                 }
             }
         }

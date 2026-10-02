@@ -915,6 +915,7 @@ impl VsockMuxer {
                         pkt.src_port(),
                         backend,
                         notifier,
+                        Arc::new(self.epoll.clone()),
                         mem.clone(),
                         queue.clone(),
                         self.rxq.clone(),

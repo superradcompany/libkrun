@@ -344,6 +344,7 @@ impl VsockMuxer {
             pkt.src_port(),
             backend,
             notifier,
+            self.epoll.clone(),
             mem.clone(),
             queue.clone(),
             self.rxq.clone(),
