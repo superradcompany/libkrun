@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "msb_krun"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "crossbeam-channel",
  "kvm-bindings",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "msb_krun_arch"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
@@ -367,11 +367,11 @@ dependencies = [
 
 [[package]]
 name = "msb_krun_arch_gen"
-version = "0.1.40"
+version = "0.1.41"
 
 [[package]]
 name = "msb_krun_cpuid"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
@@ -380,7 +380,7 @@ dependencies = [
 
 [[package]]
 name = "msb_krun_devices"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "bincode",
  "bitflags 1.3.2",
@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "msb_krun_hvf"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "crossbeam-channel",
  "libloading",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "msb_krun_kernel"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "msb-vm-memory",
  "msb_krun_utils",
@@ -428,7 +428,7 @@ dependencies = [
 
 [[package]]
 name = "msb_krun_polly"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "libc",
  "msb_krun_utils",
@@ -436,14 +436,14 @@ dependencies = [
 
 [[package]]
 name = "msb_krun_smbios"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "msb-vm-memory",
 ]
 
 [[package]]
 name = "msb_krun_utils"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "bitflags 1.3.2",
  "crossbeam-channel",
@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "msb_krun_vmm"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "bincode",
  "bzip2",
