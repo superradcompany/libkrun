@@ -420,6 +420,19 @@ pub fn check_nested_virt() -> Result<bool, Error> {
     Ok(el2_supported)
 }
 
+/// Second-stage permissions for a DAX window mapping.
+///
+/// Hypervisor.framework does not derive the stage-2 writable bit from the host
+/// mapping, so a read-only mapping has to omit `HV_MEMORY_WRITE` explicitly;
+/// otherwise a guest write would still modify the read-only host `mmap`.
+fn dax_mapping_flags(writable: bool) -> hv_memory_flags_t {
+    let mut flags = HV_MEMORY_READ | HV_MEMORY_EXEC;
+    if writable {
+        flags |= HV_MEMORY_WRITE;
+    }
+    flags.into()
+}
+
 pub struct HvfVm {}
 
 static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
@@ -462,12 +475,22 @@ impl HvfVm {
         guest_start_addr: u64,
         size: u64,
     ) -> Result<(), Error> {
+        self.map_memory_with_writable(host_start_addr, guest_start_addr, size, true)
+    }
+
+    pub fn map_memory_with_writable(
+        &self,
+        host_start_addr: u64,
+        guest_start_addr: u64,
+        size: u64,
+        writable: bool,
+    ) -> Result<(), Error> {
         let ret = unsafe {
             hv_vm_map(
                 host_start_addr as *mut core::ffi::c_void,
                 guest_start_addr,
                 size.try_into().unwrap(),
-                (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
+                dax_mapping_flags(writable),
             )
         };
         if ret != HV_SUCCESS {
@@ -1350,6 +1373,23 @@ mod tests {
             pending_advance_pc: false,
             nested_enabled,
         }
+    }
+
+    #[test]
+    fn read_only_dax_mappings_omit_write_permission() {
+        let write = HV_MEMORY_WRITE as hv_memory_flags_t;
+
+        // A read-only DAX mapping must not be writable by the guest; a guest
+        // write traps instead of modifying the read-only host mapping.
+        let read_only = dax_mapping_flags(false);
+        assert_eq!(read_only & write, 0);
+        assert_ne!(read_only & (HV_MEMORY_READ as hv_memory_flags_t), 0);
+        assert_ne!(read_only & (HV_MEMORY_EXEC as hv_memory_flags_t), 0);
+
+        // A writable DAX mapping keeps write access, and only that bit differs.
+        let writable = dax_mapping_flags(true);
+        assert_ne!(writable & write, 0);
+        assert_eq!(writable, read_only | write);
     }
 
     #[test]
