@@ -80,9 +80,12 @@ impl TcpTester {
         set_timeouts(&mut stream);
         stream.write_all(b"ping!").unwrap();
         expect_msg(&mut stream, b"pong!");
+        expect_msg(&mut stream, &vec![0xa5; 1024 * 1024]);
         expect_wouldblock(&mut stream);
         stream.write_all(b"bye!").unwrap();
-        // We leak the file descriptor for now, since there is no easy way to close it on libkrun exit
+        // Keep the connection alive until VM exit so the final response is not
+        // raced by a host-side close, matching the vsock guest-connect test.
+        mem::forget(stream);
         mem::forget(listener);
     }
 
@@ -92,6 +95,8 @@ impl TcpTester {
         expect_msg(&mut stream, b"ping!");
         expect_wouldblock(&mut stream);
         stream.write_all(b"pong!").unwrap();
+        // Exceeds the guest socket buffer: the host must return credit promptly.
+        stream.write_all(&vec![0xa5; 1024 * 1024]).unwrap();
         expect_msg(&mut stream, b"bye!");
     }
 }

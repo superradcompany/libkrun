@@ -2,19 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-/// `VsockPacket` provides a thin wrapper over the buffers exchanged via virtio queues.
-/// There are two components to a vsock packet, each using its own descriptor in a
-/// virtio queue:
-/// - the packet header; and
-/// - the packet data/buffer.
-///
-/// There is a 1:1 relation between descriptor chains and packets: the first (chain head) holds
-/// the header, and an optional second descriptor holds the data. The second descriptor is only
-/// present for data packets (VSOCK_OP_RW).
-///
-/// `VsockPacket` wraps these two buffers and provides direct access to the data stored
-/// in guest memory. This is done to avoid unnecessarily copying data from guest memory
-/// to temporary buffers, before passing it on to the vsock backend.
+/// `VsockPacket` wraps a virtqueue packet header and its optional payload.
+/// Single-descriptor payloads reference guest memory directly; fragmented TX
+/// payloads are gathered into a bounded buffer for the vsock backend.
 use std::convert::TryInto;
 use std::ffi::CStr;
 #[cfg(unix)]
@@ -198,13 +188,17 @@ pub struct TsiReleaseReq {
     pub local_port: u32,
 }
 
-/// The vsock packet, implemented as a wrapper over a virtq descriptor chain:
-/// - the chain head, holding the packet header; and
-/// - (an optional) data/buffer descriptor, only present for data packets (VSOCK_OP_RW).
+/// Payload storage, either borrowed guest memory or gathered TX data.
+enum PacketBuffer {
+    Borrowed { ptr: *mut u8, len: usize },
+    Owned(Vec<u8>),
+}
+
+/// The vsock packet wraps a virtq descriptor chain.
+/// Fragmented TX payloads are gathered; single-descriptor payloads stay zero-copy.
 pub struct VsockPacket {
     hdr: *mut u8,
-    buf: Option<*mut u8>,
-    buf_size: usize,
+    buf: Option<PacketBuffer>,
 }
 
 fn get_host_address<T: GuestMemory + vm_memory::GuestMemoryBackend>(
@@ -218,9 +212,8 @@ fn get_host_address<T: GuestMemory + vm_memory::GuestMemoryBackend>(
 impl VsockPacket {
     /// Create the packet wrapper from a TX virtq chain head.
     ///
-    /// The chain head is expected to hold valid packet header data. A following packet buffer
-    /// descriptor can optionally end the chain. Bounds and pointer checks are performed when
-    /// creating the wrapper.
+    /// The chain head holds the header, followed by readable payload descriptors.
+    /// Bounds and pointer checks are performed when creating the wrapper.
     pub fn from_tx_virtq_head(head: &DescriptorChain) -> Result<Self> {
         // All buffers in the TX queue must be readable.
         //
@@ -237,18 +230,18 @@ impl VsockPacket {
             hdr: get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
                 .map_err(VsockError::GuestMemoryMmap)?,
             buf: None,
-            buf_size: 0,
         };
 
+        let payload_len = pkt.len() as usize;
         // No point looking for a data/buffer descriptor, if the packet is zero-lengthed.
-        if pkt.len() == 0 {
+        if payload_len == 0 {
             return Ok(pkt);
         }
 
         // Reject weirdly-sized packets.
         //
-        if pkt.len() > defs::MAX_PKT_BUF_SIZE as u32 {
-            return Err(VsockError::InvalidPktLen(pkt.len()));
+        if payload_len > defs::MAX_PKT_BUF_SIZE {
+            return Err(VsockError::InvalidPktLen(payload_len as u32));
         }
 
         // If the packet header showed a non-zero length, there should be a data descriptor here.
@@ -259,17 +252,34 @@ impl VsockPacket {
             return Err(VsockError::UnreadableDescriptor);
         }
 
-        // The data buffer should be large enough to fit the size of the data, as described by
-        // the header descriptor.
-        if buf_desc.len < pkt.len() {
-            return Err(VsockError::BufDescTooSmall);
+        // Linux can scatter a large TX payload across multiple descriptors.
+        if (buf_desc.len as usize) < payload_len {
+            let mut data = Vec::with_capacity(payload_len);
+            let mut desc = buf_desc;
+            loop {
+                if desc.is_write_only() {
+                    return Err(VsockError::UnreadableDescriptor);
+                }
+                let count = (desc.len as usize).min(payload_len - data.len());
+                let ptr = get_host_address(desc.mem, desc.addr, count)
+                    .map_err(VsockError::GuestMemoryMmap)?;
+                // The guest range was checked above; copy only declared payload bytes.
+                data.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, count) });
+                if data.len() == payload_len {
+                    break;
+                }
+                desc = desc.next_descriptor().ok_or(VsockError::BufDescTooSmall)?;
+            }
+            pkt.buf = Some(PacketBuffer::Owned(data));
+            return Ok(pkt);
         }
 
-        pkt.buf_size = buf_desc.len as usize;
-        pkt.buf = Some(
-            get_host_address(buf_desc.mem, buf_desc.addr, pkt.buf_size)
+        let len = buf_desc.len as usize;
+        pkt.buf = Some(PacketBuffer::Borrowed {
+            ptr: get_host_address(buf_desc.mem, buf_desc.addr, len)
                 .map_err(VsockError::GuestMemoryMmap)?,
-        );
+            len,
+        });
 
         Ok(pkt)
     }
@@ -294,7 +304,6 @@ impl VsockPacket {
             hdr: get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
                 .map_err(VsockError::GuestMemoryMmap)?,
             buf: None,
-            buf_size: 0,
         };
 
         // Starting from Linux 6.2 the virtio-vsock driver can use a single descriptor for both
@@ -305,19 +314,21 @@ impl VsockPacket {
                 .checked_add(VSOCK_PKT_HDR_SIZE as u64)
                 .ok_or(VsockError::GuestMemoryBounds)?;
 
-            pkt.buf_size = head.len as usize - VSOCK_PKT_HDR_SIZE;
-            pkt.buf = Some(
-                get_host_address(head.mem, buf_addr, pkt.buf_size)
+            let len = head.len as usize - VSOCK_PKT_HDR_SIZE;
+            pkt.buf = Some(PacketBuffer::Borrowed {
+                ptr: get_host_address(head.mem, buf_addr, len)
                     .map_err(VsockError::GuestMemoryMmap)?,
-            );
+                len,
+            });
         } else {
             let buf_desc = head.next_descriptor().ok_or(VsockError::BufDescMissing)?;
 
-            pkt.buf_size = buf_desc.len as usize;
-            pkt.buf = Some(
-                get_host_address(buf_desc.mem, buf_desc.addr, pkt.buf_size)
+            let len = buf_desc.len as usize;
+            pkt.buf = Some(PacketBuffer::Borrowed {
+                ptr: get_host_address(buf_desc.mem, buf_desc.addr, len)
                     .map_err(VsockError::GuestMemoryMmap)?,
-            );
+                len,
+            });
         }
 
         Ok(pkt)
@@ -345,10 +356,12 @@ impl VsockPacket {
     ///            (and often is) larger than the length of the packet data. The packet data length
     ///            is stored in the packet header, and accessible via `VsockPacket::len()`.
     pub fn buf(&self) -> Option<&[u8]> {
-        self.buf.map(|ptr| {
-            // This is safe since bound checks have already been performed when creating the packet
-            // from the virtq descriptor.
-            unsafe { std::slice::from_raw_parts(ptr as *const u8, self.buf_size) }
+        self.buf.as_ref().map(|buf| match buf {
+            // Bounds were checked when creating the packet from the virtq descriptor.
+            PacketBuffer::Borrowed { ptr, len } => unsafe {
+                std::slice::from_raw_parts(*ptr, *len)
+            },
+            PacketBuffer::Owned(data) => data.as_slice(),
         })
     }
 
@@ -370,11 +383,17 @@ impl VsockPacket {
     ///            (and often is) larger than the length of the packet data. The packet data length
     ///            is stored in the packet header, and accessible via `VsockPacket::len()`.
     pub fn buf_mut(&mut self) -> Option<&mut [u8]> {
-        self.buf.map(|ptr| {
-            // This is safe since bound checks have already been performed when creating the packet
-            // from the virtq descriptor.
-            unsafe { std::slice::from_raw_parts_mut(ptr, self.buf_size) }
+        self.buf.as_mut().map(|buf| match buf {
+            // Bounds were checked when creating the packet from the virtq descriptor.
+            PacketBuffer::Borrowed { ptr, len } => unsafe {
+                std::slice::from_raw_parts_mut(*ptr, *len)
+            },
+            PacketBuffer::Owned(data) => data.as_mut_slice(),
         })
+    }
+
+    fn buf_size(&self) -> usize {
+        self.buf().map_or(0, |buf| buf.len())
     }
 
     pub fn src_cid(&self) -> u64 {
@@ -473,7 +492,7 @@ impl VsockPacket {
     }
 
     pub fn sa_family(&self) -> Option<u16> {
-        if self.buf_size >= 2 {
+        if self.buf_size() >= 2 {
             Some(byte_order::read_le_u16(&self.buf().unwrap()[0..]))
         } else {
             None
@@ -481,7 +500,7 @@ impl VsockPacket {
     }
 
     pub fn inet_port(&self) -> Option<u16> {
-        if self.buf_size >= 4 {
+        if self.buf_size() >= 4 {
             Some(byte_order::read_be_u16(&self.buf().unwrap()[2..]))
         } else {
             None
@@ -489,7 +508,7 @@ impl VsockPacket {
     }
 
     pub fn inet_addr(&self) -> Option<[u8; 4]> {
-        if self.buf_size >= 8 {
+        if self.buf_size() >= 8 {
             let ptr = &self.buf().unwrap()[4];
             let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, 4) };
             slice[0..4].try_into().ok()
@@ -499,7 +518,7 @@ impl VsockPacket {
     }
 
     pub fn unix_path(&self) -> Option<&str> {
-        if self.buf_size >= 108 {
+        if self.buf_size() >= 108 {
             let cstr =
                 unsafe { CStr::from_ptr(&self.buf().unwrap()[2] as *const _ as *const c_char) };
             cstr.to_str().ok()
@@ -508,8 +527,22 @@ impl VsockPacket {
         }
     }
 
+    #[cfg(unix)]
+    fn address_bytes(buf: &[u8], addr_len: u32) -> Option<&[u8]> {
+        let buf = buf.get(..addr_len as usize)?;
+        let family = byte_order::read_le_u16(buf.get(..2)?);
+        let minimum = match family {
+            defs::LINUX_AF_INET => 16,
+            defs::LINUX_AF_INET6 => 28,
+            defs::LINUX_AF_UNIX => 2,
+            _ => return None,
+        };
+        (buf.len() >= minimum).then_some(buf)
+    }
+
     #[cfg(target_os = "linux")]
     fn parse_address(buf: &[u8], addr_len: u32) -> Option<SockaddrStorage> {
+        let buf = Self::address_bytes(buf, addr_len)?;
         let sockaddr: SockaddrStorage = unsafe {
             SockaddrStorage::from_raw(&buf[0] as *const _ as *const sockaddr, Some(addr_len))?
         };
@@ -532,7 +565,8 @@ impl VsockPacket {
     }
 
     #[cfg(target_os = "macos")]
-    fn parse_address(buf: &[u8], _addr_len: u32) -> Option<SockaddrStorage> {
+    fn parse_address(buf: &[u8], addr_len: u32) -> Option<SockaddrStorage> {
+        let buf = Self::address_bytes(buf, addr_len)?;
         let family: u16 = byte_order::read_le_u16(&buf[0..2]);
 
         match family {
@@ -571,10 +605,11 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn read_proxy_create(&self) -> Option<TsiProxyCreate> {
-        if self.buf_size >= 6 {
-            let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
-            let family: u16 = byte_order::read_le_u16(&self.buf().unwrap()[4..]);
-            let _type: u16 = byte_order::read_le_u16(&self.buf().unwrap()[6..]);
+        let buf = self.payload()?;
+        if buf.len() >= 8 {
+            let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
+            let family: u16 = byte_order::read_le_u16(&buf[4..]);
+            let _type: u16 = byte_order::read_le_u16(&buf[6..]);
 
             Some(TsiProxyCreate {
                 peer_port,
@@ -588,8 +623,8 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn read_connect_req(&self) -> Option<TsiConnectReq> {
-        if self.buf_size >= 4 {
-            let buf = self.buf().unwrap();
+        let buf = self.payload()?;
+        if buf.len() >= 8 {
             let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
             let addr_len: u32 = byte_order::read_le_u32(&buf[4..]);
             let addr = Self::parse_address(&buf[8..], addr_len)?;
@@ -602,7 +637,7 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn write_connect_rsp(&mut self, rsp: TsiConnectRsp) {
-        if self.buf_size >= 4 {
+        if self.buf_size() >= 4 {
             if let Some(buf) = self.buf_mut() {
                 byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
             }
@@ -611,10 +646,11 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn read_getname_req(&self) -> Option<TsiGetnameReq> {
-        if self.buf_size >= 12 {
-            let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
-            let local_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[4..]);
-            let peer: u32 = byte_order::read_le_u32(&self.buf().unwrap()[8..]);
+        let buf = self.payload()?;
+        if buf.len() >= 12 {
+            let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
+            let local_port: u32 = byte_order::read_le_u32(&buf[4..]);
+            let peer: u32 = byte_order::read_le_u32(&buf[8..]);
             Some(TsiGetnameReq {
                 peer_port,
                 local_port,
@@ -627,7 +663,7 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn write_getname_rsp(&mut self, rsp: TsiGetnameRsp) {
-        if self.buf_size >= 132 {
+        if self.buf_size() >= 132 {
             if let Some(buf) = self.buf_mut() {
                 byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
                 byte_order::write_le_u32(&mut buf[4..], rsp.addr_len);
@@ -656,8 +692,8 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn read_sendto_addr(&self) -> Option<TsiSendtoAddr> {
-        if self.buf_size >= 4 {
-            let buf = self.buf().unwrap();
+        let buf = self.payload()?;
+        if buf.len() >= 8 {
             let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
             let addr_len: u32 = byte_order::read_le_u32(&buf[4..]);
             let addr = Self::parse_address(&buf[8..], addr_len)?;
@@ -670,8 +706,8 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn read_listen_req(&self) -> Option<TsiListenReq> {
-        if self.buf_size >= 12 {
-            let buf = self.buf().unwrap();
+        let buf = self.payload()?;
+        if buf.len() >= 16 {
             let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
             let vm_port: u32 = byte_order::read_le_u32(&buf[4..]);
             let backlog: u32 = byte_order::read_le_u32(&buf[8..]);
@@ -691,7 +727,7 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn write_listen_rsp(&mut self, rsp: TsiListenRsp) {
-        if self.buf_size >= 4 {
+        if self.buf_size() >= 4 {
             if let Some(buf) = self.buf_mut() {
                 byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
             }
@@ -700,9 +736,10 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn read_accept_req(&self) -> Option<TsiAcceptReq> {
-        if self.buf_size >= 8 {
-            let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
-            let flags: u32 = byte_order::read_le_u32(&self.buf().unwrap()[4..]);
+        let buf = self.payload()?;
+        if buf.len() >= 8 {
+            let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
+            let flags: u32 = byte_order::read_le_u32(&buf[4..]);
 
             Some(TsiAcceptReq { peer_port, flags })
         } else {
@@ -712,7 +749,7 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn write_accept_rsp(&mut self, rsp: TsiAcceptRsp) {
-        if self.buf_size >= 4 {
+        if self.buf_size() >= 4 {
             if let Some(buf) = self.buf_mut() {
                 byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
             }
@@ -721,9 +758,10 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn read_release_req(&self) -> Option<TsiReleaseReq> {
-        if self.buf_size >= 8 {
-            let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
-            let local_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[4..]);
+        let buf = self.payload()?;
+        if buf.len() >= 8 {
+            let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
+            let local_port: u32 = byte_order::read_le_u32(&buf[4..]);
             Some(TsiReleaseReq {
                 peer_port,
                 local_port,
@@ -734,10 +772,207 @@ impl VsockPacket {
     }
 
     pub fn write_time_sync(&mut self, time: u64) {
-        if self.buf_size >= 8 {
+        if self.buf_size() >= 8 {
             if let Some(buf) = self.buf_mut() {
                 byte_order::write_le_u64(&mut buf[0..], time);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::virtio::Descriptor;
+    use vm_memory::{Bytes, GuestMemoryMmap};
+
+    fn fragmented_packet(
+        mem: &GuestMemoryMmap,
+        declared_len: u32,
+        tail_flags: u16,
+    ) -> Result<VsockPacket> {
+        for (index, descriptor) in [
+            Descriptor {
+                addr: 0x2000,
+                len: VSOCK_PKT_HDR_SIZE as u32,
+                flags: 1,
+                next: 1,
+            },
+            Descriptor {
+                addr: 0x3000,
+                len: 32768,
+                flags: 1,
+                next: 2,
+            },
+            Descriptor {
+                addr: 0x13000,
+                len: 32768,
+                flags: tail_flags,
+                next: 0,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            mem.write_obj(descriptor, GuestAddress(0x1000 + index as u64 * 16))
+                .unwrap();
+        }
+        let mut header = [0u8; VSOCK_PKT_HDR_SIZE];
+        header[24..28].copy_from_slice(&declared_len.to_le_bytes());
+        mem.write_slice(&header, GuestAddress(0x2000)).unwrap();
+        mem.write_slice(&vec![b'a'; 32768], GuestAddress(0x3000))
+            .unwrap();
+        mem.write_slice(&vec![b'b'; 32768], GuestAddress(0x13000))
+            .unwrap();
+        let head = DescriptorChain::checked_new(mem, GuestAddress(0x1000), 3, 0).unwrap();
+        VsockPacket::from_tx_virtq_head(&head)
+    }
+
+    #[test]
+    fn gathers_fragmented_tx_without_forwarding_descriptor_padding() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let packet = fragmented_packet(&mem, 65535, 0).unwrap();
+        let mut expected = vec![b'a'; 32768];
+        expected.extend_from_slice(&vec![b'b'; 32767]);
+        assert_eq!(packet.payload().unwrap(), expected);
+    }
+
+    #[test]
+    fn rx_payload_writes_reach_guest_memory() {
+        for combined in [false, true] {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+            let payload_addr = if combined {
+                0x2000 + VSOCK_PKT_HDR_SIZE as u64
+            } else {
+                0x3000
+            };
+            let header = Descriptor {
+                addr: 0x2000,
+                len: VSOCK_PKT_HDR_SIZE as u32 + if combined { 8 } else { 0 },
+                flags: if combined { 2 } else { 3 },
+                next: 1,
+            };
+            mem.write_obj(header, GuestAddress(0x1000)).unwrap();
+            if !combined {
+                mem.write_obj(
+                    Descriptor {
+                        addr: payload_addr,
+                        len: 8,
+                        flags: 2,
+                        next: 0,
+                    },
+                    GuestAddress(0x1010),
+                )
+                .unwrap();
+            }
+            let head = DescriptorChain::checked_new(&mem, GuestAddress(0x1000), 2, 0).unwrap();
+            let mut packet = VsockPacket::from_rx_virtq_head(&head).unwrap();
+
+            packet.buf_mut().unwrap().copy_from_slice(b"response");
+            packet.set_len(8);
+
+            let mut received = [0u8; 8];
+            mem.read_slice(&mut received, GuestAddress(payload_addr))
+                .unwrap();
+            assert_eq!(&received, b"response");
+            assert_eq!(
+                mem.read_obj::<u32>(GuestAddress(0x2018)).unwrap().to_le(),
+                8
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_short_tsi_requests() {
+        for fragmented in [false, true] {
+            for len in 2..16 {
+                let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+                let first_len = if fragmented { 1 } else { len };
+                for (index, descriptor) in [
+                    Descriptor {
+                        addr: 0x2000,
+                        len: VSOCK_PKT_HDR_SIZE as u32,
+                        flags: 1,
+                        next: 1,
+                    },
+                    Descriptor {
+                        addr: 0x3000,
+                        len: first_len,
+                        flags: if fragmented { 1 } else { 0 },
+                        next: 2,
+                    },
+                    Descriptor {
+                        addr: 0x4000,
+                        len: len - first_len,
+                        flags: 0,
+                        next: 0,
+                    },
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    mem.write_obj(descriptor, GuestAddress(0x1000 + index as u64 * 16))
+                        .unwrap();
+                }
+                mem.write_obj(len.to_le(), GuestAddress(0x2018)).unwrap();
+                let head = DescriptorChain::checked_new(&mem, GuestAddress(0x1000), 3, 0).unwrap();
+                let packet = VsockPacket::from_tx_virtq_head(&head).unwrap();
+
+                assert_eq!(packet.read_proxy_create().is_some(), len >= 8);
+                assert_eq!(packet.read_getname_req().is_some(), len >= 12);
+                assert_eq!(packet.read_accept_req().is_some(), len >= 8);
+                assert_eq!(packet.read_release_req().is_some(), len >= 8);
+                assert!(packet.read_connect_req().is_none());
+                assert!(packet.read_sendto_addr().is_none());
+                assert!(packet.read_listen_req().is_none());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validates_tsi_address_lengths() {
+        for (family, size) in [(defs::LINUX_AF_INET, 16), (defs::LINUX_AF_INET6, 28)] {
+            let mut address = vec![0u8; size];
+            address[..2].copy_from_slice(&family.to_le_bytes());
+
+            for len in 0..size {
+                assert!(VsockPacket::parse_address(&address[..len], size as u32).is_none());
+                assert!(VsockPacket::parse_address(&address, len as u32).is_none());
+            }
+            assert!(VsockPacket::parse_address(&address, size as u32).is_some());
+            assert!(VsockPacket::parse_address(&address, u32::MAX).is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_writable_fragment() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        assert!(matches!(
+            fragmented_packet(&mem, 65535, 2),
+            Err(VsockError::UnreadableDescriptor)
+        ));
+    }
+
+    #[test]
+    fn rejects_truncated_fragment_chain() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let _ = fragmented_packet(&mem, 65535, 0).unwrap();
+        mem.write_obj(
+            Descriptor {
+                addr: 0x13000,
+                len: 1,
+                flags: 0,
+                next: 0,
+            },
+            GuestAddress(0x1020),
+        )
+        .unwrap();
+        let head = DescriptorChain::checked_new(&mem, GuestAddress(0x1000), 3, 0).unwrap();
+        assert!(matches!(
+            VsockPacket::from_tx_virtq_head(&head),
+            Err(VsockError::BufDescTooSmall)
+        ));
     }
 }

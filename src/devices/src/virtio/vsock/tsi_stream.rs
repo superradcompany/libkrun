@@ -527,6 +527,7 @@ impl Proxy for TsiStreamProxy {
 
         // This response goes to the connection.
         let rx = MuxerRx::OpResponse {
+            buf_alloc: defs::CONN_TX_BUF_SIZE as u32,
             local_port: pkt.dst_port(),
             peer_port: pkt.src_port(),
         };
@@ -618,7 +619,8 @@ impl Proxy for TsiStreamProxy {
         };
 
         if ret > 0
-            && (self.tx_cnt - self.last_tx_cnt_sent).0 as usize >= (defs::CONN_TX_BUF_SIZE / 2)
+            && (self.tx_cnt - self.last_tx_cnt_sent).0 as usize
+                >= defs::CONN_CREDIT_UPDATE_THRESHOLD
         {
             debug!(
                 "sending credit update: id={}, tx_cnt={}, last_tx_cnt={}",
@@ -627,6 +629,7 @@ impl Proxy for TsiStreamProxy {
             self.last_tx_cnt_sent = self.tx_cnt;
             // This packet goes to the connection.
             let rx = MuxerRx::CreditUpdate {
+                buf_alloc: defs::CONN_TX_BUF_SIZE as u32,
                 local_port: pkt.dst_port(),
                 peer_port: pkt.src_port(),
                 fwd_cnt: self.tx_cnt.0,
@@ -719,6 +722,7 @@ impl Proxy for TsiStreamProxy {
 
         // This packet goes to the connection.
         let rx = MuxerRx::OpRequest {
+            buf_alloc: defs::CONN_TX_BUF_SIZE as u32,
             local_port: self.local_port,
             peer_port: self.peer_port,
         };
@@ -835,6 +839,7 @@ impl Proxy for TsiStreamProxy {
                 if wait_credit && self.status != ProxyStatus::WaitingCreditUpdate {
                     self.status = ProxyStatus::WaitingCreditUpdate;
                     let rx = MuxerRx::CreditRequest {
+                        buf_alloc: defs::CONN_TX_BUF_SIZE as u32,
                         local_port: self.local_port,
                         peer_port: self.peer_port,
                         fwd_cnt: self.tx_cnt.0,

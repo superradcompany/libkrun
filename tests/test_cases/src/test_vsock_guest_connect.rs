@@ -48,6 +48,7 @@ mod host {
         stream_set_timeouts(&mut stream);
         stream.write_all(b"ping!").unwrap();
         stream_expect_msg(&mut stream, b"pong!");
+        stream_expect_msg(&mut stream, &vec![0xa5; 1024 * 1024]);
         stream_expect_wouldblock(&mut stream);
         stream.write_all(b"bye!").unwrap();
         // Leak the socket fd, to make sure it is not closed early when we exit the thread
@@ -105,6 +106,8 @@ mod guest {
             stream_expect_msg(&mut stream, b"ping!");
             stream_expect_wouldblock(&mut stream);
             stream.write_all(b"pong!").unwrap();
+            // Exceeds the guest socket buffer: the host must return credit promptly.
+            stream.write_all(&vec![0xa5; 1024 * 1024]).unwrap();
             stream_expect_msg(&mut stream, b"bye!");
 
             println!("OK");

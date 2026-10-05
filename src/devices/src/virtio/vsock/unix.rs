@@ -258,6 +258,7 @@ impl UnixProxy {
 
     fn push_vsock_connect_response(&self) {
         let rx = MuxerRx::OpResponse {
+            buf_alloc: defs::CONN_TX_BUF_SIZE as u32,
             local_port: self.local_port,
             peer_port: self.peer_port,
         };
@@ -405,6 +406,7 @@ impl UnixProxy {
                         ));
                     }
                     self.pending_write.drain(..written);
+                    self.tx_cnt += Wrapping(written as u32);
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(err) => return Err(err),
@@ -413,12 +415,38 @@ impl UnixProxy {
         Ok(())
     }
 
-    fn connected_poll_events(&self) -> EventSet {
-        if self.pending_write.is_empty() {
-            EventSet::IN
-        } else {
-            EventSet::IN | EventSet::OUT
+    fn maybe_push_credit_update(&mut self, update: &mut ProxyUpdate) {
+        if !matches!(
+            self.status,
+            ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+        ) || ((self.tx_cnt - self.last_tx_cnt_sent).0 as usize)
+            < defs::CONN_CREDIT_UPDATE_THRESHOLD
+        {
+            return;
         }
+
+        self.last_tx_cnt_sent = self.tx_cnt;
+        let rx = MuxerRx::CreditUpdate {
+            buf_alloc: defs::CONN_TX_BUF_SIZE as u32,
+            local_port: self.local_port,
+            peer_port: self.peer_port,
+            fwd_cnt: self.tx_cnt.0,
+        };
+        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+        update.signal_queue = true;
+    }
+
+    fn connected_poll_events(&self) -> EventSet {
+        let mut events = match self.status {
+            ProxyStatus::Connected => EventSet::IN,
+            ProxyStatus::WaitingCreditUpdate => EventSet::empty(),
+            ProxyStatus::Connecting => return EventSet::IN | EventSet::OUT,
+            _ => return EventSet::empty(),
+        };
+        if !self.pending_write.is_empty() {
+            events |= EventSet::OUT;
+        }
+        events
     }
 
     fn init_data_pkt(&self, pkt: &mut VsockPacket) {
@@ -526,11 +554,19 @@ impl Proxy for UnixProxy {
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
-        let ret = if let Some(buf) = pkt.buf() {
-            // Credit is returned when bytes enter this bounded proxy queue;
-            // readiness drives later partial flushes without blocking a VMM thread.
+        let ret = if let Some(buf) = pkt.payload() {
+            if buf.len() > defs::CONN_TX_BUF_SIZE.saturating_sub(self.pending_write.len()) {
+                warn!("guest exceeded the Unix vsock stream receive window");
+                self.push_reset();
+                self.status = ProxyStatus::Closed;
+                update.signal_queue = true;
+                update.remove_proxy = ProxyRemoval::Deferred;
+                return update;
+            }
+
+            // Return credit only after the socket consumes queued bytes. A blocked
+            // peer must not let the guest refill this queue indefinitely.
             self.pending_write.extend(buf);
-            self.tx_cnt += Wrapping(buf.len() as u32);
             if let Err(err) = self.flush_pending_write() {
                 warn!("vsock backend write failed: {err}");
                 self.push_reset();
@@ -548,23 +584,8 @@ impl Proxy for UnixProxy {
             -libc::EINVAL
         };
 
-        if ret > 0
-            && (self.tx_cnt - self.last_tx_cnt_sent).0 as usize >= (defs::CONN_TX_BUF_SIZE / 2)
-        {
-            debug!(
-                "sending credit update: id={}, tx_cnt={}, last_tx_cnt={}",
-                self.id, self.tx_cnt, self.last_tx_cnt_sent
-            );
-            self.last_tx_cnt_sent = self.tx_cnt;
-
-            let rx = MuxerRx::CreditUpdate {
-                local_port: pkt.dst_port(),
-                peer_port: pkt.src_port(),
-                fwd_cnt: self.tx_cnt.0,
-            };
-
-            push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
-            update.signal_queue = true;
+        if ret > 0 {
+            self.maybe_push_credit_update(&mut update);
         }
 
         debug!("sendmsg ret={ret}");
@@ -620,6 +641,7 @@ impl Proxy for UnixProxy {
 
         // This packet goes to the connection.
         let rx = MuxerRx::OpRequest {
+            buf_alloc: defs::CONN_TX_BUF_SIZE as u32,
             local_port: self.local_port,
             peer_port: self.peer_port,
         };
@@ -712,12 +734,14 @@ impl Proxy for UnixProxy {
                         return update;
                     }
                 }
+                self.maybe_push_credit_update(&mut update);
                 let (signal_queue, wait_credit) = self.recv_pkt();
-                update.signal_queue = signal_queue;
+                update.signal_queue |= signal_queue;
 
                 if wait_credit && self.status != ProxyStatus::WaitingCreditUpdate {
                     self.status = ProxyStatus::WaitingCreditUpdate;
                     let rx = MuxerRx::CreditRequest {
+                        buf_alloc: defs::CONN_TX_BUF_SIZE as u32,
                         local_port: self.local_port,
                         peer_port: self.peer_port,
                         fwd_cnt: self.tx_cnt.0,
@@ -738,8 +762,11 @@ impl Proxy for UnixProxy {
                     return update;
                 } else if self.status == ProxyStatus::WaitingCreditUpdate {
                     debug!("process_event: WaitingCreditUpdate");
-                    update.polling =
-                        Some((self.id(), self.endpoint.as_raw_fd(), EventSet::empty()));
+                    update.polling = Some((
+                        self.id(),
+                        self.endpoint.as_raw_fd(),
+                        self.connected_poll_events(),
+                    ));
                 }
             } else {
                 debug!("EventSet::IN while not connected: {:?}", self.status);
@@ -773,12 +800,16 @@ impl Proxy for UnixProxy {
                     self.status = ProxyStatus::Closed;
                     update.remove_proxy = ProxyRemoval::Deferred;
                 }
+                self.maybe_push_credit_update(&mut update);
                 update.polling = Some((
                     self.id(),
                     self.endpoint.as_raw_fd(),
                     self.connected_poll_events(),
                 ));
-            } else if self.status == ProxyStatus::Connected {
+            } else if matches!(
+                self.status,
+                ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+            ) {
                 if let Err(err) = self.flush_pending_write() {
                     warn!("vsock backend write failed: {err}");
                     self.push_reset();
@@ -786,6 +817,7 @@ impl Proxy for UnixProxy {
                     update.signal_queue = true;
                     update.remove_proxy = ProxyRemoval::Deferred;
                 }
+                self.maybe_push_credit_update(&mut update);
                 update.polling = Some((
                     self.id(),
                     self.endpoint.as_raw_fd(),
@@ -907,5 +939,146 @@ impl Proxy for UnixAcceptorProxy {
 impl AsRawFd for UnixAcceptorProxy {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+
+    use vm_memory::{Bytes, GuestAddress};
+
+    use super::super::packet::VSOCK_PKT_HDR_SIZE;
+    use super::*;
+    use crate::virtio::{Descriptor, DescriptorChain};
+
+    fn connected_proxy() -> (UnixProxy, UnixStream, VsockPacket) {
+        let (socket, peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        for (index, descriptor) in [
+            Descriptor {
+                addr: 0x2000,
+                len: VSOCK_PKT_HDR_SIZE as u32,
+                flags: 1,
+                next: 1,
+            },
+            Descriptor {
+                addr: 0x3000,
+                len: 65536,
+                flags: 0,
+                next: 0,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            mem.write_obj(descriptor, GuestAddress(0x1000 + index as u64 * 16))
+                .unwrap();
+        }
+        mem.write_obj(65536u32.to_le(), GuestAddress(0x2018))
+            .unwrap();
+        mem.write_slice(&vec![0xa5; 65536], GuestAddress(0x3000))
+            .unwrap();
+        let head = DescriptorChain::checked_new(&mem, GuestAddress(0x1000), 2, 0).unwrap();
+        let packet = VsockPacket::from_tx_virtq_head(&head).unwrap();
+        let mut proxy = UnixProxy::new_reverse(
+            1,
+            3,
+            3001,
+            5000,
+            socket.into(),
+            mem.clone(),
+            Arc::new(Mutex::new(VirtQueue::new(256))),
+            Arc::new(Mutex::new(MuxerRxQ::new())),
+        );
+        proxy.status = ProxyStatus::Connected;
+        (proxy, peer, packet)
+    }
+
+    #[test]
+    fn blocked_peer_receives_credit_only_as_the_socket_drains() {
+        for status in [ProxyStatus::Connected, ProxyStatus::WaitingCreditUpdate] {
+            check_blocked_peer_credit(status);
+        }
+    }
+
+    fn check_blocked_peer_credit(status: ProxyStatus) {
+        let (mut proxy, mut peer, packet) = connected_proxy();
+        proxy.status = status;
+        proxy.rxq.lock().unwrap().clear();
+
+        let mut sent = 0;
+
+        while proxy.pending_write.is_empty() {
+            proxy.sendmsg(&packet);
+            sent += 65536;
+            assert!(sent <= defs::CONN_TX_BUF_SIZE);
+        }
+        proxy.rxq.lock().unwrap().clear();
+
+        for _ in 0..16 {
+            proxy.sendmsg(&packet);
+            sent += 65536;
+        }
+        assert!(
+            proxy.rxq.lock().unwrap().is_empty(),
+            "blocked bytes must not replenish guest credit"
+        );
+
+        let mut received = 0;
+        let mut data = [0u8; 65536];
+        for _ in 0..256 {
+            loop {
+                match peer.read(&mut data) {
+                    Ok(0) => panic!("peer closed before draining"),
+                    Ok(n) => {
+                        assert!(data[..n].iter().all(|byte| *byte == 0xa5));
+                        received += n;
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(err) => panic!("peer read failed: {err}"),
+                }
+            }
+            if received == sent {
+                break;
+            }
+            let update = proxy.process_event(EventSet::OUT);
+            if status == ProxyStatus::WaitingCreditUpdate {
+                let events = update.polling.expect("update writable polling").2;
+                assert!(!events.contains(EventSet::IN));
+                assert_eq!(
+                    events.contains(EventSet::OUT),
+                    !proxy.pending_write.is_empty()
+                );
+            }
+        }
+        assert_eq!(received, sent);
+        assert!(proxy.pending_write.is_empty());
+
+        let mut last_credit = None;
+        while let Some(rx) = proxy.rxq.lock().unwrap().pop() {
+            if let MuxerRx::CreditUpdate { fwd_cnt, .. } = rx {
+                last_credit = Some(fwd_cnt);
+            }
+        }
+        let credited = last_credit.expect("draining must replenish guest credit") as usize;
+        assert!(credited <= received);
+        assert!(received - credited < defs::CONN_CREDIT_UPDATE_THRESHOLD);
+    }
+
+    #[test]
+    fn rejects_guest_writes_beyond_the_advertised_window() {
+        let (mut proxy, _peer, packet) = connected_proxy();
+        for _ in 0..1024 {
+            let update = proxy.sendmsg(&packet);
+            assert!(proxy.pending_write.len() <= defs::CONN_TX_BUF_SIZE);
+            if !matches!(update.remove_proxy, ProxyRemoval::Keep) {
+                assert_eq!(proxy.status, ProxyStatus::Closed);
+                return;
+            }
+        }
+        panic!("guest exceeded its credit without being rejected");
     }
 }

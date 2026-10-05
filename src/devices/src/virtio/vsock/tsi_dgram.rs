@@ -135,6 +135,7 @@ impl TsiDgramProxy {
     fn send_credit_request(&self) {
         // This response goes to the connection.
         let rx = MuxerRx::CreditRequest {
+            buf_alloc: defs::CONN_TX_BUF_SIZE as u32,
             local_port: self.local_port,
             peer_port: self.peer_port,
             fwd_cnt: self.tx_cnt.0,
@@ -447,6 +448,7 @@ impl Proxy for TsiDgramProxy {
             if wait_credit && self.status != ProxyStatus::WaitingCreditUpdate {
                 self.status = ProxyStatus::WaitingCreditUpdate;
                 let rx = MuxerRx::CreditRequest {
+                    buf_alloc: defs::CONN_TX_BUF_SIZE as u32,
                     local_port: self.local_port,
                     peer_port: self.peer_port,
                     fwd_cnt: self.tx_cnt.0,

@@ -74,19 +74,23 @@ pub enum MuxerRx {
         result: i32,
     },
     OpRequest {
+        buf_alloc: u32,
         local_port: u32,
         peer_port: u32,
     },
     OpResponse {
+        buf_alloc: u32,
         local_port: u32,
         peer_port: u32,
     },
     CreditRequest {
+        buf_alloc: u32,
         local_port: u32,
         peer_port: u32,
         fwd_cnt: u32,
     },
     CreditUpdate {
+        buf_alloc: u32,
         local_port: u32,
         peer_port: u32,
         fwd_cnt: u32,

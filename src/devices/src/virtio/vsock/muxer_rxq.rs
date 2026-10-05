@@ -132,6 +132,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) -> bool {
             pkt.set_len(pkt.buf().unwrap().len() as u32);
         }
         MuxerRx::OpRequest {
+            buf_alloc,
             local_port,
             peer_port,
         } => {
@@ -141,11 +142,12 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) -> bool {
                 .set_src_port(local_port)
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_STREAM)
-                .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32);
+                .set_buf_alloc(buf_alloc);
 
             pkt.set_len(0);
         }
         MuxerRx::OpResponse {
+            buf_alloc,
             local_port,
             peer_port,
         } => {
@@ -155,7 +157,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) -> bool {
                 .set_src_port(local_port)
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_STREAM)
-                .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32);
+                .set_buf_alloc(buf_alloc);
 
             pkt.set_len(0);
         }
@@ -176,6 +178,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) -> bool {
             pkt.set_len(pkt.buf().unwrap().len() as u32);
         }
         MuxerRx::CreditRequest {
+            buf_alloc,
             local_port,
             peer_port,
             fwd_cnt,
@@ -186,10 +189,11 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) -> bool {
                 .set_src_port(local_port)
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_STREAM)
-                .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
+                .set_buf_alloc(buf_alloc)
                 .set_fwd_cnt(fwd_cnt);
         }
         MuxerRx::CreditUpdate {
+            buf_alloc,
             local_port,
             peer_port,
             fwd_cnt,
@@ -200,7 +204,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) -> bool {
                 .set_src_port(local_port)
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_STREAM)
-                .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
+                .set_buf_alloc(buf_alloc)
                 .set_fwd_cnt(fwd_cnt);
         }
         #[cfg(unix)]
