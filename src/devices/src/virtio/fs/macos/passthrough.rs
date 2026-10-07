@@ -2313,7 +2313,8 @@ impl FileSystem for PassthroughFs {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
         }
 
-        let prot_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
+        let writable = (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0;
+        let prot_flags = if writable {
             libc::PROT_READ | libc::PROT_WRITE
         } else {
             libc::PROT_READ
@@ -2327,7 +2328,16 @@ impl FileSystem for PassthroughFs {
 
         debug!("setupmapping: ino {inode:?} guest_addr={guest_addr:x} len={len}");
 
-        let file = self.open_inode(inode, libc::O_RDWR)?;
+        // Open read-only for a read-only mapping: an `O_RDWR` open would fail on
+        // a read-only file or mount even though only read access is needed.
+        let file = self.open_inode(
+            inode,
+            if writable {
+                libc::O_RDWR
+            } else {
+                libc::O_RDONLY
+            },
+        )?;
         let fd = file.as_raw_fd();
 
         let host_addr = unsafe {
@@ -2344,20 +2354,20 @@ impl FileSystem for PassthroughFs {
             return Err(linux_error(io::Error::last_os_error()));
         }
 
-        let ret = unsafe { libc::close(fd) };
-        if ret == -1 {
-            return Err(linux_error(io::Error::last_os_error()));
-        }
+        // The mapping keeps the file alive after the descriptor is closed; let
+        // `file` close it exactly once on drop.
+        drop(file);
 
         // We've checked that map_sender is something above.
         let sender = map_sender.as_ref().unwrap();
         let (reply_sender, reply_receiver) = unbounded();
         sender
-            .send(WorkerMessage::GpuAddMapping(
+            .send(WorkerMessage::DaxAddMapping(
                 reply_sender,
                 host_addr as u64,
                 guest_addr,
                 len,
+                writable,
             ))
             .unwrap();
         if !reply_receiver.recv().unwrap() {
@@ -2452,5 +2462,127 @@ impl FileSystem for PassthroughFs {
             }
             _ => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            let mut path = std::env::temp_dir();
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            path.push(format!("msb-krun-fs-test-{}-{unique}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn context() -> Context {
+        Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        }
+    }
+
+    /// Accept every DAX mapping request and record whether it was writable.
+    fn dax_worker(recorded: Arc<Mutex<Vec<bool>>>) -> Sender<WorkerMessage> {
+        let (sender, receiver) = unbounded();
+        std::thread::spawn(move || {
+            while let Ok(message) = receiver.recv() {
+                if let WorkerMessage::DaxAddMapping(reply, _, _, _, writable) = message {
+                    recorded.lock().unwrap().push(writable);
+                    let _ = reply.send(true);
+                }
+            }
+        });
+        sender
+    }
+
+    /// Environment marker for the isolated child process that runs the mapping
+    /// writability test.
+    const ISOLATED_MAPPING_TEST: &str = "MSB_KRUN_DAX_MAPPING_TEST";
+
+    /// A read-only `FUSE_SETUPMAPPING` must reach the HVF worker as a
+    /// `DaxAddMapping` with `writable == false` (so it omits `HV_MEMORY_WRITE`),
+    /// while a writable request keeps write access.
+    ///
+    /// `init` clears the process-wide umask, so the body runs in a child process
+    /// and cannot change the mask observed by parallel tests.
+    #[test]
+    fn setupmapping_routes_writability_to_the_dax_worker() {
+        if std::env::var_os(ISOLATED_MAPPING_TEST).is_some() {
+            setupmapping_routes_writability_body();
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("setupmapping_routes_writability_to_the_dax_worker")
+            .env(ISOLATED_MAPPING_TEST, "1")
+            .status()
+            .expect("spawn isolated test process");
+        assert!(status.success(), "isolated test process failed: {status}");
+    }
+
+    fn setupmapping_routes_writability_body() {
+        let temp = TempDir::new();
+        std::fs::write(temp.path.join("data"), vec![0u8; 4096]).unwrap();
+        let fs = PassthroughFs::new(Config {
+            root_dir: temp.path.to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let name = CStr::from_bytes_with_nul(b"data\0").unwrap();
+        let entry = fs.lookup(context(), fuse::ROOT_ID, name).unwrap();
+
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let sender = dax_worker(recorded.clone());
+
+        fs.setupmapping(
+            context(),
+            entry.inode,
+            0,
+            0,
+            4096,
+            0,
+            0,
+            0x1000_0000,
+            0x2000,
+            &Some(sender.clone()),
+        )
+        .unwrap();
+        fs.setupmapping(
+            context(),
+            entry.inode,
+            0,
+            0,
+            4096,
+            fuse::SetupmappingFlags::WRITE.bits(),
+            0x1000,
+            0x1000_0000,
+            0x2000,
+            &Some(sender),
+        )
+        .unwrap();
+
+        assert_eq!(*recorded.lock().unwrap(), vec![false, true]);
     }
 }
