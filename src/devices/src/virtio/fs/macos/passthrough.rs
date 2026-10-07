@@ -2328,16 +2328,10 @@ impl FileSystem for PassthroughFs {
 
         debug!("setupmapping: ino {inode:?} guest_addr={guest_addr:x} len={len}");
 
-        // Open read-only for a read-only mapping: an `O_RDWR` open would fail on
-        // a read-only file or mount even though only read access is needed.
-        let file = self.open_inode(
-            inode,
-            if writable {
-                libc::O_RDWR
-            } else {
-                libc::O_RDONLY
-            },
-        )?;
+        // Hypervisor.framework rejects MAP_SHARED mappings backed by an O_RDONLY
+        // descriptor, even when the guest mapping is read-only. Keep the host
+        // file writable; `prot_flags` and DaxAddMapping enforce mapping permissions.
+        let file = self.open_inode(inode, libc::O_RDWR)?;
         let fd = file.as_raw_fd();
 
         let host_addr = unsafe {
