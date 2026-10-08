@@ -168,6 +168,8 @@ static EDK2_BINARY: &[u8] = include_bytes!("../KRUN_EFI.silent.fd");
 /// Errors associated with starting the instance.
 #[derive(Debug)]
 pub enum StartMicrovmError {
+    /// The requested nested virtualization policy cannot be honored.
+    NestedVirtualization(io::Error),
     /// Invalid or unsupported private guest-memory backing.
     PrivateMemoryBacking(io::Error),
     /// Unable to attach block device to Vmm.
@@ -421,6 +423,7 @@ impl Display for StartMicrovmError {
                 err_msg = err_msg.replace('\"', "");
                 write!(f, "Invalid Memory Configuration: {err_msg}")
             }
+            NestedVirtualization(ref error) => write!(f, "Nested virtualization: {error}"),
             PrivateMemoryBacking(ref err) => {
                 write!(f, "Cannot install private memory backing: {err}")
             }
@@ -1267,6 +1270,8 @@ pub fn build_microvm_paused(
     trace.mark("build_microvm.start");
 
     validate_vmm_vcpu_affinity(vm_resources)?;
+    crate::nested_virt::validate(vm_resources.nested_enabled)
+        .map_err(StartMicrovmError::NestedVirtualization)?;
 
     let payload = choose_payload(vm_resources)?;
 
@@ -3547,10 +3552,10 @@ pub(crate) fn setup_vm(
 #[cfg(target_os = "windows")]
 pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
-    _nested_enabled: bool,
+    nested_enabled: bool,
     vcpu_count: u8,
 ) -> std::result::Result<Vm, StartMicrovmError> {
-    let mut vm = Vm::new(vcpu_count)
+    let mut vm = Vm::new(vcpu_count, nested_enabled)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
     vm.memory_init(guest_memory)
@@ -4170,7 +4175,7 @@ fn create_vcpus_aarch64(
         )
         .map_err(Error::Vcpu)?;
 
-        vcpu.configure_aarch64(vm.fd(), mem_info, entry_addr)
+        vcpu.configure_aarch64(vm.fd(), mem_info, entry_addr, vcpu_config.nested_enabled)
             .map_err(Error::Vcpu)?;
 
         vcpus.push(vcpu);

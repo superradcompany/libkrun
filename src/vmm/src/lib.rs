@@ -44,6 +44,8 @@ mod memory_capture;
 /// Backend-neutral memory generation and incremental-baseline contracts.
 pub mod memory_state;
 mod metrics;
+/// Host nested virtualization support shared by the C and Rust APIs.
+pub mod nested_virt;
 pub mod private_memory;
 #[cfg(unix)]
 mod terminal;

@@ -594,7 +594,10 @@ impl MachineBuilder {
         self
     }
 
-    /// Enable or disable nested virtualization.
+    /// Enable or disable nested virtualization (disabled by default).
+    ///
+    /// Enabling this requires host hardware and hypervisor support; VM creation
+    /// fails if it is unavailable. The guest kernel must also include KVM.
     pub fn nested_virt(mut self, enabled: bool) -> Self {
         self.nested_virt = enabled;
         self
