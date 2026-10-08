@@ -1603,6 +1603,7 @@ impl Vcpu {
         vm_fd: &VmFd,
         mem_info: &ArchMemoryInfo,
         kernel_load_addr: GuestAddress,
+        nested_enabled: bool,
     ) -> Result<()> {
         let mut kvi: kvm_bindings::kvm_vcpu_init = kvm_bindings::kvm_vcpu_init::default();
 
@@ -1610,6 +1611,14 @@ impl Vcpu {
         vm_fd
             .get_preferred_target(&mut kvi)
             .map_err(Error::VcpuArmPreferredTarget)?;
+        // Linux UAPI KVM_ARM_VCPU_HAS_EL2 and KVM_ARM_VCPU_HAS_EL2_E2H0.
+        // Do not inherit a preferred target's nesting policy when nesting is disabled.
+        const HAS_EL2: u32 = 7;
+        const HAS_EL2_E2H0: u32 = 8;
+        kvi.features[0] &= !((1 << HAS_EL2) | (1 << HAS_EL2_E2H0));
+        if nested_enabled {
+            kvi.features[0] |= 1 << HAS_EL2;
+        }
         // We already checked that the capability is supported.
         kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_PSCI_0_2;
         // Non-boot cpus are powered off initially.
@@ -1625,8 +1634,14 @@ impl Vcpu {
         }
 
         self.fd.vcpu_init(&kvi).map_err(Error::VcpuArmInit)?;
-        arch::aarch64::regs::setup_regs(&self.fd, self.id, kernel_load_addr.raw_value(), mem_info)
-            .map_err(Error::REGSConfiguration)?;
+        arch::aarch64::regs::setup_regs(
+            &self.fd,
+            self.id,
+            kernel_load_addr.raw_value(),
+            mem_info,
+            nested_enabled,
+        )
+        .map_err(Error::REGSConfiguration)?;
 
         self.mpidr = arch::aarch64::regs::read_mpidr(&self.fd).map_err(Error::REGSConfiguration)?;
 
@@ -2810,7 +2825,7 @@ mod tests {
         .unwrap();
 
         assert!(vcpu
-            .configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(0))
+            .configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(0), false)
             .is_ok());
 
         // Try it for when vcpu id is NOT 0.
@@ -2823,7 +2838,7 @@ mod tests {
         .unwrap();
 
         assert!(vcpu
-            .configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(0))
+            .configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(0), false)
             .is_ok());
     }
 

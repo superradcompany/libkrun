@@ -1012,7 +1012,9 @@ int32_t krun_setgid(uint32_t ctx_id, gid_t gid);
  *  "enabled" - true to enable Nested Virtualization in the microVM.
  *
  * Notes:
- *  This feature is only supported on macOS.
+ *  Availability depends on the host hardware and hypervisor backend.
+ *  Enabling it on an unsupported host fails when the microVM is created.
+ *  Disabled by default. KVM support must also be present in the guest kernel.
  *
  * Returns:
  *  Zero on success or a negative error number on failure. Success doesn't imply that
@@ -1025,7 +1027,8 @@ int32_t krun_set_nested_virt(uint32_t ctx_id, bool enabled);
  * Check the system if Nested Virtualization is supported
  *
  * Notes:
- *  This feature is only supported on macOS.
+ *  Checks host hardware and hypervisor support, not guest kernel KVM support.
+ *  A failed hypervisor access or query returns a negative error number.
  *
  * Returns:
  *  - 1 : Success and Nested Virtualization is supported
