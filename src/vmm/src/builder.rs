@@ -1220,6 +1220,26 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
     }
 }
 
+// Assemble a fresh command line so a failed boot does not modify the resources.
+fn initial_kernel_cmdline(
+    payload_cmdline: Option<&str>,
+    prolog: Option<&str>,
+    host_tsc_hz: Option<u64>,
+) -> std::result::Result<Cmdline, StartMicrovmError> {
+    let mut cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
+
+    // Linux only uses CPUID leaf 0x15 to calibrate the TSC on Intel CPUs, and
+    // legacy timer calibration can fail under WHP. Supply the host frequency
+    // directly so AMD guests also have a working TSC (required by guest KVM).
+    // Prepend it so it stays before any caller-provided `--` and an explicit
+    // tsc_early_khz later in the kernel command line can override this default.
+    if let Some(khz) = host_tsc_hz.map(|hz| hz / 1000).filter(|khz| *khz != 0) {
+        cmdline.insert("tsc_early_khz", &khz.to_string())?;
+    }
+    cmdline.insert_str(payload_cmdline.or(prolog).unwrap_or(DEFAULT_KERNEL_CMDLINE))?;
+    Ok(cmdline)
+}
+
 /// Builds and starts a microVM based on the current Firecracker VmResources configuration.
 ///
 /// This is the default build recipe, one could build other microVM flavors by using the
@@ -1284,29 +1304,16 @@ pub fn build_microvm_paused(
     #[allow(unused_mut)]
     let mut vcpu_config = vm_resources.vcpu_config();
 
-    // Clone the command-line so that a failed boot doesn't pollute the original.
-    #[allow(unused_mut)]
-    let mut kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
-    // Linux only uses CPUID leaf 0x15 to calibrate the TSC on Intel CPUs, and
-    // legacy timer calibration can fail under WHP. Supply the host frequency
-    // directly so AMD guests also have a working TSC (required by guest KVM).
-    // Prepend it so it stays before any caller-provided `--` and an explicit
-    // tsc_early_khz later in the kernel command line can override this default.
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    if let Some(khz) = crate::windows::vstate::host_tsc_frequency_hz()
-        .map(|hz| hz / 1000)
-        .filter(|khz| *khz != 0)
-    {
-        kernel_cmdline.insert("tsc_early_khz", &khz.to_string())?;
-    }
+    let host_tsc_hz = crate::windows::vstate::host_tsc_frequency_hz();
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    let host_tsc_hz = None;
 
-    if let Some(cmdline) = payload_config.kernel_cmdline {
-        kernel_cmdline.insert_str(cmdline.as_str())?;
-    } else if let Some(cmdline) = &vm_resources.kernel_cmdline.prolog {
-        kernel_cmdline.insert_str(cmdline)?;
-    } else {
-        kernel_cmdline.insert_str(DEFAULT_KERNEL_CMDLINE)?;
-    }
+    let mut kernel_cmdline = initial_kernel_cmdline(
+        payload_config.kernel_cmdline.as_deref(),
+        vm_resources.kernel_cmdline.prolog.as_deref(),
+        host_tsc_hz,
+    )?;
 
     // The krun_env segment carries caller-controlled guest env; a non-cmdline-safe byte in it
     // (e.g. a tab in an OCI image env value) must surface as a StartMicrovmError, not a panic —
@@ -5028,6 +5035,40 @@ pub mod tests {
     use crate::vmm_config::kernel_bundle::KernelBundle;
 
     use crate::resources::{HostMemoryPolicy, NumaDistance, NumaNodeConfig, NumaTopology};
+
+    #[test]
+    fn initial_kernel_cmdline_preserves_clock_argument_order() {
+        // Cover both sources accepted by the boot builder. Arguments after `--`
+        // belong to init, while the last kernel-side clock value overrides earlier ones.
+        for use_payload in [false, true] {
+            for (caller, expected) in [
+                (
+                    "quiet -- tsc_early_khz=123",
+                    "tsc_early_khz=3600024 quiet -- tsc_early_khz=123",
+                ),
+                (
+                    "quiet tsc_early_khz=2400000 -- init-arg",
+                    "tsc_early_khz=3600024 quiet tsc_early_khz=2400000 -- init-arg",
+                ),
+            ] {
+                let (payload, prolog) = if use_payload {
+                    (Some(caller), Some("ignored-prolog"))
+                } else {
+                    (None, Some(caller))
+                };
+                let cmdline = initial_kernel_cmdline(payload, prolog, Some(3_600_024_432)).unwrap();
+                assert_eq!(cmdline.as_str(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn initial_kernel_cmdline_without_clock_keeps_existing_defaults() {
+        for frequency in [None, Some(0), Some(999)] {
+            let cmdline = initial_kernel_cmdline(None, None, frequency).unwrap();
+            assert_eq!(cmdline.as_str(), DEFAULT_KERNEL_CMDLINE);
+        }
+    }
 
     fn one_node_numa_topology(host_memory: HostMemoryPolicy) -> NumaTopology {
         NumaTopology {
