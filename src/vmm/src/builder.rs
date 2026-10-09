@@ -1287,6 +1287,19 @@ pub fn build_microvm_paused(
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[allow(unused_mut)]
     let mut kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
+    // Linux only uses CPUID leaf 0x15 to calibrate the TSC on Intel CPUs, and
+    // legacy timer calibration can fail under WHP. Supply the host frequency
+    // directly so AMD guests also have a working TSC (required by guest KVM).
+    // Prepend it so it stays before any caller-provided `--` and an explicit
+    // tsc_early_khz later in the kernel command line can override this default.
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    if let Some(khz) = crate::windows::vstate::host_tsc_frequency_hz()
+        .map(|hz| hz / 1000)
+        .filter(|khz| *khz != 0)
+    {
+        kernel_cmdline.insert("tsc_early_khz", &khz.to_string())?;
+    }
+
     if let Some(cmdline) = payload_config.kernel_cmdline {
         kernel_cmdline.insert_str(cmdline.as_str())?;
     } else if let Some(cmdline) = &vm_resources.kernel_cmdline.prolog {
