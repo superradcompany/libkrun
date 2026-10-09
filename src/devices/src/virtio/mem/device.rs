@@ -476,11 +476,10 @@ fn zero_guest_range(memory: &GuestMemoryMmap, start: u64, length: u64) -> io::Re
                 .get_host_address(GuestAddress(start))
                 .map_err(io::Error::other)?;
             // Never one MADV_DONTNEED over a whole page table's range (see `virtio::discard`);
-            // the pages it leaves resident are zeroed by hand.
+            // the parts it leaves untouched are zeroed by hand.
             if let Ok(kept) = crate::virtio::discard::dontneed(host, len) {
-                let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-                for p in kept {
-                    unsafe { std::ptr::write_bytes(p, 0, page) };
+                for (p, l) in kept {
+                    unsafe { std::ptr::write_bytes(p, 0, l) };
                 }
                 return Ok(());
             }
