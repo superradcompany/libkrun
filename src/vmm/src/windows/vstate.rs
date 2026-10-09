@@ -3066,7 +3066,7 @@ fn normalize_cpuid(
 
 /// Host processor clock (TSC/ARM counter) frequency, queried once. `None` when the
 /// platform cannot report it; the guest then calibrates as before.
-fn host_tsc_frequency_hz() -> Option<u64> {
+pub(crate) fn host_tsc_frequency_hz() -> Option<u64> {
     static TSC_HZ: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *TSC_HZ.get_or_init(|| {
         let mut capability: WHV_CAPABILITY = unsafe { zeroed() };

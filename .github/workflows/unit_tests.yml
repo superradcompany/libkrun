@@ -30,6 +30,9 @@ jobs:
       - name: Network builder rate-limit tests
         run: cargo test --locked -p msb_krun --features net network_rate_limiters
 
+      - name: Kernel command-line clock ordering tests
+        run: cargo test --locked --manifest-path src/vmm/Cargo.toml initial_kernel_cmdline
+
       - name: Linux nested-virt CPUID mask tests
         run: cargo test --locked --manifest-path src/cpuid/Cargo.toml filter_cpuid
 
@@ -63,6 +66,9 @@ jobs:
 
       - name: Windows eager restore memory test
         run: cargo test --locked --manifest-path src/vmm/Cargo.toml eager_restore_replaces_payload_bytes_without_losing_regions
+
+      - name: Kernel command-line clock ordering tests
+        run: cargo test --locked --manifest-path src/vmm/Cargo.toml initial_kernel_cmdline
 
       - name: Windows nested-virt CPUID mask tests
         run: cargo test --locked --manifest-path src/vmm/Cargo.toml normalize_cpuid
