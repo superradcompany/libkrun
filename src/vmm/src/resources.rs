@@ -448,7 +448,7 @@ impl Default for VmResources {
             snd_device: false,
             console_output: None,
             smbios_oem_strings: None,
-            nested_enabled: false,
+            nested_enabled: crate::nested_virt::default_enabled(),
             split_irqchip: false,
             metrics: MetricsWriter::default(),
             enable_balloon: true,
