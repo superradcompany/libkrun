@@ -44,9 +44,8 @@ accepted, so a partially written identity cannot masquerade as a reboot.
 
 On Linux x86, embed `parent.cpio` in the outer firmware kernel with
 `CONFIG_INITRAMFS_SOURCE`; its mmap boot path does not consume the external
-initramfs. macOS and Windows load `TEST_INITRAMFS` directly. Ordinary runtime builds
-still reject nested capture: diagnostic qualification requires the isolated
-admission bypass described in the shared harness documentation.
+initramfs. macOS and Windows load `TEST_INITRAMFS` directly. Use production
+builds on qualified backends; no admission bypass is required.
 
 The disk image lives in the outer guest's RAM-backed root filesystem. This checks
 inner filesystem consistency, block I/O, QEMU state, CPU state and timers across
@@ -68,5 +67,9 @@ controller profiles. Initial capture took 79 seconds with split IRQ and 196
 seconds with full IRQ, using a 900-second initial progress deadline. The sustained
 ten-second progress check was unchanged. This confirms that the earlier
 180-second boot timeout can be intermittent; it does not resolve its cause.
-Linux ARM64, Intel Windows and Windows ARM64 still need native qualification.
-The public nested-snapshot guard remains closed.
+Intel Windows subsequently passed the Microsandbox CLI matrix after the Windows
+bootstrap `/dev` fix; see the Microsandbox `scripts/smoke/cli/nested-snapshot.md`
+record. Linux ARM64 and Windows ARM64 remain unsupported. These dated runs used
+diagnostic admission bypasses; current production admission is described in
+`docs/nested-snapshots.md`. macOS full-OS results above cover the libkrun fixture,
+not Microsandbox archive export/import.

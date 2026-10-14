@@ -9,7 +9,9 @@ Linux ARM64 and Windows ARM64 nesting are not currently supported and default to
 with an unsupported error. Ordinary ARM64 VMs and their snapshots are unaffected.
 
 The 2026-10-14 qualification includes a running inner Linux VM through fresh restore,
-two forks, second-generation capture/restore, and Microsandbox archive export/import.
+two forks, and second-generation capture/restore. Linux and Windows x86-64 also
+passed Microsandbox archive export/import. macOS results cover the libkrun full-OS
+fixture; the Microsandbox archive workflow still needs an end-to-end macOS run.
 The inner workload retains its memory identity and resumes counter, timer, and disk progress.
 These results do not promise cross-host migration, external mount recovery, or restored
 network connections. The historical implementation notes below describe intermediate gates;

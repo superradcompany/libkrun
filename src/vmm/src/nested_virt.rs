@@ -1,6 +1,9 @@
 //! Host support and admission for nested virtualization.
 
 use std::io;
+use std::sync::Mutex;
+
+static HOST_SUPPORT: Mutex<Option<bool>> = Mutex::new(None);
 
 /// Query whether this backend can expose hardware virtualization to a guest.
 /// A positive result does not imply that the guest kernel includes KVM.
@@ -8,7 +11,17 @@ pub fn supported() -> io::Result<bool> {
     if cfg!(any(feature = "tee", feature = "aws-nitro")) {
         return Ok(false);
     }
-    host_supported()
+    // Windows probes create a WHP partition. Share successful discovery across
+    // builders and admission checks; do not retain transient probe errors.
+    let mut cached = HOST_SUPPORT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(supported) = *cached {
+        return Ok(supported);
+    }
+    let supported = host_supported()?;
+    *cached = Some(supported);
+    Ok(supported)
 }
 
 /// Enable nesting by default only when the host confirms support.

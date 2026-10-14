@@ -94,8 +94,8 @@ codesign --force -s - --entitlements /path/to/msb-entitlements.plist \
   tests/nested-restore/target/debug/nested-restore-live
 ```
 
-The ordinary build still rejects nested capture. Use a diagnostic build only
-for backend qualification. In addition to the initial restore, recapture a
+Use the production build for qualified backends. In addition to the initial
+restore, recapture a
 restored VM and restore that second snapshot: the original HVF ordering could
 pass the first restore but stall on the second generation. The clock offset must
 be installed before the saved timer registers so deadlines use the restored clock.
@@ -113,4 +113,5 @@ handling: a chain that only stops the child in its counter loop misses these cas
 The guest prints KVM internal-error data and its kernel log on failure.
 
 These passes do not qualify a full inner operating system, filesystem recovery
-or cross-host migration. The public nested-snapshot guard remains closed.
+or cross-host migration. They are historical counter-fixture results; the full-OS
+qualification scope is recorded in `docs/nested-snapshots.md`.

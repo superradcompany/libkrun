@@ -1,5 +1,4 @@
-//! Bounded Linux x86 nested-state transport. The VMM admission gate remains closed
-//! until fresh-VM restore is qualified on both Intel and AMD hosts.
+//! Bounded Linux x86 nested-state transport for qualified Intel and AMD hosts.
 
 use std::io;
 use std::os::fd::AsRawFd;
