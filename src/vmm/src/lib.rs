@@ -1517,7 +1517,16 @@ impl Vmm {
     /// This is a policy preflight, not a guarantee that device or CPU capture
     /// will succeed. Capture and restore also enforce this policy themselves.
     pub fn require_nested_execution_state_support(&self) -> Result<()> {
-        if self.nested_enabled {
+        if self.nested_enabled
+            && !cfg!(all(
+                not(any(feature = "tee", feature = "aws-nitro")),
+                any(
+                    all(target_os = "linux", target_arch = "x86_64"),
+                    all(target_os = "windows", target_arch = "x86_64"),
+                    all(target_os = "macos", target_arch = "aarch64")
+                )
+            ))
+        {
             return Err(Error::NestedExecutionStateUnsupported);
         }
         Ok(())

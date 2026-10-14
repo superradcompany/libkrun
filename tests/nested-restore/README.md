@@ -5,9 +5,11 @@ a counter and services timer interrupts. Capture and restore run in separate hos
 processes. Restore requires the original workload identity and continued timer
 and counter progress, so rebooting the workload cannot pass.
 
-The public nested-snapshot guard is still closed. An ordinary build must reject
-capture. Backend qualification uses an isolated diagnostic build with only that
-guard temporarily removed; never publish that build as a supported runtime.
+The production build admits nested capture and restore on qualified Linux x86-64,
+Windows x86-64, and Apple Silicon macOS hosts. Linux ARM64 and Windows ARM64
+nesting are unsupported. Run this harness without an admission bypass. The dated
+results below describe earlier diagnostic builds; see `docs/nested-snapshots.md`
+for the current platform policy and qualification scope.
 
 Build `guest.c` as a static Linux x86 executable and place it at `/init` in an
 initramfs containing `/dev/console` (character device 5:1) and `/dev`. The parent

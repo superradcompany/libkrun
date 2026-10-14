@@ -1,10 +1,25 @@
 # Nested virtualization implementation stack
 
-This is an implementation plan, not a claim of released support. Nesting remains opt-in.
-Full snapshots and forks remain disabled in Microsandbox until the relevant backend passes
-live restore qualification. Disk-only snapshots are unaffected.
+Nested virtualization defaults to enabled where the host confirms support, and disabled
+elsewhere. An explicit enable still fails on unsupported hosts; an explicit disable is
+always honored. Execution-state capture and
+restore are enabled on qualified Linux x86-64 (Intel and AMD), Windows x86-64 (Intel and AMD),
+and Apple Silicon macOS hosts, subject to the backend's hardware and restore checks.
+Linux ARM64 and Windows ARM64 nesting are not currently supported and default to off; explicitly enabling nesting fails
+with an unsupported error. Ordinary ARM64 VMs and their snapshots are unaffected.
 
-## Dependencies
+The 2026-10-14 qualification includes a running inner Linux VM through fresh restore,
+two forks, second-generation capture/restore, and Microsandbox archive export/import.
+The inner workload retains its memory identity and resumes counter, timer, and disk progress.
+These results do not promise cross-host migration, external mount recovery, or restored
+network connections. The historical implementation notes below describe intermediate gates;
+the platform policy in this section supersedes those gates.
+
+## Historical implementation and qualification notes
+
+The following records describe the staged implementation before admission was opened.
+
+### Dependencies
 
 1. libkrun #156: Windows x86 TSC discovery.
 2. libkrun #155, based on #156: host admission and opt-in nested execution.
@@ -25,7 +40,7 @@ restoring an inner hypervisor. Restore checks nesting mode before any backend st
 The backend ABI remains separate and must change when its opaque payload changes. Old
 schema-1 artifacts are treated as ordinary: they contain no reliable nesting-mode declaration.
 
-The initial contract rejects nested capture and restore on every backend. A backend PR must
+The initial contract rejected nested capture and restore on every backend. A backend PR must
 supply complete state, validate destination capabilities, and explicitly remove its own gate.
 This also prevents direct libkrun callers from bypassing the Microsandbox restriction and
 silently saving incomplete nested state.
@@ -65,9 +80,11 @@ state categories. An x64 host or an emulated ARM machine cannot establish native
 
 Hetzner Cloud excludes Windows Server on CAX and does not expose nested virtualization.
 Its dedicated RX line uses Ampere Altra; no supported Windows ARM deployment was established
-for this investigation. No unsuitable server was ordered. Native Windows ARM testing remains
-blocked on an appropriate machine; the public API review is inconclusive about execution
-and insufficient to implement full nested restore safely.
+for this investigation. No unsuitable server was ordered. A native Surface Laptop 7 (Snapdragon X Elite, Windows 11 25H2 build 26200.9711)
+accepted ordinary ARM64 partition setup and vCPU creation. With valid GIC settings,
+enabling nesting failed at WHvSetupPartition with STATUS_HV_INVALID_PARAMETER
+(0xC0350005). The probe ran as a standard user; elevated confirmation remains pending.
+No ARM64 nested-state capture/restore has been qualified.
 
 Sources:
 - https://learn.microsoft.com/en-us/virtualization/api/hypervisor-platform/funcs/whvpartitionpropertydatatypes
