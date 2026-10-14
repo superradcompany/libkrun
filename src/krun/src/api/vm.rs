@@ -1842,6 +1842,15 @@ impl VmControl {
         self.vmm.wait_until_paused_inner(None)
     }
 
+    /// Checks execution-state admission without pausing or changing the VM.
+    ///
+    /// Embedders can reject unsupported captures before preparing storage or
+    /// freezing the guest. A successful check does not replace the paused
+    /// boundary or the device and CPU checks performed during capture.
+    pub fn validate_execution_state_capture(&self) -> Result<()> {
+        self.with_running_vmm(|vmm| vmm.require_nested_execution_state_support())
+    }
+
     /// Captures the exact backend execution state at the current paused boundary.
     pub fn capture_execution_state(&self) -> Result<vmm::execution_state::ExecutionState> {
         self.with_running_vmm(vmm::Vmm::capture_execution_state)

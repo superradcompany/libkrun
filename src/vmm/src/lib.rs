@@ -451,8 +451,9 @@ fn current_execution_backend_state_abi() -> u32 {
     1
 }
 
-fn execution_state_backend_is_compatible(state: &ExecutionState) -> bool {
-    state.architecture() == current_execution_architecture()
+fn execution_state_backend_is_compatible(state: &ExecutionState, nested_enabled: bool) -> bool {
+    state.nested_enabled() == nested_enabled
+        && state.architecture() == current_execution_architecture()
         && state.backend() == current_execution_backend()
         && state.backend_state_abi() == current_execution_backend_state_abi()
 }
@@ -569,8 +570,10 @@ pub enum Error {
     ExecutionRestoreAfterActivation,
     /// Memory restore is permitted only before first activation.
     MemoryRestoreAfterActivation,
-    /// The artifact targets a different backend, architecture, or backend ABI.
+    /// The artifact targets a different backend, architecture, backend ABI, or nesting mode.
     ExecutionStateIncompatible,
+    /// This backend has not qualified nested execution-state capture and restore.
+    NestedExecutionStateUnsupported,
     /// The artifact vCPU topology differs from the constructed VMM.
     ExecutionStateTopologyMismatch,
     /// Guest memory could not be read or written for capture/materialization.
@@ -686,7 +689,11 @@ impl Display for Error {
             ),
             ExecutionStateIncompatible => write!(
                 f,
-                "execution state is incompatible with this backend or architecture"
+                "execution state is incompatible with this backend, architecture, or nesting mode"
+            ),
+            NestedExecutionStateUnsupported => write!(
+                f,
+                "nested execution-state capture and restore are not supported by this backend"
             ),
             ExecutionStateTopologyMismatch => write!(
                 f,
@@ -753,6 +760,7 @@ pub struct Vmm {
     control_request_id: VcpuControlRequestId,
     execution_state: VmmExecutionState,
     execution_restore_allowed: bool,
+    nested_enabled: bool,
     memory_restore_allowed: bool,
     memory_ledger: MemoryGenerationLedger,
     memory_access: MemoryAccessDomain,
@@ -1359,6 +1367,7 @@ impl Vmm {
     /// Captures backend execution state from every owning vCPU thread.
     pub fn capture_execution_state(&mut self) -> Result<ExecutionState> {
         let pause_generation = self.require_paused_execution_boundary()?;
+        self.require_nested_execution_state_support()?;
         let request_id = self.next_control_request_id()?;
         for handle in &self.vcpus_handles {
             handle
@@ -1461,7 +1470,19 @@ impl Vmm {
             vm_state,
             vcpus,
         )
+        .map(|state| state.with_nested_enabled(self.nested_enabled))
         .map_err(Error::ExecutionState)
+    }
+
+    /// Checks execution-state admission without pausing or changing the VM.
+    ///
+    /// This is a policy preflight, not a guarantee that device or CPU capture
+    /// will succeed. Capture and restore also enforce this policy themselves.
+    pub fn require_nested_execution_state_support(&self) -> Result<()> {
+        if self.nested_enabled {
+            return Err(Error::NestedExecutionStateUnsupported);
+        }
+        Ok(())
     }
 
     /// Restores execution state into a constructed VMM before its first activation.
@@ -1470,9 +1491,10 @@ impl Vmm {
         if !self.execution_restore_allowed {
             return Err(Error::ExecutionRestoreAfterActivation);
         }
-        if !execution_state_backend_is_compatible(state) {
+        if !execution_state_backend_is_compatible(state, self.nested_enabled) {
             return Err(Error::ExecutionStateIncompatible);
         }
+        self.require_nested_execution_state_support()?;
         if state.vcpus().len() != self.vcpus_handles.len()
             || state
                 .vcpus()
@@ -2440,7 +2462,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!execution_state_backend_is_compatible(&state));
+        assert!(!execution_state_backend_is_compatible(&state, false));
     }
 
     #[test]
@@ -2455,6 +2477,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(execution_state_backend_is_compatible(&state));
+        assert!(execution_state_backend_is_compatible(&state, false));
+        assert!(!execution_state_backend_is_compatible(&state, true));
+        let nested = state.with_nested_enabled(true);
+        assert!(!execution_state_backend_is_compatible(&nested, false));
+        assert!(execution_state_backend_is_compatible(&nested, true));
     }
 }

@@ -16,6 +16,7 @@ use std::fmt::{Display, Formatter};
 
 const EXECUTION_STATE_MAGIC: &[u8; 9] = b"MSBKEXEC\0";
 const EXECUTION_STATE_SCHEMA: u16 = 1;
+const NESTED_EXECUTION_STATE_SCHEMA: u16 = 2;
 const MAX_VCPUS: usize = 1024;
 const MAX_VM_STATE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_VCPU_STATE_BYTES: usize = 16 * 1024 * 1024;
@@ -62,6 +63,7 @@ pub struct ExecutionState {
     architecture: ExecutionArchitecture,
     backend: ExecutionBackend,
     backend_state_abi: u32,
+    nested_enabled: bool,
     pause_generation: u64,
     vm_state: Vec<u8>,
     vcpus: Vec<VcpuExecutionState>,
@@ -146,6 +148,7 @@ impl ExecutionState {
             architecture,
             backend,
             backend_state_abi,
+            nested_enabled: false,
             pause_generation,
             vm_state,
             vcpus,
@@ -167,6 +170,16 @@ impl ExecutionState {
         self.backend_state_abi
     }
 
+    /// Whether this artifact requires nested virtualization in the destination VM.
+    pub fn nested_enabled(&self) -> bool {
+        self.nested_enabled
+    }
+
+    pub(crate) fn with_nested_enabled(mut self, enabled: bool) -> Self {
+        self.nested_enabled = enabled;
+        self
+    }
+
     /// Returns the VM-wide pause generation at which state was captured.
     pub fn pause_generation(&self) -> u64 {
         self.pause_generation
@@ -186,7 +199,11 @@ impl ExecutionState {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut writer = StateWriter::new();
         writer.write_bytes(EXECUTION_STATE_MAGIC);
-        writer.write_u16(EXECUTION_STATE_SCHEMA);
+        writer.write_u16(if self.nested_enabled {
+            NESTED_EXECUTION_STATE_SCHEMA
+        } else {
+            EXECUTION_STATE_SCHEMA
+        });
         writer.write_u8(self.architecture as u8);
         writer.write_u8(self.backend as u8);
         writer.write_u32(self.backend_state_abi);
@@ -213,9 +230,11 @@ impl ExecutionState {
         if reader.read_exact(EXECUTION_STATE_MAGIC.len())? != EXECUTION_STATE_MAGIC {
             return Err(Error::UnsupportedFormat);
         }
-        if reader.read_u16()? != EXECUTION_STATE_SCHEMA {
-            return Err(Error::UnsupportedFormat);
-        }
+        let nested_enabled = match reader.read_u16()? {
+            EXECUTION_STATE_SCHEMA => false,
+            NESTED_EXECUTION_STATE_SCHEMA => true,
+            _ => return Err(Error::UnsupportedFormat),
+        };
         let architecture = match reader.read_u8()? {
             1 => ExecutionArchitecture::X86_64,
             2 => ExecutionArchitecture::Aarch64,
@@ -256,6 +275,7 @@ impl ExecutionState {
             vm_state,
             vcpus,
         )
+        .map(|state| state.with_nested_enabled(nested_enabled))
     }
 }
 
@@ -376,6 +396,27 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn envelope_preserves_nested_policy_without_changing_ordinary_artifacts() {
+        let plain = ExecutionState::new(
+            ExecutionArchitecture::X86_64,
+            ExecutionBackend::Kvm,
+            1,
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let bytes = plain.encode().unwrap();
+        assert_eq!(&bytes[9..11], &1_u16.to_le_bytes());
+        assert!(!ExecutionState::decode(&bytes).unwrap().nested_enabled());
+
+        let nested = plain.with_nested_enabled(true);
+        let bytes = nested.encode().unwrap();
+        assert_eq!(&bytes[9..11], &2_u16.to_le_bytes());
+        assert_eq!(ExecutionState::decode(&bytes).unwrap(), nested);
+    }
 
     #[test]
     fn envelope_round_trip_is_deterministic() {

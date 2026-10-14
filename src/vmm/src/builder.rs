@@ -1850,6 +1850,7 @@ pub fn build_microvm_paused(
         control_request_id: VcpuControlRequestId::INITIAL,
         execution_state: VmmExecutionState::Paused(PauseGeneration::INITIAL),
         execution_restore_allowed: true,
+        nested_enabled: vm_resources.nested_enabled,
         memory_restore_allowed: true,
         memory_ledger: MemoryGenerationLedger::new(MemoryTopologyGeneration::new(1)),
         memory_access: devices::virtio::MemoryAccessDomain::new(),
@@ -5073,6 +5074,69 @@ pub mod tests {
             let cmdline = initial_kernel_cmdline(None, None, frequency).unwrap();
             assert_eq!(cmdline.as_str(), DEFAULT_KERNEL_CMDLINE);
         }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    #[test]
+    fn nested_execution_refusal_precedes_backend_work() {
+        // No guest instruction executes. Construct an ordinary paused VM so this
+        // admission test does not depend on the CI host exposing VMX or SVM.
+        let kernel: GuestMemoryMmap =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let mut resources = VmResources::default();
+        resources.kernel_bundle = Some(KernelBundle {
+            host_addr: kernel.get_host_address(GuestAddress(0)).unwrap() as u64,
+            guest_addr: 0x20_0000,
+            entry_addr: 0x20_0000,
+            size: 4096,
+        });
+        let mut events = EventManager::new().unwrap();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let (vmm, _) = build_microvm_paused(
+            &mut resources,
+            &mut events,
+            None,
+            sender,
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            Arc::new(AtomicI32::new(0)),
+        )
+        .unwrap();
+        let mut vmm = vmm.lock().unwrap();
+        vmm.nested_enabled = true;
+        let before_request = vmm.control_request_id;
+        let before_pause = vmm.require_paused_execution_boundary().unwrap();
+        assert!(matches!(
+            vmm.capture_execution_state(),
+            Err(crate::Error::NestedExecutionStateUnsupported)
+        ));
+        assert_eq!(vmm.control_request_id, before_request);
+        assert_eq!(
+            vmm.require_paused_execution_boundary().unwrap(),
+            before_pause
+        );
+
+        let state = crate::ExecutionState::new(
+            crate::current_execution_architecture(),
+            crate::current_execution_backend(),
+            crate::current_execution_backend_state_abi(),
+            1,
+            Vec::new(),
+            (0..vmm.vcpus_handles.len())
+                .map(|id| crate::VcpuExecutionState::new(id as u32, Vec::new()).unwrap())
+                .collect(),
+        )
+        .unwrap()
+        .with_nested_enabled(true);
+        assert!(matches!(
+            vmm.restore_execution_state(&state),
+            Err(crate::Error::NestedExecutionStateUnsupported)
+        ));
+        assert_eq!(vmm.control_request_id, before_request);
+        assert_eq!(
+            vmm.require_paused_execution_boundary().unwrap(),
+            before_pause
+        );
+        assert!(vmm.execution_restore_allowed);
     }
 
     fn one_node_numa_topology(host_memory: HostMemoryPolicy) -> NumaTopology {

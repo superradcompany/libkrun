@@ -30,6 +30,9 @@ jobs:
       - name: Network builder rate-limit tests
         run: cargo test --locked -p msb_krun --features net network_rate_limiters
 
+      - name: Nested execution-state admission test
+        run: cargo test --locked --manifest-path src/vmm/Cargo.toml nested_execution_refusal_precedes_backend_work
+
       - name: Kernel command-line clock ordering tests
         run: cargo test --locked --manifest-path src/vmm/Cargo.toml initial_kernel_cmdline
 
