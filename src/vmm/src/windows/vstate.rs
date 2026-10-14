@@ -911,13 +911,13 @@ impl WhpCapabilities {
 }
 
 impl Vm {
-    pub fn new(vcpu_count: u8) -> Result<Self> {
+    pub fn new(vcpu_count: u8, nested_enabled: bool) -> Result<Self> {
         WhpCapabilities::ensure_hypervisor_present()?;
         if vcpu_count == 0 {
             return Err(Error::VcpuCountZero);
         }
 
-        let partition = Partition::new(vcpu_count)?;
+        let partition = Partition::new(vcpu_count, nested_enabled)?;
 
         Ok(Self {
             partition,
@@ -1882,8 +1882,20 @@ impl Drop for Emulator {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn nested_virt_supported() -> std::io::Result<bool> {
+    WhpCapabilities::ensure_hypervisor_present()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    match Partition::new(1, true) {
+        Ok(_) => Ok(true),
+        Err(Error::SetPartitionProperty { property, .. })
+            if property == windows_sys::Win32::System::Hypervisor::WHvPartitionPropertyCodeNestedVirtualization => Ok(false),
+        Err(error) => Err(std::io::Error::other(error.to_string())),
+    }
+}
+
 impl Partition {
-    fn new(vcpu_count: u8) -> Result<Self> {
+    fn new(vcpu_count: u8, nested_enabled: bool) -> Result<Self> {
         let mut handle = 0;
         let hresult = unsafe { WHvCreatePartition(&mut handle) };
         if hresult < 0 {
@@ -1892,6 +1904,9 @@ impl Partition {
 
         let partition = Self { handle };
         partition.set_processor_count(vcpu_count)?;
+        if nested_enabled {
+            partition.enable_nested_virt()?;
+        }
         #[cfg(target_arch = "x86_64")]
         partition.set_x64_local_apic_emulation()?;
         #[cfg(target_arch = "x86_64")]
@@ -1901,6 +1916,27 @@ impl Partition {
         partition.setup()?;
 
         Ok(partition)
+    }
+
+    fn enable_nested_virt(&self) -> Result<()> {
+        let enabled: i32 = 1;
+        let property_code =
+            windows_sys::Win32::System::Hypervisor::WHvPartitionPropertyCodeNestedVirtualization;
+        let hresult = unsafe {
+            WHvSetPartitionProperty(
+                self.handle,
+                property_code,
+                &enabled as *const i32 as *const _,
+                size_of::<i32>() as u32,
+            )
+        };
+        if hresult < 0 {
+            return Err(Error::SetPartitionProperty {
+                property: property_code,
+                hresult,
+            });
+        }
+        Ok(())
     }
 
     fn set_processor_count(&self, vcpu_count: u8) -> Result<()> {
