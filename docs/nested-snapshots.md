@@ -17,6 +17,21 @@ These results do not promise cross-host migration, external mount recovery, or r
 network connections. The historical implementation notes below describe intermediate gates;
 the platform policy in this section supersedes those gates.
 
+## Intel Windows requirements
+
+Intel Windows nested snapshots require WHP's enlightened-VMCS support and an outer
+guest kernel that uses it. libkrun enables the documented Hyper-V interface when
+the host provides the required features. The Windows firmware enables
+`CONFIG_HYPERV`; Linux KVM selects enlightened VMCS automatically. A current
+ordinary Intel VMCS is rejected during capture and restore because its cached
+state can disagree with its opaque backing memory.
+
+Nested WHP artifacts use backend ABI 3, recording the synthetic feature contract
+and partition reference time. Earlier nested WHP artifacts are rejected before
+restoration. Non-nested WHP artifacts retain ABI 1 and their existing format.
+AMD retains its existing guest feature configuration. These checks do not promise
+migration between different CPUs or Windows builds.
+
 ## Historical implementation and qualification notes
 
 The following records describe the staged implementation before admission was opened.
