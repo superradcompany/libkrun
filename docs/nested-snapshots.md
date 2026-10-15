@@ -26,9 +26,11 @@ the host provides the required features. The Windows firmware enables
 ordinary Intel VMCS is rejected during capture and restore because its cached
 state can disagree with its opaque backing memory.
 
-Nested WHP artifacts use backend ABI 3, recording the synthetic feature contract
-and partition reference time. Earlier nested WHP artifacts are rejected before
-restoration. Non-nested WHP artifacts retain ABI 1 and their existing format.
+Nested WHP artifacts use backend ABI 4, recording the synthetic feature contract,
+partition reference time and emulated PIT state. Non-nested WHP artifacts use ABI 2
+and also save PIT state. Older ordinary ABI 1 and enlightened nested ABI 3 snapshots
+require explicit periodic-PIT recovery or a restart from saved disk. Non-enlightened
+nested snapshots remain incompatible.
 AMD retains its existing guest feature configuration. These checks do not promise
 migration between different CPUs or Windows builds.
 
