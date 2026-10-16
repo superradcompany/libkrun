@@ -1254,6 +1254,8 @@ type VcpuCell = Cell<Option<*mut Vcpu>>;
 /// A wrapper around creating and using a kvm-based VCPU.
 pub struct Vcpu {
     fd: VcpuFd,
+    #[cfg(target_arch = "x86_64")]
+    tsc_scaling_supported: bool,
     id: u8,
     // Resolved host placement is applied inside the vCPU thread before KVM_RUN.
     host_cpu: Option<HostCpuId>,
@@ -1298,6 +1300,22 @@ pub struct Vcpu {
 }
 
 impl Vcpu {
+    #[cfg(target_arch = "x86_64")]
+    fn validate_tsc_frequency(&self, khz: u32) -> Result<()> {
+        if khz == 0 {
+            return Err(Error::StateCodec("zero saved TSC frequency".into()));
+        }
+        let current = self.fd.get_tsc_khz().map_err(Error::VcpuGetTscKhz)?;
+        // Without hardware scaling KVM may accept a higher rate using catch-up
+        // emulation. That does not preserve RDTSC timing inside a running L2.
+        if khz != current && !self.tsc_scaling_supported {
+            return Err(Error::StateCodec(format!(
+                "snapshot TSC rate {khz} kHz differs from destination {current} kHz; KVM TSC scaling is unsupported"
+            )));
+        }
+        Ok(())
+    }
+
     thread_local!(static TLS_VCPU_PTR: VcpuCell = const { Cell::new(None) });
 
     /// Associates `self` with the current thread.
@@ -1416,6 +1434,7 @@ impl Vcpu {
         // Initially the cpuid per vCPU is the one supported by this VM.
         Ok(Vcpu {
             fd: kvm_vcpu,
+            tsc_scaling_supported: vm_fd.check_extension(Cap::TscControl),
             id,
             host_cpu: None,
             host_cpu_required: true,
@@ -1852,12 +1871,7 @@ impl Vcpu {
                 "destination CPUID differs from nested snapshot".into(),
             ));
         }
-        let frequency = self.fd.get_tsc_khz().map_err(Error::VcpuGetTscKhz)?;
-        if state.tsc_khz != frequency {
-            return Err(Error::StateCodec(
-                "destination TSC frequency differs from nested snapshot".into(),
-            ));
-        }
+        self.validate_tsc_frequency(state.tsc_khz)?;
         if state.msrs.len() != self.msr_list.as_slice().len()
             || state
                 .msrs
@@ -1984,10 +1998,16 @@ impl Vcpu {
             *target = (*source).into();
         }
 
+        self.validate_tsc_frequency(state.tsc_khz)?;
         self.fd.set_cpuid2(&cpuid).map_err(Error::VcpuSetCpuid)?;
         self.fd
             .set_tsc_khz(state.tsc_khz)
             .map_err(Error::VcpuSetTscKhz)?;
+        if self.fd.get_tsc_khz().map_err(Error::VcpuGetTscKhz)? != state.tsc_khz {
+            return Err(Error::StateCodec(
+                "destination cannot preserve guest TSC frequency".into(),
+            ));
+        }
         self.fd
             .set_mp_state(state.mp_state)
             .map_err(Error::VcpuSetMpState)?;

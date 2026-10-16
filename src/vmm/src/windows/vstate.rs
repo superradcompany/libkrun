@@ -67,7 +67,7 @@ use windows_sys::Win32::System::Threading::{
 
 #[cfg(target_arch = "x86_64")]
 #[path = "x86_state.rs"]
-mod x86_state;
+pub(crate) mod x86_state;
 
 #[cfg(target_arch = "aarch64")]
 const AARCH64_PSR_MODE_EL1H: u64 = 0x0000_0005;
@@ -914,12 +914,20 @@ impl WhpCapabilities {
 
 impl Vm {
     pub fn new(vcpu_count: u8, nested_enabled: bool) -> Result<Self> {
+        Self::with_clock(vcpu_count, nested_enabled, None)
+    }
+
+    pub(crate) fn with_clock(
+        vcpu_count: u8,
+        nested_enabled: bool,
+        frequency: Option<u64>,
+    ) -> Result<Self> {
         WhpCapabilities::ensure_hypervisor_present()?;
         if vcpu_count == 0 {
             return Err(Error::VcpuCountZero);
         }
 
-        let partition = Partition::new(vcpu_count, nested_enabled)?;
+        let partition = Partition::with_clock(vcpu_count, nested_enabled, frequency)?;
 
         Ok(Self {
             partition,
@@ -1902,7 +1910,7 @@ impl Drop for Emulator {
 pub(crate) fn nested_virt_supported() -> std::io::Result<bool> {
     WhpCapabilities::ensure_hypervisor_present()
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    match Partition::new(1, true) {
+    match Partition::with_clock(1, true, None) {
         Ok(_) => Ok(true),
         Err(Error::SetPartitionProperty { property, .. })
             if property == windows_sys::Win32::System::Hypervisor::WHvPartitionPropertyCodeNestedVirtualization => Ok(false),
@@ -1911,7 +1919,7 @@ pub(crate) fn nested_virt_supported() -> std::io::Result<bool> {
 }
 
 impl Partition {
-    fn new(vcpu_count: u8, nested_enabled: bool) -> Result<Self> {
+    fn with_clock(vcpu_count: u8, nested_enabled: bool, frequency: Option<u64>) -> Result<Self> {
         let mut handle = 0;
         let hresult = unsafe { WHvCreatePartition(&mut handle) };
         if hresult < 0 {
@@ -1937,7 +1945,31 @@ impl Partition {
         if nested_enabled {
             partition.enable_enlightened_vmcs()?;
         }
+        // Some WHP hosts cannot set this property even to their native rate.
+        // Keep same-frequency snapshots usable there; readback still verifies it.
+        if let Some(hz) = frequency.filter(|hz| Some(*hz) != host_tsc_frequency_hz()) {
+            if hz == 0 {
+                return Err(Error::StateCodec("zero restore TSC frequency".into()));
+            }
+            let property = windows_sys::Win32::System::Hypervisor::WHvPartitionPropertyCodeProcessorClockFrequency;
+            let status = unsafe {
+                WHvSetPartitionProperty(partition.handle, property, (&hz as *const u64).cast(), 8)
+            };
+            if status < 0 {
+                return Err(Error::StateCodec(format!(
+                    "destination cannot restore guest TSC rate {hz} Hz: WHP clock scaling failed with HRESULT {status:#x}"
+                )));
+            }
+        }
         partition.setup()?;
+        #[cfg(target_arch = "x86_64")]
+        if let Some(hz) = frequency {
+            if x86_state::frequency(partition.handle)? != hz {
+                return Err(Error::StateCodec(
+                    "destination cannot preserve guest TSC frequency".into(),
+                ));
+            }
+        }
 
         Ok(partition)
     }
@@ -2829,6 +2861,17 @@ fn run_vcpu(
         return;
     }
 
+    // The partition clock is fixed before setup, including on restore.
+    #[cfg(target_arch = "x86_64")]
+    let tsc_hz = match x86_state::frequency(partition_handle) {
+        Ok(hz) => hz,
+        Err(err) => {
+            error!("cannot read guest TSC frequency: {err}");
+            signal_vcpu_exit(&response_sender, &exit_evt, 1);
+            return;
+        }
+    };
+
     // x86 APs must not execute until the guest starts them: park here until
     // the BSP's startup IPI supplies the real-mode entry vector.
     #[cfg(target_arch = "x86_64")]
@@ -3008,7 +3051,7 @@ fn run_vcpu(
         if reason == WHvRunVpExitReasonX64Cpuid {
             let cpuid = unsafe { exit_context.Anonymous.CpuidAccess };
             let vcpu_count = sipi_router.as_ref().map_or(1, |router| router.vcpu_count());
-            let result = normalize_cpuid(id, vcpu_count, nested_enabled, &cpuid);
+            let result = normalize_cpuid(id, vcpu_count, nested_enabled, &cpuid, Some(tsc_hz));
             // The VpContext bitfield's low nibble is the instruction length.
             let next_rip =
                 exit_context.VpContext.Rip + u64::from(exit_context.VpContext._bitfield & 0xf);
@@ -3121,6 +3164,7 @@ fn normalize_cpuid(
     vcpu_count: u8,
     nested_enabled: bool,
     access: &WHV_X64_CPUID_ACCESS_CONTEXT,
+    tsc_hz: Option<u64>,
 ) -> CpuidResult {
     const CPUID_1_ECX_VMX: u32 = 1 << 5;
     const CPUID_1_ECX_X2APIC: u32 = 1 << 21;
@@ -3181,16 +3225,17 @@ fn normalize_cpuid(
         }
         // TSC/crystal ratio: hand the guest its TSC frequency directly so
         // it never falls back to PIT/HPET calibration (neither of which we
-        // emulate well enough) and the jiffies clocksource. The guest TSC
-        // runs at the host rate under WHP, which the platform reports via
-        // WHvCapabilityCodeProcessorClockFrequency.
+        // emulate well enough) and the jiffies clocksource. Use the partition
+        // rate, which can differ from the host after snapshot restore.
         0x15 => {
-            if let Some(tsc_hz) = host_tsc_frequency_hz() {
-                result.rax = 1; // ratio denominator
-                result.rbx = 1; // ratio numerator
-                result.rcx = tsc_hz; // "crystal" clock in Hz
-                result.rdx = 0;
-            }
+            // CPUID fields are 32-bit. An unrepresentable frequency must not
+            // wrap into a plausible but wrong clock; early boot also receives
+            // the partition rate through tsc_early_khz.
+            let crystal_hz = tsc_hz.and_then(|hz| u32::try_from(hz).ok());
+            result.rax = u64::from(crystal_hz.is_some());
+            result.rbx = u64::from(crystal_hz.is_some());
+            result.rcx = u64::from(crystal_hz.unwrap_or(0));
+            result.rdx = 0;
         }
         // AMD extended features: drop SVM unless nested virtualization is on.
         0x8000_0001 => {
@@ -3796,6 +3841,28 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn cpuid_clock_describes_the_partition_without_truncation() {
+        let access = WHV_X64_CPUID_ACCESS_CONTEXT {
+            Rax: 0x15,
+            DefaultResultRax: 1,
+            DefaultResultRbx: 1,
+            DefaultResultRcx: 3_600_024_432,
+            ..Default::default()
+        };
+        for (frequency, expected) in [
+            (Some(1_800_012_216), (1, 1, 1_800_012_216)),
+            (Some(4_000_000_000), (1, 1, 4_000_000_000)),
+            (Some(4_500_030_540), (0, 0, 0)),
+            (None, (0, 0, 0)),
+        ] {
+            let result = normalize_cpuid(0, 2, true, &access, frequency);
+            assert_eq!((result.rax, result.rbx, result.rcx), expected);
+            assert_eq!(result.rdx, 0);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn restored_running_ap_skips_sipi_register_reset() {
         let router = ApStartupRouter::new(2);
         *router.slots[1].lock().unwrap() = ApParkState::Running;
@@ -3827,7 +3894,7 @@ mod tests {
             DefaultResultRcx: 1 << 5,
             ..Default::default()
         };
-        let result = normalize_cpuid(0, 1, false, &leaf1);
+        let result = normalize_cpuid(0, 1, false, &leaf1, None);
         assert_eq!(result.rcx as u32 & (1 << 5), 0, "VMX must be cleared");
 
         let leaf_8000_0001 = WHV_X64_CPUID_ACCESS_CONTEXT {
@@ -3835,7 +3902,7 @@ mod tests {
             DefaultResultRcx: 1 << 2,
             ..Default::default()
         };
-        let result = normalize_cpuid(0, 1, false, &leaf_8000_0001);
+        let result = normalize_cpuid(0, 1, false, &leaf_8000_0001, None);
         assert_eq!(result.rcx as u32 & (1 << 2), 0, "SVM must be cleared");
     }
 
@@ -3847,7 +3914,7 @@ mod tests {
             DefaultResultRcx: 1 << 5,
             ..Default::default()
         };
-        let result = normalize_cpuid(0, 1, true, &access);
+        let result = normalize_cpuid(0, 1, true, &access, None);
         assert_eq!(result.rcx as u32 & (1 << 5), 1 << 5, "VMX must be kept");
     }
 

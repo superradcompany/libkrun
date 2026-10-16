@@ -34,6 +34,39 @@ nested snapshots remain incompatible.
 AMD retains its existing guest feature configuration. These checks do not promise
 migration between different CPUs or Windows builds.
 
+## Restoring at a different host TSC frequency
+
+On x86 Linux and Windows, restore preserves the snapshot's guest-visible TSC
+frequency. The destination host's native frequency may differ only if its
+hypervisor can provide the saved rate. Linux requires KVM hardware TSC scaling
+for differing rates, programs each vCPU before importing nested state, and checks
+readback. Windows configures the saved partition clock before partition setup,
+then uses that rate for capture, compatibility checks and guest CPUID reporting.
+Same-frequency Windows restores do not require the optional clock-setting API.
+
+This is a clock compatibility feature, not unrestricted CPU migration. Existing
+CPU, nested-state, MSR and backend compatibility checks still apply. Restore
+rejects a rate the destination cannot provide. Linux catch-up emulation without
+hardware scaling is not sufficient for a running nested VM. No guest memory or
+saved kernel calibration values are rewritten, and the snapshot format is unchanged.
+
+The [source-clock fixture](../tests/nested-restore/clock-source/README.md) exercises
+non-native source rates with real hypervisor scaling and an unmodified destination.
+
+2026-10-16 qualification: AMD Linux (EPYC 9B45, KVM on Linux 7.0) passed the busy
+Microsandbox restore/fork/recapture/archive matrix at source rates of 1,347,974 and
+3,369,935 kHz, against a native destination rate of 2,695,948 kHz. AMD Windows
+(Ryzen 5 3600) passed the same matrix at 1,800,012,216 and 7,200,048,864 Hz, against
+3,600,024,432 Hz native. The pre-fix runtimes rejected the saved lower-rate artifacts.
+The inner workload retained its identity, disk contents, busy workers and timer
+progress; guest/host elapsed-time ratios stayed within the test's 20% tolerance.
+
+Intel Linux and Intel Windows passed the same-frequency busy matrix. The tested
+Google N2/C4 and Azure Intel hosts did not expose hardware TSC scaling, so successful
+Intel cross-frequency restore remains unqualified. The controlled-rate AMD tests
+use a source adapter on the same host; migration between distinct physical hosts
+and differing CPU contracts still needs separate qualification.
+
 ## Historical implementation and qualification notes
 
 The following records describe the staged implementation before admission was opened.

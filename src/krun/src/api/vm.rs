@@ -583,6 +583,15 @@ impl Vm {
             self.vmr.zeroed_restore_memory = self.memory_restore.is_some();
         }
 
+        #[cfg(all(not(feature = "tee"), target_os = "windows", target_arch = "x86_64"))]
+        if let Some(state) = &self.execution_restore {
+            self.vmr.restore_tsc_frequency_hz = Some(
+                state
+                    .windows_tsc_frequency_hz()
+                    .map_err(|e| Error::Build(BuildError::Start(format!("restore clock: {e}"))))?,
+            );
+        }
+
         let (_vmm, placement_report) = vmm::builder::build_microvm_paused(
             &mut self.vmr,
             &mut event_manager,

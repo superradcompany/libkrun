@@ -116,6 +116,9 @@ fn main() -> Result<()> {
             .transpose()?
             .unwrap_or(30),
     );
+    // The full-OS fixture reports CLOCK_MONOTONIC milliseconds. The bare-metal
+    // fixture uses timer counts, so opt in only for the full-OS workload.
+    let check_clock = std::env::var("TEST_CLOCK_MILLISECONDS").as_deref() == Ok("true");
     let split_irqchip = std::env::var("TEST_SPLIT_IRQCHIP")
         .ok()
         .map(|value| value.parse::<bool>())
@@ -178,6 +181,7 @@ fn main() -> Result<()> {
             let begin = Instant::now();
             let mut previous = None;
             let mut progress_started = None;
+            let mut clock_sample = None;
             loop {
                 if begin.elapsed() > progress_timeout {
                     return Err("inner counter/timer did not progress".into());
@@ -196,17 +200,30 @@ fn main() -> Result<()> {
                         let old: Progress = old;
                         if current.advanced_from(old) {
                             let started = progress_started.get_or_insert_with(Instant::now);
+                            let (sample_time, sample_ticks) = *clock_sample
+                                .get_or_insert_with(|| (Instant::now(), current.ticks));
                             if started.elapsed() >= Duration::from_secs(10) {
+                                if check_clock {
+                                    let ratio = f64::from(current.ticks - sample_ticks)
+                                        / sample_time.elapsed().as_secs_f64()
+                                        / 1000.0;
+                                    println!("guest/host elapsed-time ratio: {ratio:.4}");
+                                    if !(0.8..=1.2).contains(&ratio) {
+                                        return Err("nested guest clock rate changed".into());
+                                    }
+                                }
                                 println!("{mode}: inner progress={current:?} (previous={old:?})");
                                 break;
                             }
                         } else {
                             progress_started = None;
+                            clock_sample = None;
                         }
                     }
                     previous = Some(current);
                 } else {
                     progress_started = None;
+                    clock_sample = None;
                 }
                 thread::sleep(Duration::from_millis(200));
             }
