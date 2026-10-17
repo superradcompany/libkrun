@@ -32,8 +32,6 @@ use std::os::fd::{BorrowedFd, FromRawFd};
 #[cfg(not(target_os = "windows"))]
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -1673,6 +1671,9 @@ pub fn build_microvm_paused(
         .map_err(StartMicrovmError::Internal)?;
     }
 
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    let pit;
+
     #[cfg(target_os = "windows")]
     {
         // Size the guest-visible GIC redistributor range to the created topology:
@@ -1684,7 +1685,18 @@ pub fn build_microvm_paused(
             u64::from(setup_vcpu_count),
         )))));
         #[cfg(target_arch = "x86_64")]
+        {
+            pit = Arc::new(Mutex::new(
+                crate::windows::pit::Pit::new(intc.clone()).map_err(|error| {
+                    StartMicrovmError::Internal(Error::ExecutionStateBackend(format!(
+                        "create Windows PIT: {error}"
+                    )))
+                })?,
+            ));
+        }
+        #[cfg(target_arch = "x86_64")]
         let pio_bus = create_windows_x86_64_pio_bus(
+            pit.clone(),
             intc.clone(),
             &serial_devices,
             &exit_evt,
@@ -1872,6 +1884,8 @@ pub fn build_microvm_paused(
             all(target_os = "windows", target_arch = "x86_64")
         ))]
         irqchip: intc.clone(),
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        pit,
         #[cfg(feature = "blk")]
         quiesced_virtio_devices: Default::default(),
         #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
@@ -3617,25 +3631,6 @@ pub fn setup_serial_device(
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-struct WindowsX64PitStub {
-    channels: [u8; 3],
-    command: u8,
-    channel0_access: u8,
-    channel0_mode: u8,
-    channel0_write_lsb: Option<u8>,
-    channel0_period_ns: Arc<AtomicU64>,
-    channel0_periodic: Arc<AtomicBool>,
-    channel2_latch: u32,
-    channel2_started_at: Option<Instant>,
-    channel2_write_lsb: Option<u8>,
-    channel2_read_msb_next: bool,
-    running: Arc<AtomicBool>,
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-const PIT_TICK_RATE_HZ: u128 = 1_193_182;
-
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 #[derive(Default)]
 struct WindowsX64PicStub {
     command: u8,
@@ -3646,192 +3641,6 @@ struct WindowsX64PicStub {
 #[derive(Default)]
 struct WindowsX64PostCodeStub {
     value: u8,
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-impl WindowsX64PitStub {
-    fn new(intc: IrqChip) -> Self {
-        let channel0_period_ns = Arc::new(AtomicU64::new(0));
-        let channel0_periodic = Arc::new(AtomicBool::new(false));
-        let running = Arc::new(AtomicBool::new(true));
-        let thread_period = channel0_period_ns.clone();
-        let thread_periodic = channel0_periodic.clone();
-        let thread_running = running.clone();
-
-        // Channel 0 timer: ticks at the guest-programmed rate and injects
-        // IRQ0 through the IOAPIC route, which already drops it while the
-        // guest keeps the pin masked.
-        std::thread::spawn(move || {
-            while thread_running.load(Ordering::Relaxed) {
-                let period_ns = thread_period.load(Ordering::Relaxed);
-                if period_ns == 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    continue;
-                }
-                // Clamp so a tiny divisor cannot busy-spin the host;
-                // jiffies-grade timing is all a guest needs from a PIT.
-                std::thread::sleep(std::time::Duration::from_nanos(period_ns.max(1_000_000)));
-                if thread_period.load(Ordering::Relaxed) == 0 {
-                    continue;
-                }
-                {
-                    let intc = intc.lock().unwrap();
-                    if let Err(e) = intc.set_irq(Some(0), None) {
-                        trace!("PIT tick interrupt injection failed: {e:?}");
-                    }
-                }
-                if !thread_periodic.load(Ordering::Relaxed) {
-                    // One-shot modes fire once per reload.
-                    thread_period.store(0, Ordering::Relaxed);
-                }
-            }
-        });
-
-        Self {
-            channels: [0; 3],
-            command: 0,
-            channel0_access: 0,
-            channel0_mode: 0,
-            channel0_write_lsb: None,
-            channel0_period_ns,
-            channel0_periodic,
-            channel2_latch: 0,
-            channel2_started_at: None,
-            channel2_write_lsb: None,
-            channel2_read_msb_next: false,
-            running,
-        }
-    }
-
-    fn write_channel0(&mut self, value: u8) {
-        self.channels[0] = value;
-
-        let divisor = match self.channel0_access {
-            0b01 => u32::from(value),
-            0b10 => u32::from(value) << 8,
-            _ => {
-                if let Some(lsb) = self.channel0_write_lsb.take() {
-                    u32::from(u16::from_le_bytes([lsb, value]))
-                } else {
-                    self.channel0_write_lsb = Some(value);
-                    return;
-                }
-            }
-        };
-        let divisor = if divisor == 0 { 0x1_0000 } else { divisor };
-        let period_ns = u64::from(divisor) * 1_000_000_000 / PIT_TICK_RATE_HZ as u64;
-
-        // Modes 2 (rate generator) and 3 (square wave) reload themselves;
-        // everything else behaves as a one-shot.
-        self.channel0_periodic
-            .store(matches!(self.channel0_mode, 2 | 3), Ordering::Relaxed);
-        self.channel0_period_ns.store(period_ns, Ordering::Relaxed);
-    }
-
-    fn read_channel2(&mut self) -> u8 {
-        let counter = self.channel2_counter();
-        let value = if self.channel2_read_msb_next {
-            (counter >> 8) as u8
-        } else {
-            (counter & 0xff) as u8
-        };
-        self.channel2_read_msb_next = !self.channel2_read_msb_next;
-        value
-    }
-
-    fn write_channel2(&mut self, value: u8) {
-        self.channels[2] = value;
-
-        if self.command & 0xc0 == 0x80 && self.command & 0x30 == 0x30 {
-            if let Some(lsb) = self.channel2_write_lsb.take() {
-                let raw_latch = u16::from_le_bytes([lsb, value]);
-                self.channel2_latch = if raw_latch == 0 {
-                    0x1_0000
-                } else {
-                    u32::from(raw_latch)
-                };
-                self.channel2_started_at = Some(Instant::now());
-                self.channel2_read_msb_next = false;
-            } else {
-                self.channel2_write_lsb = Some(value);
-            }
-        }
-    }
-
-    fn channel2_counter(&self) -> u16 {
-        let Some(started_at) = self.channel2_started_at else {
-            return self.channel2_latch.min(u32::from(u16::MAX)) as u16;
-        };
-
-        // Linux early TSC calibration polls PIT channel 2 until the MSB changes.
-        // Returning a frozen byte makes that path burn the full 50k retry budget on WHP.
-        let elapsed_ticks = started_at
-            .elapsed()
-            .as_nanos()
-            .saturating_mul(PIT_TICK_RATE_HZ)
-            / 1_000_000_000;
-
-        if elapsed_ticks >= u128::from(self.channel2_latch) {
-            0
-        } else {
-            (u128::from(self.channel2_latch) - elapsed_ticks).min(u128::from(u16::MAX)) as u16
-        }
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-impl Drop for WindowsX64PitStub {
-    fn drop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-impl devices::BusDevice for WindowsX64PitStub {
-    fn read(&mut self, _vcpuid: u64, offset: u64, data: &mut [u8]) {
-        if data.len() != 1 {
-            return;
-        }
-
-        data[0] = match offset {
-            0..=1 => self.channels[offset as usize],
-            2 => self.read_channel2(),
-            3 => self.command,
-            _ => 0,
-        };
-    }
-
-    fn write(&mut self, _vcpuid: u64, offset: u64, data: &[u8]) {
-        if data.len() != 1 {
-            return;
-        }
-
-        match offset {
-            0 => self.write_channel0(data[0]),
-            1 => self.channels[1] = data[0],
-            2 => self.write_channel2(data[0]),
-            3 => {
-                self.command = data[0];
-                if self.command & 0xc0 == 0 {
-                    let access = (self.command >> 4) & 0x3;
-                    // Access 0 is the counter-latch command; anything else
-                    // reprograms the channel, so stop ticking until the
-                    // guest writes the new reload value.
-                    if access != 0 {
-                        self.channel0_access = access;
-                        self.channel0_mode = (self.command >> 1) & 0x7;
-                        self.channel0_write_lsb = None;
-                        self.channel0_period_ns.store(0, Ordering::Relaxed);
-                    }
-                }
-                if self.command & 0xc0 == 0x80 {
-                    self.channel2_write_lsb = None;
-                    self.channel2_read_msb_next = false;
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
@@ -3878,6 +3687,7 @@ impl devices::BusDevice for WindowsX64PostCodeStub {
 
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 fn create_windows_x86_64_pio_bus(
+    pit: Arc<Mutex<crate::windows::pit::Pit>>,
     intc: IrqChip,
     serial: &[Arc<Mutex<Serial>>],
     exit_evt: &EventFd,
@@ -3899,11 +3709,7 @@ fn create_windows_x86_64_pio_bus(
     }
 
     pio_bus
-        .insert(
-            Arc::new(Mutex::new(WindowsX64PitStub::new(intc.clone()))),
-            0x40,
-            0x4,
-        )
+        .insert(pit, 0x40, 0x4)
         .map_err(Error::LegacyPioBus)
         .map_err(StartMicrovmError::Internal)?;
 

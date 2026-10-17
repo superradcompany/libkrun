@@ -451,6 +451,13 @@ fn current_execution_backend_state_abi(nested_enabled: bool) -> u32 {
     if cfg!(all(target_os = "linux", target_arch = "x86_64")) && nested_enabled {
         // ABI 3 binds the nested-state blob to the source KVM feature MSRs.
         3
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        // PIT programming and timer phase are mandatory for reliable guest time.
+        if nested_enabled {
+            4
+        } else {
+            2
+        }
     } else {
         1
     }
@@ -577,6 +584,8 @@ pub enum Error {
     MemoryRestoreAfterActivation,
     /// The artifact targets a different backend, architecture, backend ABI, or nesting mode.
     ExecutionStateIncompatible,
+    /// Older Windows snapshots omitted the emulated PIT clock.
+    ExecutionStateMissingPit,
     /// This backend has not qualified nested execution-state capture and restore.
     NestedExecutionStateUnsupported,
     /// The artifact vCPU topology differs from the constructed VMM.
@@ -696,6 +705,10 @@ impl Display for Error {
                 f,
                 "execution state is incompatible with this backend, architecture, or nesting mode"
             ),
+            ExecutionStateMissingPit => write!(
+                f,
+                "this older Windows snapshot has no PIT timer state; restart from its saved disk and capture a new full snapshot, or explicitly recover with the known periodic PIT reload and validate the guest before recapturing"
+            ),
             NestedExecutionStateUnsupported => write!(
                 f,
                 "nested execution-state capture and restore are not supported by this backend"
@@ -789,6 +802,8 @@ pub struct Vmm {
         all(target_os = "windows", target_arch = "x86_64")
     ))]
     irqchip: IrqChip,
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    pit: Arc<Mutex<windows::pit::Pit>>,
     #[cfg(feature = "blk")]
     quiesced_virtio_devices: BTreeSet<(u32, String)>,
     #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
@@ -814,6 +829,7 @@ struct LinuxArmVmExecutionState {
 struct WindowsX86VmExecutionState {
     vm: Vec<u8>,
     ioapic: Vec<u8>,
+    pit: windows::pit::PitState,
 }
 
 impl Vmm {
@@ -1277,6 +1293,8 @@ impl Vmm {
         }
 
         self.wait_for_vcpu_barrier(request_id, VcpuControlTarget::Paused)?;
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        self.pit.lock().unwrap().pause();
         #[cfg(target_os = "windows")]
         self.vm
             .pause_execution_time(self.vcpus_handles.len())
@@ -1344,6 +1362,12 @@ impl Vmm {
         // vCPU worker. A failure leaves execution indeterminate, never Running.
         #[cfg(target_os = "windows")]
         self.vm.resume_execution_time().map_err(Error::Vm)?;
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        self.pit
+            .lock()
+            .unwrap()
+            .resume()
+            .map_err(Error::ExecutionStateBackend)?;
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         self.vm
             .resume_execution_time(&self.vcpus_handles)
@@ -1454,7 +1478,16 @@ impl Vmm {
                 .ok_or_else(|| Error::ExecutionStateBackend("missing WHP IOAPIC state".into()))?;
             let vm = self.vm.capture_execution_state().map_err(Error::Vm)?;
             bincode::serde::encode_to_vec(
-                WindowsX86VmExecutionState { vm, ioapic },
+                WindowsX86VmExecutionState {
+                    vm,
+                    ioapic,
+                    pit: self
+                        .pit
+                        .lock()
+                        .unwrap()
+                        .capture()
+                        .map_err(Error::ExecutionStateBackend)?,
+                },
                 bincode::config::standard(),
             )
             .map_err(|error| Error::ExecutionStateBackend(error.to_string()))?
@@ -1501,6 +1534,13 @@ impl Vmm {
         self.require_paused_execution_boundary()?;
         if !self.execution_restore_allowed {
             return Err(Error::ExecutionRestoreAfterActivation);
+        }
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        if state.architecture() == ExecutionArchitecture::X86_64
+            && state.backend() == ExecutionBackend::Whp
+            && state.backend_state_abi() == if state.nested_enabled() { 3 } else { 1 }
+        {
+            return Err(Error::ExecutionStateMissingPit);
         }
         if !execution_state_backend_is_compatible(state, self.nested_enabled) {
             return Err(Error::ExecutionStateIncompatible);
@@ -1627,6 +1667,11 @@ impl Vmm {
             if used != state.vm_state().len() {
                 return Err(Error::ExecutionStateBackend("trailing WHP VM state".into()));
             }
+            self.pit
+                .lock()
+                .unwrap()
+                .restore(backend.pit)
+                .map_err(Error::ExecutionStateBackend)?;
             self.vm
                 .restore_execution_state(&backend.vm)
                 .map_err(Error::Vm)?;

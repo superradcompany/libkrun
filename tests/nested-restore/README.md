@@ -35,8 +35,9 @@ To capture again after restoring, set `TEST_OUTPUT_SNAPSHOT` to a new directory.
 Restore that directory in another process to check a second generation. To test
 forks, restore the same baseline into different `TEST_ROOT` directories. Do not
 share output directories between concurrent runs. Require the printed `PASS`
-marker as well as exit code zero: guest shutdown can terminate the runtime before
-the controller finishes.
+marker after ten seconds of advancing counter and interrupt samples as well as
+exit code zero. The observation window restarts on stalled progress; guest shutdown
+before the controller finishes is a failure.
 
 The fixture has no persistent guest disk or host filesystem mount. CPU, guest
 memory and supported virtio device states are captured through production APIs.
@@ -44,7 +45,16 @@ It does not qualify sandbox filesystem recovery or CPU migration across hosts.
 
 2026-10-13: Intel Linux/KVM passed capture, fresh-process restore, two independent
 restores from one baseline, and capture/restore of a second generation using the
-candidate KVM capability contract and the diagnostic guard bypass.
+candidate KVM capability contract and the diagnostic guard bypass. AMD Linux and
+Intel Windows require their own live-restore results before admission can open.
+
+On Windows the harness uses an explicit `hvc0` output device. On the AMD
+Windows Server 2025 host, the initial diagnostic restore resumed the counter but
+lost PIT interrupts. Reapplying saved interrupt state after WHP NestedState fixed
+that reproduction. The candidate then passed two concurrent restores and repeated
+recapture/restore generations. Progress lines include IF flags and PIC state to
+help diagnose interrupt delivery. Counter progress alone is insufficient, and
+Intel Windows, broader workloads and filesystem recovery remain unqualified.
 
 2026-10-14: AMD EPYC 9B45 with Linux 7.0.0-1014-gcp passed capture,
 fresh-process restore, concurrent forks and a second snapshot generation after

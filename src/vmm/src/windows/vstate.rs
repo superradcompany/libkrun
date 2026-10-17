@@ -775,6 +775,8 @@ pub struct VcpuHandle {
 #[derive(Default)]
 struct Partition {
     handle: WHV_PARTITION_HANDLE,
+    #[cfg(target_arch = "x86_64")]
+    nested_enabled: bool,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1145,12 +1147,21 @@ impl Vm {
 
     #[cfg(target_arch = "x86_64")]
     pub fn capture_execution_state(&self) -> Result<Vec<u8>> {
-        x86_state::capture_vm(self.partition.handle, &self.sipi_router)
+        x86_state::capture_vm(
+            self.partition.handle,
+            &self.sipi_router,
+            self.partition.nested_enabled,
+        )
     }
 
     #[cfg(target_arch = "x86_64")]
     pub fn restore_execution_state(&mut self, bytes: &[u8]) -> Result<()> {
-        x86_state::restore_vm(self.partition.handle, &self.sipi_router, bytes)?;
+        x86_state::restore_vm(
+            self.partition.handle,
+            &self.sipi_router,
+            bytes,
+            self.partition.nested_enabled,
+        )?;
         self.time_suspended = true;
         Ok(())
     }
@@ -1161,12 +1172,17 @@ impl Vm {
         id: u32,
         _worker_bytes: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        x86_state::capture_cpu(self.partition.handle, id)
+        x86_state::capture_cpu(self.partition.handle, id, self.partition.nested_enabled)
     }
 
     #[cfg(target_arch = "x86_64")]
     pub fn prepare_vcpu_execution_restore(&self, id: u32, bytes: &[u8]) -> Result<Vec<u8>> {
-        x86_state::restore_cpu(self.partition.handle, id, bytes)?;
+        x86_state::restore_cpu(
+            self.partition.handle,
+            id,
+            bytes,
+            self.partition.nested_enabled,
+        )?;
         Ok(Vec::new())
     }
 
@@ -1902,7 +1918,11 @@ impl Partition {
             return Err(Error::CreatePartition(hresult));
         }
 
-        let partition = Self { handle };
+        let partition = Self {
+            handle,
+            #[cfg(target_arch = "x86_64")]
+            nested_enabled,
+        };
         partition.set_processor_count(vcpu_count)?;
         if nested_enabled {
             partition.enable_nested_virt()?;
@@ -1913,9 +1933,94 @@ impl Partition {
         partition.set_x64_extended_vm_exits(vcpu_count)?;
         #[cfg(target_arch = "aarch64")]
         partition.set_arm64_ic_parameters()?;
+        #[cfg(target_arch = "x86_64")]
+        if nested_enabled {
+            partition.enable_enlightened_vmcs()?;
+        }
         partition.setup()?;
 
         Ok(partition)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn enable_enlightened_vmcs(&self) -> Result<()> {
+        use windows_sys::Win32::System::Hypervisor::{
+            WHvCapabilityCodeSyntheticProcessorFeaturesBanks,
+            WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
+            WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS,
+        };
+
+        // Only Intel VMX uses eVMCS. Preserve AMD's existing SVM guest contract.
+        let mut capability: WHV_CAPABILITY = unsafe { zeroed() };
+        let mut written = 0;
+        let code = windows_sys::Win32::System::Hypervisor::WHvCapabilityCodeProcessorVendor;
+        let hresult = unsafe {
+            WHvGetCapability(
+                code,
+                (&mut capability as *mut WHV_CAPABILITY).cast(),
+                size_of::<WHV_CAPABILITY>() as u32,
+                &mut written,
+            )
+        };
+        if hresult < 0 {
+            return Err(Error::GetCapability { code, hresult });
+        }
+        if unsafe { capability.ProcessorVendor }
+            != windows_sys::Win32::System::Hypervisor::WHvProcessorVendorIntel
+        {
+            return Ok(());
+        }
+
+        // SDK WHV_SYNTHETIC_PROCESSOR_FEATURES: HypervisorPresent, Hv1,
+        // reference counter, VP assist/APIC, hypercalls, VP index, reference TSC,
+        // frequency registers, and EnlightenedVmcs. Do not expose unrelated
+        // synthetic timers, flush hypercalls, or nested enlightenments.
+        const REQUIRED: u64 =
+            3 | (1 << 3) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 11) | (1 << 32);
+        let mut features = WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS::default();
+        let mut written = 0;
+        let code = WHvCapabilityCodeSyntheticProcessorFeaturesBanks;
+        let hresult = unsafe {
+            WHvGetCapability(
+                code,
+                (&mut features as *mut WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS).cast(),
+                size_of::<WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS>() as u32,
+                &mut written,
+            )
+        };
+        if hresult as u32 == 0x8037_0300 {
+            // WHV_E_UNKNOWN_CAPABILITY on older WHP builds.
+            return Ok(());
+        }
+        if hresult < 0 {
+            return Err(Error::GetCapability { code, hresult });
+        }
+        if written as usize != size_of::<WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS>()
+            || features.BanksCount != 1
+        {
+            return Err(Error::StateCodec(
+                "invalid WHP synthetic feature banks".into(),
+            ));
+        }
+        if unsafe { features.Anonymous.AsUINT64[0] } & REQUIRED != REQUIRED {
+            // Ordinary nested execution remains available, but snapshot capture
+            // rejects a current non-enlightened VMCS rather than losing its cache.
+            return Ok(());
+        }
+        features.Anonymous.AsUINT64 = [REQUIRED];
+        let property = WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks;
+        let hresult = unsafe {
+            WHvSetPartitionProperty(
+                self.handle,
+                property,
+                (&features as *const WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS).cast(),
+                size_of::<WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS>() as u32,
+            )
+        };
+        if hresult < 0 {
+            return Err(Error::SetPartitionProperty { property, hresult });
+        }
+        Ok(())
     }
 
     fn enable_nested_virt(&self) -> Result<()> {

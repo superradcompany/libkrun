@@ -146,7 +146,16 @@ fn main() -> Result<()> {
             k.krunfw_path(std::env::var("KRUNFW_PATH").unwrap())
                 .initramfs_path(std::env::var("TEST_INITRAMFS").unwrap())
         })
-        .console(|c| c.output(root.join("console.log")))
+        .console(|c| {
+            #[cfg(target_os = "windows")]
+            {
+                c.disable_implicit().virtio_output(root.join("console.log"))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                c.output(root.join("console.log"))
+            }
+        })
         .build()?;
     if mode == "restore" {
         vm.set_execution_restore(vmm::execution_state::ExecutionState::decode(&fs::read(
