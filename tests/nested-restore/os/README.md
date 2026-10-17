@@ -36,6 +36,7 @@ Use the [shared harness](../README.md), with these additional settings:
 export TEST_INITRAMFS=/tmp/nested-os/parent.cpio
 export TEST_MEMORY_MIB=1024
 export TEST_PROGRESS_TIMEOUT_SECONDS=120
+export TEST_CLOCK_MILLISECONDS=true
 ```
 
 The longer deadline allows Linux to boot; the continuous ten-second observation
