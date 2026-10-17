@@ -1,7 +1,7 @@
 # Live nested VM restore probe
 
 This harness boots a Linux parent VM whose KVM child continuously updates
-a counter and services PIT interrupts. Capture and restore run in separate host
+a counter and services timer interrupts. Capture and restore run in separate host
 processes. Restore requires the original workload identity and continued timer
 and counter progress, so rebooting the workload cannot pass.
 
@@ -65,6 +65,58 @@ Intel Linux capture and restore also passed with the complete inventory.
 Older diagnostic nested artifacts with incomplete MSR inventories now reject
 before restore. The ordinary snapshot format and MSR inventory are unchanged.
 Intel Windows, Linux ARM64 and broader workloads still require qualification.
+
+On Windows the harness uses an explicit `hvc0` output device. On the AMD
+Windows Server 2025 host, the initial diagnostic restore resumed the counter but
+lost PIT interrupts. Reapplying saved interrupt state after WHP NestedState fixed
+that reproduction. The candidate then passed two concurrent restores and repeated
+recapture/restore generations. Progress lines include IF flags and PIC state to
+help diagnose interrupt delivery. Counter progress alone is insufficient, and
+Intel Windows, broader workloads and filesystem recovery remain unqualified.
+
+## ARM64 on macOS
+
+Build the KVM parent and its bare-metal ARM64 child together:
+
+```sh
+zig cc -target aarch64-linux-musl -static -pthread -Wall -Wextra -Werror \
+  tests/nested-restore/guest-arm64.c tests/nested-restore/inner-arm64.S -o guest
+```
+
+Package `guest` as `/init` in the initramfs described above. The parent kernel
+must include ARM KVM and VGICv3. The child runs at EL1, continuously updates RAM,
+and handles virtual timer PPI 27 through its virtual GIC. Progress includes a
+workload identity, interrupt count, fatal-exception flag, and parent monotonic time.
+
+Use the same host harness and environment variables, with `KRUNFW_PATH` pointing
+to an ARM64 libkrunfw dylib. macOS loads `TEST_INITRAMFS` through the kernel-copy
+path. Codesign the exact host executable before running it:
+
+```sh
+codesign --force -s - --entitlements /path/to/msb-entitlements.plist \
+  tests/nested-restore/target/debug/nested-restore-live
+```
+
+The macOS build still rejects nested capture. Use a diagnostic build only
+for backend qualification. In addition to the initial restore, recapture a
+restored VM and restore that second snapshot: the original HVF ordering could
+pass the first restore but stall on the second generation. The clock offset must
+be installed before the saved timer registers so deadlines use the restored clock.
+
+On 2026-10-13, Apple M5 Pro with macOS 26.5.1 passed diagnostic capture,
+two concurrent restores from one baseline and a separate chain of four successive
+restores. The same saved second-generation snapshot that stalled with the old
+clock ordering resumed after the ordering fix. Two additional saved artifacts
+exposed an internal error when the parent was captured at EL1, and bursty progress with an expired, notification-masked timer.
+Initializing the fresh CPU at EL2 before restoring its saved mode and rearming
+nested timer notifications fixed both exact reproductions. Fresh capture,
+concurrent restores and repeated recapture/restore pass the strict ten-second
+progress check. Preserve captures from the parent at EL1 and from EL2 timer
+handling: a chain that only stops the child in its counter loop misses these cases.
+The guest prints KVM internal-error data and its kernel log on failure.
+
+These passes do not qualify a full inner operating system, filesystem recovery
+or cross-host migration. The macOS nested-snapshot guard remains closed.
 
 ## Continuous integration
 

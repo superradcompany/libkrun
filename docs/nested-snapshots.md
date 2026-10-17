@@ -132,3 +132,32 @@ original CPU payload and does not bypass host compatibility checks. The missing
 phase, partial programming, and other channels cannot be reconstructed; validate
 the recovered guest and capture a new snapshot. Older nested ABI 2 snapshots cannot
 use this recovery because their non-enlightened VMCS state is independently unsafe.
+
+## macOS native qualification
+
+On Apple M5 Pro with macOS 26.5.1 (25F80), production CPU/GIC capture and two
+independent fresh-VM restores pass in the native EL2 counter probe. Recapturing
+a restored VM and restoring that state again also passes. The earlier MDCR_EL2
+failure came from an obsolete SDK encoding; it was not an unavailable API.
+Capture also now uses ICH_VTR_EL2's implemented list-register count (eight on
+this host), and restore checks the destination inventory before writing CPU state.
+
+The small probe in `tests/nested-restore-hvf` rejects watchdog cancellation as
+successful execution. The ARM64 fixture in `tests/nested-restore` additionally
+runs a real KVM child at EL1 with a virtual GIC and 100 Hz timer interrupts.
+Diagnostic full-memory capture and fresh-process restore preserved its identity,
+counter and interrupts for at least ten seconds. Two concurrent restores from
+one baseline passed, as did a separate chain of four successive restores.
+
+That workload exposed a restore-order defect: installing the HVF clock offset
+after timer registers could stall a recaptured VM. Installing the offset first
+resumed the same saved failing snapshot, without discarding clock rebasing.
+Two further saved failures required initializing the fresh vCPU at EL2 before
+restoring its saved mode, and rearming the framework's timer notifications. A
+parent captured at EL1 otherwise returned NOT_SUPPORTED from its next nested
+hypercall; retaining the old notification mask caused bursty timer progress.
+Both exact artifacts now pass the sustained-progress check. Architectural timer
+and GIC state are restored; only the nested framework notification mask is reset.
+Fresh capture, concurrent restores and repeated recapture/restore also pass.
+Nested snapshot admission stays closed. This fixture does not qualify a full
+inner operating system, sandbox filesystem recovery or cross-host migration.
