@@ -5078,12 +5078,13 @@ pub mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
     #[test]
-    fn nested_execution_refusal_precedes_backend_work() {
+    fn nested_execution_admission_preserves_paused_boundary() {
         // No guest instruction executes. Construct an ordinary paused VM so this
         // admission test does not depend on the CI host exposing VMX or SVM.
         let kernel: GuestMemoryMmap =
             GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
         let mut resources = VmResources::default();
+        resources.nested_enabled = false;
         resources.kernel_bundle = Some(KernelBundle {
             host_addr: kernel.get_host_address(GuestAddress(0)).unwrap() as u64,
             guest_addr: 0x20_0000,
@@ -5105,10 +5106,16 @@ pub mod tests {
         vmm.nested_enabled = true;
         let before_request = vmm.control_request_id;
         let before_pause = vmm.require_paused_execution_boundary().unwrap();
-        assert!(matches!(
-            vmm.capture_execution_state(),
-            Err(crate::Error::NestedExecutionStateUnsupported)
-        ));
+        if cfg!(feature = "aws-nitro") {
+            assert!(matches!(
+                vmm.capture_execution_state(),
+                Err(crate::Error::NestedExecutionStateUnsupported)
+            ));
+        } else {
+            // Admission is read-only. This ordinary fixture has no nested vCPU
+            // payload, so real nested capture belongs to the live restore harness.
+            vmm.require_nested_execution_state_support().unwrap();
+        }
         assert_eq!(vmm.control_request_id, before_request);
         assert_eq!(
             vmm.require_paused_execution_boundary().unwrap(),
@@ -5118,19 +5125,27 @@ pub mod tests {
         let state = crate::ExecutionState::new(
             crate::current_execution_architecture(),
             crate::current_execution_backend(),
-            crate::current_execution_backend_state_abi(),
+            crate::current_execution_backend_state_abi(true),
             1,
             Vec::new(),
-            (0..vmm.vcpus_handles.len())
-                .map(|id| crate::VcpuExecutionState::new(id as u32, Vec::new()).unwrap())
-                .collect(),
+            Vec::new(),
         )
         .unwrap()
         .with_nested_enabled(true);
-        assert!(matches!(
-            vmm.restore_execution_state(&state),
-            Err(crate::Error::NestedExecutionStateUnsupported)
-        ));
+        let error = vmm.restore_execution_state(&state).unwrap_err();
+        if cfg!(feature = "aws-nitro") {
+            assert!(matches!(
+                error,
+                crate::Error::NestedExecutionStateUnsupported
+            ));
+        } else {
+            // The nested policy admits this host, but missing vCPU state must
+            // still fail before backend dispatch or destination mutation.
+            assert!(matches!(
+                error,
+                crate::Error::ExecutionStateTopologyMismatch
+            ));
+        }
         assert_eq!(vmm.control_request_id, before_request);
         assert_eq!(
             vmm.require_paused_execution_boundary().unwrap(),

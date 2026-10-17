@@ -1,0 +1,15 @@
+[package]
+name = "nested-restore-live"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+msb_krun = { path = "../../src/krun", features = ["blk"] }
+vmm = { package = "msb_krun_vmm", path = "../../src/vmm", features = ["blk"] }
+
+[[bin]]
+name = "nested-restore-live"
+path = "main.rs"

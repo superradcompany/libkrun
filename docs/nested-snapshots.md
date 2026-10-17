@@ -76,3 +76,22 @@ Sources:
 - https://docs.hetzner.com/cloud/servers/windows-on-cloud/
 - https://docs.hetzner.com/cloud/servers/faq/
 - https://docs.hetzner.com/robot/dedicated-server/server-lines/apple-rx-server/
+
+## Linux x86 implementation status
+
+The draft backend transports bounded KVM nested-state blobs and restores them after
+ordinary CPU/MSR state, before saved vCPU events. Nested payloads use backend ABI 3
+and include source KVM feature MSRs; ordinary payloads remain ABI 1. No dependency
+version bump is needed. A read-only preflight checks every paused destination vCPU's
+CPUID, TSC frequency, MSR inventory and KVM feature MSRs before restoring VM state.
+
+The VMM admission gate deliberately remains closed. On 2026-10-13 an Intel GCloud
+host passed diagnostic capture and fresh-process restore of a running KVM inner VM,
+two independent restores from one baseline, and a second capture/restore generation.
+The fixture checks workload identity, counter progress and PIT interrupt progress.
+The ordinary build still refuses nested capture. Native idle-state transfer,
+incompatible-feature rejection and bounded codec checks also passed.
+
+These diagnostic results do not qualify AMD Linux, broader interrupt workloads,
+cross-host migration or sandbox filesystem recovery. Complete those checks and
+review each vendor's active nested restore ordering before opening admission.

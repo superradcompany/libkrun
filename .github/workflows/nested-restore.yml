@@ -1,0 +1,69 @@
+name: Nested restore
+
+on:
+  pull_request:
+  push:
+    branches: [krun]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nested-restore-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-x86:
+    name: Running nested VM (Linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      NESTED_TEST_DIR: ${{ github.workspace }}/nested-test-output
+      NESTED_FIRMWARE_DIR: ${{ github.workspace }}/test-firmware
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: superradcompany/libkrunfw
+          ref: 56bf194627a07996dc4ce21211fe86ada4c76080
+          path: test-firmware
+          persist-credentials: false
+      - name: Check nested virtualization host
+        run: |
+          lscpu
+          test -c /dev/kvm
+          grep -Eq '(vmx|svm)' /proc/cpuinfo
+          for module in kvm_intel kvm_amd; do
+            if test -f /sys/module/$module/parameters/nested; then
+              grep -Eq '^(Y|1)$' /sys/module/$module/parameters/nested
+            fi
+          done
+          sudo chmod a+rw /dev/kvm
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential musl-tools flex bison libelf-dev libssl-dev bc python3 python3-pyelftools
+          rustup target add x86_64-unknown-linux-musl
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: nested-cargo-${{ runner.os }}-${{ hashFiles('tests/nested-restore/**/Cargo.lock', 'tests/nested-restore/Cargo.lock') }}
+      - name: Build Rust guest, host harness and firmware
+        run: tests/nested-restore/ci.sh build
+      - name: Capture, restore, fork and recapture with both IRQ profiles
+        run: tests/nested-restore/ci.sh run
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nested-restore-linux-x86_64
+          path: |
+            ${{ github.workspace }}/nested-test-output/**/*.log
+            ${{ github.workspace }}/nested-test-output/**/progress
+            test-firmware/linux-*/.config
+          if-no-files-found: warn
