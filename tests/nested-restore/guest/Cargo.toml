@@ -1,0 +1,12 @@
+[package]
+name = "nested-counter-guest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+kvm-bindings = "=0.14.2"
+kvm-ioctls = "=0.25.1"
+libc = "0.2"

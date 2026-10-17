@@ -1,6 +1,6 @@
 # Live nested VM restore probe
 
-This manual harness boots a Linux parent VM whose KVM child continuously updates
+This harness boots a Linux parent VM whose KVM child continuously updates
 a counter and services timer interrupts. Capture and restore run in separate host
 processes. Restore requires the original workload identity and continued timer
 and counter progress, so rebooting the workload cannot pass.
@@ -11,7 +11,9 @@ nesting are unsupported. Run this harness without an admission bypass. The dated
 results below describe earlier diagnostic builds; see `docs/nested-snapshots.md`
 for the current platform policy and qualification scope.
 
-Build `guest.c` as a static Linux x86 executable and place it at `/init` in an
+Build the Rust counter guest with `cargo build --locked --release --target
+x86_64-unknown-linux-musl --manifest-path tests/nested-restore/guest/Cargo.toml`
+and place `nested-counter-guest` at `/init` in an
 initramfs containing `/dev/console` (character device 5:1) and `/dev`. The parent
 kernel needs KVM, VMX/SVM, IRQ chip and PIT support. On Linux x86 the existing
 firmware mmap boot path does not load an external initramfs, so embed it in the
@@ -115,3 +117,20 @@ The guest prints KVM internal-error data and its kernel log on failure.
 These passes do not qualify a full inner operating system, filesystem recovery
 or cross-host migration. They are historical counter-fixture results; the full-OS
 qualification scope is recorded in `docs/nested-snapshots.md`.
+
+## Continuous integration
+
+The `Nested restore` workflow runs the Rust x86 counter fixture on Linux for pull
+requests and pushes to `krun`. It captures a running nested VM, restores it in a
+fresh process, forks the original capture, recaptures a restored VM and restores
+that second generation. Both in-kernel and split outer IRQ controllers are tested.
+Missing KVM/nesting or stalled counter/timer progress fails the job; it never skips
+the live test. Logs and kernel configuration are retained as workflow artifacts.
+
+`ci.sh build` builds the static guest, harness and pinned firmware with an embedded
+initramfs; `ci.sh run` executes the matrix. Set `NESTED_TEST_DIR` to a dedicated
+output directory and `NESTED_FIRMWARE_DIR` to a clean libkrunfw checkout. The build
+requires the packages and Rust target listed in the workflow. No production kernel
+or runtime admission bypass is used. This job qualifies Linux x86 on the runner
+CPU only; Windows, macOS, cross-frequency and full-OS disk tests remain separate
+qualification runs.
