@@ -28,7 +28,7 @@ LIST
     make -C "$firmware" "$kernel"
     "$firmware/$kernel/scripts/config" --file "$firmware/$kernel/.config" --set-str INITRAMFS_SOURCE "$work/initramfs.list"
     make -C "$firmware/$kernel" olddefconfig
-    make -C "$firmware" -j "${NESTED_BUILD_JOBS:-4}"
+    (cd "$firmware" && make -j "${NESTED_BUILD_JOBS:-4}")
     ;;
   run)
     test -r /dev/kvm && test -w /dev/kvm

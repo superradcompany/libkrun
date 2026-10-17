@@ -3,7 +3,7 @@ name: Nested restore
 on:
   pull_request:
   push:
-    branches: [krun, toks/nested-snapshot-qualified]
+    branches: [krun]
   workflow_dispatch:
 
 permissions:
