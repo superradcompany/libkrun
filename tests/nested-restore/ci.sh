@@ -11,6 +11,8 @@ export CARGO_TARGET_DIR="$work/target"
 
 case "${1:-}" in
   build)
+    cargo fmt --manifest-path "$repo/tests/nested-restore/guest/Cargo.toml" -- --check
+    cargo clippy --locked --target x86_64-unknown-linux-musl --manifest-path "$repo/tests/nested-restore/guest/Cargo.toml" -- -D warnings
     cargo build --locked --release --target x86_64-unknown-linux-musl --manifest-path "$repo/tests/nested-restore/guest/Cargo.toml"
     cargo build --locked --manifest-path "$repo/tests/nested-restore/Cargo.toml"
     cargo test --locked --manifest-path "$repo/tests/nested-restore/Cargo.toml"
