@@ -31,6 +31,13 @@ tests/nested-restore/target/debug/nested-restore-live capture
 tests/nested-restore/target/debug/nested-restore-live restore
 ```
 
+On Linux x86_64, set `TEST_SPLIT_IRQCHIP=true` to use the outer VM's split
+interrupt controller, matching Microsandbox's runtime configuration. The default
+is `false`, preserving the fully in-kernel controller as a separate test profile.
+Use the same value for capture and restore. The harness prints the selected
+profile and rejects this option on other host platforms. This controls libkrun's
+outer VM, not the `kernel_irqchip` setting of QEMU inside the guest.
+
 To capture again after restoring, set `TEST_OUTPUT_SNAPSHOT` to a new directory.
 Restore that directory in another process to check a second generation. To test
 forks, restore the same baseline into different `TEST_ROOT` directories. Do not
@@ -39,7 +46,9 @@ marker after ten seconds of advancing counter and interrupt samples as well as
 exit code zero. The observation window restarts on stalled progress; guest shutdown
 before the controller finishes is a failure.
 
-The fixture has no persistent guest disk or host filesystem mount. CPU, guest
+For a complete Linux guest with an ext4 workload, use the [full-OS fixture](os/README.md).
+
+The counter fixture has no persistent guest disk or host filesystem mount. CPU, guest
 memory and supported virtio device states are captured through production APIs.
 It does not qualify sandbox filesystem recovery or CPU migration across hosts.
 
