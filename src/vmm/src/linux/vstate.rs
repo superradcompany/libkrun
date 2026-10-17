@@ -2571,7 +2571,7 @@ impl VcpuState {
     ) -> Result<Vec<u8>> {
         let config = bincode::config::standard();
         match nested {
-            Some(nested) => bincode::serde::encode_to_vec(&(self, nested), config),
+            Some(nested) => bincode::serde::encode_to_vec((self, nested), config),
             None => bincode::serde::encode_to_vec(self, config),
         }
         .map_err(|error| Error::StateCodec(error.to_string()))

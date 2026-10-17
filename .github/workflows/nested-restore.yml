@@ -45,7 +45,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential musl-tools flex bison libelf-dev libssl-dev bc python3
+          sudo apt-get install -y build-essential musl-tools flex bison libelf-dev libssl-dev bc python3 python3-pyelftools
           rustup target add x86_64-unknown-linux-musl
       - uses: actions/cache@v4
         with:
