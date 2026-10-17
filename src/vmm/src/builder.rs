@@ -1308,7 +1308,9 @@ pub fn build_microvm_paused(
     let mut vcpu_config = vm_resources.vcpu_config();
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    let host_tsc_hz = crate::windows::vstate::host_tsc_frequency_hz();
+    let host_tsc_hz = vm_resources
+        .restore_tsc_frequency_hz
+        .or_else(crate::windows::vstate::host_tsc_frequency_hz);
     #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
     let host_tsc_hz = None;
 
@@ -1365,9 +1367,22 @@ pub fn build_microvm_paused(
     let setup_vcpu_count = vcpu_config.max_vcpu_count.max(vcpu_config.vcpu_count);
     #[cfg(all(not(target_os = "windows"), not(feature = "tee")))]
     let setup_vcpu_count = vcpu_config.vcpu_count;
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     #[allow(unused_mut)]
     let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled, setup_vcpu_count)?;
+    #[cfg(all(not(feature = "tee"), target_os = "windows"))]
+    let vm = {
+        #[cfg(target_arch = "x86_64")]
+        let frequency = vm_resources.restore_tsc_frequency_hz;
+        #[cfg(not(target_arch = "x86_64"))]
+        let frequency = None;
+        setup_vm(
+            &guest_memory,
+            vm_resources.nested_enabled,
+            setup_vcpu_count,
+            frequency,
+        )?
+    };
     trace.mark("vm.ready");
 
     #[cfg(feature = "tee")]
@@ -3589,8 +3604,9 @@ pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
     nested_enabled: bool,
     vcpu_count: u8,
+    frequency: Option<u64>,
 ) -> std::result::Result<Vm, StartMicrovmError> {
-    let mut vm = Vm::new(vcpu_count, nested_enabled)
+    let mut vm = Vm::with_clock(vcpu_count, nested_enabled, frequency)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
     vm.memory_init(guest_memory)

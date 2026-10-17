@@ -126,6 +126,34 @@ impl VcpuExecutionState {
 }
 
 impl ExecutionState {
+    /// Guest counter frequency required before constructing a Windows x86 partition.
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    pub fn windows_tsc_frequency_hz(&self) -> std::result::Result<u64, String> {
+        if self.architecture == ExecutionArchitecture::X86_64
+            && self.backend == ExecutionBackend::Whp
+            && self.backend_state_abi == if self.nested_enabled { 3 } else { 1 }
+        {
+            return Err(crate::Error::ExecutionStateMissingPit.to_string());
+        }
+        if self.architecture != ExecutionArchitecture::X86_64
+            || self.backend != ExecutionBackend::Whp
+            || self.backend_state_abi != if self.nested_enabled { 4 } else { 2 }
+        {
+            return Err("unsupported Windows execution state for clock restore".into());
+        }
+        let (vm, used): (crate::WindowsX86VmExecutionState, usize) =
+            bincode::serde::decode_from_slice(
+                &self.vm_state,
+                bincode::config::standard().with_limit::<{ 1024 * 1024 }>(),
+            )
+            .map_err(|e| e.to_string())?;
+        if used != self.vm_state.len() {
+            return Err("trailing WHP VM state".into());
+        }
+        crate::windows::vstate::x86_state::saved_frequency(&vm.vm, self.nested_enabled)
+            .map_err(|e| e.to_string())
+    }
+
     /// Recover an older Windows x86 snapshot by explicitly supplying a periodic PIT reload.
     ///
     /// Only ordinary ABI 1 and enlightened nested ABI 3 can be recovered. The original

@@ -1,10 +1,77 @@
 # Nested virtualization implementation stack
 
-This is an implementation plan, not a claim of released support. Nesting remains opt-in.
-Full snapshots and forks remain disabled in Microsandbox until the relevant backend passes
-live restore qualification. Disk-only snapshots are unaffected.
+Nested virtualization defaults to enabled where the host confirms support, and disabled
+elsewhere. An explicit enable still fails on unsupported hosts; an explicit disable is
+always honored. Execution-state capture and
+restore are enabled on qualified Linux x86-64 (Intel and AMD), Windows x86-64 (Intel and AMD),
+and Apple Silicon macOS hosts, subject to the backend's hardware and restore checks.
+Linux ARM64 and Windows ARM64 nesting are not currently supported and default to off; explicitly enabling nesting fails
+with an unsupported error. Ordinary ARM64 VMs and their snapshots are unaffected.
 
-## Dependencies
+The 2026-10-14 qualification includes a running inner Linux VM through fresh restore,
+two forks, and second-generation capture/restore. Linux and Windows x86-64 also
+passed Microsandbox archive export/import. macOS results cover the libkrun full-OS
+fixture; the Microsandbox archive workflow still needs an end-to-end macOS run.
+The inner workload retains its memory identity and resumes counter, timer, and disk progress.
+These results do not promise cross-host migration, external mount recovery, or restored
+network connections. The historical implementation notes below describe intermediate gates;
+the platform policy in this section supersedes those gates.
+
+## Intel Windows requirements
+
+Intel Windows nested snapshots require WHP's enlightened-VMCS support and an outer
+guest kernel that uses it. libkrun enables the documented Hyper-V interface when
+the host provides the required features. The Windows firmware enables
+`CONFIG_HYPERV`; Linux KVM selects enlightened VMCS automatically. A current
+ordinary Intel VMCS is rejected during capture and restore because its cached
+state can disagree with its opaque backing memory.
+
+Nested WHP artifacts use backend ABI 4, recording the synthetic feature contract,
+partition reference time and emulated PIT state. Non-nested WHP artifacts use ABI 2
+and also save PIT state. Older ordinary ABI 1 and enlightened nested ABI 3 snapshots
+require explicit periodic-PIT recovery or a restart from saved disk. Non-enlightened
+nested snapshots remain incompatible.
+AMD retains its existing guest feature configuration. These checks do not promise
+migration between different CPUs or Windows builds.
+
+## Restoring at a different host TSC frequency
+
+On x86 Linux and Windows, restore preserves the snapshot's guest-visible TSC
+frequency. The destination host's native frequency may differ only if its
+hypervisor can provide the saved rate. Linux requires KVM hardware TSC scaling
+for differing rates, programs each vCPU before importing nested state, and checks
+readback. Windows configures the saved partition clock before partition setup,
+then uses that rate for capture, compatibility checks and guest CPUID reporting.
+Same-frequency Windows restores do not require the optional clock-setting API.
+
+This is a clock compatibility feature, not unrestricted CPU migration. Existing
+CPU, nested-state, MSR and backend compatibility checks still apply. Restore
+rejects a rate the destination cannot provide. Linux catch-up emulation without
+hardware scaling is not sufficient for a running nested VM. No guest memory or
+saved kernel calibration values are rewritten, and the snapshot format is unchanged.
+
+The [source-clock fixture](../tests/nested-restore/clock-source/README.md) exercises
+non-native source rates with real hypervisor scaling and an unmodified destination.
+
+2026-10-16 qualification: AMD Linux (EPYC 9B45, KVM on Linux 7.0) passed the busy
+Microsandbox restore/fork/recapture/archive matrix at source rates of 1,347,974 and
+3,369,935 kHz, against a native destination rate of 2,695,948 kHz. AMD Windows
+(Ryzen 5 3600) passed the same matrix at 1,800,012,216 and 7,200,048,864 Hz, against
+3,600,024,432 Hz native. The pre-fix runtimes rejected the saved lower-rate artifacts.
+The inner workload retained its identity, disk contents, busy workers and timer
+progress; guest/host elapsed-time ratios stayed within the test's 20% tolerance.
+
+Intel Linux and Intel Windows passed the same-frequency busy matrix. The tested
+Google N2/C4 and Azure Intel hosts did not expose hardware TSC scaling, so successful
+Intel cross-frequency restore remains unqualified. The controlled-rate AMD tests
+use a source adapter on the same host; migration between distinct physical hosts
+and differing CPU contracts still needs separate qualification.
+
+## Historical implementation and qualification notes
+
+The following records describe the staged implementation before admission was opened.
+
+### Dependencies
 
 1. libkrun #156: Windows x86 TSC discovery.
 2. libkrun #155, based on #156: host admission and opt-in nested execution.
@@ -25,7 +92,7 @@ restoring an inner hypervisor. Restore checks nesting mode before any backend st
 The backend ABI remains separate and must change when its opaque payload changes. Old
 schema-1 artifacts are treated as ordinary: they contain no reliable nesting-mode declaration.
 
-The initial contract rejects nested capture and restore on every backend. A backend PR must
+The initial contract rejected nested capture and restore on every backend. A backend PR must
 supply complete state, validate destination capabilities, and explicitly remove its own gate.
 This also prevents direct libkrun callers from bypassing the Microsandbox restriction and
 silently saving incomplete nested state.
@@ -65,9 +132,11 @@ state categories. An x64 host or an emulated ARM machine cannot establish native
 
 Hetzner Cloud excludes Windows Server on CAX and does not expose nested virtualization.
 Its dedicated RX line uses Ampere Altra; no supported Windows ARM deployment was established
-for this investigation. No unsuitable server was ordered. Native Windows ARM testing remains
-blocked on an appropriate machine; the public API review is inconclusive about execution
-and insufficient to implement full nested restore safely.
+for this investigation. No unsuitable server was ordered. A native Surface Laptop 7 (Snapdragon X Elite, Windows 11 25H2 build 26200.9711)
+accepted ordinary ARM64 partition setup and vCPU creation. With valid GIC settings,
+enabling nesting failed at WHvSetupPartition with STATUS_HV_INVALID_PARAMETER
+(0xC0350005). The probe ran as a standard user; elevated confirmation remains pending.
+No ARM64 nested-state capture/restore has been qualified.
 
 Sources:
 - https://learn.microsoft.com/en-us/virtualization/api/hypervisor-platform/funcs/whvpartitionpropertydatatypes

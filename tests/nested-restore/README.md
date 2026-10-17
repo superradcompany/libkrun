@@ -5,16 +5,15 @@ a counter and services timer interrupts. Capture and restore run in separate hos
 processes. Restore requires the original workload identity and continued timer
 and counter progress, so rebooting the workload cannot pass.
 
-Linux x86 nested snapshots are enabled in this backend PR. Other platforms remain
-behind the admission guard until their own qualification is complete.
+The production build admits nested capture and restore on qualified Linux x86-64,
+Windows x86-64, and Apple Silicon macOS hosts. Linux ARM64 and Windows ARM64
+nesting are unsupported. Run this harness without an admission bypass. The dated
+results below describe earlier diagnostic builds; see `docs/nested-snapshots.md`
+for the current platform policy and qualification scope.
 
-Build the Rust guest with:
-
-```sh
-cargo build --locked --release --target x86_64-unknown-linux-musl --manifest-path tests/nested-restore/guest/Cargo.toml
-```
-
-Place `guest/target/x86_64-unknown-linux-musl/release/nested-counter-guest` at `/init` in an
+Build the Rust counter guest with `cargo build --locked --release --target
+x86_64-unknown-linux-musl --manifest-path tests/nested-restore/guest/Cargo.toml`
+and place `nested-counter-guest` at `/init` in an
 initramfs containing `/dev/console` (character device 5:1) and `/dev`. The parent
 kernel needs KVM, VMX/SVM, IRQ chip and PIT support. On Linux x86 the existing
 firmware mmap boot path does not load an external initramfs, so embed it in the
@@ -54,16 +53,7 @@ It does not qualify sandbox filesystem recovery or CPU migration across hosts.
 
 2026-10-13: Intel Linux/KVM passed capture, fresh-process restore, two independent
 restores from one baseline, and capture/restore of a second generation using the
-candidate KVM capability contract and the diagnostic guard bypass. AMD Linux and
-Intel Windows require their own live-restore results before admission can open.
-
-On Windows the harness uses an explicit `hvc0` output device. On the AMD
-Windows Server 2025 host, the initial diagnostic restore resumed the counter but
-lost PIT interrupts. Reapplying saved interrupt state after WHP NestedState fixed
-that reproduction. The candidate then passed two concurrent restores and repeated
-recapture/restore generations. Progress lines include IF flags and PIC state to
-help diagnose interrupt delivery. Counter progress alone is insufficient, and
-Intel Windows, broader workloads and filesystem recovery remain unqualified.
+candidate KVM capability contract and the diagnostic guard bypass.
 
 2026-10-14: AMD EPYC 9B45 with Linux 7.0.0-1014-gcp passed capture,
 fresh-process restore, concurrent forks and a second snapshot generation after
@@ -106,8 +96,8 @@ codesign --force -s - --entitlements /path/to/msb-entitlements.plist \
   tests/nested-restore/target/debug/nested-restore-live
 ```
 
-The macOS build still rejects nested capture. Use a diagnostic build only
-for backend qualification. In addition to the initial restore, recapture a
+Use the production build for qualified backends. In addition to the initial
+restore, recapture a
 restored VM and restore that second snapshot: the original HVF ordering could
 pass the first restore but stall on the second generation. The clock offset must
 be installed before the saved timer registers so deadlines use the restored clock.
@@ -125,7 +115,8 @@ handling: a chain that only stops the child in its counter loop misses these cas
 The guest prints KVM internal-error data and its kernel log on failure.
 
 These passes do not qualify a full inner operating system, filesystem recovery
-or cross-host migration. The macOS nested-snapshot guard remains closed.
+or cross-host migration. They are historical counter-fixture results; the full-OS
+qualification scope is recorded in `docs/nested-snapshots.md`.
 
 ## Continuous integration
 

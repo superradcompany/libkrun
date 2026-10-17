@@ -1519,9 +1519,12 @@ impl Vmm {
     pub fn require_nested_execution_state_support(&self) -> Result<()> {
         if self.nested_enabled
             && !cfg!(all(
-                target_os = "linux",
-                target_arch = "x86_64",
-                not(any(feature = "tee", feature = "aws-nitro"))
+                not(any(feature = "tee", feature = "aws-nitro")),
+                any(
+                    all(target_os = "linux", target_arch = "x86_64"),
+                    all(target_os = "windows", target_arch = "x86_64"),
+                    all(target_os = "macos", target_arch = "aarch64")
+                )
             ))
         {
             return Err(Error::NestedExecutionStateUnsupported);

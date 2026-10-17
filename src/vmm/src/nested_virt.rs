@@ -1,6 +1,9 @@
 //! Host support and admission for nested virtualization.
 
 use std::io;
+use std::sync::Mutex;
+
+static HOST_SUPPORT: Mutex<Option<bool>> = Mutex::new(None);
 
 /// Query whether this backend can expose hardware virtualization to a guest.
 /// A positive result does not imply that the guest kernel includes KVM.
@@ -8,7 +11,26 @@ pub fn supported() -> io::Result<bool> {
     if cfg!(any(feature = "tee", feature = "aws-nitro")) {
         return Ok(false);
     }
-    host_supported()
+    // Windows probes create a WHP partition. Share successful discovery across
+    // builders and admission checks; do not retain transient probe errors.
+    let mut cached = HOST_SUPPORT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(supported) = *cached {
+        return Ok(supported);
+    }
+    let supported = host_supported()?;
+    *cached = Some(supported);
+    Ok(supported)
+}
+
+/// Enable nesting by default only when the host confirms support.
+/// Probe failures leave implicit nesting off; an explicit enable still uses strict validation.
+pub fn default_enabled() -> bool {
+    supported().unwrap_or_else(|error| {
+        log::debug!("nested virtualization support probe failed: {error}");
+        false
+    })
 }
 
 /// Refuse an enabled policy when the backend cannot honor it.
@@ -21,7 +43,7 @@ pub(crate) fn validate(enabled: bool) -> io::Result<()> {
     } else {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "nested virtualization is unavailable on this host or backend",
+            "nested virtualization is unavailable on this host or backend; Linux ARM64 and Windows ARM64 are not supported",
         ))
     }
 }
@@ -42,14 +64,6 @@ fn host_supported() -> io::Result<bool> {
     }))
 }
 
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-fn host_supported() -> io::Result<bool> {
-    // Linux UAPI KVM_CAP_ARM_EL2; older kvm-bindings releases omit the constant.
-    const KVM_CAP_ARM_EL2: libc::c_ulong = 240;
-    let kvm = kvm_ioctls::Kvm::new().map_err(io::Error::from)?;
-    Ok(kvm.check_extension_raw(KVM_CAP_ARM_EL2) > 0)
-}
-
 #[cfg(target_os = "macos")]
 fn host_supported() -> io::Result<bool> {
     hvf::check_nested_virt().map_err(|error| io::Error::other(format!("{error:?}")))
@@ -61,10 +75,7 @@ fn host_supported() -> io::Result<bool> {
 }
 
 #[cfg(not(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
+    all(target_os = "linux", target_arch = "x86_64"),
     target_os = "macos",
     all(target_os = "windows", target_arch = "x86_64")
 )))]
