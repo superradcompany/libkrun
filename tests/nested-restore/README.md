@@ -114,21 +114,20 @@ progress check. Preserve captures from the parent at EL1 and from EL2 timer
 handling: a chain that only stops the child in its counter loop misses these cases.
 The guest prints KVM internal-error data and its kernel log on failure.
 
-The macOS harness now requires every parent vCPU's saved CPSR to identify EL1
-before writing a capture or recapture. It resumes and retries for up to 30 seconds
-if the pause lands at another exception level, and fails if it cannot obtain that
-state. Restore checks the saved CPSRs again before admitting the snapshot, then
-requires the same nested workload identity and ten seconds of counter and timer
-progress. This exercises EL1-to-EL2 nested execution after a fresh restore rather
-than relying on an incidental capture point. This remains a native macOS run;
-the Linux CI job cannot exercise HVF.
+The macOS harness requires every vCPU to be in the parent kernel at EL1 before
+writing a capture or recapture. It checks both CPSR and HCR_EL2.VM: the child also
+runs at EL1, but KVM enables stage-2 translation while running it. Requiring VM
+clear excludes that misleading capture point. The harness resumes and retries
+for up to 30 seconds, then fails if it cannot capture the parent context. Restore
+checks the saved state again and requires the same workload identity and ten
+seconds of advancing nested counter and timer samples.
 
-On 2026-10-19, the strengthened test passed on M5 Pro/macOS 26.5.1 with both
-parent CPUs captured at EL1, including fresh restore, fork and second-generation
-restore. A temporary build omitting the initial EL2 CPSR write also restored the
-same capture successfully. The test enforces the EL1 restore contract, but that
-run did not reproduce the historical initialization failure or establish that
-this one write remains necessary on this host.
+The original EL1-only check could pass with a child still executing. The stronger
+check reproduces the initialization failure with fresh captures: a temporary
+build omitting only the initial EL2 CPSR write fails with KVM_EXIT_INTERNAL_ERROR,
+while the normal build restores the same snapshots and continues nested execution.
+The native run includes recapture and second-generation restore. This is a manual
+macOS test; the Linux CI job cannot exercise HVF.
 
 These passes do not qualify a full inner operating system, filesystem recovery
 or cross-host migration. They are historical counter-fixture results; the full-OS
