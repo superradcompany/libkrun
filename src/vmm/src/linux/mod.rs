@@ -5,4 +5,6 @@ pub mod tee;
 mod arm64_state;
 #[cfg(target_arch = "x86_64")]
 mod nested_state;
+#[cfg(target_arch = "x86_64")]
+mod tsc_frequency;
 pub mod vstate;

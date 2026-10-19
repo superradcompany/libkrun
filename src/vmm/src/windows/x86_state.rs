@@ -20,7 +20,7 @@ const NESTED_STATE: i32 = 0x0000_1002;
 #[derive(Serialize, Deserialize)]
 struct VmState {
     features: Vec<Vec<u8>>,
-    tsc_frequency: u64,
+    tsc_frequency_hz: u64,
     startup: Vec<ApParkState>,
 }
 
@@ -52,7 +52,7 @@ pub(super) fn capture_vm(
         .collect::<Result<Vec<_>>>()?;
     let state = VmState {
         features: features(partition, nested_enabled)?,
-        tsc_frequency: frequency(partition)?,
+        tsc_frequency_hz: tsc_frequency_hz(partition)?,
         startup,
     };
     if nested_enabled {
@@ -75,7 +75,7 @@ pub(super) fn restore_vm(
         (decode(bytes)?, None)
     };
     if state.features != features(partition, nested_enabled)?
-        || state.tsc_frequency != frequency(partition)?
+        || state.tsc_frequency_hz != tsc_frequency_hz(partition)?
         || state.startup.len() != router.slots.len()
         || state.startup.first() != Some(&ApParkState::Running)
     {
@@ -379,7 +379,7 @@ fn reference_time(partition: WHV_PARTITION_HANDLE) -> Result<u64> {
     Ok(value)
 }
 
-pub(super) fn frequency(partition: WHV_PARTITION_HANDLE) -> Result<u64> {
+pub(super) fn tsc_frequency_hz(partition: WHV_PARTITION_HANDLE) -> Result<u64> {
     let mut value = 0_u64;
     let mut written = 0;
     let status = unsafe {
@@ -404,10 +404,10 @@ pub(crate) fn saved_frequency(bytes: &[u8], nested: bool) -> Result<u64> {
     } else {
         decode(bytes)?
     };
-    if state.tsc_frequency == 0 {
+    if state.tsc_frequency_hz == 0 {
         return Err(codec("zero saved TSC frequency"));
     }
-    Ok(state.tsc_frequency)
+    Ok(state.tsc_frequency_hz)
 }
 
 fn encode<T: Serialize>(state: &T) -> Result<Vec<u8>> {

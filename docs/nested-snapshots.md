@@ -230,3 +230,62 @@ and GIC state are restored; only the nested framework notification mask is reset
 Fresh capture, concurrent restores and repeated recapture/restore also pass.
 Nested snapshot admission stays closed. This fixture does not qualify a full
 inner operating system, sandbox filesystem recovery or cross-host migration.
+
+## Apple Silicon cross-frequency restore investigation
+
+The current macOS restore path requires the saved Mach timebase to match the
+host. It rebases the virtual-counter offset once for all vCPUs before restoring
+timer deadlines. It does not scale the counter rate.
+
+An audit of the public Hypervisor.framework headers and documentation found no
+supported API that forces every required counter/timer access to exit to the
+userspace VMM while retaining nested virtualization. This is an API-contract
+finding, not proof about undocumented hardware behavior. No new native trap
+experiments were performed for this investigation.
+
+| Access | What an emulator needs | Public HVF interface and gap |
+| --- | --- | --- |
+| `CNTVCT_EL0`, `CNTPCT_EL0`, `CNTFRQ_EL0` | Return a coherent saved-rate counter and frequency to applications, kernels and the guest hypervisor | HVF exposes a virtual-counter offset, but no counter multiplier or documented host-wide counter-read trap switch. |
+| `CNTV_*`, `CNTP_*`, `CNTHP_*` timer registers | Translate control, relative/absolute deadlines and reads into the same clock domain | Register get/set APIs permit state transfer; they do not promise an exit for each guest access. Timer-expiry notifications are not access traps. |
+| `CNTKCTL_EL1`, `CNTHCTL_EL2`, `CNTVOFF_EL2` | Preserve the guest hypervisor's own timer and trap policy while applying host scaling | These are guest architectural state. Changing lower-level trap routing does not establish a host-owned interception path for the guest hypervisor's own accesses. The guest can also change its controls. |
+
+The existing system-register-exit handler only handles accesses HVF actually
+returns. Adding counter cases to it would not ensure that direct counter reads
+or hardware-managed nested timers reach that handler. Likewise, changing the
+reported frequency or periodically adjusting an offset would not preserve a
+running guest's rate and deadlines.
+
+The preferred prerequisite is an Apple-supported counter scaling API that also
+covers nested timers. A software alternative first needs a documented or safely
+qualified host interception mechanism covering the full table, including the
+guest hypervisor at virtual EL2 and a nested guest at EL0/EL1. Only then could we
+implement a shared scaled counter, deadline conversion, nested offset composition
+and interrupt delivery. Validation would need to prove interception even when
+the guest changes its controls, followed by multi-vCPU clock monotonicity,
+physical/virtual timer expiry, busy nested execution, restore, fork and recapture
+at lower and higher rates. Partial interception is insufficient. Keep rejecting
+frequency mismatches until that prerequisite is established.
+
+Sources:
+
+- [Apple Silicon HVF API](https://developer.apple.com/documentation/hypervisor/apple-silicon)
+- [Virtual timer offset](https://developer.apple.com/documentation/hypervisor/hv_vcpu_set_vtimer_offset(_:_:)):
+  the installed SDK specifies `CNTVCT_EL0 = mach_absolute_time() - vtimer_offset`.
+- [Guest CNTHCTL_EL2 register](https://developer.apple.com/documentation/hypervisor/hv_sys_reg_cnthctl_el2)
+- [Explicit debug-register trap API](https://developer.apple.com/documentation/hypervisor/hv_vcpu_get_trap_debug_reg_accesses(_:_:)):
+  the public vCPU API has debug trap controls, but no corresponding all-counter
+  or all-timer trap control.
+- [QEMU HVF backend](https://github.com/qemu/qemu/blob/master/target/arm/hvf/hvf.c):
+  initializes `gt_cntfrq_hz` from host `CNTFRQ_EL0` and checks that they agree;
+  this is supporting implementation evidence, not an Apple capability guarantee.
+
+## TSC naming and snapshot units
+
+Linux and Windows x86 state use `tsc_frequency_hz` in memory. The restore path
+uses `restore_tsc_frequency_hz` where a restore-specific value is needed. Windows
+applies it before partition setup; Linux applies it when restoring each vCPU.
+KVM's API and the existing Linux snapshot wire format still use `u32` kHz. The
+Linux codec converts exactly at the boundary and rejects values that would need
+rounding or overflow. Existing snapshot bytes and compatibility checks are
+unchanged. ARM counter/timebase fields remain architecture-specific; they are
+not x86 TSCs.

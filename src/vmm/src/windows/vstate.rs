@@ -1964,7 +1964,7 @@ impl Partition {
         partition.setup()?;
         #[cfg(target_arch = "x86_64")]
         if let Some(hz) = frequency {
-            if x86_state::frequency(partition.handle)? != hz {
+            if x86_state::tsc_frequency_hz(partition.handle)? != hz {
                 return Err(Error::StateCodec(
                     "destination cannot preserve guest TSC frequency".into(),
                 ));
@@ -2863,7 +2863,7 @@ fn run_vcpu(
 
     // The partition clock is fixed before setup, including on restore.
     #[cfg(target_arch = "x86_64")]
-    let tsc_hz = match x86_state::frequency(partition_handle) {
+    let tsc_hz = match x86_state::tsc_frequency_hz(partition_handle) {
         Ok(hz) => hz,
         Err(err) => {
             error!("cannot read guest TSC frequency: {err}");
