@@ -76,6 +76,15 @@ jobs:
       - name: Check Windows nested execution payload codec
         run: cargo test --locked --manifest-path src/vmm/Cargo.toml nested_execution_payload
 
+      - name: Windows PIT capture and restore tests
+        run: cargo test --locked --manifest-path src/vmm/Cargo.toml windows::pit::tests
+
+      - name: Windows ordinary VMX snapshot rejection test
+        run: cargo test --locked --manifest-path src/vmm/Cargo.toml nested_snapshot_rejects_an_ordinary_current_vmx_cache
+
+      - name: Windows legacy PIT recovery test
+        run: cargo test --locked --manifest-path src/vmm/Cargo.toml legacy_pit_recovery_preserves_cpu_contract_and_requires_a_known_old_format
+
       - name: Windows eager restore memory test
         run: cargo test --locked --manifest-path src/vmm/Cargo.toml eager_restore_replaces_payload_bytes_without_losing_regions
 
