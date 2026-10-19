@@ -13,3 +13,7 @@ vmm = { package = "msb_krun_vmm", path = "../../src/vmm", features = ["blk"] }
 [[bin]]
 name = "nested-restore-live"
 path = "main.rs"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+bincode = { version = "2", features = ["serde"] }
+hvf = { package = "msb_krun_hvf", path = "../../src/hvf" }

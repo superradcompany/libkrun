@@ -463,7 +463,9 @@ dependencies = [
 name = "nested-restore-live"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "msb_krun",
+ "msb_krun_hvf",
  "msb_krun_vmm",
 ]
 
