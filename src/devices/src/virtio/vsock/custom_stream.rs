@@ -322,7 +322,11 @@ impl CustomStreamProxy {
     /// Return stream credit only after the host backend has consumed bytes
     /// from the bounded proxy queue.
     fn maybe_push_credit_update(&mut self, update: &mut ProxyUpdate) {
-        if ((self.tx_cnt - self.last_tx_cnt_sent).0 as usize) < defs::CONN_TX_BUF_SIZE / 2 {
+        // The guest can block on its local send-buffer limit long before our
+        // advertised receive window is half full. Report actual consumption
+        // whenever it advances; do not require reverse application traffic
+        // to carry the fwd_cnt and unblock a unidirectional sender.
+        if self.tx_cnt == self.last_tx_cnt_sent {
             return;
         }
 
@@ -694,6 +698,28 @@ mod tests {
         assert_eq!(&*state.written.lock().unwrap(), b"hello");
         assert!(proxy.pending_write.is_empty());
         assert_eq!(proxy.tx_cnt.0, 5);
+    }
+
+    #[test]
+    fn reports_consumed_credit_below_half_window_without_reverse_data() {
+        let state = Arc::new(TestStreamState {
+            blocked: AtomicBool::new(false),
+            written: Mutex::new(Vec::new()),
+        });
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let pkt = tx_packet(&mem, 1, b"a");
+        let mut proxy = test_proxy(state, mem);
+        let update = proxy.sendmsg(&pkt);
+        assert!(update.signal_queue);
+        assert_eq!(proxy.tx_cnt.0, 1);
+        assert_eq!(proxy.last_tx_cnt_sent.0, 1);
+        assert!(matches!(
+            proxy.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::CreditUpdate { fwd_cnt: 1, .. })
+        ));
+        let mut unchanged = ProxyUpdate::default();
+        proxy.maybe_push_credit_update(&mut unchanged);
+        assert!(!unchanged.signal_queue);
     }
 
     #[test]
