@@ -40,13 +40,9 @@ fn mount_fs(source: &str, target: &str, kind: &str) -> io::Result<()> {
 
 fn record(identity: u64, generation: u64) -> [u8; 24] {
     let mut bytes = [0; 24];
-    for (chunk, value) in
-        bytes
-            .chunks_exact_mut(8)
-            .zip([identity, generation, identity ^ generation])
-    {
-        chunk.copy_from_slice(&value.to_ne_bytes());
-    }
+    bytes[..8].copy_from_slice(&identity.to_ne_bytes());
+    bytes[8..16].copy_from_slice(&generation.to_ne_bytes());
+    bytes[16..].copy_from_slice(&(identity ^ generation).to_ne_bytes());
     bytes
 }
 
