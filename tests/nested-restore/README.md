@@ -78,11 +78,18 @@ Intel Windows, broader workloads and filesystem recovery remain unqualified.
 Build the KVM parent and its bare-metal ARM64 child together:
 
 ```sh
-zig cc -target aarch64-linux-musl -static -pthread -Wall -Wextra -Werror \
-  tests/nested-restore/guest-arm64.c tests/nested-restore/inner-arm64.S -o guest
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$(rustc --print sysroot)/lib/rustlib/aarch64-apple-darwin/bin/rust-lld"
+rustup target add aarch64-unknown-linux-musl
+cargo build --locked --release --target aarch64-unknown-linux-musl --manifest-path tests/nested-restore/guest/Cargo.toml
 ```
 
-Package `guest` as `/init` in the initramfs described above. The parent kernel
+On Apple Silicon, the command above uses Rust's bundled linker to build the
+static Linux guest without a C compiler. The same guest crate selects the x86 or
+ARM64 KVM implementation at compile time; ARM64 embeds `inner-arm64.S` using
+`global_asm!` for the child CPU instructions and interrupt handlers.
+
+Package `guest/target/aarch64-unknown-linux-musl/release/nested-counter-guest`
+as `/init` in the initramfs described above. The parent kernel
 must include ARM KVM and VGICv3. The child runs at EL1, continuously updates RAM,
 and handles virtual timer PPI 27 through its virtual GIC. Progress includes a
 workload identity, interrupt count, fatal-exception flag, and parent monotonic time.
