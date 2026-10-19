@@ -3,6 +3,7 @@ name = "nested-counter-guest"
 version = "0.1.0"
 edition = "2021"
 publish = false
+default-run = "nested-counter-guest"
 
 [workspace]
 
@@ -10,3 +11,7 @@ publish = false
 kvm-bindings = "=0.14.2"
 kvm-ioctls = "=0.25.1"
 libc = "0.2"
+
+[[bin]]
+name = "nested-os-inner"
+path = "../os/inner.rs"

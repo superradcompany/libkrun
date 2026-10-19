@@ -7,8 +7,10 @@ identity stay in memory. A mismatch stops progress; a reboot against the existin
 disk fails its exclusive file creation. The host harness also requires the same
 identity and ten seconds of continued progress after restore.
 
-Build on Linux matching the guest architecture, with a C compiler, static libc,
-`busybox-static`, QEMU system binaries, `cpio`, `e2fsprogs`, and `sudo` available:
+Build on Linux matching the guest architecture, with Rust, the matching
+`*-unknown-linux-musl` target and musl linker, `busybox-static`, QEMU system
+binaries, `cpio`, `e2fsprogs`, and `sudo` available. The Rust PID 1 uses the shared
+[guest crate](../guest/Cargo.toml) and its existing dependency lockfile:
 
 ```sh
 tests/nested-restore/os/build.sh /tmp/nested-os /path/to/inner-linux-kernel

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build on Linux matching the guest architecture. Requires cc, QEMU, cpio, and e2fsprogs.
+# Build on Linux matching the guest architecture. Requires Rust with a musl target, QEMU, cpio, and e2fsprogs.
 set -euo pipefail
 source_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 output=$(realpath -m -- "${1:?output directory required}")
@@ -10,7 +10,14 @@ mkdir "$output/inner" "$output/parent"
 inner="$output/inner"
 parent="$output/parent"
 mkdir -p "$inner/dev" "$inner/proc" "$inner/data" "$parent/dev" "$parent/bin"
-cc -static -Wall -Wextra -Werror "$source_dir/inner.c" -o "$inner/init"
+case "$(uname -m)" in
+    x86_64) target=x86_64-unknown-linux-musl ;;
+    aarch64) target=aarch64-unknown-linux-musl ;;
+    *) echo 'unsupported build architecture' >&2; exit 1 ;;
+esac
+cargo build --locked --release --target "$target" --bin nested-os-inner \
+    --manifest-path "$source_dir/../guest/Cargo.toml" --target-dir "$output/target"
+cp "$output/target/$target/release/nested-os-inner" "$inner/init"
 sudo mknod "$inner/dev/console" c 5 1
 sudo mknod "$parent/dev/console" c 5 1
 (cd "$inner" && find . -print0 | cpio --null -o --format=newc --owner=0:0) > "$parent/inner-initramfs"
