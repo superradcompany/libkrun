@@ -120,7 +120,8 @@ qualification scope is recorded in `docs/nested-snapshots.md`.
 
 ## Continuous integration
 
-The `Nested restore` workflow runs the Rust x86 counter fixture on Linux for pull
+The `Nested restore` workflow runs the Rust x86 counter fixture on self-hosted
+Linux runners labeled `nested-virt` for pull
 requests and pushes to `krun`. It captures a running nested VM, restores it in a
 fresh process, forks the original capture, recaptures a restored VM and restores
 that second generation. Both in-kernel and split outer IRQ controllers are tested.
@@ -130,7 +131,9 @@ the live test. Logs and kernel configuration are retained as workflow artifacts.
 `ci.sh build` builds the static guest, harness and pinned firmware with an embedded
 initramfs; `ci.sh run` executes the matrix. Set `NESTED_TEST_DIR` to a dedicated
 output directory and `NESTED_FIRMWARE_DIR` to a clean libkrunfw checkout. The build
-requires the packages and Rust target listed in the workflow. No production kernel
+requires the packages and Rust target listed in the workflow. Provision system
+packages on the host; runner accounts only need KVM access, without sudo. Each job
+uses two compiler workers to bound contention on the shared host. No production kernel
 or runtime admission bypass is used. This job qualifies Linux x86 on the runner
 CPU only; Windows, macOS, cross-frequency and full-OS disk tests remain separate
 qualification runs.

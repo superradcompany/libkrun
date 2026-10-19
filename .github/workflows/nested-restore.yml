@@ -16,9 +16,11 @@ concurrency:
 jobs:
   linux-x86:
     name: Running nested VM (Linux x86_64)
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, self-hosted-ubuntu-2404-x64, nested-virt]
     timeout-minutes: 60
     env:
+      CARGO_BUILD_JOBS: "2"
+      NESTED_BUILD_JOBS: "2"
       NESTED_TEST_DIR: ${{ github.workspace }}/nested-test-output
       NESTED_FIRMWARE_DIR: ${{ github.workspace }}/test-firmware
     steps:
@@ -41,12 +43,20 @@ jobs:
               grep -Eq '^(Y|1)$' /sys/module/$module/parameters/nested
             fi
           done
-          sudo chmod a+rw /dev/kvm
-      - name: Install build dependencies
+          if ! test -r /dev/kvm || ! test -w /dev/kvm; then
+            echo "::error::The self-hosted runner account needs read/write access to /dev/kvm."
+            exit 1
+          fi
+      - name: Check provisioned build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential musl-tools flex bison libelf-dev libssl-dev bc python3 python3-pyelftools
-          rustup target add x86_64-unknown-linux-musl
+          for package in build-essential musl-tools flex bison libelf-dev libssl-dev bc python3 python3-pyelftools; do
+            if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -qx 'install ok installed'; then
+              echo "::error::Install $package during runner provisioning. CI jobs do not have sudo access."
+              exit 1
+            fi
+          done
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" target add x86_64-unknown-linux-musl
       - uses: actions/cache@v4
         with:
           path: |
