@@ -585,9 +585,9 @@ impl Vm {
 
         #[cfg(all(not(feature = "tee"), target_os = "windows", target_arch = "x86_64"))]
         if let Some(state) = &self.execution_restore {
-            self.vmr.restore_tsc_frequency_hz = Some(
+            self.vmr.tsc_frequency_hz = Some(
                 state
-                    .windows_tsc_frequency_hz()
+                    .tsc_frequency_hz()
                     .map_err(|e| Error::Build(BuildError::Start(format!("restore clock: {e}"))))?,
             );
         }

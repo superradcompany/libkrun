@@ -128,7 +128,7 @@ impl VcpuExecutionState {
 impl ExecutionState {
     /// Guest counter frequency required before constructing a Windows x86 partition.
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    pub fn windows_tsc_frequency_hz(&self) -> std::result::Result<u64, String> {
+    pub fn tsc_frequency_hz(&self) -> std::result::Result<u64, String> {
         if self.architecture == ExecutionArchitecture::X86_64
             && self.backend == ExecutionBackend::Whp
             && self.backend_state_abi == if self.nested_enabled { 3 } else { 1 }

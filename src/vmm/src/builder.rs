@@ -1225,7 +1225,7 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
 fn initial_kernel_cmdline(
     payload_cmdline: Option<&str>,
     prolog: Option<&str>,
-    host_tsc_hz: Option<u64>,
+    tsc_frequency_hz: Option<u64>,
 ) -> std::result::Result<Cmdline, StartMicrovmError> {
     let mut cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
 
@@ -1234,7 +1234,7 @@ fn initial_kernel_cmdline(
     // directly so AMD guests also have a working TSC (required by guest KVM).
     // Prepend it so it stays before any caller-provided `--` and an explicit
     // tsc_early_khz later in the kernel command line can override this default.
-    if let Some(khz) = host_tsc_hz.map(|hz| hz / 1000).filter(|khz| *khz != 0) {
+    if let Some(khz) = tsc_frequency_hz.map(|hz| hz / 1000).filter(|khz| *khz != 0) {
         cmdline.insert("tsc_early_khz", &khz.to_string())?;
     }
     cmdline.insert_str(payload_cmdline.or(prolog).unwrap_or(DEFAULT_KERNEL_CMDLINE))?;
@@ -1308,16 +1308,16 @@ pub fn build_microvm_paused(
     let mut vcpu_config = vm_resources.vcpu_config();
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    let host_tsc_hz = vm_resources
-        .restore_tsc_frequency_hz
+    let tsc_frequency_hz = vm_resources
+        .tsc_frequency_hz
         .or_else(crate::windows::vstate::host_tsc_frequency_hz);
     #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
-    let host_tsc_hz = None;
+    let tsc_frequency_hz = None;
 
     let mut kernel_cmdline = initial_kernel_cmdline(
         payload_config.kernel_cmdline.as_deref(),
         vm_resources.kernel_cmdline.prolog.as_deref(),
-        host_tsc_hz,
+        tsc_frequency_hz,
     )?;
 
     // The krun_env segment carries caller-controlled guest env; a non-cmdline-safe byte in it
@@ -1373,14 +1373,14 @@ pub fn build_microvm_paused(
     #[cfg(all(not(feature = "tee"), target_os = "windows"))]
     let vm = {
         #[cfg(target_arch = "x86_64")]
-        let frequency = vm_resources.restore_tsc_frequency_hz;
+        let tsc_frequency_hz = vm_resources.tsc_frequency_hz;
         #[cfg(not(target_arch = "x86_64"))]
-        let frequency = None;
+        let tsc_frequency_hz = None;
         setup_vm(
             &guest_memory,
             vm_resources.nested_enabled,
             setup_vcpu_count,
-            frequency,
+            tsc_frequency_hz,
         )?
     };
     trace.mark("vm.ready");
@@ -3604,9 +3604,9 @@ pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
     nested_enabled: bool,
     vcpu_count: u8,
-    frequency: Option<u64>,
+    tsc_frequency_hz: Option<u64>,
 ) -> std::result::Result<Vm, StartMicrovmError> {
-    let mut vm = Vm::with_clock(vcpu_count, nested_enabled, frequency)
+    let mut vm = Vm::with_clock(vcpu_count, nested_enabled, tsc_frequency_hz)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
     vm.memory_init(guest_memory)

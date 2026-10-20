@@ -2001,8 +2001,8 @@ impl Vcpu {
             *target = (*source).into();
         }
 
-        let restore_tsc_frequency_hz = state.tsc_frequency_hz;
-        let tsc_khz = self.validate_tsc_frequency(restore_tsc_frequency_hz)?;
+        let tsc_frequency_hz = state.tsc_frequency_hz;
+        let tsc_khz = self.validate_tsc_frequency(tsc_frequency_hz)?;
         self.fd.set_cpuid2(&cpuid).map_err(Error::VcpuSetCpuid)?;
         self.fd.set_tsc_khz(tsc_khz).map_err(Error::VcpuSetTscKhz)?;
         if self.fd.get_tsc_khz().map_err(Error::VcpuGetTscKhz)? != tsc_khz {

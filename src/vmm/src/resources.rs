@@ -292,7 +292,7 @@ pub enum MemoryPlacementResult {
 pub struct VmResources {
     /// Guest-visible TSC rate to configure before Windows partition setup.
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    pub restore_tsc_frequency_hz: Option<u64>,
+    pub tsc_frequency_hz: Option<u64>,
     /// Complete immutable private memory image installed before guest activation.
     #[cfg(not(feature = "tee"))]
     pub private_memory_backing: Option<crate::private_memory::PrivateMemoryBacking>,
@@ -408,7 +408,7 @@ impl Default for VmResources {
     fn default() -> Self {
         Self {
             #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-            restore_tsc_frequency_hz: None,
+            tsc_frequency_hz: None,
             #[cfg(not(feature = "tee"))]
             private_memory_backing: None,
             #[cfg(not(feature = "tee"))]

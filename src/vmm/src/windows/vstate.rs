@@ -920,14 +920,14 @@ impl Vm {
     pub(crate) fn with_clock(
         vcpu_count: u8,
         nested_enabled: bool,
-        frequency: Option<u64>,
+        tsc_frequency_hz: Option<u64>,
     ) -> Result<Self> {
         WhpCapabilities::ensure_hypervisor_present()?;
         if vcpu_count == 0 {
             return Err(Error::VcpuCountZero);
         }
 
-        let partition = Partition::with_clock(vcpu_count, nested_enabled, frequency)?;
+        let partition = Partition::with_clock(vcpu_count, nested_enabled, tsc_frequency_hz)?;
 
         Ok(Self {
             partition,
@@ -1919,7 +1919,11 @@ pub(crate) fn nested_virt_supported() -> std::io::Result<bool> {
 }
 
 impl Partition {
-    fn with_clock(vcpu_count: u8, nested_enabled: bool, frequency: Option<u64>) -> Result<Self> {
+    fn with_clock(
+        vcpu_count: u8,
+        nested_enabled: bool,
+        tsc_frequency_hz: Option<u64>,
+    ) -> Result<Self> {
         let mut handle = 0;
         let hresult = unsafe { WHvCreatePartition(&mut handle) };
         if hresult < 0 {
@@ -1947,7 +1951,7 @@ impl Partition {
         }
         // Some WHP hosts cannot set this property even to their native rate.
         // Keep same-frequency snapshots usable there; readback still verifies it.
-        if let Some(hz) = frequency.filter(|hz| Some(*hz) != host_tsc_frequency_hz()) {
+        if let Some(hz) = tsc_frequency_hz.filter(|hz| Some(*hz) != host_tsc_frequency_hz()) {
             if hz == 0 {
                 return Err(Error::StateCodec("zero restore TSC frequency".into()));
             }
@@ -1963,7 +1967,7 @@ impl Partition {
         }
         partition.setup()?;
         #[cfg(target_arch = "x86_64")]
-        if let Some(hz) = frequency {
+        if let Some(hz) = tsc_frequency_hz {
             if x86_state::tsc_frequency_hz(partition.handle)? != hz {
                 return Err(Error::StateCodec(
                     "destination cannot preserve guest TSC frequency".into(),
@@ -2863,7 +2867,7 @@ fn run_vcpu(
 
     // The partition clock is fixed before setup, including on restore.
     #[cfg(target_arch = "x86_64")]
-    let tsc_hz = match x86_state::tsc_frequency_hz(partition_handle) {
+    let tsc_frequency_hz = match x86_state::tsc_frequency_hz(partition_handle) {
         Ok(hz) => hz,
         Err(err) => {
             error!("cannot read guest TSC frequency: {err}");
@@ -3051,7 +3055,13 @@ fn run_vcpu(
         if reason == WHvRunVpExitReasonX64Cpuid {
             let cpuid = unsafe { exit_context.Anonymous.CpuidAccess };
             let vcpu_count = sipi_router.as_ref().map_or(1, |router| router.vcpu_count());
-            let result = normalize_cpuid(id, vcpu_count, nested_enabled, &cpuid, Some(tsc_hz));
+            let result = normalize_cpuid(
+                id,
+                vcpu_count,
+                nested_enabled,
+                &cpuid,
+                Some(tsc_frequency_hz),
+            );
             // The VpContext bitfield's low nibble is the instruction length.
             let next_rip =
                 exit_context.VpContext.Rip + u64::from(exit_context.VpContext._bitfield & 0xf);
@@ -3164,7 +3174,7 @@ fn normalize_cpuid(
     vcpu_count: u8,
     nested_enabled: bool,
     access: &WHV_X64_CPUID_ACCESS_CONTEXT,
-    tsc_hz: Option<u64>,
+    tsc_frequency_hz: Option<u64>,
 ) -> CpuidResult {
     const CPUID_1_ECX_VMX: u32 = 1 << 5;
     const CPUID_1_ECX_X2APIC: u32 = 1 << 21;
@@ -3231,7 +3241,7 @@ fn normalize_cpuid(
             // CPUID fields are 32-bit. An unrepresentable frequency must not
             // wrap into a plausible but wrong clock; early boot also receives
             // the partition rate through tsc_early_khz.
-            let crystal_hz = tsc_hz.and_then(|hz| u32::try_from(hz).ok());
+            let crystal_hz = tsc_frequency_hz.and_then(|hz| u32::try_from(hz).ok());
             result.rax = u64::from(crystal_hz.is_some());
             result.rbx = u64::from(crystal_hz.is_some());
             result.rcx = u64::from(crystal_hz.unwrap_or(0));

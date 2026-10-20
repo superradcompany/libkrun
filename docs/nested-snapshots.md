@@ -281,9 +281,9 @@ Sources:
 
 ## TSC naming and snapshot units
 
-Linux and Windows x86 state use `tsc_frequency_hz` in memory. The restore path
-uses `restore_tsc_frequency_hz` where a restore-specific value is needed. Windows
-applies it before partition setup; Linux applies it when restoring each vCPU.
+Linux and Windows x86 state, VM resources and restore paths use
+`tsc_frequency_hz` in memory. Windows applies it before partition setup; Linux
+applies it when restoring each vCPU.
 KVM's API and the existing Linux snapshot wire format still use `u32` kHz. The
 Linux codec converts exactly at the boundary and rejects values that would need
 rounding or overflow. Existing snapshot bytes and compatibility checks are
