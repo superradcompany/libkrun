@@ -1818,6 +1818,7 @@ pub fn build_microvm_paused(
     // exit_code is pre-created and shared with callers via Vm::exit_code().
 
     let mut vmm = Vmm {
+        guest_metrics: vm_resources.metrics.handle(),
         guest_memory,
         arch_memory_info,
         kernel_cmdline,

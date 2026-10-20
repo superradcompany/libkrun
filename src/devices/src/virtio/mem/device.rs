@@ -169,6 +169,14 @@ impl Mem {
         }
     }
 
+    /// Guest-physical start of this device's hotplug region.
+    ///
+    /// Read this together with `state_snapshot` under the same device lock when matching a
+    /// guest observation. The guest's reported address must not become the host's authority.
+    pub fn region_address(&self) -> u64 {
+        self.config.addr
+    }
+
     /// Returns coalesced zero ranges from actual block ownership, not the requested target.
     ///
     /// Call at a paused, drained host-access boundary so this inventory and the device checkpoint
@@ -790,6 +798,47 @@ mod checkpoint_tests {
                 VIRTIO_MEM_RESP_ACK
             );
         }
+    }
+
+    #[test]
+    fn host_region_matches_guest_config_without_changing_checkpoint_state() {
+        let mut source = device(9);
+        activate(&mut source, &memory(&device(9)), Queue::new(128));
+        source.set_requested_size(6 * VIRTIO_MEM_BLOCK_SIZE);
+        let base = source.region_address();
+        assert_eq!(
+            { source.handle_plug(base, 2).resp_type },
+            VIRTIO_MEM_RESP_ACK
+        );
+        source.quiesce().unwrap();
+        let before = source.capture_device_state().unwrap();
+
+        // Compare against the actual guest-visible config, not another projection of the
+        // host getter. The virtio-mem wire offsets and checkpoint encoding stay unchanged.
+        let mut config = [0_u8; 56];
+        source.read_config(0, &mut config);
+        assert_eq!(
+            source.region_address(),
+            u64::from_le_bytes(config[16..24].try_into().unwrap())
+        );
+        let host = source.state_snapshot();
+        assert_eq!(
+            host.region_size,
+            u64::from_le_bytes(config[24..32].try_into().unwrap())
+        );
+        assert_eq!(host.plugged_size, 2 * VIRTIO_MEM_BLOCK_SIZE);
+        assert_eq!(host.requested_size, 6 * VIRTIO_MEM_BLOCK_SIZE);
+        assert_eq!(source.capture_device_state().unwrap(), before);
+
+        let mut restored = device(9);
+        restored.restore_device_state(&before).unwrap();
+        assert_eq!(restored.region_address(), base);
+        assert_eq!(restored.state_snapshot().plugged_size, host.plugged_size);
+        assert_eq!(
+            restored.state_snapshot().requested_size,
+            host.requested_size
+        );
+        assert_eq!(restored.capture_device_state().unwrap(), before);
     }
 
     #[test]

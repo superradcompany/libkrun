@@ -31,6 +31,7 @@ pub(crate) const BASE_AVAIL_FEATURES: u64 = (1 << uapi::VIRTIO_F_VERSION_1 as u6
     | (1 << uapi::VIRTIO_BALLOON_F_FREE_PAGE_HINT as u64)
     | (1 << uapi::VIRTIO_BALLOON_F_REPORTING as u64);
 
+pub(crate) const VIRTIO_BALLOON_S_MEMTOT: u16 = 5;
 pub(crate) const VIRTIO_BALLOON_S_AVAIL: u16 = 6;
 pub(crate) const MAX_STATS_TAGS: u32 = 256;
 pub(crate) const MAX_STATS_DESC_LEN: u32 =
@@ -72,6 +73,8 @@ pub struct Balloon {
     pub(crate) stats_polling_interval: Option<Duration>,
     pub(crate) stats_timer: TimerFd,
     pub(crate) stats_desc_index: Option<u16>,
+    /// Epoch of the request owning the next response; the initial unsolicited report is untrusted.
+    pub(crate) stats_request_epoch: Option<u64>,
 }
 
 impl Balloon {
@@ -87,6 +90,7 @@ impl Balloon {
                 .map_err(BalloonError::EventFd)?,
             device_state: DeviceState::Inactive,
             config: VirtioBalloonConfig::default(),
+            stats_request_epoch: None,
             metrics,
             stats_polling_interval,
             stats_timer: TimerFd::new().map_err(BalloonError::TimerFd)?,
@@ -249,6 +253,9 @@ impl VirtioDevice for Balloon {
     }
 
     fn reset(&mut self) -> bool {
+        // A fresh queue must not inherit a request or observation from the old device.
+        self.stats_request_epoch = None;
+        self.metrics.handle().invalidate_guest_memory_observation();
         self.stats_desc_index = None;
         let _ = self.stats_timer.disarm();
         self.queues = None;
@@ -269,7 +276,8 @@ impl VirtioDevice for Balloon {
 
         // The stats queue deliberately retains one consumed descriptor between samples. Return it
         // through the used ring so the captured queue satisfies consumed-or-terminal ownership.
-        self.trigger_stats_update();
+        self.return_stats_descriptor(None);
+        self.stats_request_epoch = None;
         self.stats_timer.disarm()?;
         let queues = self
             .queues
@@ -279,5 +287,34 @@ impl VirtioDevice for Balloon {
             ))?;
         self.device_state = DeviceState::Inactive;
         Ok(queues)
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_invalidates_guest_observation_and_outstanding_request() {
+        let metrics = MetricsWriter::default();
+        let epoch = metrics.guest_memory_epoch();
+        assert!(metrics.record_guest_memory_observation(epoch, 8192, 1024, Duration::from_secs(1)));
+        let mut balloon = Balloon::new(metrics.clone(), Some(Duration::from_secs(1))).unwrap();
+        balloon.stats_request_epoch = Some(epoch);
+        balloon.stats_desc_index = Some(3);
+        assert!(balloon.reset());
+        assert!(balloon.stats_request_epoch.is_none());
+        assert!(balloon.stats_desc_index.is_none());
+        assert!(metrics.handle().guest_memory_observation().is_none());
+        assert!(!metrics.record_guest_memory_observation(
+            epoch,
+            8192,
+            2048,
+            Duration::from_secs(1)
+        ));
     }
 }

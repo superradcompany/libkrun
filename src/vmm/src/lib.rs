@@ -742,6 +742,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Contains the state and associated methods required for the Firecracker VMM.
 pub struct Vmm {
     // Guest VM core resources.
+    guest_metrics: utils::metrics::MetricsHandle,
     guest_memory: GuestMemoryMmap,
     arch_memory_info: ArchMemoryInfo,
 
@@ -1252,6 +1253,8 @@ impl Vmm {
             VmmExecutionState::Indeterminate => return Err(Error::VcpuControlIndeterminate),
         }
 
+        // In-flight pre-pause statistics must not survive the lifecycle boundary.
+        self.guest_metrics.invalidate_guest_memory_observation();
         let request_id = self.next_control_request_id()?;
         self.execution_state = VmmExecutionState::Indeterminate;
 
@@ -1270,6 +1273,8 @@ impl Vmm {
         self.vm
             .pause_execution_time(&self.vcpus_handles)
             .map_err(Error::Vm)?;
+        // A report may have arrived while individual vCPUs were still converging.
+        self.guest_metrics.invalidate_guest_memory_observation();
         let generation = PauseGeneration(request_id);
         self.execution_state = VmmExecutionState::Paused(generation);
         Ok(generation)
@@ -1317,6 +1322,9 @@ impl Vmm {
             // them before running again; failure here leaves execution at the paused boundary.
             self.release_memory_baseline()?;
         }
+        // Require a new request/response after resume, including restoration of
+        // a queue containing pre-checkpoint statistics.
+        self.guest_metrics.invalidate_guest_memory_observation();
         // Repair CPU mappings before reopening device workers, then release vCPUs last.
         // Any mapping repair failure leaves both execution and devices quiesced.
         #[cfg(feature = "blk")]

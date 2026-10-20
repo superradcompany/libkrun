@@ -291,11 +291,32 @@ pub struct VmMemoryState {
     /// Total memory the host asked the guest to converge on.
     pub target_mib: u64,
 
-    /// Total memory currently usable by the guest (boot + plugged).
+    /// Boot plus plugged memory. Plugged pages may still be offline in the guest.
     pub current_mib: u64,
 
     /// Boot-time ceiling for live growth (boot + hotplug capacity).
     pub max_mib: u64,
+}
+
+/// Coherent host view of the exact virtio-mem device backing a VM.
+///
+/// All byte counts exclude boot memory except `boot_size`. Neither target equality nor plugged
+/// capacity confirms guest onlining. Completion also needs fresh guest evidence bound to this
+/// device, the runtime incarnation and the accepted resize operation.
+#[cfg(not(feature = "tee"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct VmMemoryDeviceState {
+    /// Boot memory in bytes.
+    pub boot_size: u64,
+    /// Guest-physical start address of the host's hotplug device.
+    pub address: u64,
+    /// Reserved hotplug capacity in bytes.
+    pub region_size: u64,
+    /// Hotplugged bytes currently requested by the host.
+    pub requested_size: u64,
+    /// Bytes currently plugged by this device, not necessarily online in the guest.
+    pub plugged_size: u64,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1334,6 +1355,49 @@ mod tests {
 
     #[cfg(not(feature = "tee"))]
     #[test]
+    fn memory_device_state_requires_host_region_and_preserves_legacy_sizing() {
+        let mut control = make_vm().control_handle();
+        assert_eq!(control.memory_device_state(), None);
+        control.boot_mib = 256;
+        control.mem = Some(Arc::new(std::sync::Mutex::new(
+            devices::virtio::Mem::new().unwrap(),
+        )));
+        assert_eq!(control.memory_device_state(), None);
+        control
+            .mem
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .set_region(4 << 30, 512 << 20)
+            .unwrap();
+
+        // This goes through the real setter's block rounding. Requesting 515 MiB accepts 514,
+        // but no guest has plugged or onlined any pages merely because the host accepted it.
+        assert_eq!(control.set_memory_target_mib(515), Some(514));
+        let device = control.memory_device_state().unwrap();
+        assert_eq!(device.boot_size, 256 << 20);
+        assert_eq!(device.address, 4 << 30);
+        assert_eq!(device.region_size, 512 << 20);
+        assert_eq!(device.requested_size, 258 << 20);
+        assert_eq!(device.plugged_size, 0);
+        let legacy = control.memory_state().unwrap();
+        assert_eq!(legacy.boot_mib, device.boot_size >> 20);
+        assert_eq!(legacy.target_mib, 514);
+        assert_eq!(legacy.current_mib, 256);
+        assert_eq!(legacy.max_mib, 768);
+
+        // A later target changes the snapshot, never the previously returned evidence.
+        assert_eq!(control.set_memory_target_mib(256), Some(256));
+        let next = control.memory_device_state().unwrap();
+        assert_eq!(next.requested_size, 0);
+        assert_eq!(next.address, device.address);
+        assert_eq!(next.region_size, device.region_size);
+        assert_eq!(device.requested_size, 258 << 20);
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
     fn waiting_for_running_times_out_before_vmm_startup() {
         let control = make_vm().control_handle();
 
@@ -2105,13 +2169,13 @@ impl VmControl {
         })
     }
 
-    /// Ask the guest to converge on `total_mib` of usable memory.
+    /// Ask the guest to converge on `total_mib` of memory capacity.
     ///
     /// Returns the accepted target in MiB (clamped to the boot..max range and
     /// rounded down to hotplug block granularity), or `None` when the VM
     /// booted without hotplug capacity. The guest plugs/unplugs blocks
-    /// asynchronously; poll [`memory_state`](Self::memory_state) for
-    /// convergence.
+    /// asynchronously. [`memory_state`](Self::memory_state) reports device progress;
+    /// it does not confirm guest onlining or operation-specific completion.
     pub fn set_memory_target_mib(&self, total_mib: u64) -> Option<u64> {
         let mem = self.mem.as_ref()?;
         let hotplug_target = total_mib.saturating_sub(self.boot_mib) << 20;
@@ -2128,6 +2192,26 @@ impl VmControl {
             target_mib: self.boot_mib + (snap.requested_size >> 20),
             current_mib: self.boot_mib + (snap.plugged_size >> 20),
             max_mib: self.boot_mib + (snap.region_size >> 20),
+        })
+    }
+
+    /// Read the device identity and byte-exact sizing under one device lock.
+    ///
+    /// Returns `None` without hotplug capacity or before the builder assigns its region. Unlike
+    /// the legacy MiB view, byte counts preserve the exact device contract for matching a guest
+    /// readiness record. This read does not sample the guest, resize, or establish completion.
+    pub fn memory_device_state(&self) -> Option<VmMemoryDeviceState> {
+        let mem = self.mem.as_ref()?.lock().unwrap();
+        let snapshot = mem.state_snapshot();
+        if snapshot.region_size == 0 {
+            return None;
+        }
+        Some(VmMemoryDeviceState {
+            boot_size: self.boot_mib.checked_mul(1 << 20)?,
+            address: mem.region_address(),
+            region_size: snapshot.region_size,
+            requested_size: snapshot.requested_size,
+            plugged_size: snapshot.plugged_size,
         })
     }
 
