@@ -1,7 +1,6 @@
 # Nested virtualization implementation stack
 
-Nested virtualization defaults to enabled where the host confirms support, and disabled
-elsewhere. An explicit enable still fails on unsupported hosts; an explicit disable is
+Nested virtualization is disabled by default on every host. Enable it explicitly when needed. An explicit enable still fails on unsupported hosts; an explicit disable is
 always honored. Execution-state capture and
 restore are enabled on qualified Linux x86-64 (Intel and AMD), Windows x86-64 (Intel and AMD),
 and Apple Silicon macOS hosts, subject to the backend's hardware and restore checks.

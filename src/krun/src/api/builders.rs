@@ -594,7 +594,7 @@ impl MachineBuilder {
         self
     }
 
-    /// Override nested virtualization (enabled by default where the host supports it).
+    /// Override nested virtualization (disabled by default).
     ///
     /// Enabling this requires host hardware and hypervisor support; VM creation
     /// fails if it is unavailable. The guest kernel must also include KVM.
@@ -1700,6 +1700,14 @@ mod tests {
             .finish();
 
         assert_eq!(topology.nodes[0].max_memory_mib, 512);
+    }
+
+    #[test]
+    fn nested_virtualization_requires_explicit_opt_in() {
+        assert!(!MachineBuilder::new().nested_virt);
+        assert!(MachineBuilder::new().nested_virt(true).nested_virt);
+        assert!(!MachineBuilder::new().nested_virt(false).nested_virt);
+        assert!(!vmm::resources::VmResources::default().nested_enabled);
     }
 
     #[test]

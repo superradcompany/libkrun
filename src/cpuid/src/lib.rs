@@ -164,8 +164,7 @@ mod tests {
 
     #[test]
     fn test_filter_cpuid_masks_nested_virt_when_disabled() {
-        let mut vm_spec = VmSpec::new(0, 1, false).unwrap();
-        vm_spec.set_nested_enabled(false);
+        let vm_spec = VmSpec::new(0, 1, false).unwrap();
         let mut cpuid = virt_cpuid();
         filter_cpuid(&mut cpuid, &vm_spec).unwrap();
         assert_eq!(virt_bits(&cpuid), 0);
@@ -173,8 +172,8 @@ mod tests {
 
     #[test]
     fn test_filter_cpuid_keeps_nested_virt_when_enabled() {
-        // Nested virtualization is enabled by default.
-        let vm_spec = VmSpec::new(0, 1, false).unwrap();
+        let mut vm_spec = VmSpec::new(0, 1, false).unwrap();
+        vm_spec.set_nested_enabled(true);
         assert!(vm_spec.nested_enabled());
         let mut cpuid = virt_cpuid();
         filter_cpuid(&mut cpuid, &vm_spec).unwrap();

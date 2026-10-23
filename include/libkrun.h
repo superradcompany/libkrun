@@ -1014,7 +1014,7 @@ int32_t krun_setgid(uint32_t ctx_id, gid_t gid);
  * Notes:
  *  Availability depends on the host hardware and hypervisor backend.
  *  Enabling it on an unsupported host fails when the microVM is created.
- *  Enabled by default where the host confirms support; otherwise disabled.
+ *  Disabled by default; callers must explicitly enable it.
  *  KVM support must also be present in the guest kernel.
  *
  * Returns:

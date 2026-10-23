@@ -24,13 +24,9 @@ pub fn supported() -> io::Result<bool> {
     Ok(supported)
 }
 
-/// Enable nesting by default only when the host confirms support.
-/// Probe failures leave implicit nesting off; an explicit enable still uses strict validation.
+/// Nested virtualization requires an explicit opt-in, independently of host support.
 pub fn default_enabled() -> bool {
-    supported().unwrap_or_else(|error| {
-        log::debug!("nested virtualization support probe failed: {error}");
-        false
-    })
+    false
 }
 
 /// Refuse an enabled policy when the backend cannot honor it.
