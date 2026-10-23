@@ -99,7 +99,11 @@ mod tests {
     #[test]
     fn test_vm_spec_nested_enabled() {
         let mut vm_spec = VmSpec::new(0, 1, false).unwrap();
+        assert!(!vm_spec.nested_enabled());
+
+        vm_spec.set_nested_enabled(true);
         assert!(vm_spec.nested_enabled());
+
         vm_spec.set_nested_enabled(false);
         assert!(!vm_spec.nested_enabled());
     }
