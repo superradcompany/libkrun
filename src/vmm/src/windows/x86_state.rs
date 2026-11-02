@@ -116,6 +116,7 @@ pub(super) fn capture_cpu(
     id: u32,
     nested_enabled: bool,
 ) -> Result<Vec<u8>> {
+    super::require_processor_state_api()?;
     let cpu = u8::try_from(id).map_err(codec)?;
     let names = register_names(partition, cpu)?;
     let values = super::get_vcpu_register_bytes(partition, cpu, &names)?;
@@ -183,6 +184,7 @@ pub(super) fn restore_cpu(
     bytes: &[u8],
     nested_enabled: bool,
 ) -> Result<()> {
+    super::require_processor_state_api()?;
     let cpu = u8::try_from(id).map_err(codec)?;
     let (state, nested) = decode_cpu_payload(bytes, nested_enabled)?;
     let names = register_names(partition, cpu)?;

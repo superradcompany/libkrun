@@ -260,6 +260,25 @@ impl ProcessorStateApi {
         static API: std::sync::OnceLock<ProcessorStateApi> = std::sync::OnceLock::new();
         *API.get_or_init(Self::load)
     }
+
+    fn require(self) -> Result<()> {
+        if self.get.is_none() {
+            return Err(Error::ProcessorStateApiUnavailable(
+                "WHvGetVirtualProcessorState",
+            ));
+        }
+        if self.set.is_none() {
+            return Err(Error::ProcessorStateApiUnavailable(
+                "WHvSetVirtualProcessorState",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Fails before any vCPU state is read or changed when the host cannot capture or restore it.
+fn require_processor_state_api() -> Result<()> {
+    ProcessorStateApi::host().require()
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2519,6 +2538,7 @@ fn capture_whp_vcpu_state_on_controller(
     partition_handle: WHV_PARTITION_HANDLE,
     id: u32,
 ) -> Result<Vec<u8>> {
+    require_processor_state_api()?;
     let id = u8::try_from(id).map_err(|_| Error::StateCodec("vCPU id exceeds u8".to_string()))?;
     let (names, sve_enabled) = arm64_execution_registers(partition_handle)?;
     let values = get_vcpu_register_bytes(partition_handle, id, &names)?;
@@ -2565,6 +2585,7 @@ fn restore_whp_vcpu_state_on_controller(
     id: u32,
     bytes: &[u8],
 ) -> Result<Arm64TimerState> {
+    require_processor_state_api()?;
     let id = u8::try_from(id).map_err(|_| Error::StateCodec("vCPU id exceeds u8".to_string()))?;
     let (state, consumed): (WhpVcpuExecutionState, usize) =
         bincode::serde::decode_from_slice(bytes, bincode::config::standard())
@@ -3986,6 +4007,12 @@ mod tests {
     #[test]
     fn missing_processor_state_api_fails_with_a_named_error() {
         let api = ProcessorStateApi::default();
+        assert!(matches!(
+            api.require(),
+            Err(Error::ProcessorStateApiUnavailable(
+                "WHvGetVirtualProcessorState"
+            ))
+        ));
         let handle = WHV_PARTITION_HANDLE::default();
 
         let error = get_virtual_processor_state_with(api, handle, 0, 0).unwrap_err();
@@ -4011,6 +4038,13 @@ mod tests {
             set: Some(fake_set_state),
         };
         let handle = WHV_PARTITION_HANDLE::default();
+        api.require().unwrap();
+        assert!(matches!(
+            ProcessorStateApi { set: None, ..api }.require(),
+            Err(Error::ProcessorStateApiUnavailable(
+                "WHvSetVirtualProcessorState"
+            ))
+        ));
 
         assert_eq!(
             get_virtual_processor_state_with(api, handle, 0, 0).unwrap(),
