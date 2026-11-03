@@ -32,13 +32,13 @@ use windows_sys::Win32::Foundation::{E_FAIL, E_INVALIDARG, S_OK};
 use windows_sys::Win32::System::Hypervisor::{
     WHvCancelRunVirtualProcessor, WHvCapabilityCodeHypervisorPresent, WHvCreatePartition,
     WHvCreateVirtualProcessor, WHvDeletePartition, WHvDeleteVirtualProcessor, WHvGetCapability,
-    WHvGetVirtualProcessorRegisters, WHvGetVirtualProcessorState, WHvMapGpaRange,
-    WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagTrackDirtyPages,
-    WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeProcessorCount, WHvQueryGpaRangeDirtyBitmap,
-    WHvRunVirtualProcessor, WHvRunVpExitReasonNone, WHvSetPartitionProperty,
-    WHvSetVirtualProcessorRegisters, WHvSetVirtualProcessorState, WHvSetupPartition,
-    WHvUnmapGpaRange, WHV_CAPABILITY, WHV_MAP_GPA_RANGE_FLAGS, WHV_PARTITION_HANDLE,
-    WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON,
+    WHvGetVirtualProcessorRegisters, WHvMapGpaRange, WHvMapGpaRangeFlagExecute,
+    WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagTrackDirtyPages, WHvMapGpaRangeFlagWrite,
+    WHvPartitionPropertyCodeProcessorCount, WHvQueryGpaRangeDirtyBitmap, WHvRunVirtualProcessor,
+    WHvRunVpExitReasonNone, WHvSetPartitionProperty, WHvSetVirtualProcessorRegisters,
+    WHvSetupPartition, WHvUnmapGpaRange, WHV_CAPABILITY, WHV_MAP_GPA_RANGE_FLAGS,
+    WHV_PARTITION_HANDLE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON,
+    WHV_VIRTUAL_PROCESSOR_STATE_TYPE,
 };
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::Hypervisor::{
@@ -199,6 +199,88 @@ type WhvEmulatorTryIoEmulation = unsafe extern "system" fn(
     *mut WHV_EMULATOR_STATUS,
 ) -> windows_sys::core::HRESULT;
 
+// Windows 10 ships a winhvplatform.dll without the opaque vCPU state APIs. A static import of
+// either symbol stops the loader from starting the whole binary, so they are resolved at run time.
+// Only execution-state capture and restore use them.
+type WhvGetVirtualProcessorState = unsafe extern "system" fn(
+    WHV_PARTITION_HANDLE,
+    u32,
+    WHV_VIRTUAL_PROCESSOR_STATE_TYPE,
+    *mut core::ffi::c_void,
+    u32,
+    *mut u32,
+) -> windows_sys::core::HRESULT;
+type WhvSetVirtualProcessorState = unsafe extern "system" fn(
+    WHV_PARTITION_HANDLE,
+    u32,
+    WHV_VIRTUAL_PROCESSOR_STATE_TYPE,
+    *const core::ffi::c_void,
+    u32,
+) -> windows_sys::core::HRESULT;
+
+#[derive(Clone, Copy, Default)]
+struct ProcessorStateApi {
+    get: Option<WhvGetVirtualProcessorState>,
+    set: Option<WhvSetVirtualProcessorState>,
+}
+
+impl ProcessorStateApi {
+    fn load() -> Self {
+        // winhvplatform.dll is already loaded through the other WHP imports, so this only takes a
+        // reference. The library is kept for the life of the process because the pointers escape.
+        let library = match unsafe {
+            libloading::os::windows::Library::load_with_flags(
+                "winhvplatform.dll",
+                libloading::os::windows::LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        } {
+            Ok(library) => library,
+            Err(error) => {
+                warn!("winhvplatform.dll could not be loaded for vCPU state APIs: {error}");
+                return Self::default();
+            }
+        };
+        let api = Self {
+            get: unsafe {
+                library.get::<WhvGetVirtualProcessorState>(b"WHvGetVirtualProcessorState")
+            }
+            .ok()
+            .map(|symbol| *symbol),
+            set: unsafe {
+                library.get::<WhvSetVirtualProcessorState>(b"WHvSetVirtualProcessorState")
+            }
+            .ok()
+            .map(|symbol| *symbol),
+        };
+        std::mem::forget(library);
+        api
+    }
+
+    fn host() -> Self {
+        static API: std::sync::OnceLock<ProcessorStateApi> = std::sync::OnceLock::new();
+        *API.get_or_init(Self::load)
+    }
+
+    fn require(self) -> Result<()> {
+        if self.get.is_none() {
+            return Err(Error::ProcessorStateApiUnavailable(
+                "WHvGetVirtualProcessorState",
+            ));
+        }
+        if self.set.is_none() {
+            return Err(Error::ProcessorStateApiUnavailable(
+                "WHvSetVirtualProcessorState",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Fails before any vCPU state is read or changed when the host cannot capture or restore it.
+fn require_processor_state_api() -> Result<()> {
+    ProcessorStateApi::host().require()
+}
+
 #[cfg(target_arch = "x86_64")]
 const X86_BOOT_GDT_OFFSET: u64 = 0x500;
 #[cfg(target_arch = "x86_64")]
@@ -308,6 +390,7 @@ pub enum Error {
         state_type: i32,
         hresult: windows_sys::core::HRESULT,
     },
+    ProcessorStateApiUnavailable(&'static str),
     StateCodec(String),
     StateTooLarge,
     SetPartitionProperty {
@@ -467,6 +550,12 @@ impl Display for Error {
                 f,
                 "WHvSetVirtualProcessorState({id}, {state_type:#x}) failed with HRESULT 0x{:08x}",
                 *hresult as u32
+            ),
+            Error::ProcessorStateApiUnavailable(symbol) => write!(
+                f,
+                "{symbol} is not available in this host's winhvplatform.dll; \
+                 WHP execution-state capture and restore need a newer Windows release, \
+                 such as Windows 11"
             ),
             Error::StateCodec(error) => write!(f, "WHP execution-state codec failed: {error}"),
             Error::StateTooLarge => write!(f, "WHP execution-state payload exceeds its limit"),
@@ -2449,6 +2538,7 @@ fn capture_whp_vcpu_state_on_controller(
     partition_handle: WHV_PARTITION_HANDLE,
     id: u32,
 ) -> Result<Vec<u8>> {
+    require_processor_state_api()?;
     let id = u8::try_from(id).map_err(|_| Error::StateCodec("vCPU id exceeds u8".to_string()))?;
     let (names, sve_enabled) = arm64_execution_registers(partition_handle)?;
     let values = get_vcpu_register_bytes(partition_handle, id, &names)?;
@@ -2495,6 +2585,7 @@ fn restore_whp_vcpu_state_on_controller(
     id: u32,
     bytes: &[u8],
 ) -> Result<Arm64TimerState> {
+    require_processor_state_api()?;
     let id = u8::try_from(id).map_err(|_| Error::StateCodec("vCPU id exceeds u8".to_string()))?;
     let (state, consumed): (WhpVcpuExecutionState, usize) =
         bincode::serde::decode_from_slice(bytes, bincode::config::standard())
@@ -2656,11 +2747,23 @@ fn get_virtual_processor_state(
     id: u32,
     state_type: i32,
 ) -> Result<Vec<u8>> {
+    get_virtual_processor_state_with(ProcessorStateApi::host(), partition_handle, id, state_type)
+}
+
+fn get_virtual_processor_state_with(
+    api: ProcessorStateApi,
+    partition_handle: WHV_PARTITION_HANDLE,
+    id: u32,
+    state_type: i32,
+) -> Result<Vec<u8>> {
+    let get_state = api.get.ok_or(Error::ProcessorStateApiUnavailable(
+        "WHvGetVirtualProcessorState",
+    ))?;
     // WHP documents a two-call contract for opaque state. The zero-sized query avoids guessing a
     // category's ABI size and is required for ARM64 GIC state on current Windows builds.
     let mut written = 0_u32;
     let size_result = unsafe {
-        WHvGetVirtualProcessorState(
+        get_state(
             partition_handle,
             id,
             state_type,
@@ -2680,7 +2783,7 @@ fn get_virtual_processor_state(
 
     let mut bytes = vec![0_u8; required];
     let hresult = unsafe {
-        WHvGetVirtualProcessorState(
+        get_state(
             partition_handle,
             id,
             state_type,
@@ -2706,9 +2809,28 @@ fn set_virtual_processor_state(
     state_type: i32,
     bytes: &[u8],
 ) -> Result<()> {
+    set_virtual_processor_state_with(
+        ProcessorStateApi::host(),
+        partition_handle,
+        id,
+        state_type,
+        bytes,
+    )
+}
+
+fn set_virtual_processor_state_with(
+    api: ProcessorStateApi,
+    partition_handle: WHV_PARTITION_HANDLE,
+    id: u32,
+    state_type: i32,
+    bytes: &[u8],
+) -> Result<()> {
+    let set_state = api.set.ok_or(Error::ProcessorStateApiUnavailable(
+        "WHvSetVirtualProcessorState",
+    ))?;
     let size = u32::try_from(bytes.len()).map_err(|_| Error::StateTooLarge)?;
     let hresult = unsafe {
-        WHvSetVirtualProcessorState(
+        set_state(
             partition_handle,
             id,
             state_type,
@@ -3848,6 +3970,104 @@ unsafe extern "system" fn emulator_translate_gva_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    unsafe extern "system" fn fake_get_state(
+        _partition: WHV_PARTITION_HANDLE,
+        _id: u32,
+        _state_type: WHV_VIRTUAL_PROCESSOR_STATE_TYPE,
+        buffer: *mut core::ffi::c_void,
+        size: u32,
+        written: *mut u32,
+    ) -> windows_sys::core::HRESULT {
+        const STATE: [u8; 3] = [1, 2, 3];
+        unsafe { *written = STATE.len() as u32 };
+        if (size as usize) < STATE.len() {
+            return 0x8007_007a_u32 as i32; // ERROR_INSUFFICIENT_BUFFER
+        }
+        unsafe { std::ptr::copy_nonoverlapping(STATE.as_ptr(), buffer.cast(), STATE.len()) };
+        0
+    }
+
+    unsafe extern "system" fn fake_set_state(
+        _partition: WHV_PARTITION_HANDLE,
+        _id: u32,
+        _state_type: WHV_VIRTUAL_PROCESSOR_STATE_TYPE,
+        _buffer: *const core::ffi::c_void,
+        size: u32,
+    ) -> windows_sys::core::HRESULT {
+        if size == 3 {
+            0
+        } else {
+            E_INVALIDARG_FOR_TEST
+        }
+    }
+
+    const E_INVALIDARG_FOR_TEST: windows_sys::core::HRESULT = 0x8007_0057_u32 as i32;
+
+    #[test]
+    fn missing_processor_state_api_fails_with_a_named_error() {
+        let api = ProcessorStateApi::default();
+        assert!(matches!(
+            api.require(),
+            Err(Error::ProcessorStateApiUnavailable(
+                "WHvGetVirtualProcessorState"
+            ))
+        ));
+        let handle = WHV_PARTITION_HANDLE::default();
+
+        let error = get_virtual_processor_state_with(api, handle, 0, 0).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ProcessorStateApiUnavailable("WHvGetVirtualProcessorState")
+        ));
+        let message = error.to_string();
+        assert!(message.contains("WHvGetVirtualProcessorState"), "{message}");
+        assert!(message.contains("newer Windows release"), "{message}");
+
+        let error = set_virtual_processor_state_with(api, handle, 0, 0, &[1, 2, 3]).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ProcessorStateApiUnavailable("WHvSetVirtualProcessorState")
+        ));
+    }
+
+    #[test]
+    fn resolved_processor_state_api_is_called_through_its_pointers() {
+        let api = ProcessorStateApi {
+            get: Some(fake_get_state),
+            set: Some(fake_set_state),
+        };
+        let handle = WHV_PARTITION_HANDLE::default();
+        api.require().unwrap();
+        assert!(matches!(
+            ProcessorStateApi { set: None, ..api }.require(),
+            Err(Error::ProcessorStateApiUnavailable(
+                "WHvSetVirtualProcessorState"
+            ))
+        ));
+
+        assert_eq!(
+            get_virtual_processor_state_with(api, handle, 0, 0).unwrap(),
+            vec![1, 2, 3]
+        );
+        set_virtual_processor_state_with(api, handle, 0, 0, &[1, 2, 3]).unwrap();
+        assert!(matches!(
+            set_virtual_processor_state_with(api, handle, 1, 2, &[1]),
+            Err(Error::SetVirtualProcessorState {
+                id: 1,
+                state_type: 2,
+                hresult: E_INVALIDARG_FOR_TEST,
+            })
+        ));
+    }
+
+    #[test]
+    fn host_processor_state_api_resolves_both_symbols_or_neither() {
+        // Windows 10 exports neither symbol and Windows 11 exports both. A partial result means
+        // the lookup is broken, not that the host is old.
+        let api = ProcessorStateApi::host();
+        assert_eq!(api.get.is_some(), api.set.is_some());
+    }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
