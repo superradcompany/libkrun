@@ -40,6 +40,8 @@ pub struct CustomStreamProxy {
     peer_fwd_cnt: Wrapping<u32>,
     peer_buf_alloc: u32,
     tx_cnt: Wrapping<u32>,
+    // Advances only after credit is published or retained in the coalescing
+    // RX queue. Rejected updates remain pending in these connection counters.
     last_tx_cnt_sent: Wrapping<u32>,
     rx_cnt: Wrapping<u32>,
     pending_write: VecDeque<u8>,
@@ -132,6 +134,13 @@ impl CustomStreamProxy {
         if let Err(err) = self.notifier.clear() {
             warn!("failed to clear custom vsock notification: {err}");
         }
+    }
+
+    fn has_pending_credit(&self) -> bool {
+        matches!(
+            self.status,
+            ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+        ) && self.tx_cnt != self.last_tx_cnt_sent
     }
 
     // Apply interest changes while the proxy lock still protects its state.
@@ -326,23 +335,50 @@ impl CustomStreamProxy {
         // advertised receive window is half full. Report actual consumption
         // whenever it advances; do not require reverse application traffic
         // to carry the fwd_cnt and unblock a unidirectional sender.
-        if self.tx_cnt == self.last_tx_cnt_sent {
+        if !self.has_pending_credit() {
             return;
         }
 
-        self.last_tx_cnt_sent = self.tx_cnt;
-        push_packet(
-            self.cid,
-            MuxerRx::CreditUpdate {
-                local_port: self.local_port,
-                peer_port: self.peer_port,
-                fwd_cnt: self.tx_cnt.0,
-            },
-            &self.rxq,
-            &self.queue,
-            &self.mem,
-        );
-        update.signal_queue = true;
+        // One coalesced entry per stream preserves delivery priority over
+        // backend data without letting tiny writes consume the whole queue.
+        // Match the muxer's queue -> rxq lock order throughout publication.
+        let mut queue = self.queue.lock().unwrap();
+        let mut rxq = self.rxq.lock().unwrap();
+        while rxq.is_empty() {
+            let Some(head) = queue.pop(&self.mem) else {
+                break;
+            };
+            let len = match VsockPacket::from_rx_virtq_head(&head) {
+                Ok(mut pkt) => {
+                    self.init_data_pkt(&mut pkt);
+                    pkt.set_op(uapi::VSOCK_OP_CREDIT_UPDATE)
+                        .set_len(0)
+                        .set_flags(0);
+                    pkt.hdr().len() as u32
+                }
+                Err(err) => {
+                    // Return invalid buffers with zero used length, so a bad
+                    // head cannot permanently hide a later usable RX buffer.
+                    debug!("custom vsock credit RX queue error: {err:?}");
+                    0
+                }
+            };
+            if let Err(err) = queue.add_used(&self.mem, head.index, len) {
+                error!("failed to publish custom vsock credit: {err:?}");
+                return;
+            }
+            update.signal_queue = true;
+            if len != 0 {
+                self.last_tx_cnt_sent = self.tx_cnt;
+                return;
+            }
+        }
+        if rxq.push_credit_update(self.local_port, self.peer_port, self.tx_cnt.0) {
+            self.last_tx_cnt_sent = self.tx_cnt;
+            update.signal_queue = true;
+        }
+        // A rejected update remains pending. The device retries it after RX
+        // processing frees queue capacity, even without new application data.
     }
 
     fn init_data_pkt(&self, pkt: &mut VsockPacket) {
@@ -439,8 +475,8 @@ impl Proxy for CustomStreamProxy {
             self.fail(&mut update, "custom vsock backend write failed", &err);
             return update;
         }
-        self.update_polling();
         self.maybe_push_credit_update(&mut update);
+        self.update_polling();
 
         update
     }
@@ -534,8 +570,10 @@ impl Proxy for CustomStreamProxy {
                 self.fail(&mut update, "custom vsock backend write failed", &err);
                 return update;
             }
-            self.maybe_push_credit_update(&mut update);
         }
+
+        // Retried credit is independent of pending writes and download credit.
+        self.maybe_push_credit_update(&mut update);
 
         // A hang-up can arrive with unread host bytes (including macOS EV_EOF).
         // Drain through the normal credit/virtqueue path and close only after
@@ -578,6 +616,12 @@ impl Proxy for CustomStreamProxy {
             warn!("failed to kick custom vsock backend: {err}");
         }
     }
+
+    fn retry_credit(&mut self) -> bool {
+        let mut update = ProxyUpdate::default();
+        self.maybe_push_credit_update(&mut update);
+        update.signal_queue
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -593,6 +637,11 @@ mod tests {
     use super::super::packet::VSOCK_PKT_HDR_SIZE;
     use super::*;
     use crate::virtio::{Descriptor, DescriptorChain};
+
+    const RX_DESC: u64 = 0x4000;
+    const RX_AVAIL: u64 = 0x5000;
+    const RX_USED: u64 = 0x6000;
+    const RX_DATA: u64 = 0x8000;
 
     struct TestStreamState {
         blocked: AtomicBool,
@@ -678,6 +727,86 @@ mod tests {
         .unwrap()
     }
 
+    fn writable_proxy(mem: GuestMemoryMmap) -> CustomStreamProxy {
+        test_proxy(
+            Arc::new(TestStreamState {
+                blocked: AtomicBool::new(false),
+                written: Mutex::new(Vec::new()),
+            }),
+            mem,
+        )
+    }
+
+    fn configure_rx(proxy: &mut CustomStreamProxy, available: u16) {
+        let mut queue = VirtQueue::new(8);
+        queue.size = 8;
+        queue.ready = true;
+        queue.desc_table = GuestAddress(RX_DESC);
+        queue.avail_ring = GuestAddress(RX_AVAIL);
+        queue.used_ring = GuestAddress(RX_USED);
+        for index in 0..8u16 {
+            let addr = RX_DATA + u64::from(index) * 128;
+            proxy
+                .mem
+                .write_slice(&[0xff; 64], GuestAddress(addr))
+                .unwrap();
+            proxy
+                .mem
+                .write_obj(
+                    Descriptor {
+                        addr,
+                        len: 64,
+                        flags: 2,
+                        next: 0,
+                    },
+                    GuestAddress(RX_DESC + u64::from(index) * 16),
+                )
+                .unwrap();
+            proxy
+                .mem
+                .write_obj(index, GuestAddress(RX_AVAIL + 4 + u64::from(index) * 2))
+                .unwrap();
+        }
+        proxy
+            .mem
+            .write_obj(available, GuestAddress(RX_AVAIL + 2))
+            .unwrap();
+        proxy.queue = Arc::new(Mutex::new(queue));
+        proxy.peer_buf_alloc = 65536;
+    }
+
+    fn used_count(proxy: &CustomStreamProxy) -> u16 {
+        proxy.mem.read_obj(GuestAddress(RX_USED + 2)).unwrap()
+    }
+
+    fn rx_packet(proxy: &CustomStreamProxy, index: u16) -> VsockPacket {
+        let head =
+            DescriptorChain::checked_new(&proxy.mem, GuestAddress(RX_DESC), 8, index).unwrap();
+        VsockPacket::from_rx_virtq_head(&head).unwrap()
+    }
+
+    fn retry_after_guest_kick(proxy: &mut CustomStreamProxy) -> ProxyUpdate {
+        // The muxer retries credit synchronously, before waking backend I/O.
+        // A backend waiting for download credit need not have a poll interest.
+        let signal_queue = proxy.retry_credit();
+        proxy.kick();
+        let mut events = vec![EpollEvent::new(EventSet::empty(), 0); 2];
+        let count = proxy.epoll.wait(2, 0, &mut events).unwrap();
+        let mut update = ProxyUpdate {
+            signal_queue,
+            ..Default::default()
+        };
+        for event in &events[..count] {
+            update.signal_queue |= proxy.process_event(event.event_set()).signal_queue;
+        }
+        assert_eq!(
+            proxy.epoll.wait(2, 0, &mut events).unwrap(),
+            0,
+            "a handled retry must not leave the notifier spinning"
+        );
+        update
+    }
+
     #[test]
     fn buffers_partial_writes_without_losing_bytes() {
         let state = Arc::new(TestStreamState {
@@ -709,17 +838,182 @@ mod tests {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let pkt = tx_packet(&mem, 1, b"a");
         let mut proxy = test_proxy(state, mem);
+        configure_rx(&mut proxy, 1);
         let update = proxy.sendmsg(&pkt);
         assert!(update.signal_queue);
         assert_eq!(proxy.tx_cnt.0, 1);
         assert_eq!(proxy.last_tx_cnt_sent.0, 1);
-        assert!(matches!(
-            proxy.rxq.lock().unwrap().pop(),
-            Some(MuxerRx::CreditUpdate { fwd_cnt: 1, .. })
-        ));
+        assert_eq!(used_count(&proxy), 1);
+        let credit = rx_packet(&proxy, 0);
+        assert_eq!(credit.op(), uapi::VSOCK_OP_CREDIT_UPDATE);
+        assert_eq!(credit.fwd_cnt(), 1);
+        assert_eq!(credit.flags(), 0);
+        assert_eq!(credit.len(), 0);
+        assert!(proxy.rxq.lock().unwrap().is_empty());
         let mut unchanged = ProxyUpdate::default();
         proxy.maybe_push_credit_update(&mut unchanged);
         assert!(!unchanged.signal_queue);
+    }
+
+    #[test]
+    fn tiny_writes_leave_room_for_connection_replies_and_other_streams() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut a = writable_proxy(mem.clone());
+        configure_rx(&mut a, 0);
+        let mut b = writable_proxy(mem.clone());
+        b.local_port = 6000;
+        b.peer_port = 4001;
+        b.queue = Arc::clone(&a.queue);
+        b.rxq = Arc::clone(&a.rxq);
+        let packet = tx_packet(&mem, 1, b"x");
+        for _ in 0..defs::MUXER_RXQ_SIZE * 4 {
+            a.sendmsg(&packet);
+        }
+        b.sendmsg(&packet);
+        assert_eq!(a.tx_cnt.0, 1024);
+        assert_eq!(b.tx_cnt.0, 1);
+        assert_eq!(
+            a.rxq.lock().unwrap().len(),
+            2,
+            "one retained credit per stream"
+        );
+        assert_eq!(a.last_tx_cnt_sent.0, 1024);
+        assert_eq!(b.last_tx_cnt_sent.0, 1);
+
+        // Both required controls still fit after more tiny writes than the
+        // entire shared queue can hold. Credit preserves its FIFO position.
+        a.push_connect_response();
+        b.push_reset();
+        assert!(matches!(
+            a.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::CreditUpdate {
+                local_port: 5000,
+                peer_port: 4000,
+                fwd_cnt: 1024
+            })
+        ));
+        assert!(matches!(
+            a.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::CreditUpdate {
+                local_port: 6000,
+                peer_port: 4001,
+                fwd_cnt: 1
+            })
+        ));
+        assert!(matches!(
+            a.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::OpResponse { .. })
+        ));
+        assert!(matches!(
+            a.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::Reset { .. })
+        ));
+    }
+
+    #[test]
+    fn retries_credit_after_a_full_control_queue_without_more_application_data() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut proxy = writable_proxy(mem.clone());
+        configure_rx(&mut proxy, 2);
+        for port in 0..defs::MUXER_RXQ_SIZE {
+            assert!(proxy.rxq.lock().unwrap().push(MuxerRx::Reset {
+                local_port: port as u32,
+                peer_port: 1
+            }));
+        }
+        let packet = tx_packet(&mem, 1, b"x");
+        proxy.sendmsg(&packet);
+        assert!(proxy.pending_write.is_empty());
+        assert_eq!(proxy.last_tx_cnt_sent.0, 0);
+        assert_eq!(
+            used_count(&proxy),
+            0,
+            "queued controls must retain priority"
+        );
+        proxy.rxq.lock().unwrap().clear();
+        assert!(retry_after_guest_kick(&mut proxy).signal_queue);
+        assert_eq!(used_count(&proxy), 1);
+        assert_eq!(rx_packet(&proxy, 0).fwd_cnt(), 1);
+        assert_eq!(proxy.last_tx_cnt_sent.0, 1);
+        assert!(!retry_after_guest_kick(&mut proxy).signal_queue);
+        assert_eq!(
+            used_count(&proxy),
+            1,
+            "unchanged credit needs no duplicate packet"
+        );
+    }
+
+    #[test]
+    fn retries_upload_credit_while_waiting_for_download_credit() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut proxy = writable_proxy(mem.clone());
+        configure_rx(&mut proxy, 0);
+        proxy.status = ProxyStatus::WaitingCreditUpdate;
+        for port in 0..defs::MUXER_RXQ_SIZE {
+            assert!(proxy.rxq.lock().unwrap().push(MuxerRx::Reset {
+                local_port: port as u32,
+                peer_port: 1
+            }));
+        }
+        proxy.sendmsg(&tx_packet(&mem, 1, b"x"));
+        assert_eq!(proxy.last_tx_cnt_sent.0, 0);
+        proxy.rxq.lock().unwrap().clear();
+        mem.write_obj(1u16, GuestAddress(RX_AVAIL + 2)).unwrap();
+        assert!(retry_after_guest_kick(&mut proxy).signal_queue);
+        assert_eq!(used_count(&proxy), 1);
+        assert_eq!(rx_packet(&proxy, 0).fwd_cnt(), 1);
+        assert_eq!(proxy.status, ProxyStatus::WaitingCreditUpdate);
+    }
+
+    #[test]
+    fn coalesces_wrapping_credit_and_only_reports_consumed_bytes() {
+        let state = Arc::new(TestStreamState {
+            blocked: AtomicBool::new(true),
+            written: Mutex::new(Vec::new()),
+        });
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut proxy = test_proxy(Arc::clone(&state), mem.clone());
+        configure_rx(&mut proxy, 1);
+        proxy.tx_cnt = Wrapping(u32::MAX - 1);
+        proxy.last_tx_cnt_sent = proxy.tx_cnt;
+        proxy.sendmsg(&tx_packet(&mem, 5, b"hello"));
+        assert_eq!(used_count(&proxy), 1);
+        assert_eq!(rx_packet(&proxy, 0).fwd_cnt(), 0);
+        assert_eq!(proxy.pending_write.len(), 3);
+        state.blocked.store(false, Ordering::Relaxed);
+        proxy.process_event(EventSet::OUT);
+        assert_eq!(proxy.tx_cnt.0, 3);
+        assert_eq!(proxy.last_tx_cnt_sent.0, 3);
+        assert_eq!(&*state.written.lock().unwrap(), b"hello");
+        assert!(matches!(
+            proxy.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::CreditUpdate { fwd_cnt: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_rx_buffer_does_not_lose_pending_credit() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut proxy = writable_proxy(mem.clone());
+        configure_rx(&mut proxy, 2);
+        mem.write_obj(4u32, GuestAddress(RX_DESC + 8)).unwrap();
+        assert!(proxy.sendmsg(&tx_packet(&mem, 1, b"x")).signal_queue);
+        assert_eq!(used_count(&proxy), 2);
+        let discarded_len: u32 = mem.read_obj(GuestAddress(RX_USED + 8)).unwrap();
+        assert_eq!(discarded_len, 0);
+        assert_eq!(rx_packet(&proxy, 1).fwd_cnt(), 1);
+        assert_eq!(proxy.last_tx_cnt_sent.0, 1);
+    }
+
+    #[test]
+    fn failed_used_ring_publication_does_not_acknowledge_credit() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut proxy = writable_proxy(mem.clone());
+        configure_rx(&mut proxy, 2);
+        proxy.queue.lock().unwrap().used_ring = GuestAddress(0x20000);
+        proxy.sendmsg(&tx_packet(&mem, 1, b"x"));
+        assert_eq!(proxy.last_tx_cnt_sent.0, 0);
+        assert_eq!(used_count(&proxy), 0);
     }
 
     #[test]

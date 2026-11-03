@@ -66,6 +66,45 @@ impl MuxerRxQ {
         false
     }
 
+    /// Queue retryable custom-stream credit without crowding out other controls.
+    /// The caller must retain and retry progress when this returns false.
+    pub fn push_credit_update(&mut self, local_port: u32, peer_port: u32, fwd_cnt: u32) -> bool {
+        let position = self.q.iter().position(|pending| {
+            matches!(pending,
+            MuxerRx::CreditUpdate { local_port: local, peer_port: peer, .. }
+                if *local == local_port && *peer == peer_port)
+        });
+        if let Some(position) = position {
+            // Move the newest count to the tail: a later same-stream credit
+            // request may still carry an older count. Updating in place would
+            // make the guest observe progress backwards. Counts also wrap, so
+            // max(old, new) is not a valid way to choose the latest value.
+            self.q.remove(position);
+            self.q.push_back(MuxerRx::CreditUpdate {
+                local_port,
+                peer_port,
+                fwd_cnt,
+            });
+            return true;
+        }
+        let credit_count = self
+            .q
+            .iter()
+            .filter(|pending| matches!(pending, MuxerRx::CreditUpdate { .. }))
+            .count();
+        // Reserve half the queue for replies, resets, and credit requests.
+        // Apply this only to callers that retain rejected credit: legacy
+        // producers using push() do not implement this retry contract.
+        if credit_count >= Self::SIZE / 2 {
+            return false;
+        }
+        self.push(MuxerRx::CreditUpdate {
+            local_port,
+            peer_port,
+            fwd_cnt,
+        })
+    }
+
     /// Pop an RX item from the front of the queue.
     pub fn pop(&mut self) -> Option<MuxerRx> {
         self.q.pop_front()
@@ -181,6 +220,8 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) -> bool {
             fwd_cnt,
         } => {
             pkt.set_op(uapi::VSOCK_OP_CREDIT_REQUEST)
+                .set_len(0)
+                .set_flags(0)
                 .set_src_cid(uapi::VSOCK_HOST_CID)
                 .set_dst_cid(cid)
                 .set_src_port(local_port)
@@ -195,6 +236,8 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) -> bool {
             fwd_cnt,
         } => {
             pkt.set_op(uapi::VSOCK_OP_CREDIT_UPDATE)
+                .set_len(0)
+                .set_flags(0)
                 .set_src_cid(uapi::VSOCK_HOST_CID)
                 .set_dst_cid(cid)
                 .set_src_port(local_port)
@@ -267,4 +310,138 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) -> bool {
     }
 
     true
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::virtio::{Descriptor, DescriptorChain};
+    use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+    #[test]
+    fn credit_budget_reserves_control_capacity_and_full_queue_still_coalesces() {
+        let mut queue = MuxerRxQ::new();
+        for port in 0..MuxerRxQ::SIZE / 2 {
+            assert!(queue.push_credit_update(port as u32, 1, u32::MAX));
+        }
+        assert!(
+            !queue.push_credit_update(0, 2, 1),
+            "both ports identify a stream"
+        );
+        for port in 0..MuxerRxQ::SIZE / 2 {
+            assert!(queue.push(MuxerRx::Reset {
+                local_port: port as u32,
+                peer_port: 2
+            }));
+        }
+        assert!(queue.is_full());
+        assert!(
+            queue.push_credit_update(0, 1, 0),
+            "coalescing needs no extra slot, even after wrap"
+        );
+        assert_eq!(queue.len(), MuxerRxQ::SIZE);
+        let mut last = None;
+        while let Some(packet) = queue.pop() {
+            last = Some(packet);
+        }
+        assert!(matches!(
+            last,
+            Some(MuxerRx::CreditUpdate {
+                local_port: 0,
+                peer_port: 1,
+                fwd_cnt: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn coalesced_credit_follows_older_requests_and_preserves_other_streams() {
+        let mut queue = MuxerRxQ::new();
+        assert!(queue.push_credit_update(5, 6, u32::MAX));
+        assert!(queue.push(MuxerRx::CreditRequest {
+            local_port: 5,
+            peer_port: 6,
+            fwd_cnt: u32::MAX
+        }));
+        assert!(queue.push_credit_update(5, 7, 8));
+        assert!(queue.push_credit_update(7, 6, 9));
+        assert!(queue.push_credit_update(5, 6, 0));
+        assert_eq!(queue.len(), 4);
+        assert!(matches!(
+            queue.pop(),
+            Some(MuxerRx::CreditRequest {
+                fwd_cnt: u32::MAX,
+                ..
+            })
+        ));
+        assert!(matches!(
+            queue.pop(),
+            Some(MuxerRx::CreditUpdate {
+                local_port: 5,
+                peer_port: 7,
+                fwd_cnt: 8
+            })
+        ));
+        assert!(matches!(
+            queue.pop(),
+            Some(MuxerRx::CreditUpdate {
+                local_port: 7,
+                peer_port: 6,
+                fwd_cnt: 9
+            })
+        ));
+        assert!(matches!(
+            queue.pop(),
+            Some(MuxerRx::CreditUpdate {
+                local_port: 5,
+                peer_port: 6,
+                fwd_cnt: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn credit_controls_clear_recycled_rx_header_length_and_flags() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        mem.write_obj(
+            Descriptor {
+                addr: 0x2000,
+                len: 128,
+                flags: 2,
+                next: 0,
+            },
+            GuestAddress(0x1000),
+        )
+        .unwrap();
+        for request in [false, true] {
+            mem.write_slice(&[0xff; 128], GuestAddress(0x2000)).unwrap();
+            let head = DescriptorChain::checked_new(&mem, GuestAddress(0x1000), 1, 0).unwrap();
+            let mut packet = VsockPacket::from_rx_virtq_head(&head).unwrap();
+            let control = if request {
+                MuxerRx::CreditRequest {
+                    local_port: 5,
+                    peer_port: 6,
+                    fwd_cnt: 7,
+                }
+            } else {
+                MuxerRx::CreditUpdate {
+                    local_port: 5,
+                    peer_port: 6,
+                    fwd_cnt: 7,
+                }
+            };
+            assert!(rx_to_pkt(3, control, &mut packet));
+            assert_eq!(packet.len(), 0);
+            assert_eq!(packet.flags(), 0);
+            assert_eq!(
+                (packet.src_port(), packet.dst_port(), packet.fwd_cnt()),
+                (5, 6, 7)
+            );
+            assert_eq!(packet.buf_alloc(), defs::CONN_TX_BUF_SIZE as u32);
+        }
+    }
 }
