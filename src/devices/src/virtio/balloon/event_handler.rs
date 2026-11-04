@@ -2,9 +2,11 @@
 use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+use std::sync::atomic::Ordering;
 
 use polly::event_manager::{EventManager, Pollable, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
+use vm_memory::{Address, Bytes};
 
 use super::device::{
     Balloon, BalloonStat, DFQ_INDEX, FRQ_INDEX, IFQ_INDEX, MAX_STATS_DESC_LEN, PHQ_INDEX,
@@ -12,6 +14,7 @@ use super::device::{
 };
 use crate::virtio::descriptor_utils::Reader;
 use crate::virtio::device::VirtioDevice;
+use crate::virtio::queue::Error as QueueError;
 
 impl Balloon {
     fn queue_event(&self, idx: usize) -> &std::sync::Arc<utils::eventfd::EventFd> {
@@ -116,9 +119,26 @@ impl Balloon {
         if !queue.ready {
             return false;
         }
-        match &self.device_state {
-            crate::virtio::DeviceState::Activated(mem, _) => !queue.is_empty(mem),
-            crate::virtio::DeviceState::Inactive => false,
+        let crate::virtio::DeviceState::Activated(mem, _) = &self.device_state else {
+            return false;
+        };
+        // Unsupported queues have not had their guest-controlled ring addresses
+        // validated. Queue::is_empty unwraps read errors, so use a checked atomic
+        // read of virtq_avail->idx instead, preserving its acquire ordering.
+        let available = queue
+            .avail_ring
+            .checked_add(2)
+            .ok_or(QueueError::AddressOverflow)
+            .and_then(|addr| {
+                mem.load::<u16>(addr, Ordering::Acquire)
+                    .map_err(QueueError::GuestMemory)
+            });
+        match available {
+            Ok(available) => available != queue.next_avail.0,
+            Err(err) => {
+                error!("Failed to read balloon queue {index} available index: {err:?}");
+                false
+            }
         }
     }
 
@@ -475,6 +495,39 @@ mod tests {
                 assert_eq!(
                     balloon.queues.as_ref().unwrap()[index].queue.next_avail.0,
                     consumed
+                );
+            }
+
+            // Unsupported rings are guest-controlled and need not be valid,
+            // even when marked ready. Invalid notifications must be drained
+            // and diagnosed without panicking or changing queue ownership.
+            for (ready, address) in [
+                (false, u64::MAX - 1),
+                (true, u64::MAX - 1), // Adding the index offset overflows.
+                (true, 0x10000),      // The ring lies outside guest memory.
+                (true, 0xfffd),       // The index crosses the memory boundary.
+                (true, 0x1001),       // Atomic ring-index reads need alignment.
+            ] {
+                let queue = &mut balloon.queues.as_mut().unwrap()[index].queue;
+                queue.ready = ready;
+                queue.avail_ring = GuestAddress(address);
+                queue.next_avail = Wrapping(7);
+                LOGS.with(|logs| logs.borrow_mut().clear());
+                balloon.queue_event(index).write(1).unwrap();
+                handler(&mut balloon, &EpollEvent::new(EventSet::IN, 0));
+                let logs = LOGS.with(|logs| logs.borrow().clone());
+                if ready {
+                    assert_eq!(logs.len(), 1);
+                    assert!(logs[0].starts_with(&format!(
+                        "Failed to read balloon queue {index} available index:"
+                    )));
+                } else {
+                    assert!(logs.is_empty());
+                }
+                assert!(balloon.queue_event(index).read().is_err());
+                assert_eq!(
+                    balloon.queues.as_ref().unwrap()[index].queue.next_avail.0,
+                    7
                 );
             }
 
