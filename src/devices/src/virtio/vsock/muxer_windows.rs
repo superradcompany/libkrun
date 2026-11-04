@@ -228,8 +228,18 @@ impl VsockMuxer {
 
     /// Retry proxy work after the caller has released the guest RX queue.
     pub(crate) fn kick_backends(&self) {
+        let mut signal_queue = false;
         for proxy in self.proxy_map.read().unwrap().values() {
-            proxy.lock().unwrap().kick();
+            let mut proxy = proxy.lock().unwrap();
+            // Also supports pollable handles without registering a second
+            // Windows wait handle under the same proxy token.
+            signal_queue |= proxy.retry_credit();
+            proxy.kick();
+        }
+        if signal_queue {
+            if let Some(interrupt) = &self.interrupt {
+                interrupt.signal_used_queue();
+            }
         }
     }
 
@@ -344,6 +354,7 @@ impl VsockMuxer {
             pkt.src_port(),
             backend,
             notifier,
+            self.epoll.clone(),
             mem.clone(),
             queue.clone(),
             self.rxq.clone(),

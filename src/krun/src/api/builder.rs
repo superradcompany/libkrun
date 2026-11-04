@@ -90,6 +90,8 @@ pub struct VmBuilder {
     #[cfg_attr(feature = "tee", allow(dead_code))]
     #[cfg(not(feature = "tee"))]
     fs: FsBuilder,
+    #[cfg(not(feature = "tee"))]
+    device_state_limits: devices::virtio::DeviceStateLimits,
     console: ConsoleBuilder,
     exec: ExecBuilder,
     #[cfg(feature = "net")]
@@ -111,7 +113,7 @@ impl VmBuilder {
     /// - 1 vCPU
     /// - 512 MiB memory
     /// - Hyperthreading disabled
-    /// - Nested virtualization disabled
+    /// - Nested virtualization enabled where the host supports it
     pub fn new() -> Self {
         Self {
             machine: MachineBuilder::new(),
@@ -119,6 +121,8 @@ impl VmBuilder {
             kernel: KernelBuilder::new(),
             #[cfg(not(feature = "tee"))]
             fs: FsBuilder::new(),
+            #[cfg(not(feature = "tee"))]
+            device_state_limits: devices::virtio::DeviceStateLimits::default(),
             console: ConsoleBuilder::new(),
             exec: ExecBuilder::new(),
             #[cfg(feature = "net")]
@@ -208,6 +212,46 @@ impl VmBuilder {
     pub fn fs(mut self, f: impl FnOnce(FsBuilder) -> FsBuilder) -> Self {
         let new_fs = f(FsBuilder::new());
         self.fs.configs.extend(new_fs.configs);
+        self
+    }
+
+    /// Set the largest backend state, in bytes, that each virtio-fs device captures or restores.
+    ///
+    /// Applies to every filesystem device, including custom backends. Defaults to
+    /// [`DEFAULT_MAX_FS_BACKEND_STATE_BYTES`](crate::DEFAULT_MAX_FS_BACKEND_STATE_BYTES). The
+    /// limit must fit a `u32`; larger values make state capture and restore fail.
+    /// With `blk` enabled, use the built VM's `device_state_codec()` so encoding
+    /// and decoding automatically use this budget too. Standalone
+    /// `VirtioDeviceState::encode()` and `decode()` still use the default budget.
+    #[cfg(not(feature = "tee"))]
+    pub fn fs_state_limit(mut self, bytes: usize) -> Self {
+        self.device_state_limits = self.device_state_limits.with_fs_state_limit(bytes);
+        self
+    }
+
+    /// Use limits shared with standalone device-state codecs.
+    ///
+    /// The built VM exposes a codec using these limits through `device_state_codec()`
+    /// when the `blk` feature is enabled. Later calls to `fs_state_limit()` override
+    /// the filesystem budget in this value.
+    ///
+    /// ```no_run
+    /// # #[cfg(all(feature = "blk", not(feature = "tee")))]
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// use msb_krun::{DeviceStateCodec, DeviceStateLimits, VmBuilder};
+    ///
+    /// let limits = DeviceStateLimits::default().with_fs_state_limit(64 << 20);
+    /// let standalone = DeviceStateCodec::new(limits);
+    /// let vm = VmBuilder::new().device_state_limits(limits).build()?;
+    /// let codec = vm.device_state_codec();
+    /// // Use codec.encode(&state) and codec.decode(&bytes) for this VM.
+    /// // standalone uses the same budget for imports before VM creation.
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(not(feature = "tee"))]
+    pub fn device_state_limits(mut self, limits: devices::virtio::DeviceStateLimits) -> Self {
+        self.device_state_limits = limits;
         self
     }
 
@@ -643,32 +687,10 @@ impl VmBuilder {
 
         // Apply filesystem configuration
         #[cfg(not(feature = "tee"))]
-        for config in self.fs.configs {
-            match config {
-                FsConfig::Path {
-                    tag,
-                    path,
-                    shm_size,
-                } => {
-                    let fs_config = FsDeviceConfig {
-                        fs_id: tag,
-                        shared_dir: path.to_string_lossy().to_string(),
-                        shm_size,
-                        allow_root_dir_delete: false,
-                    };
-                    vmr.fs.push(fs_config);
-                }
-                #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-                FsConfig::Custom { tag, backend } => {
-                    let backend: Box<dyn devices::virtio::fs::DynFileSystem> = backend;
-                    let custom_config = CustomFsDeviceConfig {
-                        fs_id: tag,
-                        backend: Arc::from(backend),
-                        shm_size: None,
-                    };
-                    vmr.custom_fs.push(custom_config);
-                }
-            }
+        apply_fs_configs(&mut vmr, self.fs.configs);
+        #[cfg(not(feature = "tee"))]
+        {
+            vmr.device_state_limits = self.device_state_limits;
         }
 
         // Apply console configuration
@@ -1149,6 +1171,41 @@ fn validate_cmdline_env(key: &str, value: &str) -> std::result::Result<(), &'sta
         return Err("the key contains whitespace");
     }
     Ok(())
+}
+
+#[cfg(not(feature = "tee"))]
+fn apply_fs_configs(vmr: &mut VmResources, configs: Vec<FsConfig>) {
+    for config in configs {
+        match config {
+            FsConfig::Path {
+                tag,
+                path,
+                shm_size,
+            } => {
+                let fs_config = FsDeviceConfig {
+                    fs_id: tag,
+                    shared_dir: path.to_string_lossy().to_string(),
+                    shm_size,
+                    allow_root_dir_delete: false,
+                };
+                vmr.fs.push(fs_config);
+            }
+            #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+            FsConfig::Custom {
+                tag,
+                backend,
+                shm_size,
+            } => {
+                let backend: Box<dyn devices::virtio::fs::DynFileSystem> = backend;
+                let custom_config = CustomFsDeviceConfig {
+                    fs_id: tag,
+                    backend: Arc::from(backend),
+                    shm_size,
+                };
+                vmr.custom_fs.push(custom_config);
+            }
+        }
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1828,5 +1885,80 @@ mod tests {
 
         limit.set_target_bytes(128 * 1024 * 1024).unwrap();
         assert_eq!(configured.target_bytes(), 128 * 1024 * 1024);
+    }
+
+    #[test]
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    fn custom_fs_dax_size_is_applied_to_vm_resources() {
+        struct DummyFs;
+        impl devices::virtio::fs::DynFileSystem for DummyFs {}
+
+        let mut vmr = VmResources::default();
+        apply_fs_configs(
+            &mut vmr,
+            vec![FsConfig::Custom {
+                tag: "share".to_string(),
+                backend: Box::new(DummyFs),
+                shm_size: Some(64 << 20),
+            }],
+        );
+
+        assert_eq!(vmr.custom_fs.len(), 1);
+        assert_eq!(vmr.custom_fs[0].fs_id, "share");
+        assert_eq!(vmr.custom_fs[0].shm_size, Some(64 << 20));
+    }
+
+    #[test]
+    #[cfg(all(feature = "blk", not(feature = "tee")))]
+    fn fs_state_limit_is_used_by_the_vm_codec() {
+        use devices::virtio::{DeviceStateLimits, VirtioMmioState, VIRTIO_MMIO_STATE_VERSION};
+        use vmm::device_state::{DeviceStateCodec, VirtioDeviceState};
+
+        let limits = DeviceStateLimits::default().with_fs_state_limit(8 << 20);
+        let state = VirtioDeviceState {
+            pause_generation: 1,
+            device_id: "fs0".into(),
+            transport: VirtioMmioState {
+                version: VIRTIO_MMIO_STATE_VERSION,
+                device_type: 26,
+                features_select: 0,
+                acked_features_select: 0,
+                queue_select: 0,
+                device_status: 0,
+                config_generation: 0,
+                shm_region_select: 0,
+                interrupt_status: 0,
+                irq_line: None,
+                acked_features: 0,
+                queues: vec![],
+            },
+            device_state: vec![7; 5 << 20],
+        };
+        let standalone = DeviceStateCodec::new(limits);
+        let encoded = standalone.encode(&state).unwrap();
+        let default_vm = VmBuilder::new().build().unwrap();
+        assert!(default_vm.device_state_codec().decode(&encoded).is_err());
+        assert!(default_vm.device_state_codec().encode(&state).is_err());
+
+        for builder in [
+            VmBuilder::new().fs_state_limit(8 << 20),
+            VmBuilder::new().device_state_limits(limits),
+        ] {
+            let vm = builder.build().unwrap();
+            let codec = vm.device_state_codec();
+            assert_eq!(codec.decode(&encoded).unwrap(), state);
+            assert_eq!(
+                standalone.decode(&codec.encode(&state).unwrap()).unwrap(),
+                state
+            );
+            assert!(encoded.len() <= codec.max_state_bytes(26));
+            assert_eq!(codec.limits(), limits);
+        }
+        let vm = VmBuilder::new()
+            .device_state_limits(limits)
+            .fs_state_limit(1024)
+            .build()
+            .unwrap();
+        assert!(vm.device_state_codec().decode(&encoded).is_err());
     }
 }

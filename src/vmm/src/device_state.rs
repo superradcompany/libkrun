@@ -8,7 +8,8 @@ use std::fmt::{Display, Formatter};
 
 #[cfg(feature = "blk")]
 use devices::virtio::{
-    BlockState, CacheType, QueueState, VirtioMmioState, BLOCK_STATE_VERSION, QUEUE_STATE_VERSION,
+    BlockState, CacheType, DeviceStateLimits, QueueState, VirtioMmioState, BLOCK_STATE_VERSION,
+    DEFAULT_MAX_FS_BACKEND_STATE_BYTES, FS_DEVICE_STATE_HEADER_BYTES, QUEUE_STATE_VERSION,
     VIRTIO_MMIO_STATE_VERSION,
 };
 
@@ -32,10 +33,6 @@ const VIRTIO_DEVICE_STATE_SCHEMA: u16 = 2;
 const MAX_DEVICE_STATE_BYTES: usize = 1024 * 1024;
 #[cfg(feature = "blk")]
 const MAX_DEVICE_SPECIFIC_STATE_BYTES: usize = 64 * 1024;
-#[cfg(feature = "blk")]
-const MAX_FS_DEVICE_STATE_BYTES: usize = 8 * 1024 * 1024;
-#[cfg(feature = "blk")]
-const MAX_FS_DEVICE_SPECIFIC_STATE_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(feature = "blk")]
 const MAX_DEVICE_STRING_BYTES: usize = 4096;
 #[cfg(feature = "blk")]
@@ -74,6 +71,13 @@ pub struct VirtioDeviceState {
     pub transport: VirtioMmioState,
     /// Bounded device-specific protocol state interpreted only by the matching device.
     pub device_state: Vec<u8>,
+}
+
+/// A reusable codec carrying the same limits as VM device capture and restore.
+#[cfg(feature = "blk")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeviceStateCodec {
+    limits: DeviceStateLimits,
 }
 
 /// Framing and compatibility errors for virtio-block state artifacts.
@@ -262,19 +266,54 @@ impl BlockDeviceState {
 }
 
 #[cfg(feature = "blk")]
+impl DeviceStateCodec {
+    /// Create a standalone codec, for example when importing state before a VM exists.
+    pub fn new(limits: DeviceStateLimits) -> Self {
+        Self { limits }
+    }
+
+    /// Return the limits used by this codec, for reuse when building a destination VM.
+    pub fn limits(self) -> DeviceStateLimits {
+        self.limits
+    }
+
+    /// Encode a device state using this codec's configured budget.
+    pub fn encode(&self, state: &VirtioDeviceState) -> Result<Vec<u8>> {
+        state.encode_with_fs_state_limit(self.limits.fs_state_limit())
+    }
+
+    /// Decode a device state using this codec's configured budget.
+    pub fn decode(&self, bytes: &[u8]) -> Result<VirtioDeviceState> {
+        VirtioDeviceState::decode_with_fs_state_limit(bytes, self.limits.fs_state_limit())
+    }
+
+    /// Largest admitted encoded object for a device type, including its envelope.
+    pub fn max_state_bytes(&self, device_type: u32) -> usize {
+        max_virtio_device_state_bytes(device_type, self.limits.fs_state_limit())
+    }
+}
+
+#[cfg(feature = "blk")]
 impl VirtioDeviceState {
-    /// Encodes this typed state into deterministic, bounded bytes.
+    /// Encodes this typed state into deterministic, bounded bytes, allowing virtio-fs backend
+    /// state up to the default budget.
     pub fn encode(&self) -> Result<Vec<u8>> {
+        self.encode_with_fs_state_limit(DEFAULT_MAX_FS_BACKEND_STATE_BYTES)
+    }
+
+    /// Encodes this typed state, allowing virtio-fs backend state up to `fs_state_limit` bytes.
+    pub fn encode_with_fs_state_limit(&self, fs_state_limit: usize) -> Result<Vec<u8>> {
         let mut writer = Writer { bytes: Vec::new() };
         writer.bytes(VIRTIO_DEVICE_STATE_MAGIC);
         writer.u16(VIRTIO_DEVICE_STATE_SCHEMA);
         writer.u64(self.pause_generation);
         writer.string(&self.device_id, MAX_DEVICE_STRING_BYTES)?;
         encode_transport(&mut writer, &self.transport)?;
-        let max_device_state = max_device_state_bytes(self.transport.device_type);
+        let max_device_state =
+            max_virtio_device_state_bytes(self.transport.device_type, fs_state_limit);
         writer.sized_bytes(
             &self.device_state,
-            max_device_specific_state_bytes(self.transport.device_type),
+            max_device_specific_state_bytes(self.transport.device_type, fs_state_limit),
         )?;
         if writer.bytes.len() > max_device_state {
             return Err(Error::InvalidLength);
@@ -282,9 +321,16 @@ impl VirtioDeviceState {
         Ok(writer.bytes)
     }
 
-    /// Decodes and validates one generic virtio state artifact.
+    /// Decodes and validates one generic virtio state artifact, allowing virtio-fs backend state
+    /// up to the default budget.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() > MAX_FS_DEVICE_STATE_BYTES {
+        Self::decode_with_fs_state_limit(bytes, DEFAULT_MAX_FS_BACKEND_STATE_BYTES)
+    }
+
+    /// Decodes and validates one generic virtio state artifact, allowing virtio-fs backend state
+    /// up to `fs_state_limit` bytes.
+    pub fn decode_with_fs_state_limit(bytes: &[u8], fs_state_limit: usize) -> Result<Self> {
+        if bytes.len() > max_virtio_device_state_bytes(TYPE_FS, fs_state_limit) {
             return Err(Error::InvalidLength);
         }
         let mut reader = Reader { bytes, offset: 0 };
@@ -296,11 +342,14 @@ impl VirtioDeviceState {
         let pause_generation = reader.u64()?;
         let device_id = reader.string(MAX_DEVICE_STRING_BYTES)?;
         let transport = decode_transport(&mut reader)?;
-        if bytes.len() > max_device_state_bytes(transport.device_type) {
+        if bytes.len() > max_virtio_device_state_bytes(transport.device_type, fs_state_limit) {
             return Err(Error::InvalidLength);
         }
         let device_state = reader
-            .sized_bytes(max_device_specific_state_bytes(transport.device_type))?
+            .sized_bytes(max_device_specific_state_bytes(
+                transport.device_type,
+                fs_state_limit,
+            ))?
             .to_vec();
         if reader.offset != bytes.len() {
             return Err(Error::TrailingBytes);
@@ -469,19 +518,22 @@ impl<'a> Reader<'a> {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
+/// Largest encoded [`VirtioDeviceState`] for a device type. `fs_state_limit` is the virtio-fs
+/// backend state budget and only affects virtio-fs devices.
 #[cfg(feature = "blk")]
-fn max_device_state_bytes(device_type: u32) -> usize {
+pub fn max_virtio_device_state_bytes(device_type: u32, fs_state_limit: usize) -> usize {
     if device_type == TYPE_FS {
-        MAX_FS_DEVICE_STATE_BYTES
+        max_device_specific_state_bytes(device_type, fs_state_limit)
+            .saturating_add(MAX_DEVICE_STATE_BYTES)
     } else {
         MAX_DEVICE_STATE_BYTES
     }
 }
 
 #[cfg(feature = "blk")]
-fn max_device_specific_state_bytes(device_type: u32) -> usize {
+fn max_device_specific_state_bytes(device_type: u32, fs_state_limit: usize) -> usize {
     if device_type == TYPE_FS {
-        MAX_FS_DEVICE_SPECIFIC_STATE_BYTES
+        FS_DEVICE_STATE_HEADER_BYTES.saturating_add(fs_state_limit)
     } else {
         MAX_DEVICE_SPECIFIC_STATE_BYTES
     }
@@ -707,6 +759,75 @@ mod tests {
                 .device_state
                 .len(),
             MAX_DEVICE_SPECIFIC_STATE_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn fs_virtio_state_above_the_default_budget_needs_a_larger_limit() {
+        let mut state = generic_state();
+        state.transport.device_type = TYPE_FS;
+        state.device_state =
+            vec![7; FS_DEVICE_STATE_HEADER_BYTES + DEFAULT_MAX_FS_BACKEND_STATE_BYTES + 1];
+        let limit = DEFAULT_MAX_FS_BACKEND_STATE_BYTES * 2;
+
+        assert_eq!(state.encode(), Err(Error::InvalidLength));
+        let encoded = state.encode_with_fs_state_limit(limit).unwrap();
+        assert_eq!(
+            VirtioDeviceState::decode(&encoded),
+            Err(Error::InvalidLength)
+        );
+        assert_eq!(
+            VirtioDeviceState::decode_with_fs_state_limit(&encoded, limit).unwrap(),
+            state
+        );
+        assert_eq!(
+            VirtioDeviceState::decode_with_fs_state_limit(
+                &encoded,
+                DEFAULT_MAX_FS_BACKEND_STATE_BYTES
+            ),
+            Err(Error::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn fs_virtio_state_limits_are_derived_from_the_backend_budget() {
+        let limit = 10 * 1024 * 1024;
+        let specific = FS_DEVICE_STATE_HEADER_BYTES + limit;
+        assert_eq!(
+            max_virtio_device_state_bytes(TYPE_FS, limit),
+            specific + MAX_DEVICE_STATE_BYTES
+        );
+
+        let mut state = generic_state();
+        state.transport.device_type = TYPE_FS;
+        state.device_state = vec![0; specific];
+        let encoded = state.encode_with_fs_state_limit(limit).unwrap();
+        assert!(encoded.len() <= max_virtio_device_state_bytes(TYPE_FS, limit));
+        assert_eq!(
+            VirtioDeviceState::decode_with_fs_state_limit(&encoded, limit).unwrap(),
+            state
+        );
+
+        state.device_state.push(0);
+        assert_eq!(
+            state.encode_with_fs_state_limit(limit),
+            Err(Error::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn non_fs_virtio_state_limits_ignore_the_fs_budget() {
+        let limit = DEFAULT_MAX_FS_BACKEND_STATE_BYTES * 4;
+        assert_eq!(
+            max_virtio_device_state_bytes(3, limit),
+            MAX_DEVICE_STATE_BYTES
+        );
+
+        let mut state = generic_state();
+        state.device_state = vec![0; MAX_DEVICE_SPECIFIC_STATE_BYTES + 1];
+        assert_eq!(
+            state.encode_with_fs_state_limit(limit),
+            Err(Error::InvalidLength)
         );
     }
 }

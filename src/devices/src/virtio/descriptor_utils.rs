@@ -97,12 +97,17 @@ impl<'a> DescriptorChainConsumer<'a> {
                 break;
             }
 
-            bufs.push(vs);
-
             let rem = count - buflen;
             if rem < vs.len() {
+                // Hand the caller only the bytes it was asked for: the tail of
+                // this slice must not be written. Passing the full slice let
+                // `preadv`/`pwritev` fill it and report consuming more than
+                // `count`, which underflowed `ZeroCopyWriter::write_all_from`
+                // (`count -= n`) for a read shorter than the descriptor.
+                bufs.push(vs.subslice(0, rem).unwrap());
                 buflen += rem;
             } else {
+                bufs.push(vs);
                 buflen += vs.len();
             }
         }
@@ -630,6 +635,33 @@ mod tests {
 
         assert_eq!(writer.available_bytes(), 0);
         assert_eq!(writer.bytes_written(), 106);
+    }
+
+    #[test]
+    fn writer_consume_truncates_the_final_slice() {
+        use DescriptorType::*;
+
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0x0), 0x10000)]).unwrap();
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0x0),
+            GuestAddress(0x100),
+            vec![(Writable, 4096)],
+            0,
+        )
+        .expect("create_descriptor_chain failed");
+        let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
+
+        // Mimic `preadv` filling the slices in full and reporting the total.
+        // The closure must never be handed more than the requested `count`, or
+        // `write_all_from`'s `count -= n` underflows; a 64-byte read into a
+        // 4096-byte descriptor used to report 4096.
+        let consumed = writer
+            .buffer
+            .consume(64, |bufs| Ok(bufs.iter().map(|vs| vs.len()).sum()))
+            .unwrap();
+        assert_eq!(consumed, 64);
+        assert_eq!(writer.available_bytes(), 4096 - 64);
     }
 
     #[test]

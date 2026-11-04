@@ -213,6 +213,7 @@ pub enum FsConfig {
     Custom {
         tag: String,
         backend: Box<dyn DynFileSystem + Send + Sync>,
+        shm_size: Option<usize>,
     },
 }
 
@@ -481,7 +482,7 @@ impl MachineBuilder {
             max_vcpus: None,
             max_memory_mib: None,
             hyperthreading: false,
-            nested_virt: false,
+            nested_virt: vmm::nested_virt::default_enabled(),
             split_irqchip: false,
             balloon: true,
             balloon_stats_interval: Some(Duration::from_secs(1)),
@@ -593,7 +594,10 @@ impl MachineBuilder {
         self
     }
 
-    /// Enable or disable nested virtualization.
+    /// Override nested virtualization (disabled by default).
+    ///
+    /// Enabling this requires host hardware and hypervisor support; VM creation
+    /// fails if it is unavailable. The guest kernel must also include KVM.
     pub fn nested_virt(mut self, enabled: bool) -> Self {
         self.nested_virt = enabled;
         self
@@ -896,9 +900,17 @@ impl KernelBuilder {
         self
     }
 
-    /// Set an explicit path to the libkrunfw shared library.
+    /// Select the kernel image, or the `libkrunfw` shared library to load.
     ///
-    /// When not set, the OS dynamic linker's default search path is used.
+    /// Without the `static-krunfw` feature this is the path of the `libkrunfw`
+    /// shared library to `dlopen`; when unset, the OS dynamic linker's default
+    /// search path is used.
+    ///
+    /// With the `static-krunfw` feature the value is passed as the
+    /// NUL-terminated `path` argument to the embedder's `krunfw_get_kernel`
+    /// callback (see the crate docs); `None` passes `NULL` to select the
+    /// default image. An embedder that ships several kernel images can map the
+    /// path to one of them here.
     pub fn krunfw_path(mut self, path: impl AsRef<Path>) -> Self {
         self.krunfw_path = Some(path.as_ref().to_path_buf());
         self
@@ -986,8 +998,13 @@ impl FsBuilder {
             .current_tag
             .take()
             .unwrap_or_else(|| format!("fs{}", self.configs.len()));
+        let shm_size = self.current_shm_size.take();
 
-        self.configs.push(FsConfig::Custom { tag, backend });
+        self.configs.push(FsConfig::Custom {
+            tag,
+            backend,
+            shm_size,
+        });
         self
     }
 }
@@ -1583,6 +1600,26 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    fn fs_builder_records_dax_size_for_custom_backend() {
+        struct DummyFs;
+        impl DynFileSystem for DummyFs {}
+
+        let builder = FsBuilder::new()
+            .tag("share")
+            .shm_size(64 << 20)
+            .custom(Box::new(DummyFs));
+
+        match &builder.configs[0] {
+            FsConfig::Custom { tag, shm_size, .. } => {
+                assert_eq!(tag, "share");
+                assert_eq!(*shm_size, Some(64 << 20));
+            }
+            _ => panic!("expected a custom filesystem config"),
+        }
+    }
+
+    #[test]
     fn host_cpu_id_defaults_to_group_zero() {
         assert_eq!(HostCpuId::new(7), HostCpuId::in_group(0, 7));
         assert_eq!(HostCpuId::in_group(3, 11).group, 3);
@@ -1663,6 +1700,14 @@ mod tests {
             .finish();
 
         assert_eq!(topology.nodes[0].max_memory_mib, 512);
+    }
+
+    #[test]
+    fn nested_virtualization_requires_explicit_opt_in() {
+        assert!(!MachineBuilder::new().nested_virt);
+        assert!(MachineBuilder::new().nested_virt(true).nested_virt);
+        assert!(!MachineBuilder::new().nested_virt(false).nested_virt);
+        assert!(!vmm::resources::VmResources::default().nested_enabled);
     }
 
     #[test]

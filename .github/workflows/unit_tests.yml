@@ -24,11 +24,33 @@ jobs:
       - name: Unit tests
         run: cargo test
 
+      - name: Vsock queue and stream regressions
+        timeout-minutes: 5
+        run: cargo test --locked -p msb_krun_devices --lib 'virtio::vsock::'
+
       - name: Virtio-net rate-limit tests
         run: cargo test --locked -p msb_krun_devices --features net virtio::net
 
       - name: Network builder rate-limit tests
         run: cargo test --locked -p msb_krun --features net network_rate_limiters
+
+      - name: Nested execution-state admission test
+        run: cargo test --locked --manifest-path src/vmm/Cargo.toml nested_execution_refusal_precedes_backend_work
+
+      - name: Kernel command-line clock ordering tests
+        run: cargo test --locked --manifest-path src/vmm/Cargo.toml initial_kernel_cmdline
+
+      - name: Linux nested-state framing tests
+        run: cargo test --locked --manifest-path src/vmm/Cargo.toml nested_state_rejects_invalid_wire_headers
+
+      - name: Check nested execution payload codec
+        run: cargo test --locked --manifest-path src/vmm/Cargo.toml nested_execution_payload
+
+      - name: Linux CPUID unit tests
+        run: cargo test --locked --manifest-path src/cpuid/Cargo.toml
+
+      - name: Virtio descriptor consume test
+        run: cargo test --locked -p msb_krun_devices writer_consume_truncates_the_final_slice
 
   unit-tests-windows-x86_64:
     name: Unit tests (Windows x86_64)
@@ -42,18 +64,43 @@ jobs:
       - name: Windows errno translation tests
         run: cargo test --locked --manifest-path src/devices/Cargo.toml virtio::linux_errno::tests
 
+      - name: Vsock queue and stream regressions
+        timeout-minutes: 5
+        run: cargo test --locked -p msb_krun_devices --lib 'virtio::vsock::'
+
       - name: Windows DAX default error test
         run: cargo test --locked --manifest-path src/devices/Cargo.toml virtio::fs::dyn_filesystem::tests
 
       - name: Windows passthrough error test
         run: cargo test --locked --manifest-path src/devices/Cargo.toml read_translates_zero_copy_win32_errors
 
+      - name: Windows virtio descriptor consume test
+        run: cargo test --locked --manifest-path src/devices/Cargo.toml writer_consume_truncates_the_final_slice
+
       # This calls VirtualAlloc2 on the native runner, not just the cross-compiled wrapper.
       - name: Windows NUMA allocation test
         run: cargo test --locked --manifest-path src/vmm/Cargo.toml windows_numa_mapping_allocates_accessible_memory
 
+      - name: Check Windows nested execution payload codec
+        run: cargo test --locked --manifest-path src/vmm/Cargo.toml nested_execution_payload
+
+      - name: Windows PIT capture and restore tests
+        run: cargo test --locked --manifest-path src/vmm/Cargo.toml windows::pit::tests
+
+      - name: Windows ordinary VMX snapshot rejection test
+        run: cargo test --locked --manifest-path src/vmm/Cargo.toml nested_snapshot_rejects_an_ordinary_current_vmx_cache
+
+      - name: Windows legacy PIT recovery test
+        run: cargo test --locked --manifest-path src/vmm/Cargo.toml legacy_pit_recovery_preserves_cpu_contract_and_requires_a_known_old_format
+
       - name: Windows eager restore memory test
         run: cargo test --locked --manifest-path src/vmm/Cargo.toml eager_restore_replaces_payload_bytes_without_losing_regions
+
+      - name: Kernel command-line clock ordering tests
+        run: cargo test --locked --manifest-path src/vmm/Cargo.toml initial_kernel_cmdline
+
+      - name: Windows nested-virt CPUID mask tests
+        run: cargo test --locked --manifest-path src/vmm/Cargo.toml normalize_cpuid
 
       - name: Windows device Clippy
         run: cargo clippy --locked --manifest-path src/devices/Cargo.toml -- -D warnings

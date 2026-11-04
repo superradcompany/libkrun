@@ -134,7 +134,7 @@ impl MetricsHandle {
     /// Counters are monotonic atomics. Callers that need rates should compute
     /// deltas between snapshots.
     pub fn snapshot(&self) -> VmMetrics {
-        self.snapshot_inner(true)
+        self.snapshot_inner(true, true)
     }
 
     /// Return aggregate VM metrics without per-device block details.
@@ -142,16 +142,33 @@ impl MetricsHandle {
     /// This avoids cloning the per-device vector for high-frequency samplers
     /// that only publish aggregate counters.
     pub fn aggregate_snapshot(&self) -> VmMetrics {
-        self.snapshot_inner(false)
+        self.snapshot_inner(false, true)
     }
 
-    fn snapshot_inner(&self, include_block_devices: bool) -> VmMetrics {
+    /// Return current aggregate counters without querying host page residency.
+    ///
+    /// `memory.host_resident_bytes` is `None` in this snapshot. Host residency can
+    /// change even while a guest is paused, so returning a cached value would
+    /// misrepresent it as a current observation. Other counters are read normally.
+    pub fn aggregate_snapshot_without_host_residency(&self) -> VmMetrics {
+        self.snapshot_inner(false, false)
+    }
+
+    fn snapshot_inner(
+        &self,
+        include_block_devices: bool,
+        include_host_residency: bool,
+    ) -> VmMetrics {
         let total_bytes = self.state.memory_total_bytes.load(Ordering::Relaxed);
         let available_bytes = valid_value(
             &self.state.memory_available_valid,
             &self.state.memory_available_bytes,
         );
-        let host_resident_bytes = self.host_resident_bytes();
+        let host_resident_bytes = if include_host_residency {
+            self.host_resident_bytes()
+        } else {
+            None
+        };
         VmMetrics {
             cpu: CpuMetrics {
                 vcpu_time_ns: valid_value(&self.state.vcpu_time_valid, &self.state.vcpu_time_ns),
@@ -468,6 +485,45 @@ mod tests {
             writer.handle().snapshot().memory.host_resident_bytes,
             Some(8192)
         );
+    }
+
+    #[test]
+    fn aggregate_snapshot_can_skip_residency_without_caching_other_counters() {
+        let writer = MetricsWriter::default();
+        let calls = Arc::new(AtomicU64::new(0));
+        let sampler_calls = Arc::clone(&calls);
+        writer.set_memory_host_resident_sampler(move || {
+            Some((sampler_calls.fetch_add(1, Ordering::Relaxed) + 1) * 4096)
+        });
+        let handle = writer.handle();
+        assert_eq!(
+            handle.aggregate_snapshot().memory.host_resident_bytes,
+            Some(4096)
+        );
+
+        // A skipped scan must not leak the previous residency or freeze unrelated counters.
+        writer.set_memory_total_bytes(8192);
+        writer.set_memory_available_bytes(2048);
+        writer.set_upper_filesystem_bytes(1024, 3072);
+        let block = writer.register_block_device("root".into());
+        for tick in 1..=2 {
+            writer.add_vcpu_time_ns(100);
+            block.add_read_bytes(512);
+            let sample = handle.aggregate_snapshot_without_host_residency();
+            assert_eq!(sample.memory.host_resident_bytes, None);
+            assert_eq!(sample.memory.used_bytes, Some(6144));
+            assert_eq!(sample.filesystem.upper_used_bytes, Some(1024));
+            assert_eq!(sample.cpu.vcpu_time_ns, Some(tick * 100));
+            assert_eq!(sample.block.read_bytes, tick * 512);
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+        }
+
+        // Normal sampling resumes with a new observation, not the pre-pause cache.
+        assert_eq!(
+            handle.aggregate_snapshot().memory.host_resident_bytes,
+            Some(8192)
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]

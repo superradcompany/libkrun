@@ -1,14 +1,21 @@
 [package]
 name = "msb_krun"
-version = "0.1.39"
+version = "0.1.44"
 authors = ["The libkrun Authors"]
 edition = "2021"
 description = "Native Rust API for libkrun microVMs"
-repository = "https://github.com/zerocore-ai/libkrun"
+repository = "https://github.com/superradcompany/libkrun"
 license = "Apache-2.0"
 
 [features]
 default = []
+# Link the krunfw kernel accessor into the embedding program instead of
+# loading libkrunfw with `dlopen`. The embedder must provide a
+# `krunfw_get_kernel(const char *path, uint64_t *guest_addr,
+# uint64_t *entry_addr, size_t *size)` C function; see the crate documentation
+# for the callback signature, a minimal implementation and the kernel-memory
+# lifetime.
+static-krunfw = []
 net = ["devices/net", "vmm/net"]
 blk = ["devices/blk", "vmm/blk"]
 gpu = ["krun_display", "devices/gpu", "vmm/gpu"]
@@ -27,20 +34,20 @@ libloading = "0.8"
 log = "0.4.0"
 vm-memory = { package = "msb-vm-memory", version = "=0.18.0-msb.2", default-features = false, features = ["backend-mmap"] }
 
-devices = { package = "msb_krun_devices", version = "0.1.39", path = "../devices" }
-polly = { package = "msb_krun_polly", version = "0.1.39", path = "../polly" }
-utils = { package = "msb_krun_utils", version = "0.1.39", path = "../utils" }
-vmm = { package = "msb_krun_vmm", version = "0.1.39", path = "../vmm" }
+devices = { package = "msb_krun_devices", version = "0.1.44", path = "../devices" }
+polly = { package = "msb_krun_polly", version = "0.1.44", path = "../polly" }
+utils = { package = "msb_krun_utils", version = "0.1.44", path = "../utils" }
+vmm = { package = "msb_krun_vmm", version = "0.1.44", path = "../vmm" }
 
 # Optional dependencies
-krun_display = { package = "msb_krun_display", version = "0.1.39", path = "../krun_display", optional = true, features = ["bindgen_clang_runtime"] }
-krun_input = { package = "msb_krun_input", version = "0.1.39", path = "../krun_input", optional = true, features = ["bindgen_clang_runtime"] }
+krun_display = { package = "msb_krun_display", version = "0.1.44", path = "../krun_display", optional = true, features = ["bindgen_clang_runtime"] }
+krun_input = { package = "msb_krun_input", version = "0.1.44", path = "../krun_input", optional = true, features = ["bindgen_clang_runtime"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-hvf = { package = "msb_krun_hvf", version = "0.1.39", path = "../hvf" }
+hvf = { package = "msb_krun_hvf", version = "0.1.44", path = "../hvf" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 kvm-bindings = { version = ">=0.11", features = ["fam-wrappers"] }
 kvm-ioctls = ">=0.21"
-aws-nitro = { package = "msb_krun_aws_nitro", version = "0.1.39", path = "../aws_nitro", optional = true }
+aws-nitro = { package = "msb_krun_aws_nitro", version = "0.1.44", path = "../aws_nitro", optional = true }
 nitro-enclaves = { version = "0.6.0", optional = true }

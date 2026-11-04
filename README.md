@@ -6,6 +6,10 @@
 
 # libkrun
 
+This repository is Microsandbox's maintained fork of [upstream libkrun](https://github.com/libkrun/libkrun). We publish its Rust API and implementation crates as `msb_krun` and `msb_krun_*`. These crates have their own release versions, independent of upstream libkrun's releases. The fork has diverged substantially, and relevant upstream changes are selectively incorporated.
+
+For the source of the `msb_krun*` crates, use [this repository](https://github.com/superradcompany/libkrun) and its `krun` branch. When reporting dependency audit findings, include the advisory IDs, crate versions, and dependency paths so we can identify the affected code and required updates. See the [2026-11-03 dependency audit](docs/dependency-audit-2026-11-03.md) for the findings, fixes, and remaining follow-ups.
+
 ```libkrun``` is a dynamic library that allows programs to easily acquire the ability to run processes in a partially isolated environment using [KVM](https://www.kernel.org/doc/Documentation/virtual/kvm/api.txt) Virtualization on Linux and [HVF](https://developer.apple.com/documentation/hypervisor) on macOS/ARM64.
 
 It integrates a VMM (Virtual Machine Monitor, the userspace side of an Hypervisor) with the minimum amount of emulated devices required to its purpose, abstracting most of the complexity that comes from Virtual Machine management, offering users a simple C API.

@@ -16,6 +16,7 @@ use std::fmt::{Display, Formatter};
 
 const EXECUTION_STATE_MAGIC: &[u8; 9] = b"MSBKEXEC\0";
 const EXECUTION_STATE_SCHEMA: u16 = 1;
+const NESTED_EXECUTION_STATE_SCHEMA: u16 = 2;
 const MAX_VCPUS: usize = 1024;
 const MAX_VM_STATE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_VCPU_STATE_BYTES: usize = 16 * 1024 * 1024;
@@ -62,6 +63,7 @@ pub struct ExecutionState {
     architecture: ExecutionArchitecture,
     backend: ExecutionBackend,
     backend_state_abi: u32,
+    nested_enabled: bool,
     pause_generation: u64,
     vm_state: Vec<u8>,
     vcpus: Vec<VcpuExecutionState>,
@@ -124,6 +126,81 @@ impl VcpuExecutionState {
 }
 
 impl ExecutionState {
+    /// Guest counter frequency required before constructing a Windows x86 partition.
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    pub fn tsc_frequency_hz(&self) -> std::result::Result<u64, String> {
+        if self.architecture == ExecutionArchitecture::X86_64
+            && self.backend == ExecutionBackend::Whp
+            && self.backend_state_abi == if self.nested_enabled { 3 } else { 1 }
+        {
+            return Err(crate::Error::ExecutionStateMissingPit.to_string());
+        }
+        if self.architecture != ExecutionArchitecture::X86_64
+            || self.backend != ExecutionBackend::Whp
+            || self.backend_state_abi != if self.nested_enabled { 4 } else { 2 }
+        {
+            return Err("unsupported Windows execution state for clock restore".into());
+        }
+        let (vm, used): (crate::WindowsX86VmExecutionState, usize) =
+            bincode::serde::decode_from_slice(
+                &self.vm_state,
+                bincode::config::standard().with_limit::<{ 1024 * 1024 }>(),
+            )
+            .map_err(|e| e.to_string())?;
+        if used != self.vm_state.len() {
+            return Err("trailing WHP VM state".into());
+        }
+        crate::windows::vstate::x86_state::saved_frequency(&vm.vm, self.nested_enabled)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Recover an older Windows x86 snapshot by explicitly supplying a periodic PIT reload.
+    ///
+    /// Only ordinary ABI 1 and enlightened nested ABI 3 can be recovered. The original
+    /// timer phase, other PIT channel programming, and any partially written reload were
+    /// not saved. This opt-in starts channel 0 at a fresh full period; it cannot promise
+    /// exact timer continuity. Capture a new snapshot after validating the recovered guest.
+    pub fn recover_windows_periodic_pit(self, divisor: u32) -> std::result::Result<Self, String> {
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        {
+            if self.architecture != ExecutionArchitecture::X86_64
+                || self.backend != ExecutionBackend::Whp
+                || self.backend_state_abi != if self.nested_enabled { 3 } else { 1 }
+            {
+                return Err("periodic PIT recovery requires an older Windows x86 snapshot without PIT state; older non-enlightened nested state is not recoverable".into());
+            }
+            #[derive(serde::Deserialize)]
+            struct Legacy {
+                vm: Vec<u8>,
+                ioapic: Vec<u8>,
+            }
+            let (legacy, used): (Legacy, usize) = bincode::serde::decode_from_slice(
+                &self.vm_state,
+                bincode::config::standard().with_limit::<{ 1024 * 1024 }>(),
+            )
+            .map_err(|e| e.to_string())?;
+            if used != self.vm_state.len() {
+                return Err("trailing legacy Windows VM state".into());
+            }
+            let state = crate::WindowsX86VmExecutionState {
+                vm: legacy.vm,
+                ioapic: legacy.ioapic,
+                pit: crate::windows::pit::PitState::recover_periodic(divisor)?,
+            };
+            Ok(Self {
+                backend_state_abi: if self.nested_enabled { 4 } else { 2 },
+                vm_state: bincode::serde::encode_to_vec(state, bincode::config::standard())
+                    .map_err(|e| e.to_string())?,
+                ..self
+            })
+        }
+        #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+        {
+            let _ = divisor;
+            Err("legacy Windows PIT recovery requires a Windows x86 host".into())
+        }
+    }
+
     pub(crate) fn new(
         architecture: ExecutionArchitecture,
         backend: ExecutionBackend,
@@ -146,6 +223,7 @@ impl ExecutionState {
             architecture,
             backend,
             backend_state_abi,
+            nested_enabled: false,
             pause_generation,
             vm_state,
             vcpus,
@@ -167,6 +245,16 @@ impl ExecutionState {
         self.backend_state_abi
     }
 
+    /// Whether this artifact requires nested virtualization in the destination VM.
+    pub fn nested_enabled(&self) -> bool {
+        self.nested_enabled
+    }
+
+    pub(crate) fn with_nested_enabled(mut self, enabled: bool) -> Self {
+        self.nested_enabled = enabled;
+        self
+    }
+
     /// Returns the VM-wide pause generation at which state was captured.
     pub fn pause_generation(&self) -> u64 {
         self.pause_generation
@@ -186,7 +274,11 @@ impl ExecutionState {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut writer = StateWriter::new();
         writer.write_bytes(EXECUTION_STATE_MAGIC);
-        writer.write_u16(EXECUTION_STATE_SCHEMA);
+        writer.write_u16(if self.nested_enabled {
+            NESTED_EXECUTION_STATE_SCHEMA
+        } else {
+            EXECUTION_STATE_SCHEMA
+        });
         writer.write_u8(self.architecture as u8);
         writer.write_u8(self.backend as u8);
         writer.write_u32(self.backend_state_abi);
@@ -213,9 +305,11 @@ impl ExecutionState {
         if reader.read_exact(EXECUTION_STATE_MAGIC.len())? != EXECUTION_STATE_MAGIC {
             return Err(Error::UnsupportedFormat);
         }
-        if reader.read_u16()? != EXECUTION_STATE_SCHEMA {
-            return Err(Error::UnsupportedFormat);
-        }
+        let nested_enabled = match reader.read_u16()? {
+            EXECUTION_STATE_SCHEMA => false,
+            NESTED_EXECUTION_STATE_SCHEMA => true,
+            _ => return Err(Error::UnsupportedFormat),
+        };
         let architecture = match reader.read_u8()? {
             1 => ExecutionArchitecture::X86_64,
             2 => ExecutionArchitecture::Aarch64,
@@ -256,6 +350,7 @@ impl ExecutionState {
             vm_state,
             vcpus,
         )
+        .map(|state| state.with_nested_enabled(nested_enabled))
     }
 }
 
@@ -376,6 +471,71 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[test]
+    fn legacy_pit_recovery_preserves_cpu_contract_and_requires_a_known_old_format() {
+        // ABI 1/3 encoded only two byte vectors: VM [42] and IOAPIC [17].
+        // Keep these legacy bytes independent of the current serializer.
+        let old = ExecutionState::new(
+            ExecutionArchitecture::X86_64,
+            ExecutionBackend::Whp,
+            1,
+            91,
+            vec![1, 42, 1, 17],
+            vec![VcpuExecutionState::new(0, vec![7, 8]).unwrap()],
+        )
+        .unwrap();
+        for nested in [false, true] {
+            let mut source = old.clone().with_nested_enabled(nested);
+            source.backend_state_abi = if nested { 3 } else { 1 };
+            let recovered = source.clone().recover_windows_periodic_pit(4773).unwrap();
+            assert_eq!(recovered.backend_state_abi, if nested { 4 } else { 2 });
+            assert_eq!(recovered.vcpus, source.vcpus);
+            assert_eq!(recovered.pause_generation, 91);
+            assert_eq!(recovered.nested_enabled, nested);
+            let (vm, used): (crate::WindowsX86VmExecutionState, _) =
+                bincode::serde::decode_from_slice(&recovered.vm_state, bincode::config::standard())
+                    .unwrap();
+            assert_eq!(used, recovered.vm_state.len());
+            assert_eq!(vm.vm, [42]);
+            assert_eq!(vm.ioapic, [17]);
+            assert!(recovered.recover_windows_periodic_pit(4773).is_err());
+        }
+        for divisor in [0, 65537, u32::MAX] {
+            assert!(old.clone().recover_windows_periodic_pit(divisor).is_err());
+        }
+        let mut ordinary_vmcs = old.clone().with_nested_enabled(true);
+        ordinary_vmcs.backend_state_abi = 2;
+        assert!(ordinary_vmcs.recover_windows_periodic_pit(4773).is_err());
+        let mut trailing = old.clone();
+        trailing.vm_state.push(0);
+        assert!(trailing.recover_windows_periodic_pit(4773).is_err());
+        let mut other_backend = old;
+        other_backend.backend = ExecutionBackend::Kvm;
+        assert!(other_backend.recover_windows_periodic_pit(4773).is_err());
+    }
+
+    #[test]
+    fn envelope_preserves_nested_policy_without_changing_ordinary_artifacts() {
+        let plain = ExecutionState::new(
+            ExecutionArchitecture::X86_64,
+            ExecutionBackend::Kvm,
+            1,
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let bytes = plain.encode().unwrap();
+        assert_eq!(&bytes[9..11], &1_u16.to_le_bytes());
+        assert!(!ExecutionState::decode(&bytes).unwrap().nested_enabled());
+
+        let nested = plain.with_nested_enabled(true);
+        let bytes = nested.encode().unwrap();
+        assert_eq!(&bytes[9..11], &2_u16.to_le_bytes());
+        assert_eq!(ExecutionState::decode(&bytes).unwrap(), nested);
+    }
 
     #[test]
     fn envelope_round_trip_is_deterministic() {

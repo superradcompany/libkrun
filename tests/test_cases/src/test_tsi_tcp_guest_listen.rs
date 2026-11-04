@@ -22,16 +22,19 @@ mod host {
     use crate::{krun_call, krun_call_u32, Test, TestSetup};
     use krun_sys::*;
     use std::ffi::CString;
+    use std::panic::catch_unwind;
     use std::ptr::null;
     use std::thread;
-    use std::time::Duration;
 
     impl Test for TestTsiTcpGuestListen {
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             unsafe {
                 thread::spawn(move || {
-                    thread::sleep(Duration::from_secs(1));
-                    self.tcp_tester.run_client();
+                    // This is already a per-test subprocess. A client failure must
+                    // stop the VM too, otherwise the guest waits forever in accept().
+                    if catch_unwind(|| self.tcp_tester.run_client()).is_err() {
+                        std::process::exit(1);
+                    }
                 });
 
                 krun_call!(krun_set_log_level(KRUN_LOG_LEVEL_WARN))?;

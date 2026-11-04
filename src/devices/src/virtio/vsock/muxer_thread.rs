@@ -21,7 +21,7 @@ use vm_memory::GuestMemoryMmap;
 
 pub struct MuxerThread {
     cid: u64,
-    pub epoll: Epoll,
+    pub epoll: Arc<Epoll>,
     rxq: Arc<Mutex<MuxerRxQ>>,
     proxy_map: ProxyMap,
     mem: GuestMemoryMmap,
@@ -36,7 +36,7 @@ impl MuxerThread {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cid: u64,
-        epoll: Epoll,
+        epoll: Arc<Epoll>,
         rxq: Arc<Mutex<MuxerRxQ>>,
         proxy_map: ProxyMap,
         mem: GuestMemoryMmap,

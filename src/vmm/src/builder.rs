@@ -32,8 +32,6 @@ use std::os::fd::{BorrowedFd, FromRawFd};
 #[cfg(not(target_os = "windows"))]
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -168,6 +166,8 @@ static EDK2_BINARY: &[u8] = include_bytes!("../KRUN_EFI.silent.fd");
 /// Errors associated with starting the instance.
 #[derive(Debug)]
 pub enum StartMicrovmError {
+    /// The requested nested virtualization policy cannot be honored.
+    NestedVirtualization(io::Error),
     /// Invalid or unsupported private guest-memory backing.
     PrivateMemoryBacking(io::Error),
     /// Unable to attach block device to Vmm.
@@ -421,6 +421,7 @@ impl Display for StartMicrovmError {
                 err_msg = err_msg.replace('\"', "");
                 write!(f, "Invalid Memory Configuration: {err_msg}")
             }
+            NestedVirtualization(ref error) => write!(f, "Nested virtualization: {error}"),
             PrivateMemoryBacking(ref err) => {
                 write!(f, "Cannot install private memory backing: {err}")
             }
@@ -1220,6 +1221,26 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
     }
 }
 
+// Assemble a fresh command line so a failed boot does not modify the resources.
+fn initial_kernel_cmdline(
+    payload_cmdline: Option<&str>,
+    prolog: Option<&str>,
+    tsc_frequency_hz: Option<u64>,
+) -> std::result::Result<Cmdline, StartMicrovmError> {
+    let mut cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
+
+    // Linux only uses CPUID leaf 0x15 to calibrate the TSC on Intel CPUs, and
+    // legacy timer calibration can fail under WHP. Supply the host frequency
+    // directly so AMD guests also have a working TSC (required by guest KVM).
+    // Prepend it so it stays before any caller-provided `--` and an explicit
+    // tsc_early_khz later in the kernel command line can override this default.
+    if let Some(khz) = tsc_frequency_hz.map(|hz| hz / 1000).filter(|khz| *khz != 0) {
+        cmdline.insert("tsc_early_khz", &khz.to_string())?;
+    }
+    cmdline.insert_str(payload_cmdline.or(prolog).unwrap_or(DEFAULT_KERNEL_CMDLINE))?;
+    Ok(cmdline)
+}
+
 /// Builds and starts a microVM based on the current Firecracker VmResources configuration.
 ///
 /// This is the default build recipe, one could build other microVM flavors by using the
@@ -1267,6 +1288,8 @@ pub fn build_microvm_paused(
     trace.mark("build_microvm.start");
 
     validate_vmm_vcpu_affinity(vm_resources)?;
+    crate::nested_virt::validate(vm_resources.nested_enabled)
+        .map_err(StartMicrovmError::NestedVirtualization)?;
 
     let payload = choose_payload(vm_resources)?;
 
@@ -1284,16 +1307,18 @@ pub fn build_microvm_paused(
     #[allow(unused_mut)]
     let mut vcpu_config = vm_resources.vcpu_config();
 
-    // Clone the command-line so that a failed boot doesn't pollute the original.
-    #[allow(unused_mut)]
-    let mut kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
-    if let Some(cmdline) = payload_config.kernel_cmdline {
-        kernel_cmdline.insert_str(cmdline.as_str())?;
-    } else if let Some(cmdline) = &vm_resources.kernel_cmdline.prolog {
-        kernel_cmdline.insert_str(cmdline)?;
-    } else {
-        kernel_cmdline.insert_str(DEFAULT_KERNEL_CMDLINE)?;
-    }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    let tsc_frequency_hz = vm_resources
+        .tsc_frequency_hz
+        .or_else(crate::windows::vstate::host_tsc_frequency_hz);
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    let tsc_frequency_hz = None;
+
+    let mut kernel_cmdline = initial_kernel_cmdline(
+        payload_config.kernel_cmdline.as_deref(),
+        vm_resources.kernel_cmdline.prolog.as_deref(),
+        tsc_frequency_hz,
+    )?;
 
     // The krun_env segment carries caller-controlled guest env; a non-cmdline-safe byte in it
     // (e.g. a tab in an OCI image env value) must surface as a StartMicrovmError, not a panic —
@@ -1342,9 +1367,22 @@ pub fn build_microvm_paused(
     let setup_vcpu_count = vcpu_config.max_vcpu_count.max(vcpu_config.vcpu_count);
     #[cfg(all(not(target_os = "windows"), not(feature = "tee")))]
     let setup_vcpu_count = vcpu_config.vcpu_count;
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     #[allow(unused_mut)]
     let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled, setup_vcpu_count)?;
+    #[cfg(all(not(feature = "tee"), target_os = "windows"))]
+    let vm = {
+        #[cfg(target_arch = "x86_64")]
+        let tsc_frequency_hz = vm_resources.tsc_frequency_hz;
+        #[cfg(not(target_arch = "x86_64"))]
+        let tsc_frequency_hz = None;
+        setup_vm(
+            &guest_memory,
+            vm_resources.nested_enabled,
+            setup_vcpu_count,
+            tsc_frequency_hz,
+        )?
+    };
     trace.mark("vm.ready");
 
     #[cfg(feature = "tee")]
@@ -1648,6 +1686,9 @@ pub fn build_microvm_paused(
         .map_err(StartMicrovmError::Internal)?;
     }
 
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    let pit;
+
     #[cfg(target_os = "windows")]
     {
         // Size the guest-visible GIC redistributor range to the created topology:
@@ -1659,7 +1700,18 @@ pub fn build_microvm_paused(
             u64::from(setup_vcpu_count),
         )))));
         #[cfg(target_arch = "x86_64")]
+        {
+            pit = Arc::new(Mutex::new(
+                crate::windows::pit::Pit::new(intc.clone()).map_err(|error| {
+                    StartMicrovmError::Internal(Error::ExecutionStateBackend(format!(
+                        "create Windows PIT: {error}"
+                    )))
+                })?,
+            ));
+        }
+        #[cfg(target_arch = "x86_64")]
         let pio_bus = create_windows_x86_64_pio_bus(
+            pit.clone(),
             intc.clone(),
             &serial_devices,
             &exit_evt,
@@ -1825,6 +1877,7 @@ pub fn build_microvm_paused(
         control_request_id: VcpuControlRequestId::INITIAL,
         execution_state: VmmExecutionState::Paused(PauseGeneration::INITIAL),
         execution_restore_allowed: true,
+        nested_enabled: vm_resources.nested_enabled,
         memory_restore_allowed: true,
         memory_ledger: MemoryGenerationLedger::new(MemoryTopologyGeneration::new(1)),
         memory_access: devices::virtio::MemoryAccessDomain::new(),
@@ -1846,6 +1899,8 @@ pub fn build_microvm_paused(
             all(target_os = "windows", target_arch = "x86_64")
         ))]
         irqchip: intc.clone(),
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        pit,
         #[cfg(feature = "blk")]
         quiesced_virtio_devices: Default::default(),
         #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
@@ -1998,6 +2053,7 @@ pub fn build_microvm_paused(
     attach_fs_devices(
         &mut vmm,
         &vm_resources.fs,
+        vm_resources.device_state_limits.fs_state_limit(),
         &mut _shm_manager,
         #[cfg(not(feature = "tee"))]
         export_table,
@@ -2011,6 +2067,7 @@ pub fn build_microvm_paused(
     attach_custom_fs_devices(
         &mut vmm,
         &vm_resources.custom_fs,
+        vm_resources.device_state_limits.fs_state_limit(),
         &mut _shm_manager,
         vm_resources.fs.len(),
         intc.clone(),
@@ -3545,10 +3602,11 @@ pub(crate) fn setup_vm(
 #[cfg(target_os = "windows")]
 pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
-    _nested_enabled: bool,
+    nested_enabled: bool,
     vcpu_count: u8,
+    tsc_frequency_hz: Option<u64>,
 ) -> std::result::Result<Vm, StartMicrovmError> {
-    let mut vm = Vm::new(vcpu_count)
+    let mut vm = Vm::with_clock(vcpu_count, nested_enabled, tsc_frequency_hz)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
     vm.memory_init(guest_memory)
@@ -3589,25 +3647,6 @@ pub fn setup_serial_device(
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-struct WindowsX64PitStub {
-    channels: [u8; 3],
-    command: u8,
-    channel0_access: u8,
-    channel0_mode: u8,
-    channel0_write_lsb: Option<u8>,
-    channel0_period_ns: Arc<AtomicU64>,
-    channel0_periodic: Arc<AtomicBool>,
-    channel2_latch: u32,
-    channel2_started_at: Option<Instant>,
-    channel2_write_lsb: Option<u8>,
-    channel2_read_msb_next: bool,
-    running: Arc<AtomicBool>,
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-const PIT_TICK_RATE_HZ: u128 = 1_193_182;
-
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 #[derive(Default)]
 struct WindowsX64PicStub {
     command: u8,
@@ -3618,192 +3657,6 @@ struct WindowsX64PicStub {
 #[derive(Default)]
 struct WindowsX64PostCodeStub {
     value: u8,
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-impl WindowsX64PitStub {
-    fn new(intc: IrqChip) -> Self {
-        let channel0_period_ns = Arc::new(AtomicU64::new(0));
-        let channel0_periodic = Arc::new(AtomicBool::new(false));
-        let running = Arc::new(AtomicBool::new(true));
-        let thread_period = channel0_period_ns.clone();
-        let thread_periodic = channel0_periodic.clone();
-        let thread_running = running.clone();
-
-        // Channel 0 timer: ticks at the guest-programmed rate and injects
-        // IRQ0 through the IOAPIC route, which already drops it while the
-        // guest keeps the pin masked.
-        std::thread::spawn(move || {
-            while thread_running.load(Ordering::Relaxed) {
-                let period_ns = thread_period.load(Ordering::Relaxed);
-                if period_ns == 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    continue;
-                }
-                // Clamp so a tiny divisor cannot busy-spin the host;
-                // jiffies-grade timing is all a guest needs from a PIT.
-                std::thread::sleep(std::time::Duration::from_nanos(period_ns.max(1_000_000)));
-                if thread_period.load(Ordering::Relaxed) == 0 {
-                    continue;
-                }
-                {
-                    let intc = intc.lock().unwrap();
-                    if let Err(e) = intc.set_irq(Some(0), None) {
-                        trace!("PIT tick interrupt injection failed: {e:?}");
-                    }
-                }
-                if !thread_periodic.load(Ordering::Relaxed) {
-                    // One-shot modes fire once per reload.
-                    thread_period.store(0, Ordering::Relaxed);
-                }
-            }
-        });
-
-        Self {
-            channels: [0; 3],
-            command: 0,
-            channel0_access: 0,
-            channel0_mode: 0,
-            channel0_write_lsb: None,
-            channel0_period_ns,
-            channel0_periodic,
-            channel2_latch: 0,
-            channel2_started_at: None,
-            channel2_write_lsb: None,
-            channel2_read_msb_next: false,
-            running,
-        }
-    }
-
-    fn write_channel0(&mut self, value: u8) {
-        self.channels[0] = value;
-
-        let divisor = match self.channel0_access {
-            0b01 => u32::from(value),
-            0b10 => u32::from(value) << 8,
-            _ => {
-                if let Some(lsb) = self.channel0_write_lsb.take() {
-                    u32::from(u16::from_le_bytes([lsb, value]))
-                } else {
-                    self.channel0_write_lsb = Some(value);
-                    return;
-                }
-            }
-        };
-        let divisor = if divisor == 0 { 0x1_0000 } else { divisor };
-        let period_ns = u64::from(divisor) * 1_000_000_000 / PIT_TICK_RATE_HZ as u64;
-
-        // Modes 2 (rate generator) and 3 (square wave) reload themselves;
-        // everything else behaves as a one-shot.
-        self.channel0_periodic
-            .store(matches!(self.channel0_mode, 2 | 3), Ordering::Relaxed);
-        self.channel0_period_ns.store(period_ns, Ordering::Relaxed);
-    }
-
-    fn read_channel2(&mut self) -> u8 {
-        let counter = self.channel2_counter();
-        let value = if self.channel2_read_msb_next {
-            (counter >> 8) as u8
-        } else {
-            (counter & 0xff) as u8
-        };
-        self.channel2_read_msb_next = !self.channel2_read_msb_next;
-        value
-    }
-
-    fn write_channel2(&mut self, value: u8) {
-        self.channels[2] = value;
-
-        if self.command & 0xc0 == 0x80 && self.command & 0x30 == 0x30 {
-            if let Some(lsb) = self.channel2_write_lsb.take() {
-                let raw_latch = u16::from_le_bytes([lsb, value]);
-                self.channel2_latch = if raw_latch == 0 {
-                    0x1_0000
-                } else {
-                    u32::from(raw_latch)
-                };
-                self.channel2_started_at = Some(Instant::now());
-                self.channel2_read_msb_next = false;
-            } else {
-                self.channel2_write_lsb = Some(value);
-            }
-        }
-    }
-
-    fn channel2_counter(&self) -> u16 {
-        let Some(started_at) = self.channel2_started_at else {
-            return self.channel2_latch.min(u32::from(u16::MAX)) as u16;
-        };
-
-        // Linux early TSC calibration polls PIT channel 2 until the MSB changes.
-        // Returning a frozen byte makes that path burn the full 50k retry budget on WHP.
-        let elapsed_ticks = started_at
-            .elapsed()
-            .as_nanos()
-            .saturating_mul(PIT_TICK_RATE_HZ)
-            / 1_000_000_000;
-
-        if elapsed_ticks >= u128::from(self.channel2_latch) {
-            0
-        } else {
-            (u128::from(self.channel2_latch) - elapsed_ticks).min(u128::from(u16::MAX)) as u16
-        }
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-impl Drop for WindowsX64PitStub {
-    fn drop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-impl devices::BusDevice for WindowsX64PitStub {
-    fn read(&mut self, _vcpuid: u64, offset: u64, data: &mut [u8]) {
-        if data.len() != 1 {
-            return;
-        }
-
-        data[0] = match offset {
-            0..=1 => self.channels[offset as usize],
-            2 => self.read_channel2(),
-            3 => self.command,
-            _ => 0,
-        };
-    }
-
-    fn write(&mut self, _vcpuid: u64, offset: u64, data: &[u8]) {
-        if data.len() != 1 {
-            return;
-        }
-
-        match offset {
-            0 => self.write_channel0(data[0]),
-            1 => self.channels[1] = data[0],
-            2 => self.write_channel2(data[0]),
-            3 => {
-                self.command = data[0];
-                if self.command & 0xc0 == 0 {
-                    let access = (self.command >> 4) & 0x3;
-                    // Access 0 is the counter-latch command; anything else
-                    // reprograms the channel, so stop ticking until the
-                    // guest writes the new reload value.
-                    if access != 0 {
-                        self.channel0_access = access;
-                        self.channel0_mode = (self.command >> 1) & 0x7;
-                        self.channel0_write_lsb = None;
-                        self.channel0_period_ns.store(0, Ordering::Relaxed);
-                    }
-                }
-                if self.command & 0xc0 == 0x80 {
-                    self.channel2_write_lsb = None;
-                    self.channel2_read_msb_next = false;
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
@@ -3850,6 +3703,7 @@ impl devices::BusDevice for WindowsX64PostCodeStub {
 
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 fn create_windows_x86_64_pio_bus(
+    pit: Arc<Mutex<crate::windows::pit::Pit>>,
     intc: IrqChip,
     serial: &[Arc<Mutex<Serial>>],
     exit_evt: &EventFd,
@@ -3871,11 +3725,7 @@ fn create_windows_x86_64_pio_bus(
     }
 
     pio_bus
-        .insert(
-            Arc::new(Mutex::new(WindowsX64PitStub::new(intc.clone()))),
-            0x40,
-            0x4,
-        )
+        .insert(pit, 0x40, 0x4)
         .map_err(Error::LegacyPioBus)
         .map_err(StartMicrovmError::Internal)?;
 
@@ -4133,7 +3983,7 @@ fn create_vcpus_windows(
                 metrics.clone(),
             )
             .map_err(Error::Vcpu)?;
-        vcpu.configure_windows(guest_mem, mem_info, entry_addr)
+        vcpu.configure_windows(guest_mem, mem_info, entry_addr, vcpu_config.nested_enabled)
             .map_err(Error::Vcpu)?;
         #[cfg(target_arch = "x86_64")]
         {
@@ -4168,7 +4018,7 @@ fn create_vcpus_aarch64(
         )
         .map_err(Error::Vcpu)?;
 
-        vcpu.configure_aarch64(vm.fd(), mem_info, entry_addr)
+        vcpu.configure_aarch64(vm.fd(), mem_info, entry_addr, vcpu_config.nested_enabled)
             .map_err(Error::Vcpu)?;
 
         vcpus.push(vcpu);
@@ -4296,9 +4146,11 @@ fn attach_mmio_device(
 }
 
 #[cfg(not(feature = "tee"))]
+#[allow(clippy::too_many_arguments)]
 fn attach_fs_devices(
     vmm: &mut Vmm,
     fs_devs: &[FsDeviceConfig],
+    backend_state_limit: usize,
     shm_manager: &mut ShmManager,
     #[cfg(not(feature = "tee"))] export_table: Option<ExportTable>,
     intc: IrqChip,
@@ -4317,6 +4169,10 @@ fn attach_fs_devices(
             )
             .unwrap(),
         ));
+
+        fs.lock()
+            .unwrap()
+            .set_max_backend_state_bytes(backend_state_limit);
 
         let id = format!("{}{}", String::from(fs.lock().unwrap().id()), i);
 
@@ -4347,9 +4203,11 @@ fn attach_fs_devices(
 }
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[allow(clippy::too_many_arguments)]
 fn attach_custom_fs_devices(
     vmm: &mut Vmm,
     custom_fs_devs: &[CustomFsDeviceConfig],
+    backend_state_limit: usize,
     shm_manager: &mut ShmManager,
     index_offset: usize,
     intc: IrqChip,
@@ -4367,6 +4225,10 @@ fn attach_custom_fs_devices(
             )
             .unwrap(),
         ));
+
+        fs.lock()
+            .unwrap()
+            .set_max_backend_state_bytes(backend_state_limit);
 
         let id = format!(
             "{}{}",
@@ -5002,6 +4864,118 @@ pub mod tests {
 
     use crate::resources::{HostMemoryPolicy, NumaDistance, NumaNodeConfig, NumaTopology};
 
+    #[test]
+    fn initial_kernel_cmdline_preserves_clock_argument_order() {
+        // Cover both sources accepted by the boot builder. Arguments after `--`
+        // belong to init, while the last kernel-side clock value overrides earlier ones.
+        for use_payload in [false, true] {
+            for (caller, expected) in [
+                (
+                    "quiet -- tsc_early_khz=123",
+                    "tsc_early_khz=3600024 quiet -- tsc_early_khz=123",
+                ),
+                (
+                    "quiet tsc_early_khz=2400000 -- init-arg",
+                    "tsc_early_khz=3600024 quiet tsc_early_khz=2400000 -- init-arg",
+                ),
+            ] {
+                let (payload, prolog) = if use_payload {
+                    (Some(caller), Some("ignored-prolog"))
+                } else {
+                    (None, Some(caller))
+                };
+                let cmdline = initial_kernel_cmdline(payload, prolog, Some(3_600_024_432)).unwrap();
+                assert_eq!(cmdline.as_str(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn initial_kernel_cmdline_without_clock_keeps_existing_defaults() {
+        for frequency in [None, Some(0), Some(999)] {
+            let cmdline = initial_kernel_cmdline(None, None, frequency).unwrap();
+            assert_eq!(cmdline.as_str(), DEFAULT_KERNEL_CMDLINE);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    #[test]
+    fn nested_execution_admission_preserves_paused_boundary() {
+        // No guest instruction executes. Construct an ordinary paused VM so this
+        // admission test does not depend on the CI host exposing VMX or SVM.
+        let kernel: GuestMemoryMmap =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let mut resources = VmResources::default();
+        resources.nested_enabled = false;
+        resources.kernel_bundle = Some(KernelBundle {
+            host_addr: kernel.get_host_address(GuestAddress(0)).unwrap() as u64,
+            guest_addr: 0x20_0000,
+            entry_addr: 0x20_0000,
+            size: 4096,
+        });
+        let mut events = EventManager::new().unwrap();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let (vmm, _) = build_microvm_paused(
+            &mut resources,
+            &mut events,
+            None,
+            sender,
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            Arc::new(AtomicI32::new(0)),
+        )
+        .unwrap();
+        let mut vmm = vmm.lock().unwrap();
+        vmm.nested_enabled = true;
+        let before_request = vmm.control_request_id;
+        let before_pause = vmm.require_paused_execution_boundary().unwrap();
+        if cfg!(feature = "aws-nitro") {
+            assert!(matches!(
+                vmm.capture_execution_state(),
+                Err(crate::Error::NestedExecutionStateUnsupported)
+            ));
+        } else {
+            // Admission is read-only. This ordinary fixture has no nested vCPU
+            // payload, so real nested capture belongs to the live restore harness.
+            vmm.require_nested_execution_state_support().unwrap();
+        }
+        assert_eq!(vmm.control_request_id, before_request);
+        assert_eq!(
+            vmm.require_paused_execution_boundary().unwrap(),
+            before_pause
+        );
+
+        let state = crate::ExecutionState::new(
+            crate::current_execution_architecture(),
+            crate::current_execution_backend(),
+            crate::current_execution_backend_state_abi(true),
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap()
+        .with_nested_enabled(true);
+        let error = vmm.restore_execution_state(&state).unwrap_err();
+        if cfg!(feature = "aws-nitro") {
+            assert!(matches!(
+                error,
+                crate::Error::NestedExecutionStateUnsupported
+            ));
+        } else {
+            // The nested policy admits this host, but missing vCPU state must
+            // still fail before backend dispatch or destination mutation.
+            assert!(matches!(
+                error,
+                crate::Error::ExecutionStateTopologyMismatch
+            ));
+        }
+        assert_eq!(vmm.control_request_id, before_request);
+        assert_eq!(
+            vmm.require_paused_execution_boundary().unwrap(),
+            before_pause
+        );
+        assert!(vmm.execution_restore_allowed);
+    }
+
     fn one_node_numa_topology(host_memory: HostMemoryPolicy) -> NumaTopology {
         NumaTopology {
             nodes: vec![NumaNodeConfig {
@@ -5392,6 +5366,7 @@ pub mod tests {
             vcpu_count,
             max_vcpu_count: vcpu_count,
             ht_enabled: false,
+            nested_enabled: false,
             cpu_template: None,
         };
 
@@ -5429,6 +5404,7 @@ pub mod tests {
             vcpu_count,
             max_vcpu_count: vcpu_count,
             ht_enabled: false,
+            nested_enabled: false,
             cpu_template: None,
         };
 

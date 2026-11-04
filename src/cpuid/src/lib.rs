@@ -65,5 +65,122 @@ pub fn filter_cpuid(kvm_cpuid: &mut CpuId, vm_spec: &VmSpec) -> Result<(), Error
         cpuid_transformer.process_cpuid(kvm_cpuid, vm_spec)?;
     }
 
+    // With nested virtualization disabled, clear the hardware virtualization
+    // feature bits so the guest cannot run its own VMs.
+    if !vm_spec.nested_enabled() {
+        mask_nested_virt(kvm_cpuid);
+    }
+
     Ok(())
+}
+
+/// Clear the hardware virtualization feature bits from the guest CPUID: VMX
+/// (leaf 0x1, ECX bit 5) and SVM (leaf 0x8000_0001, ECX bit 2).
+fn mask_nested_virt(kvm_cpuid: &mut CpuId) {
+    const VMX_BIT: u32 = 1 << 5;
+    const SVM_BIT: u32 = 1 << 2;
+    for entry in kvm_cpuid.as_mut_slice() {
+        if entry.index != 0 {
+            continue;
+        }
+        match entry.function {
+            0x1 => entry.ecx &= !VMX_BIT,
+            0x8000_0001 => entry.ecx &= !SVM_BIT,
+            _ => {}
+        }
+    }
+}
+
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+mod tests {
+    use super::*;
+    use kvm_bindings::kvm_cpuid_entry2;
+
+    #[test]
+    fn test_vm_spec_nested_enabled() {
+        let mut vm_spec = VmSpec::new(0, 1, false).unwrap();
+        assert!(!vm_spec.nested_enabled());
+
+        vm_spec.set_nested_enabled(true);
+        assert!(vm_spec.nested_enabled());
+
+        vm_spec.set_nested_enabled(false);
+        assert!(!vm_spec.nested_enabled());
+    }
+
+    #[test]
+    fn test_mask_nested_virt() {
+        let mut cpuid = CpuId::new(2).unwrap();
+        cpuid.as_mut_slice()[0] = kvm_cpuid_entry2 {
+            function: 0x1,
+            index: 0,
+            ecx: u32::MAX,
+            ..Default::default()
+        };
+        cpuid.as_mut_slice()[1] = kvm_cpuid_entry2 {
+            function: 0x8000_0001,
+            index: 0,
+            ecx: u32::MAX,
+            ..Default::default()
+        };
+
+        mask_nested_virt(&mut cpuid);
+
+        let entries = cpuid.as_slice();
+        assert_eq!(entries[0].ecx & (1 << 5), 0, "VMX must be cleared");
+        assert_eq!(entries[1].ecx & (1 << 2), 0, "SVM must be cleared");
+        // Unrelated bits are preserved.
+        assert_eq!(entries[0].ecx, !(1u32 << 5));
+    }
+
+    /// A CPUID with the Intel VMX and AMD SVM feature bits set.
+    fn virt_cpuid() -> CpuId {
+        let mut cpuid = CpuId::new(2).unwrap();
+        cpuid.as_mut_slice()[0] = kvm_cpuid_entry2 {
+            function: 0x1,
+            index: 0,
+            ecx: 1 << 5,
+            ..Default::default()
+        };
+        cpuid.as_mut_slice()[1] = kvm_cpuid_entry2 {
+            function: 0x8000_0001,
+            index: 0,
+            ecx: 1 << 2,
+            ..Default::default()
+        };
+        cpuid
+    }
+
+    /// The VMX/SVM bits the guest would see in a filtered CPUID.
+    fn virt_bits(cpuid: &CpuId) -> u32 {
+        let mut bits = 0;
+        for entry in cpuid.as_slice() {
+            if entry.index == 0 {
+                match entry.function {
+                    0x1 => bits |= entry.ecx & (1 << 5),
+                    0x8000_0001 => bits |= entry.ecx & (1 << 2),
+                    _ => {}
+                }
+            }
+        }
+        bits
+    }
+
+    #[test]
+    fn test_filter_cpuid_masks_nested_virt_when_disabled() {
+        let vm_spec = VmSpec::new(0, 1, false).unwrap();
+        let mut cpuid = virt_cpuid();
+        filter_cpuid(&mut cpuid, &vm_spec).unwrap();
+        assert_eq!(virt_bits(&cpuid), 0);
+    }
+
+    #[test]
+    fn test_filter_cpuid_keeps_nested_virt_when_enabled() {
+        let mut vm_spec = VmSpec::new(0, 1, false).unwrap();
+        vm_spec.set_nested_enabled(true);
+        assert!(vm_spec.nested_enabled());
+        let mut cpuid = virt_cpuid();
+        filter_cpuid(&mut cpuid, &vm_spec).unwrap();
+        assert_eq!(virt_bits(&cpuid), (1 << 5) | (1 << 2));
+    }
 }

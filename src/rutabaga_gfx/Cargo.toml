@@ -1,11 +1,11 @@
 [package]
 name = "msb_krun_rutabaga_gfx"
-version = "0.1.39"
+version = "0.1.44"
 authors = ["The ChromiumOS Authors + Android Open Source Project"]
 edition = "2021"
 description = "[highly unstable] Handling virtio-gpu protocols"
 license = "BSD-3-Clause"
-repository = "https://github.com/containers/libkrun"
+repository = "https://github.com/superradcompany/libkrun"
 
 [features]
 gfxstream = []

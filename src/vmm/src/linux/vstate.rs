@@ -88,6 +88,8 @@ pub(crate) const VCPU_RTSIG_OFFSET: i32 = 0;
 
 #[cfg(target_arch = "x86_64")]
 const MSR_IA32_XSS: u32 = 0x0000_0da0;
+#[cfg(target_arch = "x86_64")]
+const MSR_IA32_FEATURE_CONTROL: u32 = 0x3a;
 
 /// Errors associated with the wrappers over KVM ioctls.
 #[derive(Debug)]
@@ -1240,6 +1242,8 @@ pub struct VcpuConfig {
     pub max_vcpu_count: u8,
     /// Enable hyperthreading in the CPUID configuration.
     pub ht_enabled: bool,
+    /// Enable nested virtualization in the CPUID configuration.
+    pub nested_enabled: bool,
     /// CPUID template to use.
     pub cpu_template: Option<CpuFeaturesTemplate>,
 }
@@ -1250,6 +1254,8 @@ type VcpuCell = Cell<Option<*mut Vcpu>>;
 /// A wrapper around creating and using a kvm-based VCPU.
 pub struct Vcpu {
     fd: VcpuFd,
+    #[cfg(target_arch = "x86_64")]
+    tsc_scaling_supported: bool,
     id: u8,
     // Resolved host placement is applied inside the vCPU thread before KVM_RUN.
     host_cpu: Option<HostCpuId>,
@@ -1294,6 +1300,24 @@ pub struct Vcpu {
 }
 
 impl Vcpu {
+    #[cfg(target_arch = "x86_64")]
+    fn validate_tsc_frequency(&self, tsc_frequency_hz: u64) -> Result<u32> {
+        let khz = super::tsc_frequency::to_khz(tsc_frequency_hz)
+            .map_err(|error| Error::StateCodec(error.into()))?;
+        if khz == 0 {
+            return Err(Error::StateCodec("zero saved TSC frequency".into()));
+        }
+        let current = self.fd.get_tsc_khz().map_err(Error::VcpuGetTscKhz)?;
+        // Without hardware scaling KVM may accept a higher rate using catch-up
+        // emulation. That does not preserve RDTSC timing inside a running L2.
+        if khz != current && !self.tsc_scaling_supported {
+            return Err(Error::StateCodec(format!(
+                "snapshot TSC rate {khz} kHz differs from destination {current} kHz; KVM TSC scaling is unsupported"
+            )));
+        }
+        Ok(khz)
+    }
+
     thread_local!(static TLS_VCPU_PTR: VcpuCell = const { Cell::new(None) });
 
     /// Associates `self` with the current thread.
@@ -1412,6 +1436,7 @@ impl Vcpu {
         // Initially the cpuid per vCPU is the one supported by this VM.
         Ok(Vcpu {
             fd: kvm_vcpu,
+            tsc_scaling_supported: vm_fd.check_extension(Cap::TscControl),
             id,
             host_cpu: None,
             host_cpu_required: true,
@@ -1551,8 +1576,10 @@ impl Vcpu {
         vcpu_config: &VcpuConfig,
         kernel_boot: bool,
     ) -> Result<()> {
-        let cpuid_vm_spec = VmSpec::new(self.id, vcpu_config.vcpu_count, vcpu_config.ht_enabled)
-            .map_err(Error::CpuId)?;
+        let mut cpuid_vm_spec =
+            VmSpec::new(self.id, vcpu_config.vcpu_count, vcpu_config.ht_enabled)
+                .map_err(Error::CpuId)?;
+        cpuid_vm_spec.set_nested_enabled(vcpu_config.nested_enabled);
 
         filter_cpuid(&mut self.cpuid, &cpuid_vm_spec).map_err(|e| {
             error!("Failure in configuring CPUID for vcpu {}: {:?}", self.id, e);
@@ -1573,6 +1600,11 @@ impl Vcpu {
         self.fd
             .set_cpuid2(&self.cpuid)
             .map_err(Error::VcpuSetCpuid)?;
+
+        if self.nested_state_enabled() {
+            self.msr_list = super::nested_state::runtime_msrs()
+                .map_err(|error| Error::StateCodec(format!("nested runtime MSRs: {error}")))?;
+        }
 
         if kernel_boot {
             arch::x86_64::msr::setup_msrs(&self.fd).map_err(Error::MSRSConfiguration)?;
@@ -1599,6 +1631,7 @@ impl Vcpu {
         vm_fd: &VmFd,
         mem_info: &ArchMemoryInfo,
         kernel_load_addr: GuestAddress,
+        nested_enabled: bool,
     ) -> Result<()> {
         let mut kvi: kvm_bindings::kvm_vcpu_init = kvm_bindings::kvm_vcpu_init::default();
 
@@ -1606,6 +1639,14 @@ impl Vcpu {
         vm_fd
             .get_preferred_target(&mut kvi)
             .map_err(Error::VcpuArmPreferredTarget)?;
+        // Linux UAPI KVM_ARM_VCPU_HAS_EL2 and KVM_ARM_VCPU_HAS_EL2_E2H0.
+        // Do not inherit a preferred target's nesting policy when nesting is disabled.
+        const HAS_EL2: u32 = 7;
+        const HAS_EL2_E2H0: u32 = 8;
+        kvi.features[0] &= !((1 << HAS_EL2) | (1 << HAS_EL2_E2H0));
+        if nested_enabled {
+            kvi.features[0] |= 1 << HAS_EL2;
+        }
         // We already checked that the capability is supported.
         kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_PSCI_0_2;
         // Non-boot cpus are powered off initially.
@@ -1621,8 +1662,14 @@ impl Vcpu {
         }
 
         self.fd.vcpu_init(&kvi).map_err(Error::VcpuArmInit)?;
-        arch::aarch64::regs::setup_regs(&self.fd, self.id, kernel_load_addr.raw_value(), mem_info)
-            .map_err(Error::REGSConfiguration)?;
+        arch::aarch64::regs::setup_regs(
+            &self.fd,
+            self.id,
+            kernel_load_addr.raw_value(),
+            mem_info,
+            nested_enabled,
+        )
+        .map_err(Error::REGSConfiguration)?;
 
         self.mpidr = arch::aarch64::regs::read_mpidr(&self.fd).map_err(Error::REGSConfiguration)?;
 
@@ -1743,7 +1790,8 @@ impl Vcpu {
             .fd
             .get_vcpu_events()
             .map_err(Error::VcpuGetVcpuEvents)?;
-        let tsc_khz = self.fd.get_tsc_khz().map_err(Error::VcpuGetTscKhz)?;
+        let tsc_frequency_hz =
+            u64::from(self.fd.get_tsc_khz().map_err(Error::VcpuGetTscKhz)?) * 1000;
         Ok(VcpuState {
             cpuid: self
                 .cpuid
@@ -1766,7 +1814,7 @@ impl Vcpu {
             vcpu_events,
             xcrs,
             xsave,
-            tsc_khz,
+            tsc_frequency_hz,
         })
     }
 
@@ -1774,20 +1822,94 @@ impl Vcpu {
     #[cfg(target_arch = "x86_64")]
     fn capture_execution_state(&self) -> Result<Vec<u8>> {
         let state = self.save_state()?;
-        bincode::serde::encode_to_vec(&state, bincode::config::standard())
-            .map_err(|error| Error::StateCodec(error.to_string()))
+        if self.nested_state_enabled() {
+            let nested = super::nested_state::capture(&self.fd)
+                .map_err(|error| Error::StateCodec(format!("capture nested state: {error}")))?;
+            return state.encode_execution_payload(Some(&nested));
+        }
+        state.encode_execution_payload(None)
     }
 
     /// Restores a backend payload while running on the owning vCPU thread.
     #[cfg(target_arch = "x86_64")]
     fn restore_execution_state(&self, bytes: &[u8]) -> Result<()> {
-        let (state, consumed): (VcpuState, usize) =
-            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-                .map_err(|error| Error::StateCodec(error.to_string()))?;
-        if consumed != bytes.len() {
-            return Err(Error::StateCodec("trailing vCPU state bytes".to_string()));
+        let (state, nested) =
+            VcpuState::decode_execution_payload(bytes, self.nested_state_enabled())?;
+        if let Some(nested) = nested {
+            super::nested_state::validate_destination(&nested)
+                .map_err(|error| Error::StateCodec(format!("validate nested state: {error}")))?;
+            self.restore_state_with_nested(state, Some(&nested))
+        } else {
+            self.restore_state(state)
         }
-        self.restore_state(state)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn validate_execution_restore(&self, bytes: &[u8]) -> Result<()> {
+        let (state, nested) =
+            VcpuState::decode_execution_payload(bytes, self.nested_state_enabled())?;
+        if let Some(nested) = &nested {
+            super::nested_state::validate_destination(nested)
+                .map_err(|error| Error::StateCodec(format!("validate nested state: {error}")))?;
+            self.validate_nested_cpu_contract(&state, nested)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn validate_nested_cpu_contract(
+        &self,
+        state: &VcpuState,
+        nested: &super::nested_state::Snapshot,
+    ) -> Result<()> {
+        let expected = self
+            .cpuid
+            .as_slice()
+            .iter()
+            .copied()
+            .map(KvmCpuidEntryState::from)
+            .collect::<Vec<_>>();
+        if state.cpuid != expected {
+            return Err(Error::StateCodec(
+                "destination CPUID differs from nested snapshot".into(),
+            ));
+        }
+        self.validate_tsc_frequency(state.tsc_frequency_hz)?;
+        if state.msrs.len() != self.msr_list.as_slice().len()
+            || state
+                .msrs
+                .iter()
+                .zip(self.msr_list.as_slice())
+                .any(|(entry, index)| entry.index != *index)
+        {
+            return Err(Error::StateCodec(
+                "nested snapshot runtime MSR inventory differs from destination".into(),
+            ));
+        }
+        let vmx = self
+            .cpuid
+            .as_slice()
+            .iter()
+            .any(|entry| entry.function == 1 && entry.ecx & (1 << 5) != 0);
+        let expected_format = if vmx { 0_u16 } else { 1 };
+        if u16::from_le_bytes(nested.state[2..4].try_into().unwrap()) != expected_format {
+            return Err(Error::StateCodec(
+                "nested snapshot vendor differs from destination".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn nested_state_enabled(&self) -> bool {
+        self.cpuid.as_slice().iter().any(|entry| {
+            entry.index == 0
+                && match entry.function {
+                    1 => entry.ecx & (1 << 5) != 0,
+                    0x8000_0001 => entry.ecx & (1 << 2) != 0,
+                    _ => false,
+                }
+        })
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -1817,6 +1939,15 @@ impl Vcpu {
     #[allow(unused)]
     #[cfg(target_arch = "x86_64")]
     fn restore_state(&self, state: VcpuState) -> Result<()> {
+        self.restore_state_with_nested(state, None)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn restore_state_with_nested(
+        &self,
+        state: VcpuState,
+        nested: Option<&super::nested_state::Snapshot>,
+    ) -> Result<()> {
         /*
          * Ordering requirements:
          *
@@ -1844,6 +1975,9 @@ impl Vcpu {
                 "KVM execution state exceeds the supported register inventory".to_string(),
             ));
         }
+        if let Some(nested) = nested {
+            self.validate_nested_cpu_contract(&state, nested)?;
+        }
         let mut cpuid =
             CpuId::new(state.cpuid.len()).map_err(|error| Error::StateCodec(error.to_string()))?;
         for (target, source) in cpuid.as_mut_slice().iter_mut().zip(&state.cpuid) {
@@ -1851,23 +1985,57 @@ impl Vcpu {
         }
         let destination_supports_xss = self.msr_list.as_slice().contains(&MSR_IA32_XSS);
         let (xss, generic_msr_states) = split_restored_msrs(&state.msrs, destination_supports_xss)?;
+        // FEATURE_CONTROL can leave VMX operation, and KVM rejects writes to
+        // VMX capability MSRs after VMXON. Install both before nested admission.
+        let (nested_setup_msrs, generic_msr_states): (Vec<_>, Vec<_>) =
+            generic_msr_states.into_iter().partition(|msr| {
+                nested.is_some()
+                    && (msr.index == MSR_IA32_FEATURE_CONTROL
+                        || (arch_gen::x86::msr_index::MSR_IA32_VMX_BASIC
+                            ..=arch_gen::x86::msr_index::MSR_IA32_VMX_VMFUNC)
+                            .contains(&msr.index))
+            });
         let mut msrs = Msrs::new(generic_msr_states.len())
             .map_err(|error| Error::StateCodec(error.to_string()))?;
         for (target, source) in msrs.as_mut_slice().iter_mut().zip(&generic_msr_states) {
             *target = (*source).into();
         }
 
+        let tsc_frequency_hz = state.tsc_frequency_hz;
+        let tsc_khz = self.validate_tsc_frequency(tsc_frequency_hz)?;
         self.fd.set_cpuid2(&cpuid).map_err(Error::VcpuSetCpuid)?;
-        self.fd
-            .set_tsc_khz(state.tsc_khz)
-            .map_err(Error::VcpuSetTscKhz)?;
+        self.fd.set_tsc_khz(tsc_khz).map_err(Error::VcpuSetTscKhz)?;
+        if self.fd.get_tsc_khz().map_err(Error::VcpuGetTscKhz)? != tsc_khz {
+            return Err(Error::StateCodec(
+                "destination cannot preserve guest TSC frequency".into(),
+            ));
+        }
         self.fd
             .set_mp_state(state.mp_state)
             .map_err(Error::VcpuSetMpState)?;
-        self.fd.set_regs(&state.regs).map_err(Error::VcpuSetRegs)?;
+        if !nested_setup_msrs.is_empty() {
+            let entries: Vec<kvm_msr_entry> =
+                nested_setup_msrs.iter().copied().map(Into::into).collect();
+            let setup = Msrs::from_entries(&entries)
+                .map_err(|error| Error::StateCodec(error.to_string()))?;
+            if self.fd.set_msrs(&setup).map_err(Error::VcpuSetMsrs)? != entries.len() {
+                return Err(Error::StateCodec(
+                    "KVM did not restore the nested virtualization setup MSRs".into(),
+                ));
+            }
+        }
         self.fd
             .set_sregs(&state.sregs)
             .map_err(Error::VcpuSetSregs)?;
+        // Match QEMU kvm_arch_put_registers: SREGS supplies EFER.SVME before
+        // nested admission; nested VM entry can overwrite RIP/RSP and debug/MSR
+        // state, so restore the final register values only after that transition.
+        // https://github.com/qemu/qemu/blob/v10.1.0/target/i386/kvm/kvm.c
+        if let Some(nested) = nested {
+            super::nested_state::restore(&self.fd, nested)
+                .map_err(|error| Error::StateCodec(format!("restore nested state: {error}")))?;
+        }
+        self.fd.set_regs(&state.regs).map_err(Error::VcpuSetRegs)?;
         if let Some(xss) = xss {
             let xss = Msrs::from_entries(&[xss.into()])
                 .map_err(|error| Error::StateCodec(error.to_string()))?;
@@ -1893,8 +2061,9 @@ impl Vcpu {
         let restored_msrs = self.fd.set_msrs(&msrs).map_err(Error::VcpuSetMsrs)?;
         if restored_msrs != msrs.as_slice().len() {
             return Err(Error::StateCodec(format!(
-                "KVM restored {restored_msrs} of {} MSRs",
-                msrs.as_slice().len()
+                "KVM restored {restored_msrs} of {} MSRs; rejected index {:#x}",
+                msrs.as_slice().len(),
+                msrs.as_slice()[restored_msrs].index
             )));
         }
         self.fd
@@ -2159,6 +2328,15 @@ impl Vcpu {
                     .send(VcpuResponse::StateCaptured { request_id, result })
                     .expect("failed to send captured vCPU state");
             }
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuEvent::ValidateState { request_id, .. }) => {
+                self.response_sender
+                    .send(VcpuResponse::StateValidated {
+                        request_id,
+                        result: Err("restore preflight requires a paused vCPU".into()),
+                    })
+                    .expect("failed to send validation response");
+            }
             Ok(VcpuEvent::RestoreState { request_id, bytes }) => {
                 let result = self
                     .restore_execution_state(&bytes)
@@ -2206,6 +2384,16 @@ impl Vcpu {
                 self.response_sender
                     .send(VcpuResponse::StateCaptured { request_id, result })
                     .expect("failed to send captured vCPU state");
+                StateMachine::next(Self::paused)
+            }
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuEvent::ValidateState { request_id, bytes }) => {
+                let result = self
+                    .validate_execution_restore(&bytes)
+                    .map_err(|error| error.to_string());
+                self.response_sender
+                    .send(VcpuResponse::StateValidated { request_id, result })
+                    .expect("failed to send validation response");
                 StateMachine::next(Self::paused)
             }
             Ok(VcpuEvent::RestoreState { request_id, bytes }) => {
@@ -2374,11 +2562,54 @@ pub struct VcpuState {
     vcpu_events: kvm_vcpu_events,
     xcrs: kvm_xcrs,
     xsave: kvm_xsave,
-    tsc_khz: u32,
+    // Keep the existing u32 kHz snapshot encoding; use Hz everywhere in memory.
+    #[serde(with = "super::tsc_frequency")]
+    tsc_frequency_hz: u64,
 }
 
 #[cfg(target_arch = "x86_64")]
-#[derive(Clone, Copy, Serialize, Deserialize)]
+impl VcpuState {
+    fn encode_execution_payload(
+        &self,
+        nested: Option<&super::nested_state::Snapshot>,
+    ) -> Result<Vec<u8>> {
+        let config = bincode::config::standard();
+        match nested {
+            Some(nested) => bincode::serde::encode_to_vec((self, nested), config),
+            None => bincode::serde::encode_to_vec(self, config),
+        }
+        .map_err(|error| Error::StateCodec(error.to_string()))
+    }
+
+    fn decode_execution_payload(
+        bytes: &[u8],
+        nested: bool,
+    ) -> Result<(Self, Option<super::nested_state::Snapshot>)> {
+        if nested {
+            let ((state, nested), consumed): ((Self, super::nested_state::Snapshot), usize) =
+                bincode::serde::decode_from_slice(
+                    bytes,
+                    bincode::config::standard().with_limit::<{ 16 * 1024 * 1024 }>(),
+                )
+                .map_err(|error| Error::StateCodec(error.to_string()))?;
+            if consumed != bytes.len() {
+                return Err(Error::StateCodec("trailing nested vCPU state bytes".into()));
+            }
+            Ok((state, Some(nested)))
+        } else {
+            let (state, consumed) =
+                bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                    .map_err(|error| Error::StateCodec(error.to_string()))?;
+            if consumed != bytes.len() {
+                return Err(Error::StateCodec("trailing vCPU state bytes".into()));
+            }
+            Ok((state, None))
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct KvmCpuidEntryState {
     function: u32,
     index: u32,
@@ -2474,6 +2705,14 @@ pub enum VcpuEvent {
         /// Correlates this command with its response.
         request_id: VcpuControlRequestId,
     },
+    /// Validate a nested restore without changing backend state.
+    #[cfg(target_arch = "x86_64")]
+    ValidateState {
+        /// Correlates this command with its response.
+        request_id: VcpuControlRequestId,
+        /// Incoming execution payload.
+        bytes: Vec<u8>,
+    },
     /// Restore backend state on the owning paused vCPU thread.
     RestoreState {
         /// Correlates this command with its response.
@@ -2502,6 +2741,14 @@ pub enum VcpuResponse {
         request_id: VcpuControlRequestId,
         /// Encoded state or the backend failure.
         result: std::result::Result<Vec<u8>, String>,
+    },
+    /// Read-only restore preflight result.
+    #[cfg(target_arch = "x86_64")]
+    StateValidated {
+        /// Request acknowledged by this response.
+        request_id: VcpuControlRequestId,
+        /// Validation result.
+        result: std::result::Result<(), String>,
     },
     /// Backend state restored on the vCPU thread.
     StateRestored {
@@ -2613,6 +2860,76 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn nested_execution_payload_preserves_state_and_rejects_corruption() {
+        let state = VcpuState {
+            cpuid: vec![kvm_cpuid_entry2 {
+                function: 1,
+                ecx: 1 << 5,
+                ..Default::default()
+            }
+            .into()],
+            msrs: vec![KvmMsrEntryState {
+                index: 0x10,
+                reserved: 0,
+                data: 12345,
+            }],
+            debug_regs: Default::default(),
+            lapic: Default::default(),
+            mp_state: Default::default(),
+            regs: kvm_regs {
+                rip: 0x1234,
+                rax: 42,
+                ..Default::default()
+            },
+            sregs: Default::default(),
+            vcpu_events: Default::default(),
+            xcrs: Default::default(),
+            xsave: Default::default(),
+            tsc_frequency_hz: 2_400_000_000,
+        };
+        let legacy = bincode::serde::encode_to_vec(&state, bincode::config::standard()).unwrap();
+        assert_eq!(state.encode_execution_payload(None).unwrap(), legacy);
+        let (ordinary, nested) = VcpuState::decode_execution_payload(&legacy, false).unwrap();
+        assert!(nested.is_none());
+        assert_eq!(ordinary.regs.rip, 0x1234);
+
+        let nested = super::super::nested_state::Snapshot {
+            state: vec![0x5a; 128],
+            feature_msrs: vec![(0x480, 0x1234)],
+        };
+        let payload = state.encode_execution_payload(Some(&nested)).unwrap();
+        let (restored, restored_nested) =
+            VcpuState::decode_execution_payload(&payload, true).unwrap();
+        assert_eq!(restored_nested.unwrap(), nested);
+        assert_eq!(restored.regs.rip, 0x1234);
+        assert_eq!(restored.regs.rax, 42);
+        assert_eq!(restored.cpuid[0].ecx, 1 << 5);
+        assert_eq!(restored.msrs[0].data, 12345);
+        assert_eq!(restored.tsc_frequency_hz, 2_400_000_000);
+        assert_eq!(restored.encode_execution_payload(None).unwrap(), legacy);
+
+        assert!(VcpuState::decode_execution_payload(&legacy, true).is_err());
+        assert!(VcpuState::decode_execution_payload(&payload[..payload.len() - 1], true).is_err());
+        let mut trailing = payload.clone();
+        trailing.push(0);
+        assert!(VcpuState::decode_execution_payload(&trailing, true).is_err());
+
+        // A valid but oversized vector must fail the decoder's allocation bound,
+        // rather than merely failing because input is truncated.
+        let oversized = state
+            .encode_execution_payload(Some(&super::super::nested_state::Snapshot {
+                state: vec![0; 16 * 1024 * 1024],
+                feature_msrs: vec![],
+            }))
+            .unwrap();
+        let error = VcpuState::decode_execution_payload(&oversized, true)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("LimitExceeded"), "{error}");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn restored_msrs_require_and_separate_xss_when_supported() {
         let generic = KvmMsrEntryState {
             index: 0x10,
@@ -2680,6 +2997,45 @@ mod tests {
             apply_host_cpu_affinity(Some(unavailable), false, 0),
             Ok(VcpuPlacementResult::Inherited { .. })
         ));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "requires hardware nesting and KVM_CAP_NESTED_STATE"]
+    fn nested_restore_rejects_incomplete_runtime_msr_inventory() {
+        let (_vm, mut vcpu, memory) = setup_vcpu(0x1000);
+        vcpu.configure_x86_64(
+            &memory,
+            GuestAddress(0),
+            &VcpuConfig {
+                vcpu_count: 2,
+                max_vcpu_count: 2,
+                ht_enabled: false,
+                cpu_template: None,
+                nested_enabled: true,
+            },
+            false,
+        )
+        .unwrap();
+        assert!(vcpu.nested_state_enabled());
+        let bytes = vcpu.capture_execution_state().unwrap();
+        vcpu.validate_execution_restore(&bytes).unwrap();
+
+        for duplicate in [false, true] {
+            let (mut state, nested) = VcpuState::decode_execution_payload(&bytes, true).unwrap();
+            assert!(state.msrs.len() > 1);
+            if duplicate {
+                state.msrs[1].index = state.msrs[0].index;
+            } else {
+                state.msrs.pop();
+            }
+            let malformed = state.encode_execution_payload(nested.as_ref()).unwrap();
+            let error = vcpu.validate_execution_restore(&malformed).unwrap_err();
+            assert!(
+                error.to_string().contains("runtime MSR inventory"),
+                "{error}"
+            );
+        }
     }
 
     // Auxiliary function being used throughout the tests.
@@ -2765,6 +3121,7 @@ mod tests {
             vcpu_count: 1,
             max_vcpu_count: 1,
             ht_enabled: false,
+            nested_enabled: false,
             cpu_template: None,
         };
 
@@ -2805,7 +3162,7 @@ mod tests {
         .unwrap();
 
         assert!(vcpu
-            .configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(0))
+            .configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(0), false)
             .is_ok());
 
         // Try it for when vcpu id is NOT 0.
@@ -2818,7 +3175,7 @@ mod tests {
         .unwrap();
 
         assert!(vcpu
-            .configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(0))
+            .configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(0), false)
             .is_ok());
     }
 

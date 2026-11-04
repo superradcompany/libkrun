@@ -21,6 +21,8 @@ pub struct VmSpec {
     cpu_count: u8,
     /// Specifies whether hyper-threading is enabled.
     ht_enabled: bool,
+    /// Specifies whether nested virtualization is enabled.
+    nested_enabled: bool,
     /// The desired brand string for the guest.
     brand_string: BrandString,
 }
@@ -36,8 +38,19 @@ impl VmSpec {
             cpu_id,
             cpu_count,
             ht_enabled,
+            nested_enabled: false,
             brand_string: BrandString::from_vendor_id(&cpu_vendor_id),
         })
+    }
+
+    /// Sets whether nested virtualization is enabled in the guest CPUID.
+    pub fn set_nested_enabled(&mut self, enabled: bool) {
+        self.nested_enabled = enabled;
+    }
+
+    /// Returns whether nested virtualization is enabled in the guest CPUID.
+    pub fn nested_enabled(&self) -> bool {
+        self.nested_enabled
     }
 
     /// Returns an immutable reference to cpu_vendor_id

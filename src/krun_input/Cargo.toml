@@ -1,10 +1,10 @@
 [package]
 name = "msb_krun_input"
 description = "Rust bindings for implementing input backends in Rust for libkrun"
-version = "0.1.39"
+version = "0.1.44"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/containers/libkrun"
+repository = "https://github.com/superradcompany/libkrun"
 
 [dependencies]
 thiserror = "2.0.12"

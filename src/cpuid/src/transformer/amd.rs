@@ -126,6 +126,14 @@ pub fn update_extended_apic_id_entry(
     Ok(())
 }
 
+fn update_topology_id_entry(entry: &mut kvm_cpuid_entry2, vm_spec: &VmSpec) -> Result<(), Error> {
+    // KVM may return the current host CPU's x2APIC ID even for an invalid
+    // topology level. Guest identity must not depend on host scheduling.
+    entry.edx = u32::from(vm_spec.cpu_id);
+
+    Ok(())
+}
+
 pub fn update_feature_info_entry(
     entry: &mut kvm_cpuid_entry2,
     vm_spec: &VmSpec,
@@ -156,6 +164,7 @@ impl CpuidTransformer for AmdCpuidTransformer {
         match entry.function {
             leaf_0x1::LEAF_NUM => Some(amd::update_feature_info_entry),
             leaf_0x7::LEAF_NUM => Some(amd::update_structured_extended_entry),
+            leaf_0xb::LEAF_NUM => Some(amd::update_topology_id_entry),
             leaf_0x80000000::LEAF_NUM => Some(amd::update_largest_extended_fn_entry),
             leaf_0x80000001::LEAF_NUM => Some(amd::update_extended_feature_info_entry),
             leaf_0x80000008::LEAF_NUM => Some(amd::update_amd_features_entry),
@@ -170,6 +179,32 @@ impl CpuidTransformer for AmdCpuidTransformer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_topology_id_does_not_depend_on_host_cpu() {
+        for cpu_id in [0, 1] {
+            let vm_spec = VmSpec::new(cpu_id, 2, false).unwrap();
+            for host_id in [0, 2] {
+                let mut cpuid = CpuId::from_entries(&[kvm_cpuid_entry2 {
+                    function: leaf_0xb::LEAF_NUM,
+                    flags: KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    edx: host_id,
+                    ..Default::default()
+                }])
+                .unwrap();
+
+                AmdCpuidTransformer {}
+                    .process_entries(&mut cpuid, &vm_spec)
+                    .unwrap();
+
+                let entry = &cpuid.as_slice()[0];
+                assert_eq!(entry.edx, u32::from(cpu_id));
+                // KVM's invalid topology level stays invalid; AMD topology is
+                // advertised separately through the extended CPUID leaves.
+                assert_eq!((entry.eax, entry.ebx, entry.ecx), (0, 0, 0));
+            }
+        }
+    }
 
     #[test]
     fn test_update_structured_extended_entry() {

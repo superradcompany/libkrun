@@ -14,6 +14,7 @@ use vm_memory::{ByteValued, GuestMemoryMmap};
 
 use super::super::{
     ActivateResult, DeviceQueue, DeviceState, FsError, QueueConfig, VirtioDevice, VirtioShmRegion,
+    DEFAULT_MAX_FS_BACKEND_STATE_BYTES,
 };
 use super::dyn_filesystem::{DynFileSystem, DynFileSystemAdapter};
 use super::filesystem::{FileSystem, FsOptions};
@@ -58,6 +59,7 @@ pub struct Fs {
     shm_region: Option<VirtioShmRegion>,
     backend: FsBackend,
     session_options: u64,
+    max_backend_state_bytes: usize,
     worker_thread: Option<JoinHandle<super::worker::FsWorkerState>>,
     worker_stopfd: EventFd,
     exit_code: Arc<AtomicI32>,
@@ -96,6 +98,7 @@ impl Fs {
                 filesystem: OnceLock::new(),
             },
             session_options: 0,
+            max_backend_state_bytes: DEFAULT_MAX_FS_BACKEND_STATE_BYTES,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
             exit_code,
@@ -124,6 +127,7 @@ impl Fs {
             shm_region: None,
             backend: FsBackend::Custom(backend),
             session_options: 0,
+            max_backend_state_bytes: DEFAULT_MAX_FS_BACKEND_STATE_BYTES,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
             exit_code,
@@ -134,6 +138,11 @@ impl Fs {
 
     pub fn id(&self) -> &str {
         defs::FS_DEV_ID
+    }
+
+    /// Sets the largest backend state this device captures or restores.
+    pub fn set_max_backend_state_bytes(&mut self, bytes: usize) {
+        self.max_backend_state_bytes = bytes;
     }
 
     pub fn set_shm_region(&mut self, shm_region: VirtioShmRegion) {
@@ -358,12 +367,13 @@ impl VirtioDevice for Fs {
             session_options: self.session_options,
             backend_state,
         }
-        .encode()
+        .encode(self.max_backend_state_bytes)
         .map_err(super::super::VirtioStateError::Device)
     }
 
     fn validate_device_state(&self, bytes: &[u8]) -> Result<(), super::super::VirtioStateError> {
-        let state = FsDeviceState::decode(bytes).map_err(super::super::VirtioStateError::Device)?;
+        let state = FsDeviceState::decode(bytes, self.max_backend_state_bytes)
+            .map_err(super::super::VirtioStateError::Device)?;
         if FsOptions::from_bits(state.session_options).is_none() {
             return Err(super::super::VirtioStateError::Incompatible(
                 "virtio-fs state contains unknown negotiated FUSE options".into(),
@@ -383,7 +393,8 @@ impl VirtioDevice for Fs {
 
     fn restore_device_state(&mut self, bytes: &[u8]) -> Result<(), super::super::VirtioStateError> {
         self.validate_device_state(bytes)?;
-        let state = FsDeviceState::decode(bytes).map_err(super::super::VirtioStateError::Device)?;
+        let state = FsDeviceState::decode(bytes, self.max_backend_state_bytes)
+            .map_err(super::super::VirtioStateError::Device)?;
         match &self.backend {
             FsBackend::Passthrough { filesystem, .. } => filesystem
                 .get()
@@ -454,5 +465,46 @@ mod tests {
         assert_eq!(fs.quiesce().unwrap().len(), fs.queue_config().len());
 
         std::fs::remove_dir(directory).unwrap();
+    }
+
+    struct StatefulBackend(usize);
+
+    impl DynFileSystem for StatefulBackend {
+        fn capture_state(&self) -> std::io::Result<Vec<u8>> {
+            Ok(vec![0x5a; self.0])
+        }
+
+        fn validate_state(&self, state: &[u8]) -> std::io::Result<()> {
+            assert_eq!(state.len(), self.0);
+            Ok(())
+        }
+
+        fn restore_state(&self, state: &[u8]) -> std::io::Result<()> {
+            self.validate_state(state)
+        }
+    }
+
+    #[test]
+    fn fs_state_budget_applies_to_capture_validate_and_restore() {
+        let backend_len = DEFAULT_MAX_FS_BACKEND_STATE_BYTES + 1;
+        let new_fs = || {
+            Fs::with_custom_backend(
+                "test-fs".into(),
+                Arc::new(StatefulBackend(backend_len)),
+                Arc::new(AtomicI32::new(0)),
+            )
+            .unwrap()
+        };
+
+        let mut fs = new_fs();
+        assert!(fs.capture_device_state().is_err());
+
+        fs.set_max_backend_state_bytes(backend_len);
+        let state = fs.capture_device_state().unwrap();
+        fs.restore_device_state(&state).unwrap();
+
+        let mut default_fs = new_fs();
+        assert!(default_fs.validate_device_state(&state).is_err());
+        assert!(default_fs.restore_device_state(&state).is_err());
     }
 }

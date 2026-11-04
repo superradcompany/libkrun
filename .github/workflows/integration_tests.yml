@@ -52,12 +52,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG=$(gh api repos/containers/libkrunfw/releases/latest --jq '.tag_name')
-          curl -L -o /tmp/libkrunfw-x86_64.tgz "https://github.com/containers/libkrunfw/releases/download/$TAG/libkrunfw-x86_64.tgz"
+          curl -fL -o /tmp/libkrunfw-x86_64.tgz "https://github.com/containers/libkrunfw/releases/download/$TAG/libkrunfw-x86_64.tgz"
           mkdir tmp
           tar xf /tmp/libkrunfw-x86_64.tgz -C tmp
-          sudo mv tmp/lib64/* /lib/x86_64-linux-gnu
+          sudo mv tmp/lib/x86_64-linux-gnu/* /lib/x86_64-linux-gnu
       
       - name: Integration tests
+        timeout-minutes: 10
         run: KRUN_ENOMEM_WORKAROUND=1 KRUN_NO_UNSHARE=1 KRUN_TEST_BASE_DIR=/tmp/libkrun-tests make test TEST_FLAGS="--keep-all --github-summary"
 
       - name: Upload test logs

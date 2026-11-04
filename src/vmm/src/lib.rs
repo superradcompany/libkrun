@@ -44,6 +44,8 @@ mod memory_capture;
 /// Backend-neutral memory generation and incremental-baseline contracts.
 pub mod memory_state;
 mod metrics;
+/// Host nested virtualization support shared by the C and Rust APIs.
+pub mod nested_virt;
 pub mod private_memory;
 #[cfg(unix)]
 mod terminal;
@@ -428,14 +430,14 @@ fn current_execution_backend() -> ExecutionBackend {
 }
 
 #[cfg(target_os = "macos")]
-fn current_execution_backend_state_abi() -> u32 {
+fn current_execution_backend_state_abi(_nested_enabled: bool) -> u32 {
     // ABI 2 adds the per-vCPU GIC CPU-interface state that is separate from the process-wide HVF
     // distributor artifact. ABI 1 cannot safely deliver interrupts after construction restore.
     2
 }
 
 #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-fn current_execution_backend_state_abi() -> u32 {
+fn current_execution_backend_state_abi(_nested_enabled: bool) -> u32 {
     // ARM64 activity state is mandatory: old artifacts cannot distinguish
     // online CPUs from processors intentionally left startup-suspended.
     2
@@ -445,14 +447,27 @@ fn current_execution_backend_state_abi() -> u32 {
     target_os = "macos",
     all(target_os = "windows", target_arch = "aarch64")
 )))]
-fn current_execution_backend_state_abi() -> u32 {
-    1
+fn current_execution_backend_state_abi(nested_enabled: bool) -> u32 {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) && nested_enabled {
+        // ABI 3 binds the nested-state blob to the source KVM feature MSRs.
+        3
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        // PIT programming and timer phase are mandatory for reliable guest time.
+        if nested_enabled {
+            4
+        } else {
+            2
+        }
+    } else {
+        1
+    }
 }
 
-fn execution_state_backend_is_compatible(state: &ExecutionState) -> bool {
-    state.architecture() == current_execution_architecture()
+fn execution_state_backend_is_compatible(state: &ExecutionState, nested_enabled: bool) -> bool {
+    state.nested_enabled() == nested_enabled
+        && state.architecture() == current_execution_architecture()
         && state.backend() == current_execution_backend()
-        && state.backend_state_abi() == current_execution_backend_state_abi()
+        && state.backend_state_abi() == current_execution_backend_state_abi(nested_enabled)
 }
 
 fn incremental_capture_is_not_beneficial(
@@ -567,8 +582,12 @@ pub enum Error {
     ExecutionRestoreAfterActivation,
     /// Memory restore is permitted only before first activation.
     MemoryRestoreAfterActivation,
-    /// The artifact targets a different backend, architecture, or backend ABI.
+    /// The artifact targets a different backend, architecture, backend ABI, or nesting mode.
     ExecutionStateIncompatible,
+    /// Older Windows snapshots omitted the emulated PIT clock.
+    ExecutionStateMissingPit,
+    /// This backend has not qualified nested execution-state capture and restore.
+    NestedExecutionStateUnsupported,
     /// The artifact vCPU topology differs from the constructed VMM.
     ExecutionStateTopologyMismatch,
     /// Guest memory could not be read or written for capture/materialization.
@@ -684,7 +703,15 @@ impl Display for Error {
             ),
             ExecutionStateIncompatible => write!(
                 f,
-                "execution state is incompatible with this backend or architecture"
+                "execution state is incompatible with this backend, architecture, or nesting mode"
+            ),
+            ExecutionStateMissingPit => write!(
+                f,
+                "this older Windows snapshot has no PIT timer state; restart from its saved disk and capture a new full snapshot, or explicitly recover with the known periodic PIT reload and validate the guest before recapturing"
+            ),
+            NestedExecutionStateUnsupported => write!(
+                f,
+                "nested execution-state capture and restore are not supported by this backend"
             ),
             ExecutionStateTopologyMismatch => write!(
                 f,
@@ -751,6 +778,7 @@ pub struct Vmm {
     control_request_id: VcpuControlRequestId,
     execution_state: VmmExecutionState,
     execution_restore_allowed: bool,
+    nested_enabled: bool,
     memory_restore_allowed: bool,
     memory_ledger: MemoryGenerationLedger,
     memory_access: MemoryAccessDomain,
@@ -774,6 +802,8 @@ pub struct Vmm {
         all(target_os = "windows", target_arch = "x86_64")
     ))]
     irqchip: IrqChip,
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    pit: Arc<Mutex<windows::pit::Pit>>,
     #[cfg(feature = "blk")]
     quiesced_virtio_devices: BTreeSet<(u32, String)>,
     #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
@@ -799,6 +829,7 @@ struct LinuxArmVmExecutionState {
 struct WindowsX86VmExecutionState {
     vm: Vec<u8>,
     ioapic: Vec<u8>,
+    pit: windows::pit::PitState,
 }
 
 impl Vmm {
@@ -1262,6 +1293,8 @@ impl Vmm {
         }
 
         self.wait_for_vcpu_barrier(request_id, VcpuControlTarget::Paused)?;
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        self.pit.lock().unwrap().pause();
         #[cfg(target_os = "windows")]
         self.vm
             .pause_execution_time(self.vcpus_handles.len())
@@ -1329,6 +1362,12 @@ impl Vmm {
         // vCPU worker. A failure leaves execution indeterminate, never Running.
         #[cfg(target_os = "windows")]
         self.vm.resume_execution_time().map_err(Error::Vm)?;
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        self.pit
+            .lock()
+            .unwrap()
+            .resume()
+            .map_err(Error::ExecutionStateBackend)?;
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         self.vm
             .resume_execution_time(&self.vcpus_handles)
@@ -1357,6 +1396,7 @@ impl Vmm {
     /// Captures backend execution state from every owning vCPU thread.
     pub fn capture_execution_state(&mut self) -> Result<ExecutionState> {
         let pause_generation = self.require_paused_execution_boundary()?;
+        self.require_nested_execution_state_support()?;
         let request_id = self.next_control_request_id()?;
         for handle in &self.vcpus_handles {
             handle
@@ -1438,7 +1478,16 @@ impl Vmm {
                 .ok_or_else(|| Error::ExecutionStateBackend("missing WHP IOAPIC state".into()))?;
             let vm = self.vm.capture_execution_state().map_err(Error::Vm)?;
             bincode::serde::encode_to_vec(
-                WindowsX86VmExecutionState { vm, ioapic },
+                WindowsX86VmExecutionState {
+                    vm,
+                    ioapic,
+                    pit: self
+                        .pit
+                        .lock()
+                        .unwrap()
+                        .capture()
+                        .map_err(Error::ExecutionStateBackend)?,
+                },
                 bincode::config::standard(),
             )
             .map_err(|error| Error::ExecutionStateBackend(error.to_string()))?
@@ -1454,12 +1503,33 @@ impl Vmm {
         ExecutionState::new(
             current_execution_architecture(),
             current_execution_backend(),
-            current_execution_backend_state_abi(),
+            current_execution_backend_state_abi(self.nested_enabled),
             pause_generation.request_id().get(),
             vm_state,
             vcpus,
         )
+        .map(|state| state.with_nested_enabled(self.nested_enabled))
         .map_err(Error::ExecutionState)
+    }
+
+    /// Checks execution-state admission without pausing or changing the VM.
+    ///
+    /// This is a policy preflight, not a guarantee that device or CPU capture
+    /// will succeed. Capture and restore also enforce this policy themselves.
+    pub fn require_nested_execution_state_support(&self) -> Result<()> {
+        if self.nested_enabled
+            && !cfg!(all(
+                not(any(feature = "tee", feature = "aws-nitro")),
+                any(
+                    all(target_os = "linux", target_arch = "x86_64"),
+                    all(target_os = "windows", target_arch = "x86_64"),
+                    all(target_os = "macos", target_arch = "aarch64")
+                )
+            ))
+        {
+            return Err(Error::NestedExecutionStateUnsupported);
+        }
+        Ok(())
     }
 
     /// Restores execution state into a constructed VMM before its first activation.
@@ -1468,9 +1538,17 @@ impl Vmm {
         if !self.execution_restore_allowed {
             return Err(Error::ExecutionRestoreAfterActivation);
         }
-        if !execution_state_backend_is_compatible(state) {
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        if state.architecture() == ExecutionArchitecture::X86_64
+            && state.backend() == ExecutionBackend::Whp
+            && state.backend_state_abi() == if state.nested_enabled() { 3 } else { 1 }
+        {
+            return Err(Error::ExecutionStateMissingPit);
+        }
+        if !execution_state_backend_is_compatible(state, self.nested_enabled) {
             return Err(Error::ExecutionStateIncompatible);
         }
+        self.require_nested_execution_state_support()?;
         if state.vcpus().len() != self.vcpus_handles.len()
             || state
                 .vcpus()
@@ -1479,6 +1557,54 @@ impl Vmm {
                 .any(|(index, vcpu)| vcpu.id() != index as u32)
         {
             return Err(Error::ExecutionStateTopologyMismatch);
+        }
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if self.nested_enabled {
+            let request_id = self.next_control_request_id()?;
+            for (handle, vcpu) in self.vcpus_handles.iter().zip(state.vcpus()) {
+                if let Err(error) = handle.send_event(VcpuEvent::ValidateState {
+                    request_id,
+                    bytes: vcpu.bytes().to_vec(),
+                }) {
+                    // A partial dispatch leaves outstanding replies. Do not reuse
+                    // this control channel after losing its synchronization.
+                    self.execution_state = VmmExecutionState::Indeterminate;
+                    return Err(Error::VcpuEvent(error));
+                }
+            }
+            let deadline = Instant::now() + VCPU_CONTROL_TIMEOUT;
+            let mut first_error = None;
+            // Drain every response, including after a rejection, so a later request
+            // cannot consume a leftover acknowledgement from this preflight.
+            for (vcpu_index, handle) in self.vcpus_handles.iter().enumerate() {
+                let result = match handle.response_receiver().recv_deadline(deadline) {
+                    Ok(VcpuResponse::StateValidated {
+                        request_id: response_id,
+                        result,
+                    }) if response_id == request_id => result.map_err(Error::ExecutionStateBackend),
+                    Ok(response) => {
+                        self.execution_state = VmmExecutionState::Indeterminate;
+                        Err(Error::ExecutionStateBackend(format!(
+                            "unexpected preflight response: {response:?}"
+                        )))
+                    }
+                    Err(_) => {
+                        self.execution_state = VmmExecutionState::Indeterminate;
+                        Err(Error::VcpuControlTimeout {
+                            operation: "nested restore preflight",
+                            request_id,
+                            vcpu_index,
+                        })
+                    }
+                };
+                if let Err(error) = result {
+                    first_error.get_or_insert(error);
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
         }
 
         self.execution_state = VmmExecutionState::Indeterminate;
@@ -1544,6 +1670,11 @@ impl Vmm {
             if used != state.vm_state().len() {
                 return Err(Error::ExecutionStateBackend("trailing WHP VM state".into()));
             }
+            self.pit
+                .lock()
+                .unwrap()
+                .restore(backend.pit)
+                .map_err(Error::ExecutionStateBackend)?;
             self.vm
                 .restore_execution_state(&backend.vm)
                 .map_err(Error::Vm)?;
@@ -2195,7 +2326,7 @@ impl Vmm {
             .add_mapping(reply_sender, host_addr, guest_addr, len);
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn add_mapping_with_writable(
         &self,
         reply_sender: Sender<bool>,
@@ -2427,7 +2558,7 @@ mod tests {
 
     #[test]
     fn execution_backend_rejects_an_old_abi() {
-        let current_abi = current_execution_backend_state_abi();
+        let current_abi = current_execution_backend_state_abi(false);
         let state = ExecutionState::new(
             current_execution_architecture(),
             current_execution_backend(),
@@ -2438,7 +2569,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!execution_state_backend_is_compatible(&state));
+        assert!(!execution_state_backend_is_compatible(&state, false));
     }
 
     #[test]
@@ -2446,13 +2577,20 @@ mod tests {
         let state = ExecutionState::new(
             current_execution_architecture(),
             current_execution_backend(),
-            current_execution_backend_state_abi(),
+            current_execution_backend_state_abi(false),
             1,
             Vec::new(),
             Vec::new(),
         )
         .unwrap();
 
-        assert!(execution_state_backend_is_compatible(&state));
+        assert!(execution_state_backend_is_compatible(&state, false));
+        assert!(!execution_state_backend_is_compatible(&state, true));
+        let nested = state.with_nested_enabled(true);
+        assert!(!execution_state_backend_is_compatible(&nested, false));
+        assert_eq!(
+            execution_state_backend_is_compatible(&nested, true),
+            current_execution_backend_state_abi(false) == current_execution_backend_state_abi(true)
+        );
     }
 }

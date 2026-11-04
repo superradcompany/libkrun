@@ -84,7 +84,7 @@ pub struct Vm {
     #[cfg(not(target_os = "windows"))]
     vsock_host_port_map: Option<HashMap<u16, u16>>,
     /// Keeps the libkrunfw library loaded so kernel memory pointers remain valid.
-    _krunfw_library: Option<libloading::Library>,
+    _krunfw_library: Option<KrunfwLibrary>,
     /// Keeps an explicit initramfs allocation alive until it is copied to guest memory.
     _initramfs_data: Option<Vec<u8>>,
     /// Receives the VMM reference and execution-state notifications after startup begins.
@@ -303,6 +303,16 @@ pub struct VmMemoryState {
 //--------------------------------------------------------------------------------------------------
 
 impl Vm {
+    /// Return a codec using the limits configured on this VM's builder.
+    ///
+    /// Use this for states returned by `capture_virtio_device_state`, and for
+    /// decoding states before `restore_virtio_device_state`. It is available
+    /// before VM startup and can be retained independently of the VM.
+    #[cfg(all(feature = "blk", not(feature = "tee")))]
+    pub fn device_state_codec(&self) -> vmm::device_state::DeviceStateCodec {
+        vmm::device_state::DeviceStateCodec::new(self.vmr.device_state_limits)
+    }
+
     /// Create a new Vm instance.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -370,8 +380,10 @@ impl Vm {
     }
 
     /// Supplies backend-qualified execution state to restore before the first guest instruction.
+    /// The captured nesting mode replaces the boot policy, including its automatic default.
     #[cfg(not(feature = "tee"))]
     pub fn set_execution_restore(&mut self, state: vmm::execution_state::ExecutionState) {
+        self.vmr.nested_enabled = state.nested_enabled();
         self.execution_restore = Some(state);
     }
 
@@ -571,6 +583,15 @@ impl Vm {
             self.vmr.zeroed_restore_memory = self.memory_restore.is_some();
         }
 
+        #[cfg(all(not(feature = "tee"), target_os = "windows", target_arch = "x86_64"))]
+        if let Some(state) = &self.execution_restore {
+            self.vmr.tsc_frequency_hz = Some(
+                state
+                    .tsc_frequency_hz()
+                    .map_err(|e| Error::Build(BuildError::Start(format!("restore clock: {e}"))))?,
+            );
+        }
+
         let (_vmm, placement_report) = vmm::builder::build_microvm_paused(
             &mut self.vmr,
             &mut event_manager,
@@ -716,13 +737,47 @@ impl Vm {
         let mut kernel_entry_addr: u64 = 0;
         let mut kernel_size: usize = 0;
 
+        // The dynamically loaded libkrunfw owns one image, so it takes no path.
+        // A `static-krunfw` embedder selects the image by `krunfw_path` (null
+        // when it is unset).
+        #[cfg(feature = "static-krunfw")]
+        let path = self
+            .krunfw_path
+            .as_deref()
+            .map(|p| std::ffi::CString::new(p.as_os_str().as_encoded_bytes()))
+            .transpose()
+            .map_err(|_| {
+                Error::Build(BuildError::Krunfw(
+                    "the krunfw path contains a NUL byte".to_string(),
+                ))
+            })?;
+
         let kernel_host_addr = unsafe {
-            (krunfw.get_kernel)(
-                &mut kernel_guest_addr as *mut u64,
-                &mut kernel_entry_addr as *mut u64,
-                &mut kernel_size as *mut usize,
-            )
+            #[cfg(feature = "static-krunfw")]
+            {
+                (krunfw.get_kernel)(
+                    path.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+                    &mut kernel_guest_addr as *mut u64,
+                    &mut kernel_entry_addr as *mut u64,
+                    &mut kernel_size as *mut usize,
+                )
+            }
+            #[cfg(not(feature = "static-krunfw"))]
+            {
+                (krunfw.get_kernel)(
+                    &mut kernel_guest_addr as *mut u64,
+                    &mut kernel_entry_addr as *mut u64,
+                    &mut kernel_size as *mut usize,
+                )
+            }
         };
+
+        #[cfg(feature = "static-krunfw")]
+        if kernel_host_addr.is_null() {
+            return Err(Error::Build(BuildError::Krunfw(
+                "no krunfw image for the requested path".to_string(),
+            )));
+        }
 
         let kernel_bundle = KernelBundle {
             host_addr: kernel_host_addr as u64,
@@ -1142,24 +1197,48 @@ fn wait_until_paused_timeout(timeout: Duration, state: Option<VmExecutionState>)
     )))
 }
 
+/// Handle that keeps a dynamically loaded libkrunfw mapping alive.
+///
+/// With the `static-krunfw` feature the kernel accessor is provided by the
+/// embedding program, so there is nothing to keep alive.
+#[cfg(not(feature = "static-krunfw"))]
+type KrunfwLibrary = libloading::Library;
+#[cfg(feature = "static-krunfw")]
+type KrunfwLibrary = ();
+
 /// Bindings to libkrunfw functions.
 struct KrunfwBindings {
+    /// Fills `guest_addr`/`entry_addr`/`size` and returns the selected kernel
+    /// image's host address (null if none was selected).
+    ///
+    /// The dynamically loaded libkrunfw owns a single image and takes no path;
+    /// a `static-krunfw` embedder receives the requested `path` as its first
+    /// argument (a NUL-terminated string, or null for the default image).
+    #[cfg(feature = "static-krunfw")]
+    get_kernel: unsafe extern "C" fn(
+        *const std::ffi::c_char,
+        *mut u64,
+        *mut u64,
+        *mut usize,
+    ) -> *mut std::ffi::c_char,
+    #[cfg(not(feature = "static-krunfw"))]
     get_kernel: unsafe extern "C" fn(*mut u64, *mut u64, *mut usize) -> *mut std::ffi::c_char,
-    library: libloading::Library,
+    library: KrunfwLibrary,
 }
 
 /// Library name for libkrunfw.
-#[cfg(target_os = "linux")]
+#[cfg(all(not(feature = "static-krunfw"), target_os = "linux"))]
 const KRUNFW_NAME: &str = "libkrunfw.so.5";
-#[cfg(target_os = "macos")]
+#[cfg(all(not(feature = "static-krunfw"), target_os = "macos"))]
 const KRUNFW_NAME: &str = "libkrunfw.5.dylib";
-#[cfg(target_os = "windows")]
+#[cfg(all(not(feature = "static-krunfw"), target_os = "windows"))]
 const KRUNFW_NAME: &str = "libkrunfw.dll";
 
 /// Load the libkrunfw library.
 ///
 /// If `path` is provided, loads from that exact path. Otherwise falls back to the
 /// default library name, which lets the OS dynamic linker search standard paths.
+#[cfg(not(feature = "static-krunfw"))]
 fn load_krunfw_library(path: Option<&std::path::Path>) -> Result<KrunfwBindings> {
     let name = path
         .map(|p| p.as_os_str().to_os_string())
@@ -1182,6 +1261,30 @@ fn load_krunfw_library(path: Option<&std::path::Path>) -> Result<KrunfwBindings>
     Ok(KrunfwBindings {
         get_kernel,
         library,
+    })
+}
+
+/// Return the statically linked libkrunfw accessor.
+///
+/// The embedding program provides `krunfw_get_kernel`, which receives the
+/// requested krunfw `path` (a NUL-terminated string, or null for the default),
+/// fills the guest address, entry point and size of the selected image, and
+/// returns its host address (or null if the path selects no image), so one
+/// embedder can provide several kernel images.
+#[cfg(feature = "static-krunfw")]
+fn load_krunfw_library(_path: Option<&std::path::Path>) -> Result<KrunfwBindings> {
+    extern "C" {
+        fn krunfw_get_kernel(
+            path: *const std::ffi::c_char,
+            guest_addr: *mut u64,
+            entry_addr: *mut u64,
+            size: *mut usize,
+        ) -> *mut std::ffi::c_char;
+    }
+
+    Ok(KrunfwBindings {
+        get_kernel: krunfw_get_kernel,
+        library: (),
     })
 }
 
@@ -1305,6 +1408,29 @@ mod tests {
             .vmm
             .publish_execution_state(VmExecutionState::Indeterminate);
         assert!(control.wait_until_paused_without_timeout().is_err());
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn execution_restore_uses_captured_nesting_instead_of_boot_policy() {
+        for (schema, nested) in [(1_u16, false), (2_u16, true)] {
+            // Minimal versioned x86 KVM envelope; no backend is started by this test.
+            let mut bytes = b"MSBKEXEC\0".to_vec();
+            bytes.extend_from_slice(&schema.to_le_bytes());
+            bytes.extend_from_slice(&[1, 1]);
+            bytes.extend_from_slice(&1_u32.to_le_bytes());
+            bytes.extend_from_slice(&1_u64.to_le_bytes());
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+            let state = vmm::execution_state::ExecutionState::decode(&bytes).unwrap();
+            let mut vm = make_vm();
+            vm.vmr.nested_enabled = !nested;
+
+            vm.set_execution_restore(state);
+
+            assert_eq!(vm.vmr.nested_enabled, nested);
+            assert_eq!(vm.execution_restore.unwrap().encode().unwrap(), bytes);
+        }
     }
 
     #[cfg(not(feature = "tee"))]
@@ -1748,6 +1874,15 @@ impl VmControl {
     /// This does not resume the VM or relax any vCPU/device quiescence barriers.
     pub fn wait_until_paused_without_timeout(&self) -> Result<VmExecutionState> {
         self.vmm.wait_until_paused_inner(None)
+    }
+
+    /// Checks execution-state admission without pausing or changing the VM.
+    ///
+    /// Embedders can reject unsupported captures before preparing storage or
+    /// freezing the guest. A successful check does not replace the paused
+    /// boundary or the device and CPU checks performed during capture.
+    pub fn validate_execution_state_capture(&self) -> Result<()> {
+        self.with_running_vmm(|vmm| vmm.require_nested_execution_state_support())
     }
 
     /// Captures the exact backend execution state at the current paused boundary.

@@ -32,13 +32,13 @@ use windows_sys::Win32::Foundation::{E_FAIL, E_INVALIDARG, S_OK};
 use windows_sys::Win32::System::Hypervisor::{
     WHvCancelRunVirtualProcessor, WHvCapabilityCodeHypervisorPresent, WHvCreatePartition,
     WHvCreateVirtualProcessor, WHvDeletePartition, WHvDeleteVirtualProcessor, WHvGetCapability,
-    WHvGetVirtualProcessorRegisters, WHvGetVirtualProcessorState, WHvMapGpaRange,
-    WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagTrackDirtyPages,
-    WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeProcessorCount, WHvQueryGpaRangeDirtyBitmap,
-    WHvRunVirtualProcessor, WHvRunVpExitReasonNone, WHvSetPartitionProperty,
-    WHvSetVirtualProcessorRegisters, WHvSetVirtualProcessorState, WHvSetupPartition,
-    WHvUnmapGpaRange, WHV_CAPABILITY, WHV_MAP_GPA_RANGE_FLAGS, WHV_PARTITION_HANDLE,
-    WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON,
+    WHvGetVirtualProcessorRegisters, WHvMapGpaRange, WHvMapGpaRangeFlagExecute,
+    WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagTrackDirtyPages, WHvMapGpaRangeFlagWrite,
+    WHvPartitionPropertyCodeProcessorCount, WHvQueryGpaRangeDirtyBitmap, WHvRunVirtualProcessor,
+    WHvRunVpExitReasonNone, WHvSetPartitionProperty, WHvSetVirtualProcessorRegisters,
+    WHvSetupPartition, WHvUnmapGpaRange, WHV_CAPABILITY, WHV_MAP_GPA_RANGE_FLAGS,
+    WHV_PARTITION_HANDLE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON,
+    WHV_VIRTUAL_PROCESSOR_STATE_TYPE,
 };
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::Hypervisor::{
@@ -67,7 +67,7 @@ use windows_sys::Win32::System::Threading::{
 
 #[cfg(target_arch = "x86_64")]
 #[path = "x86_state.rs"]
-mod x86_state;
+pub(crate) mod x86_state;
 
 #[cfg(target_arch = "aarch64")]
 const AARCH64_PSR_MODE_EL1H: u64 = 0x0000_0005;
@@ -199,6 +199,88 @@ type WhvEmulatorTryIoEmulation = unsafe extern "system" fn(
     *mut WHV_EMULATOR_STATUS,
 ) -> windows_sys::core::HRESULT;
 
+// Windows 10 ships a winhvplatform.dll without the opaque vCPU state APIs. A static import of
+// either symbol stops the loader from starting the whole binary, so they are resolved at run time.
+// Only execution-state capture and restore use them.
+type WhvGetVirtualProcessorState = unsafe extern "system" fn(
+    WHV_PARTITION_HANDLE,
+    u32,
+    WHV_VIRTUAL_PROCESSOR_STATE_TYPE,
+    *mut core::ffi::c_void,
+    u32,
+    *mut u32,
+) -> windows_sys::core::HRESULT;
+type WhvSetVirtualProcessorState = unsafe extern "system" fn(
+    WHV_PARTITION_HANDLE,
+    u32,
+    WHV_VIRTUAL_PROCESSOR_STATE_TYPE,
+    *const core::ffi::c_void,
+    u32,
+) -> windows_sys::core::HRESULT;
+
+#[derive(Clone, Copy, Default)]
+struct ProcessorStateApi {
+    get: Option<WhvGetVirtualProcessorState>,
+    set: Option<WhvSetVirtualProcessorState>,
+}
+
+impl ProcessorStateApi {
+    fn load() -> Self {
+        // winhvplatform.dll is already loaded through the other WHP imports, so this only takes a
+        // reference. The library is kept for the life of the process because the pointers escape.
+        let library = match unsafe {
+            libloading::os::windows::Library::load_with_flags(
+                "winhvplatform.dll",
+                libloading::os::windows::LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        } {
+            Ok(library) => library,
+            Err(error) => {
+                warn!("winhvplatform.dll could not be loaded for vCPU state APIs: {error}");
+                return Self::default();
+            }
+        };
+        let api = Self {
+            get: unsafe {
+                library.get::<WhvGetVirtualProcessorState>(b"WHvGetVirtualProcessorState")
+            }
+            .ok()
+            .map(|symbol| *symbol),
+            set: unsafe {
+                library.get::<WhvSetVirtualProcessorState>(b"WHvSetVirtualProcessorState")
+            }
+            .ok()
+            .map(|symbol| *symbol),
+        };
+        std::mem::forget(library);
+        api
+    }
+
+    fn host() -> Self {
+        static API: std::sync::OnceLock<ProcessorStateApi> = std::sync::OnceLock::new();
+        *API.get_or_init(Self::load)
+    }
+
+    fn require(self) -> Result<()> {
+        if self.get.is_none() {
+            return Err(Error::ProcessorStateApiUnavailable(
+                "WHvGetVirtualProcessorState",
+            ));
+        }
+        if self.set.is_none() {
+            return Err(Error::ProcessorStateApiUnavailable(
+                "WHvSetVirtualProcessorState",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Fails before any vCPU state is read or changed when the host cannot capture or restore it.
+fn require_processor_state_api() -> Result<()> {
+    ProcessorStateApi::host().require()
+}
+
 #[cfg(target_arch = "x86_64")]
 const X86_BOOT_GDT_OFFSET: u64 = 0x500;
 #[cfg(target_arch = "x86_64")]
@@ -308,6 +390,7 @@ pub enum Error {
         state_type: i32,
         hresult: windows_sys::core::HRESULT,
     },
+    ProcessorStateApiUnavailable(&'static str),
     StateCodec(String),
     StateTooLarge,
     SetPartitionProperty {
@@ -468,6 +551,12 @@ impl Display for Error {
                 "WHvSetVirtualProcessorState({id}, {state_type:#x}) failed with HRESULT 0x{:08x}",
                 *hresult as u32
             ),
+            Error::ProcessorStateApiUnavailable(symbol) => write!(
+                f,
+                "{symbol} is not available in this host's winhvplatform.dll; \
+                 WHP execution-state capture and restore need a newer Windows release, \
+                 such as Windows 11"
+            ),
             Error::StateCodec(error) => write!(f, "WHP execution-state codec failed: {error}"),
             Error::StateTooLarge => write!(f, "WHP execution-state payload exceeds its limit"),
             Error::SetPartitionProperty { property, hresult } => write!(
@@ -535,6 +624,9 @@ pub struct VcpuConfig {
     /// has no parked-vcpu bring-up; wider capacity is rejected at config time.
     pub max_vcpu_count: u8,
     pub ht_enabled: bool,
+    /// Enable nested virtualization in the CPUID configuration; the WHP
+    /// backend masks VMX/SVM out of trapped CPUID results when this is false.
+    pub nested_enabled: bool,
     pub cpu_template: Option<CpuFeaturesTemplate>,
 }
 
@@ -549,6 +641,8 @@ pub struct Vcpu {
     pio_bus: Option<devices::Bus>,
     #[cfg(target_arch = "x86_64")]
     sipi_router: Option<Arc<ApStartupRouter>>,
+    #[cfg(target_arch = "x86_64")]
+    nested_enabled: bool,
     exit_evt: EventFd,
     metrics: MetricsWriter,
     event_sender: Option<Sender<VcpuEvent>>,
@@ -770,6 +864,8 @@ pub struct VcpuHandle {
 #[derive(Default)]
 struct Partition {
     handle: WHV_PARTITION_HANDLE,
+    #[cfg(target_arch = "x86_64")]
+    nested_enabled: bool,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -906,13 +1002,21 @@ impl WhpCapabilities {
 }
 
 impl Vm {
-    pub fn new(vcpu_count: u8) -> Result<Self> {
+    pub fn new(vcpu_count: u8, nested_enabled: bool) -> Result<Self> {
+        Self::with_clock(vcpu_count, nested_enabled, None)
+    }
+
+    pub(crate) fn with_clock(
+        vcpu_count: u8,
+        nested_enabled: bool,
+        tsc_frequency_hz: Option<u64>,
+    ) -> Result<Self> {
         WhpCapabilities::ensure_hypervisor_present()?;
         if vcpu_count == 0 {
             return Err(Error::VcpuCountZero);
         }
 
-        let partition = Partition::new(vcpu_count)?;
+        let partition = Partition::with_clock(vcpu_count, nested_enabled, tsc_frequency_hz)?;
 
         Ok(Self {
             partition,
@@ -1140,12 +1244,21 @@ impl Vm {
 
     #[cfg(target_arch = "x86_64")]
     pub fn capture_execution_state(&self) -> Result<Vec<u8>> {
-        x86_state::capture_vm(self.partition.handle, &self.sipi_router)
+        x86_state::capture_vm(
+            self.partition.handle,
+            &self.sipi_router,
+            self.partition.nested_enabled,
+        )
     }
 
     #[cfg(target_arch = "x86_64")]
     pub fn restore_execution_state(&mut self, bytes: &[u8]) -> Result<()> {
-        x86_state::restore_vm(self.partition.handle, &self.sipi_router, bytes)?;
+        x86_state::restore_vm(
+            self.partition.handle,
+            &self.sipi_router,
+            bytes,
+            self.partition.nested_enabled,
+        )?;
         self.time_suspended = true;
         Ok(())
     }
@@ -1156,12 +1269,17 @@ impl Vm {
         id: u32,
         _worker_bytes: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        x86_state::capture_cpu(self.partition.handle, id)
+        x86_state::capture_cpu(self.partition.handle, id, self.partition.nested_enabled)
     }
 
     #[cfg(target_arch = "x86_64")]
     pub fn prepare_vcpu_execution_restore(&self, id: u32, bytes: &[u8]) -> Result<Vec<u8>> {
-        x86_state::restore_cpu(self.partition.handle, id, bytes)?;
+        x86_state::restore_cpu(
+            self.partition.handle,
+            id,
+            bytes,
+            self.partition.nested_enabled,
+        )?;
         Ok(Vec::new())
     }
 
@@ -1305,6 +1423,8 @@ impl Vcpu {
             pio_bus: None,
             #[cfg(target_arch = "x86_64")]
             sipi_router: None,
+            #[cfg(target_arch = "x86_64")]
+            nested_enabled: false,
             exit_evt,
             metrics,
             event_sender: Some(event_sender),
@@ -1340,6 +1460,7 @@ impl Vcpu {
         guest_mem: &GuestMemoryMmap,
         mem_info: &ArchMemoryInfo,
         entry_addr: GuestAddress,
+        _nested_enabled: bool,
     ) -> Result<()> {
         self.guest_mem = Some(guest_mem.clone());
         self.configure_aarch64(entry_addr, mem_info.fdt_addr)
@@ -1351,7 +1472,9 @@ impl Vcpu {
         guest_mem: &GuestMemoryMmap,
         _mem_info: &ArchMemoryInfo,
         entry_addr: GuestAddress,
+        nested_enabled: bool,
     ) -> Result<()> {
+        self.nested_enabled = nested_enabled;
         self.guest_mem = Some(guest_mem.clone());
         self.configure_x86_64(guest_mem, entry_addr)
     }
@@ -1387,6 +1510,8 @@ impl Vcpu {
         let pio_bus = self.pio_bus.take();
         #[cfg(target_arch = "x86_64")]
         let sipi_router = self.sipi_router.take();
+        #[cfg(target_arch = "x86_64")]
+        let nested_enabled = self.nested_enabled;
         let exit_evt = self.exit_evt.try_clone().map_err(Error::VcpuThreadSpawn)?;
         let metrics = self.metrics.clone();
         self.partition_handle = 0;
@@ -1411,6 +1536,8 @@ impl Vcpu {
                         pio_bus,
                         #[cfg(target_arch = "x86_64")]
                         sipi_router,
+                        #[cfg(target_arch = "x86_64")]
+                        nested_enabled,
                         exit_evt,
                         metrics,
                         event_receiver,
@@ -1868,25 +1995,178 @@ impl Drop for Emulator {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn nested_virt_supported() -> std::io::Result<bool> {
+    WhpCapabilities::ensure_hypervisor_present()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    match Partition::with_clock(1, true, None) {
+        Ok(_) => Ok(true),
+        Err(Error::SetPartitionProperty { property, .. })
+            if property == windows_sys::Win32::System::Hypervisor::WHvPartitionPropertyCodeNestedVirtualization => Ok(false),
+        Err(error) => Err(std::io::Error::other(error.to_string())),
+    }
+}
+
 impl Partition {
-    fn new(vcpu_count: u8) -> Result<Self> {
+    fn with_clock(
+        vcpu_count: u8,
+        nested_enabled: bool,
+        tsc_frequency_hz: Option<u64>,
+    ) -> Result<Self> {
         let mut handle = 0;
         let hresult = unsafe { WHvCreatePartition(&mut handle) };
         if hresult < 0 {
             return Err(Error::CreatePartition(hresult));
         }
 
-        let partition = Self { handle };
+        let partition = Self {
+            handle,
+            #[cfg(target_arch = "x86_64")]
+            nested_enabled,
+        };
         partition.set_processor_count(vcpu_count)?;
+        if nested_enabled {
+            partition.enable_nested_virt()?;
+        }
         #[cfg(target_arch = "x86_64")]
         partition.set_x64_local_apic_emulation()?;
         #[cfg(target_arch = "x86_64")]
         partition.set_x64_extended_vm_exits(vcpu_count)?;
         #[cfg(target_arch = "aarch64")]
         partition.set_arm64_ic_parameters()?;
+        #[cfg(target_arch = "x86_64")]
+        if nested_enabled {
+            partition.enable_enlightened_vmcs()?;
+        }
+        // Some WHP hosts cannot set this property even to their native rate.
+        // Keep same-frequency snapshots usable there; readback still verifies it.
+        if let Some(hz) = tsc_frequency_hz.filter(|hz| Some(*hz) != host_tsc_frequency_hz()) {
+            if hz == 0 {
+                return Err(Error::StateCodec("zero restore TSC frequency".into()));
+            }
+            let property = windows_sys::Win32::System::Hypervisor::WHvPartitionPropertyCodeProcessorClockFrequency;
+            let status = unsafe {
+                WHvSetPartitionProperty(partition.handle, property, (&hz as *const u64).cast(), 8)
+            };
+            if status < 0 {
+                return Err(Error::StateCodec(format!(
+                    "destination cannot restore guest TSC rate {hz} Hz: WHP clock scaling failed with HRESULT {status:#x}"
+                )));
+            }
+        }
         partition.setup()?;
+        #[cfg(target_arch = "x86_64")]
+        if let Some(hz) = tsc_frequency_hz {
+            if x86_state::tsc_frequency_hz(partition.handle)? != hz {
+                return Err(Error::StateCodec(
+                    "destination cannot preserve guest TSC frequency".into(),
+                ));
+            }
+        }
 
         Ok(partition)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn enable_enlightened_vmcs(&self) -> Result<()> {
+        use windows_sys::Win32::System::Hypervisor::{
+            WHvCapabilityCodeSyntheticProcessorFeaturesBanks,
+            WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
+            WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS,
+        };
+
+        // Only Intel VMX uses eVMCS. Preserve AMD's existing SVM guest contract.
+        let mut capability: WHV_CAPABILITY = unsafe { zeroed() };
+        let mut written = 0;
+        let code = windows_sys::Win32::System::Hypervisor::WHvCapabilityCodeProcessorVendor;
+        let hresult = unsafe {
+            WHvGetCapability(
+                code,
+                (&mut capability as *mut WHV_CAPABILITY).cast(),
+                size_of::<WHV_CAPABILITY>() as u32,
+                &mut written,
+            )
+        };
+        if hresult < 0 {
+            return Err(Error::GetCapability { code, hresult });
+        }
+        if unsafe { capability.ProcessorVendor }
+            != windows_sys::Win32::System::Hypervisor::WHvProcessorVendorIntel
+        {
+            return Ok(());
+        }
+
+        // SDK WHV_SYNTHETIC_PROCESSOR_FEATURES: HypervisorPresent, Hv1,
+        // reference counter, VP assist/APIC, hypercalls, VP index, reference TSC,
+        // frequency registers, and EnlightenedVmcs. Do not expose unrelated
+        // synthetic timers, flush hypercalls, or nested enlightenments.
+        const REQUIRED: u64 =
+            3 | (1 << 3) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 11) | (1 << 32);
+        let mut features = WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS::default();
+        let mut written = 0;
+        let code = WHvCapabilityCodeSyntheticProcessorFeaturesBanks;
+        let hresult = unsafe {
+            WHvGetCapability(
+                code,
+                (&mut features as *mut WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS).cast(),
+                size_of::<WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS>() as u32,
+                &mut written,
+            )
+        };
+        if hresult as u32 == 0x8037_0300 {
+            // WHV_E_UNKNOWN_CAPABILITY on older WHP builds.
+            return Ok(());
+        }
+        if hresult < 0 {
+            return Err(Error::GetCapability { code, hresult });
+        }
+        if written as usize != size_of::<WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS>()
+            || features.BanksCount != 1
+        {
+            return Err(Error::StateCodec(
+                "invalid WHP synthetic feature banks".into(),
+            ));
+        }
+        if unsafe { features.Anonymous.AsUINT64[0] } & REQUIRED != REQUIRED {
+            // Ordinary nested execution remains available, but snapshot capture
+            // rejects a current non-enlightened VMCS rather than losing its cache.
+            return Ok(());
+        }
+        features.Anonymous.AsUINT64 = [REQUIRED];
+        let property = WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks;
+        let hresult = unsafe {
+            WHvSetPartitionProperty(
+                self.handle,
+                property,
+                (&features as *const WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS).cast(),
+                size_of::<WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS>() as u32,
+            )
+        };
+        if hresult < 0 {
+            return Err(Error::SetPartitionProperty { property, hresult });
+        }
+        Ok(())
+    }
+
+    fn enable_nested_virt(&self) -> Result<()> {
+        let enabled: i32 = 1;
+        let property_code =
+            windows_sys::Win32::System::Hypervisor::WHvPartitionPropertyCodeNestedVirtualization;
+        let hresult = unsafe {
+            WHvSetPartitionProperty(
+                self.handle,
+                property_code,
+                &enabled as *const i32 as *const _,
+                size_of::<i32>() as u32,
+            )
+        };
+        if hresult < 0 {
+            return Err(Error::SetPartitionProperty {
+                property: property_code,
+                hresult,
+            });
+        }
+        Ok(())
     }
 
     fn set_processor_count(&self, vcpu_count: u8) -> Result<()> {
@@ -2258,6 +2538,7 @@ fn capture_whp_vcpu_state_on_controller(
     partition_handle: WHV_PARTITION_HANDLE,
     id: u32,
 ) -> Result<Vec<u8>> {
+    require_processor_state_api()?;
     let id = u8::try_from(id).map_err(|_| Error::StateCodec("vCPU id exceeds u8".to_string()))?;
     let (names, sve_enabled) = arm64_execution_registers(partition_handle)?;
     let values = get_vcpu_register_bytes(partition_handle, id, &names)?;
@@ -2304,6 +2585,7 @@ fn restore_whp_vcpu_state_on_controller(
     id: u32,
     bytes: &[u8],
 ) -> Result<Arm64TimerState> {
+    require_processor_state_api()?;
     let id = u8::try_from(id).map_err(|_| Error::StateCodec("vCPU id exceeds u8".to_string()))?;
     let (state, consumed): (WhpVcpuExecutionState, usize) =
         bincode::serde::decode_from_slice(bytes, bincode::config::standard())
@@ -2465,11 +2747,23 @@ fn get_virtual_processor_state(
     id: u32,
     state_type: i32,
 ) -> Result<Vec<u8>> {
+    get_virtual_processor_state_with(ProcessorStateApi::host(), partition_handle, id, state_type)
+}
+
+fn get_virtual_processor_state_with(
+    api: ProcessorStateApi,
+    partition_handle: WHV_PARTITION_HANDLE,
+    id: u32,
+    state_type: i32,
+) -> Result<Vec<u8>> {
+    let get_state = api.get.ok_or(Error::ProcessorStateApiUnavailable(
+        "WHvGetVirtualProcessorState",
+    ))?;
     // WHP documents a two-call contract for opaque state. The zero-sized query avoids guessing a
     // category's ABI size and is required for ARM64 GIC state on current Windows builds.
     let mut written = 0_u32;
     let size_result = unsafe {
-        WHvGetVirtualProcessorState(
+        get_state(
             partition_handle,
             id,
             state_type,
@@ -2489,7 +2783,7 @@ fn get_virtual_processor_state(
 
     let mut bytes = vec![0_u8; required];
     let hresult = unsafe {
-        WHvGetVirtualProcessorState(
+        get_state(
             partition_handle,
             id,
             state_type,
@@ -2515,9 +2809,28 @@ fn set_virtual_processor_state(
     state_type: i32,
     bytes: &[u8],
 ) -> Result<()> {
+    set_virtual_processor_state_with(
+        ProcessorStateApi::host(),
+        partition_handle,
+        id,
+        state_type,
+        bytes,
+    )
+}
+
+fn set_virtual_processor_state_with(
+    api: ProcessorStateApi,
+    partition_handle: WHV_PARTITION_HANDLE,
+    id: u32,
+    state_type: i32,
+    bytes: &[u8],
+) -> Result<()> {
+    let set_state = api.set.ok_or(Error::ProcessorStateApiUnavailable(
+        "WHvSetVirtualProcessorState",
+    ))?;
     let size = u32::try_from(bytes.len()).map_err(|_| Error::StateTooLarge)?;
     let hresult = unsafe {
-        WHvSetVirtualProcessorState(
+        set_state(
             partition_handle,
             id,
             state_type,
@@ -2664,6 +2977,7 @@ fn run_vcpu(
     mmio_bus: Option<devices::Bus>,
     #[cfg(target_arch = "x86_64")] pio_bus: Option<devices::Bus>,
     #[cfg(target_arch = "x86_64")] sipi_router: Option<Arc<ApStartupRouter>>,
+    #[cfg(target_arch = "x86_64")] nested_enabled: bool,
     exit_evt: EventFd,
     metrics: MetricsWriter,
     event_receiver: Receiver<VcpuEvent>,
@@ -2672,6 +2986,17 @@ fn run_vcpu(
     if wait_until_resumed(partition_handle, id, &event_receiver, &response_sender).is_err() {
         return;
     }
+
+    // The partition clock is fixed before setup, including on restore.
+    #[cfg(target_arch = "x86_64")]
+    let tsc_frequency_hz = match x86_state::tsc_frequency_hz(partition_handle) {
+        Ok(hz) => hz,
+        Err(err) => {
+            error!("cannot read guest TSC frequency: {err}");
+            signal_vcpu_exit(&response_sender, &exit_evt, 1);
+            return;
+        }
+    };
 
     // x86 APs must not execute until the guest starts them: park here until
     // the BSP's startup IPI supplies the real-mode entry vector.
@@ -2852,7 +3177,13 @@ fn run_vcpu(
         if reason == WHvRunVpExitReasonX64Cpuid {
             let cpuid = unsafe { exit_context.Anonymous.CpuidAccess };
             let vcpu_count = sipi_router.as_ref().map_or(1, |router| router.vcpu_count());
-            let result = normalize_cpuid(id, vcpu_count, &cpuid);
+            let result = normalize_cpuid(
+                id,
+                vcpu_count,
+                nested_enabled,
+                &cpuid,
+                Some(tsc_frequency_hz),
+            );
             // The VpContext bitfield's low nibble is the instruction length.
             let next_rip =
                 exit_context.VpContext.Rip + u64::from(exit_context.VpContext._bitfield & 0xf);
@@ -2956,11 +3287,22 @@ struct CpuidResult {
 /// IDs and topology derived from the vCPU count, the hypervisor-present
 /// bit, and no x2APIC (the local APIC emulation mode is xAPIC-only). Guest
 /// boot paths must not vary with the host CPU vendor or WHP build defaults.
+///
+/// When nested virtualization is disabled the VMX (Intel) and SVM (AMD)
+/// feature bits are cleared as well, so the guest cannot run its own VMs.
 #[cfg(target_arch = "x86_64")]
-fn normalize_cpuid(id: u8, vcpu_count: u8, access: &WHV_X64_CPUID_ACCESS_CONTEXT) -> CpuidResult {
+fn normalize_cpuid(
+    id: u8,
+    vcpu_count: u8,
+    nested_enabled: bool,
+    access: &WHV_X64_CPUID_ACCESS_CONTEXT,
+    tsc_frequency_hz: Option<u64>,
+) -> CpuidResult {
+    const CPUID_1_ECX_VMX: u32 = 1 << 5;
     const CPUID_1_ECX_X2APIC: u32 = 1 << 21;
     const CPUID_1_ECX_HYPERVISOR: u32 = 1 << 31;
     const CPUID_1_EDX_HTT: u32 = 1 << 28;
+    const CPUID_8000_0001_ECX_SVM: u32 = 1 << 2;
 
     let leaf = access.Rax as u32;
     let subleaf = access.Rcx as u32;
@@ -2987,6 +3329,9 @@ fn normalize_cpuid(id: u8, vcpu_count: u8, access: &WHV_X64_CPUID_ACCESS_CONTEXT
             let mut ecx = result.rcx as u32;
             ecx |= CPUID_1_ECX_HYPERVISOR;
             ecx &= !CPUID_1_ECX_X2APIC;
+            if !nested_enabled {
+                ecx &= !CPUID_1_ECX_VMX;
+            }
             result.rcx = u64::from(ecx);
 
             let mut edx = result.rdx as u32;
@@ -3012,15 +3357,23 @@ fn normalize_cpuid(id: u8, vcpu_count: u8, access: &WHV_X64_CPUID_ACCESS_CONTEXT
         }
         // TSC/crystal ratio: hand the guest its TSC frequency directly so
         // it never falls back to PIT/HPET calibration (neither of which we
-        // emulate well enough) and the jiffies clocksource. The guest TSC
-        // runs at the host rate under WHP, which the platform reports via
-        // WHvCapabilityCodeProcessorClockFrequency.
+        // emulate well enough) and the jiffies clocksource. Use the partition
+        // rate, which can differ from the host after snapshot restore.
         0x15 => {
-            if let Some(tsc_hz) = host_tsc_frequency_hz() {
-                result.rax = 1; // ratio denominator
-                result.rbx = 1; // ratio numerator
-                result.rcx = tsc_hz; // "crystal" clock in Hz
-                result.rdx = 0;
+            // CPUID fields are 32-bit. An unrepresentable frequency must not
+            // wrap into a plausible but wrong clock; early boot also receives
+            // the partition rate through tsc_early_khz.
+            let crystal_hz = tsc_frequency_hz.and_then(|hz| u32::try_from(hz).ok());
+            result.rax = u64::from(crystal_hz.is_some());
+            result.rbx = u64::from(crystal_hz.is_some());
+            result.rcx = u64::from(crystal_hz.unwrap_or(0));
+            result.rdx = 0;
+        }
+        // AMD extended features: drop SVM unless nested virtualization is on.
+        0x8000_0001 => {
+            if !nested_enabled {
+                let ecx = result.rcx as u32 & !CPUID_8000_0001_ECX_SVM;
+                result.rcx = u64::from(ecx);
             }
         }
         _ => {}
@@ -3031,7 +3384,7 @@ fn normalize_cpuid(id: u8, vcpu_count: u8, access: &WHV_X64_CPUID_ACCESS_CONTEXT
 
 /// Host processor clock (TSC/ARM counter) frequency, queried once. `None` when the
 /// platform cannot report it; the guest then calibrates as before.
-fn host_tsc_frequency_hz() -> Option<u64> {
+pub(crate) fn host_tsc_frequency_hz() -> Option<u64> {
     static TSC_HZ: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *TSC_HZ.get_or_init(|| {
         let mut capability: WHV_CAPABILITY = unsafe { zeroed() };
@@ -3618,6 +3971,126 @@ unsafe extern "system" fn emulator_translate_gva_callback(
 mod tests {
     use super::*;
 
+    unsafe extern "system" fn fake_get_state(
+        _partition: WHV_PARTITION_HANDLE,
+        _id: u32,
+        _state_type: WHV_VIRTUAL_PROCESSOR_STATE_TYPE,
+        buffer: *mut core::ffi::c_void,
+        size: u32,
+        written: *mut u32,
+    ) -> windows_sys::core::HRESULT {
+        const STATE: [u8; 3] = [1, 2, 3];
+        unsafe { *written = STATE.len() as u32 };
+        if (size as usize) < STATE.len() {
+            return 0x8007_007a_u32 as i32; // ERROR_INSUFFICIENT_BUFFER
+        }
+        unsafe { std::ptr::copy_nonoverlapping(STATE.as_ptr(), buffer.cast(), STATE.len()) };
+        0
+    }
+
+    unsafe extern "system" fn fake_set_state(
+        _partition: WHV_PARTITION_HANDLE,
+        _id: u32,
+        _state_type: WHV_VIRTUAL_PROCESSOR_STATE_TYPE,
+        _buffer: *const core::ffi::c_void,
+        size: u32,
+    ) -> windows_sys::core::HRESULT {
+        if size == 3 {
+            0
+        } else {
+            E_INVALIDARG_FOR_TEST
+        }
+    }
+
+    const E_INVALIDARG_FOR_TEST: windows_sys::core::HRESULT = 0x8007_0057_u32 as i32;
+
+    #[test]
+    fn missing_processor_state_api_fails_with_a_named_error() {
+        let api = ProcessorStateApi::default();
+        assert!(matches!(
+            api.require(),
+            Err(Error::ProcessorStateApiUnavailable(
+                "WHvGetVirtualProcessorState"
+            ))
+        ));
+        let handle = WHV_PARTITION_HANDLE::default();
+
+        let error = get_virtual_processor_state_with(api, handle, 0, 0).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ProcessorStateApiUnavailable("WHvGetVirtualProcessorState")
+        ));
+        let message = error.to_string();
+        assert!(message.contains("WHvGetVirtualProcessorState"), "{message}");
+        assert!(message.contains("newer Windows release"), "{message}");
+
+        let error = set_virtual_processor_state_with(api, handle, 0, 0, &[1, 2, 3]).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ProcessorStateApiUnavailable("WHvSetVirtualProcessorState")
+        ));
+    }
+
+    #[test]
+    fn resolved_processor_state_api_is_called_through_its_pointers() {
+        let api = ProcessorStateApi {
+            get: Some(fake_get_state),
+            set: Some(fake_set_state),
+        };
+        let handle = WHV_PARTITION_HANDLE::default();
+        api.require().unwrap();
+        assert!(matches!(
+            ProcessorStateApi { set: None, ..api }.require(),
+            Err(Error::ProcessorStateApiUnavailable(
+                "WHvSetVirtualProcessorState"
+            ))
+        ));
+
+        assert_eq!(
+            get_virtual_processor_state_with(api, handle, 0, 0).unwrap(),
+            vec![1, 2, 3]
+        );
+        set_virtual_processor_state_with(api, handle, 0, 0, &[1, 2, 3]).unwrap();
+        assert!(matches!(
+            set_virtual_processor_state_with(api, handle, 1, 2, &[1]),
+            Err(Error::SetVirtualProcessorState {
+                id: 1,
+                state_type: 2,
+                hresult: E_INVALIDARG_FOR_TEST,
+            })
+        ));
+    }
+
+    #[test]
+    fn host_processor_state_api_resolves_both_symbols_or_neither() {
+        // Windows 10 exports neither symbol and Windows 11 exports both. A partial result means
+        // the lookup is broken, not that the host is old.
+        let api = ProcessorStateApi::host();
+        assert_eq!(api.get.is_some(), api.set.is_some());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn cpuid_clock_describes_the_partition_without_truncation() {
+        let access = WHV_X64_CPUID_ACCESS_CONTEXT {
+            Rax: 0x15,
+            DefaultResultRax: 1,
+            DefaultResultRbx: 1,
+            DefaultResultRcx: 3_600_024_432,
+            ..Default::default()
+        };
+        for (frequency, expected) in [
+            (Some(1_800_012_216), (1, 1, 1_800_012_216)),
+            (Some(4_000_000_000), (1, 1, 4_000_000_000)),
+            (Some(4_500_030_540), (0, 0, 0)),
+            (None, (0, 0, 0)),
+        ] {
+            let result = normalize_cpuid(0, 2, true, &access, frequency);
+            assert_eq!((result.rax, result.rbx, result.rcx), expected);
+            assert_eq!(result.rdx, 0);
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn restored_running_ap_skips_sipi_register_reset() {
@@ -3641,6 +4114,38 @@ mod tests {
             Ok(Some(0x42))
         );
         assert!(*router.slots[1].lock().unwrap() == ApParkState::Running);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn normalize_cpuid_masks_nested_virt_when_disabled() {
+        let leaf1 = WHV_X64_CPUID_ACCESS_CONTEXT {
+            Rax: 0x1,
+            DefaultResultRcx: 1 << 5,
+            ..Default::default()
+        };
+        let result = normalize_cpuid(0, 1, false, &leaf1, None);
+        assert_eq!(result.rcx as u32 & (1 << 5), 0, "VMX must be cleared");
+
+        let leaf_8000_0001 = WHV_X64_CPUID_ACCESS_CONTEXT {
+            Rax: 0x8000_0001,
+            DefaultResultRcx: 1 << 2,
+            ..Default::default()
+        };
+        let result = normalize_cpuid(0, 1, false, &leaf_8000_0001, None);
+        assert_eq!(result.rcx as u32 & (1 << 2), 0, "SVM must be cleared");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn normalize_cpuid_keeps_nested_virt_when_enabled() {
+        let access = WHV_X64_CPUID_ACCESS_CONTEXT {
+            Rax: 0x1,
+            DefaultResultRcx: 1 << 5,
+            ..Default::default()
+        };
+        let result = normalize_cpuid(0, 1, true, &access, None);
+        assert_eq!(result.rcx as u32 & (1 << 5), 1 << 5, "VMX must be kept");
     }
 
     #[test]

@@ -290,6 +290,9 @@ pub enum MemoryPlacementResult {
 /// A data structure that encapsulates the device configurations
 /// held in the Vmm.
 pub struct VmResources {
+    /// Guest-visible TSC rate to configure before Windows partition setup.
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    pub tsc_frequency_hz: Option<u64>,
     /// Complete immutable private memory image installed before guest activation.
     #[cfg(not(feature = "tee"))]
     pub private_memory_backing: Option<crate::private_memory::PrivateMemoryBacking>,
@@ -325,6 +328,9 @@ pub struct VmResources {
     /// The fs device.
     #[cfg(not(feature = "tee"))]
     pub fs: Vec<FsDeviceConfig>,
+    /// Limits shared by device capture, restore, and standalone state codecs.
+    #[cfg(not(feature = "tee"))]
+    pub device_state_limits: devices::virtio::DeviceStateLimits,
     /// Custom filesystem devices.
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     pub custom_fs: Vec<CustomFsDeviceConfig>,
@@ -401,6 +407,8 @@ pub struct VmResources {
 impl Default for VmResources {
     fn default() -> Self {
         Self {
+            #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+            tsc_frequency_hz: None,
             #[cfg(not(feature = "tee"))]
             private_memory_backing: None,
             #[cfg(not(feature = "tee"))]
@@ -422,6 +430,8 @@ impl Default for VmResources {
             initrd_bundle: None,
             #[cfg(not(feature = "tee"))]
             fs: Vec::new(),
+            #[cfg(not(feature = "tee"))]
+            device_state_limits: devices::virtio::DeviceStateLimits::default(),
             #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
             custom_fs: Vec::new(),
             vsock: VsockBuilder::default(),
@@ -443,7 +453,7 @@ impl Default for VmResources {
             snd_device: false,
             console_output: None,
             smbios_oem_strings: None,
-            nested_enabled: false,
+            nested_enabled: crate::nested_virt::default_enabled(),
             split_irqchip: false,
             metrics: MetricsWriter::default(),
             enable_balloon: true,
@@ -475,6 +485,10 @@ impl VmResources {
             vcpu_count,
             max_vcpu_count: self.vm_config().max_vcpu_count.unwrap_or(vcpu_count),
             ht_enabled: self.vm_config().ht_enabled.unwrap(),
+            // Acted on by the Linux/KVM x86_64 backend (guest-CPUID mask),
+            // Windows/WHP x86_64 (trapped-CPUID mask) and macOS/HVF;
+            // Linux/aarch64 does not expose nested virtualization at all.
+            nested_enabled: self.nested_enabled,
             cpu_template: self.vm_config().cpu_template,
         }
     }
@@ -755,6 +769,7 @@ mod tests {
             vcpu_count: vm_resources.vm_config().vcpu_count.unwrap(),
             max_vcpu_count: vm_resources.vm_config().vcpu_count.unwrap(),
             ht_enabled: vm_resources.vm_config().ht_enabled.unwrap(),
+            nested_enabled: vm_resources.nested_enabled,
             cpu_template: vm_resources.vm_config().cpu_template,
         };
 

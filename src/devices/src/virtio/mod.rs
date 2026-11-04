@@ -24,6 +24,9 @@ pub mod device;
 pub mod file_traits;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub mod fs;
+// The virtio-fs state limits are compiled under every feature: the typed device
+// state codec recognizes virtio-fs state even when the fs device is not built.
+pub mod fs_state_limits;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 #[cfg(feature = "input")]
@@ -71,6 +74,7 @@ pub use self::cpu::*;
 pub use self::device::*;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use self::fs::*;
+pub use self::fs_state_limits::*;
 #[cfg(feature = "gpu")]
 pub use self::gpu::*;
 #[cfg(not(feature = "tee"))]
