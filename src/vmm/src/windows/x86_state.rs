@@ -238,6 +238,21 @@ pub(super) fn restore_cpu(
         WHvVirtualProcessorStateTypeInterruptControllerState2,
         &state.apic,
     )?;
+    // A fresh APIC is not in TSC-deadline mode, so the earlier register write
+    // is ignored; changing timer modes also disarms the deadline. Reapply it
+    // after restoring the APIC, including zero to preserve a disarmed timer.
+    // Only write it when it belongs to the validated register contract.
+    if let Some(index) = names
+        .iter()
+        .position(|name| *name == WHvX64RegisterTscDeadline)
+    {
+        super::set_vcpu_registers(
+            partition,
+            cpu,
+            &names[index..=index],
+            &values[index..=index],
+        )?;
+    }
     for (kind, payload) in [
         WHvVirtualProcessorStateTypeSynicMessagePage,
         WHvVirtualProcessorStateTypeSynicEventFlagPage,
