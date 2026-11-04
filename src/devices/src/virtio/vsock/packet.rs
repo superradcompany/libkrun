@@ -205,6 +205,9 @@ pub struct VsockPacket {
     hdr: *mut u8,
     buf: Option<*mut u8>,
     buf_size: usize,
+    // Only fragmented TX payloads are copied. RX and contiguous TX retain
+    // their guest-memory backing; owned storage must move with the packet.
+    tx_payload: Option<Vec<u8>>,
 }
 
 fn get_host_address<T: GuestMemory + vm_memory::GuestMemoryBackend>(
@@ -238,17 +241,20 @@ impl VsockPacket {
                 .map_err(VsockError::GuestMemoryMmap)?,
             buf: None,
             buf_size: 0,
+            tx_payload: None,
         };
 
+        // Snapshot the guest-controlled length once before bounding allocation.
+        let payload_len = pkt.len() as usize;
         // No point looking for a data/buffer descriptor, if the packet is zero-lengthed.
-        if pkt.len() == 0 {
+        if payload_len == 0 {
             return Ok(pkt);
         }
 
         // Reject weirdly-sized packets.
         //
-        if pkt.len() > defs::MAX_PKT_BUF_SIZE as u32 {
-            return Err(VsockError::InvalidPktLen(pkt.len()));
+        if payload_len > defs::MAX_PKT_BUF_SIZE {
+            return Err(VsockError::InvalidPktLen(payload_len as u32));
         }
 
         // If the packet header showed a non-zero length, there should be a data descriptor here.
@@ -259,10 +265,34 @@ impl VsockPacket {
             return Err(VsockError::UnreadableDescriptor);
         }
 
-        // The data buffer should be large enough to fit the size of the data, as described by
-        // the header descriptor.
-        if buf_desc.len < pkt.len() {
-            return Err(VsockError::BufDescTooSmall);
+        // Linux can split a TX payload over multiple readable descriptors.
+        // Keep the existing zero-copy path for a contiguous payload, but gather
+        // a fragmented payload into bounded packet-owned storage. Never expose
+        // bytes beyond the declared length or relax guest-memory validation.
+        if (buf_desc.len as usize) < payload_len {
+            use vm_memory::Bytes;
+
+            let mut payload = vec![0u8; payload_len];
+            let mut copied = 0;
+            let mut descriptor = Some(buf_desc);
+            while copied < payload_len {
+                let desc = descriptor.ok_or(VsockError::BufDescTooSmall)?;
+                if desc.is_write_only() {
+                    return Err(VsockError::UnreadableDescriptor);
+                }
+                let count = (desc.len as usize).min(payload_len - copied);
+                if count != 0 {
+                    desc.mem
+                        .read_slice(&mut payload[copied..copied + count], desc.addr)
+                        .map_err(VsockError::GuestMemoryMmap)?;
+                }
+                copied += count;
+                // DescriptorChain bounds traversal (including cycles) by TTL.
+                descriptor = desc.next_descriptor();
+            }
+            pkt.buf_size = payload_len;
+            pkt.tx_payload = Some(payload);
+            return Ok(pkt);
         }
 
         pkt.buf_size = buf_desc.len as usize;
@@ -295,6 +325,7 @@ impl VsockPacket {
                 .map_err(VsockError::GuestMemoryMmap)?,
             buf: None,
             buf_size: 0,
+            tx_payload: None,
         };
 
         // Starting from Linux 6.2 the virtio-vsock driver can use a single descriptor for both
@@ -345,6 +376,9 @@ impl VsockPacket {
     ///            (and often is) larger than the length of the packet data. The packet data length
     ///            is stored in the packet header, and accessible via `VsockPacket::len()`.
     pub fn buf(&self) -> Option<&[u8]> {
+        if let Some(payload) = &self.tx_payload {
+            return Some(payload);
+        }
         self.buf.map(|ptr| {
             // This is safe since bound checks have already been performed when creating the packet
             // from the virtq descriptor.
@@ -370,6 +404,9 @@ impl VsockPacket {
     ///            (and often is) larger than the length of the packet data. The packet data length
     ///            is stored in the packet header, and accessible via `VsockPacket::len()`.
     pub fn buf_mut(&mut self) -> Option<&mut [u8]> {
+        if let Some(payload) = &mut self.tx_payload {
+            return Some(payload);
+        }
         self.buf.map(|ptr| {
             // This is safe since bound checks have already been performed when creating the packet
             // from the virtq descriptor.
@@ -741,3 +778,7 @@ impl VsockPacket {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "packet_tests.rs"]
+mod tests;
