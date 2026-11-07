@@ -43,6 +43,8 @@ pub mod linux_errno;
 // vCPU run loops still reference its enforcement types unconditionally.
 pub mod cpu;
 mod dirty_bitmap;
+#[cfg(all(target_os = "linux", not(feature = "tee")))]
+mod discard;
 #[cfg(not(feature = "tee"))]
 pub mod mem;
 pub mod memory_access;
