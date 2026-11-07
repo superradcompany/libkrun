@@ -9,17 +9,20 @@
 //! discarding guest pages, as balloon free page reporting does: page tables of the VMM are
 //! later found overwritten (`BUG: Bad page map ... pte:101010101010101`).
 //!
-//! Whatever the kernel, the discards here never cover a whole PMD block in one call: from each
-//! such block the first page is left out, so no page table is ever empty enough to be reclaimed.
-//! The guest's memory still goes back to the host, less one base page per PMD block (0.2 % with
-//! 4 KiB pages), and the page tables stay, as they would have without reclaim.
+//! Whatever the kernel, the discards here never cover a whole PMD block in one call. A
+//! PMD-aligned range is first advanced by one base page, then split into PMD-sized calls from
+//! that unaligned address. Each call therefore touches only parts of two adjacent PMD blocks;
+//! the page-table reclaim condition cannot hold for either part. Unlike leaving a page behind in
+//! every block, this still returns every complete guest page to the host.
 
+#[cfg(target_os = "linux")]
 use std::io;
 
 /// Address ranges, as `(start, len)`.
 type Ranges = Vec<(usize, usize)>;
 
 /// The host's base page size and the span one page table maps (a PMD entry).
+#[cfg(target_os = "linux")]
 fn page_and_pmd_size() -> (usize, usize) {
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     let page = if page > 0 { page as usize } else { 4096 };
@@ -27,16 +30,29 @@ fn page_and_pmd_size() -> (usize, usize) {
     (page, page * (page / 8))
 }
 
-/// The pieces of `[start, start + len)` to discard, as `(start, len)`, and the parts left out of
-/// it, likewise. Only whole host pages are discarded: `madvise` rounds a length up to a whole
-/// page, so a partial page at either end is left out, or a call ending in it could still cover a
-/// whole PMD block. The rest gives one piece per PMD block that lies wholly inside the range
-/// (without its first page) and the parts at either end, with neighbours joined.
+/// The separate `madvise` calls covering the complete pages in `[start, start + len)`, plus
+/// partial pages left out at either end. `madvise` rounds a length up to a host page, so partial
+/// end pages must remain untouched: rounding one into a call could otherwise cover a whole PMD.
+///
+/// A PMD-sized call is safe when its start is not PMD-aligned: no individual PMD it crosses is
+/// wholly covered. If the range starts on a PMD boundary, discard its first page in a distinct
+/// small call to shift the following calls. Keeping the calls distinct is essential—combining
+/// adjacent pieces would restore the exact range that triggers page-table reclaim.
 fn plan(start: usize, len: usize, page: usize, pmd: usize) -> (Ranges, Ranges) {
     let end = start.saturating_add(len);
     let mut pieces = Ranges::new();
     let mut kept = Ranges::new();
-    fn push(s: usize, e: usize, list: &mut Ranges) {
+
+    // Pieces represent system-call boundaries, so deliberately do not coalesce them.
+    fn push_piece(s: usize, e: usize, list: &mut Ranges) {
+        if s < e {
+            list.push((s, e - s));
+        }
+    }
+
+    // Kept fragments have no call-boundary meaning, so join neighbours for callers that zero
+    // them manually after a successful discard.
+    fn push_kept(s: usize, e: usize, list: &mut Ranges) {
         if s >= e {
             return;
         }
@@ -48,28 +64,29 @@ fn plan(start: usize, len: usize, page: usize, pmd: usize) -> (Ranges, Ranges) {
 
     let first = start.div_ceil(page).saturating_mul(page).min(end);
     let last = (end / page * page).max(first);
-    push(start, first, &mut kept);
+    push_kept(start, first, &mut kept);
 
     let mut cur = first;
-    while cur < last {
-        let block = cur.div_ceil(pmd).saturating_mul(pmd);
-        if block >= last || block.saturating_add(pmd) > last {
-            push(cur, last, &mut pieces);
-            break;
-        }
-        push(cur, block, &mut pieces);
-        push(block, block + page, &mut kept);
-        push(block + page, block + pmd, &mut pieces);
-        cur = block + pmd;
+    if last.saturating_sub(cur) >= pmd && cur.is_multiple_of(pmd) {
+        // This first page moves every subsequent PMD-sized call off the PMD boundary.
+        push_piece(cur, cur + page, &mut pieces);
+        cur += page;
     }
 
-    push(last, end, &mut kept);
+    while last.saturating_sub(cur) > pmd {
+        push_piece(cur, cur + pmd, &mut pieces);
+        cur += pmd;
+    }
+    push_piece(cur, last, &mut pieces);
+
+    push_kept(last, end, &mut kept);
     (pieces, kept)
 }
 
 /// `madvise(MADV_DONTNEED)` over the whole pages of `[addr, addr + len)`, never over a whole PMD
 /// block in one call. Returns the parts it left untouched, as `(start, len)`, so a caller that
 /// needs the range zeroed can zero them.
+#[cfg(target_os = "linux")]
 pub(crate) fn dontneed(addr: *mut u8, len: usize) -> io::Result<Vec<(*mut u8, usize)>> {
     let (page, pmd) = page_and_pmd_size();
     let (pieces, kept) = plan(addr as usize, len, page, pmd);
@@ -91,17 +108,31 @@ mod tests {
     /// Whether one call, with its length rounded up to whole pages as `madvise` does, covers a
     /// whole PMD block.
     fn covers_whole_block(pieces: &[(usize, usize)]) -> bool {
+        covers_whole_block_for(pieces, P, M)
+    }
+
+    fn covers_whole_block_for(pieces: &[(usize, usize)], page: usize, pmd: usize) -> bool {
         pieces
             .iter()
-            .any(|&(s, l)| s.div_ceil(M) * M + M <= (s + l).div_ceil(P) * P)
+            .any(|&(s, l)| s.div_ceil(pmd) * pmd + pmd <= (s + l).div_ceil(page) * page)
     }
 
     /// Pieces and kept parts together are exactly `[start, start + len)`, without overlap, and
     /// every piece is whole pages.
     fn assert_exact(start: usize, len: usize, pieces: &[(usize, usize)], kept: &[(usize, usize)]) {
+        assert_exact_for(start, len, pieces, kept, P);
+    }
+
+    fn assert_exact_for(
+        start: usize,
+        len: usize,
+        pieces: &[(usize, usize)],
+        kept: &[(usize, usize)],
+        page: usize,
+    ) {
         assert!(pieces
             .iter()
-            .all(|&(s, l)| s % P == 0 && l % P == 0 && l > 0));
+            .all(|&(s, l)| s % page == 0 && l % page == 0 && l > 0));
         let mut all: Vec<(usize, usize)> = pieces.iter().chain(kept).copied().collect();
         all.sort();
         let mut cur = start;
@@ -113,17 +144,21 @@ mod tests {
     }
 
     #[test]
-    fn one_aligned_block_is_one_call_without_its_first_page() {
+    fn one_aligned_block_is_split_without_retaining_a_page() {
         let (pieces, kept) = plan(16 * M, M, P, M);
-        assert_eq!(pieces, vec![(16 * M + P, M - P)]);
-        assert_eq!(kept, vec![(16 * M, P)]);
+        assert_eq!(pieces, vec![(16 * M, P), (16 * M + P, M - P)]);
+        assert!(kept.is_empty());
+        assert!(!covers_whole_block(&pieces));
     }
 
     #[test]
-    fn two_aligned_blocks_leave_a_page_out_of_each() {
+    fn aligned_blocks_use_offset_calls_without_retaining_guest_memory() {
         let (pieces, kept) = plan(16 * M, 2 * M, P, M);
-        assert_eq!(pieces, vec![(16 * M + P, M - P), (17 * M + P, M - P)]);
-        assert_eq!(kept, vec![(16 * M, P), (17 * M, P)]);
+        assert_eq!(
+            pieces,
+            vec![(16 * M, P), (16 * M + P, M), (17 * M + P, M - P),]
+        );
+        assert!(kept.is_empty());
         assert!(!covers_whole_block(&pieces));
     }
 
@@ -142,15 +177,8 @@ mod tests {
         let start = 16 * M + 100 * P;
         let len = 3 * M;
         let (pieces, kept) = plan(start, len, P, M);
-        assert_eq!(kept, vec![(17 * M, P), (18 * M, P)]);
-        assert_eq!(
-            pieces,
-            vec![
-                (start, 17 * M - start),
-                (17 * M + P, M - P),
-                (18 * M + P, start + len - 18 * M - P),
-            ]
-        );
+        assert!(kept.is_empty());
+        assert_eq!(pieces, vec![(start, M), (start + M, M), (start + 2 * M, M)]);
         assert!(!covers_whole_block(&pieces));
         assert_exact(start, len, &pieces, &kept);
     }
@@ -169,9 +197,8 @@ mod tests {
         let start = 16 * M - 10;
         let len = 10 + M + 20;
         let (pieces, kept) = plan(start, len, P, M);
-        // The 10 bytes before the block join its first page, which is left out too.
-        assert_eq!(kept, vec![(start, 10 + P), (17 * M, 20)]);
-        assert_eq!(pieces, vec![(16 * M + P, M - P)]);
+        assert_eq!(kept, vec![(start, 10), (17 * M, 20)]);
+        assert_eq!(pieces, vec![(16 * M, P), (16 * M + P, M - P)]);
         assert_exact(start, len, &pieces, &kept);
     }
 
@@ -218,13 +245,42 @@ mod tests {
     }
 
     #[test]
+    fn planner_preserves_the_invariant_for_larger_linux_page_sizes() {
+        // A 64-bit PTE table has page / 8 entries. Exercise common Linux base-page sizes rather
+        // than baking the usual 4 KiB / 2 MiB geometry into the safety property.
+        for page in [4096, 16384, 65536] {
+            let pmd = page * (page / 8);
+            for start_offset in [0, 1, page - 1, page, pmd - page, pmd - 1, pmd, pmd + page] {
+                for len in [1, page - 1, page, pmd - 1, pmd, pmd + page, 2 * pmd + 1] {
+                    let start = 16 * pmd + start_offset;
+                    let (pieces, kept) = plan(start, len, page, pmd);
+                    assert!(
+                        !covers_whole_block_for(&pieces, page, pmd),
+                        "page={page:#x} start_offset={start_offset:#x} len={len:#x}"
+                    );
+                    assert_exact_for(start, len, &pieces, &kept, page);
+
+                    // All complete pages in the original range must be returned to the host;
+                    // only incomplete boundary pages are allowed to remain in `kept`.
+                    assert!(kept.iter().all(|&(s, l)| {
+                        s.div_ceil(page).saturating_mul(page).saturating_add(page) > s + l
+                    }));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn empty_range_does_nothing() {
         assert_eq!(plan(16 * M, 0, P, M), (vec![], vec![]));
     }
 
+    // Linux guarantees anonymous pages read back as zero after MADV_DONTNEED. Other Unix hosts
+    // may treat the advice lazily, so their portable planner coverage stops above.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn dontneed_keeps_one_page_per_block_and_zeroes_the_rest() {
-        let (page, pmd) = page_and_pmd_size();
+    fn dontneed_discards_an_entire_aligned_block() {
+        let (_, pmd) = page_and_pmd_size();
         let map_len = 3 * pmd;
         let map = unsafe {
             libc::mmap(
@@ -242,14 +298,14 @@ mod tests {
         unsafe { std::ptr::write_bytes(block, 0xA5, pmd) };
 
         let kept = dontneed(block, pmd).unwrap();
-        assert_eq!(kept, vec![(block, page)]);
+        assert!(kept.is_empty());
         let bytes = unsafe { std::slice::from_raw_parts(block, pmd) };
-        assert!(bytes[..page].iter().all(|&b| b == 0xA5));
-        assert!(bytes[page..].iter().all(|&b| b == 0));
+        assert!(bytes.iter().all(|&b| b == 0));
 
         unsafe { libc::munmap(map, map_len) };
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn dontneed_leaves_a_partial_last_page_untouched() {
         let (page, pmd) = page_and_pmd_size();

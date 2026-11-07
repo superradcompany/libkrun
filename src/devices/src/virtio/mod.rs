@@ -43,7 +43,9 @@ pub mod linux_errno;
 // vCPU run loops still reference its enforcement types unconditionally.
 pub mod cpu;
 mod dirty_bitmap;
-#[cfg(all(target_os = "linux", not(feature = "tee")))]
+// Compile the Linux-only helper in Unix unit tests too, so the range planner has coverage on
+// macOS development hosts. Production builds still include it only on Linux.
+#[cfg(all(not(feature = "tee"), any(target_os = "linux", all(test, unix))))]
 mod discard;
 #[cfg(not(feature = "tee"))]
 pub mod mem;
