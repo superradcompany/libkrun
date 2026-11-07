@@ -146,7 +146,13 @@ impl Balloon {
     }
 }
 
-#[cfg(unix)]
+// On Linux, never one MADV_DONTNEED over a whole page table's range: see `virtio::discard`.
+#[cfg(target_os = "linux")]
+fn discard_guest_pages(host_addr: *mut u8, len: u32) -> std::io::Result<()> {
+    crate::virtio::discard::dontneed(host_addr, len as usize).map(|_| ())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn discard_guest_pages(host_addr: *mut u8, len: u32) -> std::io::Result<()> {
     let ret = unsafe {
         libc::madvise(
