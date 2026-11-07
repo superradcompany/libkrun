@@ -58,6 +58,10 @@ pub fn filter_cpuid(kvm_cpuid: &mut CpuId, vm_spec: &VmSpec) -> Result<(), Error
     let maybe_cpuid_transformer: Option<&dyn CpuidTransformer> = match vm_spec.cpu_vendor_id() {
         VENDOR_ID_INTEL => Some(&intel::IntelCpuidTransformer {}),
         VENDOR_ID_AMD => Some(&amd::AmdCpuidTransformer {}),
+        // Hygon C86 is Dhyana (Zen-1 derived, CPUID family 24, AMD64 license);
+        // it needs the same leaf handling as AMD (e.g. the leaf-0x1 TSC-deadline
+        // advertisement), otherwise the guest hangs in timer calibration.
+        VENDOR_ID_HYGON => Some(&amd::AmdCpuidTransformer {}),
         _ => None,
     };
 
