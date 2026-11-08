@@ -1,7 +1,7 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::common::{VENDOR_ID_AMD, VENDOR_ID_INTEL};
+use crate::common::{VENDOR_ID_AMD, VENDOR_ID_HYGON, VENDOR_ID_INTEL};
 use std::arch::x86_64::__cpuid as host_cpuid;
 use std::slice;
 
@@ -22,6 +22,7 @@ pub enum Reg {
 
 const BRAND_STRING_INTEL: &[u8] = b"Intel(R) Xeon(R) Processor";
 const BRAND_STRING_AMD: &[u8] = b"AMD EPYC";
+const BRAND_STRING_HYGON: &[u8] = b"Hygon C86";
 
 /// A CPUID brand string wrapper, providing some efficient manipulation primitives.
 ///
@@ -96,6 +97,7 @@ impl BrandString {
                 this
             }
             VENDOR_ID_AMD => BrandString::from_bytes_unchecked(BRAND_STRING_AMD),
+            VENDOR_ID_HYGON => BrandString::from_bytes_unchecked(BRAND_STRING_HYGON),
             _ => BrandString::from_bytes_unchecked(b""),
         }
     }
@@ -410,6 +412,8 @@ mod tests {
         assert!(bstr.as_bytes().starts_with(BRAND_STRING_INTEL));
         let bstr = BrandString::from_vendor_id(VENDOR_ID_AMD);
         assert!(bstr.as_bytes().starts_with(BRAND_STRING_AMD));
+        let bstr = BrandString::from_vendor_id(VENDOR_ID_HYGON);
+        assert!(bstr.as_bytes().starts_with(BRAND_STRING_HYGON));
         let bstr = BrandString::from_vendor_id(b"............");
         assert!(bstr.as_bytes() == vec![b'\0'; 48].as_slice());
     }
