@@ -370,9 +370,6 @@ pub fn counter_timebase() -> Option<(u32, u32)> {
     (ret == 0 && info.numer != 0 && info.denom != 0).then_some((info.numer, info.denom))
 }
 
-/// `HV_UNSUPPORTED` of Hypervisor.framework (0xfae9400f), which the bindings do not name.
-const HV_UNSUPPORTED_RETURN: hv_return_t = 0xfae9_400f_u32 as hv_return_t;
-
 /// What a captured vCPU records for `hv_vcpu_get_pending_interrupt`.
 ///
 /// With the in-kernel GIC, macOS 27 answers `HV_UNSUPPORTED` to the per-vCPU pending flags:
@@ -381,7 +378,7 @@ const HV_UNSUPPORTED_RETURN: hv_return_t = 0xfae9_400f_u32 as hv_return_t;
 fn captured_pending_interrupt(result: hv_return_t, pending: bool) -> Result<bool, Error> {
     match result {
         HV_SUCCESS => Ok(pending),
-        HV_UNSUPPORTED_RETURN => Ok(false),
+        HV_UNSUPPORTED => Ok(false),
         _ => Err(Error::VcpuReadPendingInterrupt),
     }
 }
@@ -393,7 +390,7 @@ fn captured_pending_interrupt(result: hv_return_t, pending: bool) -> Result<bool
 fn restored_pending_interrupt(result: hv_return_t, pending: bool) -> Result<(), Error> {
     match result {
         HV_SUCCESS => Ok(()),
-        HV_UNSUPPORTED_RETURN if !pending => Ok(()),
+        HV_UNSUPPORTED if !pending => Ok(()),
         _ => Err(Error::VcpuSetPendingIrq),
     }
 }
@@ -1569,7 +1566,7 @@ mod tests {
             Ok(false)
         ));
         assert!(matches!(
-            captured_pending_interrupt(HV_UNSUPPORTED_RETURN, false),
+            captured_pending_interrupt(HV_UNSUPPORTED, false),
             Ok(false)
         ));
         assert!(matches!(
@@ -1581,9 +1578,9 @@ mod tests {
     #[test]
     fn restore_accepts_unsupported_only_for_a_clear_flag() {
         assert!(restored_pending_interrupt(HV_SUCCESS, true).is_ok());
-        assert!(restored_pending_interrupt(HV_UNSUPPORTED_RETURN, false).is_ok());
+        assert!(restored_pending_interrupt(HV_UNSUPPORTED, false).is_ok());
         assert!(matches!(
-            restored_pending_interrupt(HV_UNSUPPORTED_RETURN, true),
+            restored_pending_interrupt(HV_UNSUPPORTED, true),
             Err(Error::VcpuSetPendingIrq)
         ));
         assert!(matches!(
