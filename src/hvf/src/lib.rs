@@ -370,6 +370,34 @@ pub fn counter_timebase() -> Option<(u32, u32)> {
     (ret == 0 && info.numer != 0 && info.denom != 0).then_some((info.numer, info.denom))
 }
 
+/// `HV_UNSUPPORTED` of Hypervisor.framework (0xfae9400f), which the bindings do not name.
+const HV_UNSUPPORTED_RETURN: hv_return_t = 0xfae9_400f_u32 as hv_return_t;
+
+/// What a captured vCPU records for `hv_vcpu_get_pending_interrupt`.
+///
+/// With the in-kernel GIC, macOS 27 answers `HV_UNSUPPORTED` to the per-vCPU pending flags:
+/// the GIC owns interrupt delivery, and its pending state is part of the captured GIC state.
+/// There is no manually asserted interrupt to carry over, so that answer reads as `false`.
+fn captured_pending_interrupt(result: hv_return_t, pending: bool) -> Result<bool, Error> {
+    match result {
+        HV_SUCCESS => Ok(pending),
+        HV_UNSUPPORTED_RETURN => Ok(false),
+        _ => Err(Error::VcpuReadPendingInterrupt),
+    }
+}
+
+/// Whether `hv_vcpu_set_pending_interrupt` restored a captured flag.
+///
+/// Where macOS refuses the per-vCPU flags (see [`captured_pending_interrupt`]), leaving a flag
+/// clear is not an error; asserting one still is.
+fn restored_pending_interrupt(result: hv_return_t, pending: bool) -> Result<(), Error> {
+    match result {
+        HV_SUCCESS => Ok(()),
+        HV_UNSUPPORTED_RETURN if !pending => Ok(()),
+        _ => Err(Error::VcpuSetPendingIrq),
+    }
+}
+
 pub fn vcpu_set_pending_irq(
     vcpuid: u64,
     irq_type: InterruptType,
@@ -973,8 +1001,8 @@ impl HvfVcpu<'_> {
         for &(register, value) in &state.ich {
             self.write_ich_reg(register, value)?;
         }
-        vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, state.pending_irq)?;
-        vcpu_set_pending_irq(self.vcpuid, InterruptType::Fiq, state.pending_fiq)?;
+        self.restore_pending_interrupt(InterruptType::Irq, state.pending_irq)?;
+        self.restore_pending_interrupt(InterruptType::Fiq, state.pending_fiq)?;
 
         // This mask suppresses framework notifications, not the guest timer interrupt.
         // Rearm notifications in a fresh nested context: carrying over a masked exit
@@ -1003,11 +1031,20 @@ impl HvfVcpu<'_> {
     fn read_pending_interrupt(&self, interrupt: hv_interrupt_type_t) -> Result<bool, Error> {
         let mut pending = false;
         let result = unsafe { hv_vcpu_get_pending_interrupt(self.vcpuid, interrupt, &mut pending) };
-        if result == HV_SUCCESS {
-            Ok(pending)
-        } else {
-            Err(Error::VcpuReadPendingInterrupt)
-        }
+        captured_pending_interrupt(result, pending)
+    }
+
+    fn restore_pending_interrupt(
+        &self,
+        irq_type: InterruptType,
+        pending: bool,
+    ) -> Result<(), Error> {
+        let interrupt = match irq_type {
+            InterruptType::Irq => hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ,
+            InterruptType::Fiq => hv_interrupt_type_t_HV_INTERRUPT_TYPE_FIQ,
+        };
+        let result = unsafe { hv_vcpu_set_pending_interrupt(self.vcpuid, interrupt, pending) };
+        restored_pending_interrupt(result, pending)
     }
 
     fn read_icc_reg(&self, register: hv_gic_icc_reg_t) -> Result<u64, Error> {
@@ -1517,5 +1554,41 @@ mod tests {
         assert!(!reordered.has_register_topology(false, 0));
 
         assert!(!state(true).has_register_topology(false, 0));
+    }
+
+    const HV_BAD_ARGUMENT_RETURN: hv_return_t = 0xfae9_4003_u32 as hv_return_t;
+
+    #[test]
+    fn capture_reads_unsupported_as_no_pending_interrupt() {
+        assert!(matches!(
+            captured_pending_interrupt(HV_SUCCESS, true),
+            Ok(true)
+        ));
+        assert!(matches!(
+            captured_pending_interrupt(HV_SUCCESS, false),
+            Ok(false)
+        ));
+        assert!(matches!(
+            captured_pending_interrupt(HV_UNSUPPORTED_RETURN, false),
+            Ok(false)
+        ));
+        assert!(matches!(
+            captured_pending_interrupt(HV_BAD_ARGUMENT_RETURN, false),
+            Err(Error::VcpuReadPendingInterrupt)
+        ));
+    }
+
+    #[test]
+    fn restore_accepts_unsupported_only_for_a_clear_flag() {
+        assert!(restored_pending_interrupt(HV_SUCCESS, true).is_ok());
+        assert!(restored_pending_interrupt(HV_UNSUPPORTED_RETURN, false).is_ok());
+        assert!(matches!(
+            restored_pending_interrupt(HV_UNSUPPORTED_RETURN, true),
+            Err(Error::VcpuSetPendingIrq)
+        ));
+        assert!(matches!(
+            restored_pending_interrupt(HV_BAD_ARGUMENT_RETURN, false),
+            Err(Error::VcpuSetPendingIrq)
+        ));
     }
 }
