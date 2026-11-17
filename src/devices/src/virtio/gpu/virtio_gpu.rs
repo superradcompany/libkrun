@@ -273,7 +273,15 @@ impl VirtioGpu {
 
         let fence =
             Self::create_fence_handler(mem, queue_ctl.clone(), fence_state.clone(), interrupt);
-        builder.clone().build(fence.clone(), None).ok()
+        match builder.clone().build(fence.clone(), None) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                // Surface the reason before the venus-less fallback is tried —
+                // a silent fallback strands guests with a dead venus capset.
+                error!("rutabaga init with configured virgl flags failed: {e:?}");
+                None
+            }
+        }
     }
 
     pub fn create_fallback_rutabaga(
@@ -883,7 +891,13 @@ impl VirtioGpu {
 
         if let Ok(export) = self.rutabaga.export_blob(resource_id) {
             if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE {
-                if offset + resource.size > shm_region.size as u64 {
+                // hv_vm_map requires host-page-aligned sizes (16 KiB on Apple
+                // Silicon); venus blob sizes are guest-page (4 KiB) granular, so
+                // round up. The host allocation is page-backed, so the tail read
+                // stays within the same allocation's final page.
+                let host_page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+                let map_len = resource.size.div_ceil(host_page) * host_page;
+                if offset + map_len > shm_region.size as u64 {
                     error!("mapping DOES NOT FIT");
                     return Err(ErrUnspec);
                 }
@@ -900,10 +914,15 @@ impl VirtioGpu {
                         reply_sender,
                         map_ptr,
                         guest_addr,
-                        resource.size,
+                        map_len,
                     ))
                     .unwrap();
-                if !reply_receiver.recv().unwrap() {
+                let mapped = reply_receiver.recv().unwrap();
+                if !mapped {
+                    error!(
+                        "hypervisor mapping failed: res={} host={:#x} guest={:#x} len={:#x}",
+                        resource_id, map_ptr, guest_addr, map_len
+                    );
                     return Err(ErrUnspec);
                 }
             } else {
@@ -979,7 +998,10 @@ impl VirtioGpu {
             .send(WorkerMessage::GpuRemoveMapping(
                 reply_sender,
                 guest_addr,
-                resource.size,
+                {
+                    let host_page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+                    resource.size.div_ceil(host_page) * host_page
+                },
             ))
             .unwrap();
         if !reply_receiver.recv().unwrap() {

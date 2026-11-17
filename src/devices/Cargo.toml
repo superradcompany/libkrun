@@ -17,7 +17,7 @@ efi = ["blk", "net"]
 gpu = ["rutabaga_gfx", "thiserror", "zerocopy", "krun_display"]
 snd = ["pw", "thiserror"]
 input = ["zerocopy", "krun_input"]
-virgl_resource_map2 = []
+virgl_resource_map2 = ["rutabaga_gfx/virgl_resource_map2"]
 aws-nitro = []
 test_utils = []
 
