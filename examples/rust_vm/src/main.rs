@@ -44,7 +44,8 @@ fn main() -> Result<()> {
     #[cfg(not(feature = "tee"))]
     let builder = builder.fs(|fs| fs.root(&rootfs_path));
 
-    builder
+    // A successful enter never returns; only initialization errors reach the caller.
+    match builder
         .exec(|e| {
             e.path("/bin/echo")
                 .args(["Hello from libkrun VM!"])
@@ -54,9 +55,7 @@ fn main() -> Result<()> {
             eprintln!("[on_exit] VM exiting with code {exit_code}");
         })
         .build()?
-        .enter()?;
-
-    unreachable!()
+        .enter()? {}
 }
 
 fn default_krunfw_path() -> String {

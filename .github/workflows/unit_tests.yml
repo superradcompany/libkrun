@@ -24,6 +24,9 @@ jobs:
       - name: Unit tests
         run: cargo test
 
+      - name: Virtio-fs completion lengths
+        run: cargo test --locked -p msb_krun_devices --lib virtio::fs::worker::tests
+
       - name: Vsock queue and stream regressions
         timeout-minutes: 5
         run: cargo test --locked -p msb_krun_devices --lib 'virtio::vsock::'
@@ -63,6 +66,9 @@ jobs:
 
       - name: Windows errno translation tests
         run: cargo test --locked --manifest-path src/devices/Cargo.toml virtio::linux_errno::tests
+
+      - name: Virtio-fs completion lengths
+        run: cargo test --locked -p msb_krun_devices --lib virtio::fs::worker::tests
 
       - name: Vsock queue and stream regressions
         timeout-minutes: 5
