@@ -4349,7 +4349,9 @@ pub const hv_sys_reg_t_HV_SYS_REG_FAR_EL2: hv_sys_reg_t = 58112;
 pub const hv_sys_reg_t_HV_SYS_REG_HCR_EL2: hv_sys_reg_t = 57480;
 pub const hv_sys_reg_t_HV_SYS_REG_HPFAR_EL2: hv_sys_reg_t = 58116;
 pub const hv_sys_reg_t_HV_SYS_REG_MAIR_EL2: hv_sys_reg_t = 58640;
-pub const hv_sys_reg_t_HV_SYS_REG_MDCR_EL2: hv_sys_reg_t = 57369;
+// Older Apple SDKs incorrectly encoded MDCR_EL2 as 0xe019.
+// Use the corrected architectural encoding from the macOS 26 SDK.
+pub const hv_sys_reg_t_HV_SYS_REG_MDCR_EL2: hv_sys_reg_t = 57481;
 pub const hv_sys_reg_t_HV_SYS_REG_SCTLR_EL2: hv_sys_reg_t = 57472;
 pub const hv_sys_reg_t_HV_SYS_REG_SPSR_EL2: hv_sys_reg_t = 57856;
 pub const hv_sys_reg_t_HV_SYS_REG_SP_EL2: hv_sys_reg_t = 61960;

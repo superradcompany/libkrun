@@ -1,0 +1,10 @@
+[package]
+name = "nested-tsc-source-host"
+version = "0.1.0"
+edition = "2021"
+[lib]
+crate-type = ["cdylib"]
+[dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader"] }
+
+[workspace]

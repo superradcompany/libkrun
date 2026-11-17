@@ -38,7 +38,7 @@ impl VmSpec {
             cpu_id,
             cpu_count,
             ht_enabled,
-            nested_enabled: true,
+            nested_enabled: false,
             brand_string: BrandString::from_vendor_id(&cpu_vendor_id),
         })
     }

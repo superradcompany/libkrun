@@ -1,0 +1,14 @@
+[package]
+name = "nested-hvf-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+hvf = { package = "msb_krun_hvf", path = "../../src/hvf" }
+
+[[bin]]
+name = "nested-hvf-probe"
+path = "macos.rs"

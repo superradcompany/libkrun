@@ -10,6 +10,7 @@ use crate::cpu_leaf::*;
 
 pub const VENDOR_ID_INTEL: &[u8; 12] = b"GenuineIntel";
 pub const VENDOR_ID_AMD: &[u8; 12] = b"AuthenticAMD";
+pub const VENDOR_ID_HYGON: &[u8; 12] = b"HygonGenuine";
 
 #[derive(Clone, Debug)]
 pub enum Error {

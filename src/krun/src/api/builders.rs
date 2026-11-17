@@ -482,7 +482,7 @@ impl MachineBuilder {
             max_vcpus: None,
             max_memory_mib: None,
             hyperthreading: false,
-            nested_virt: false,
+            nested_virt: vmm::nested_virt::default_enabled(),
             split_irqchip: false,
             balloon: true,
             balloon_stats_interval: Some(Duration::from_secs(1)),
@@ -594,7 +594,10 @@ impl MachineBuilder {
         self
     }
 
-    /// Enable or disable nested virtualization.
+    /// Override nested virtualization (disabled by default).
+    ///
+    /// Enabling this requires host hardware and hypervisor support; VM creation
+    /// fails if it is unavailable. The guest kernel must also include KVM.
     pub fn nested_virt(mut self, enabled: bool) -> Self {
         self.nested_virt = enabled;
         self
@@ -1697,6 +1700,14 @@ mod tests {
             .finish();
 
         assert_eq!(topology.nodes[0].max_memory_mib, 512);
+    }
+
+    #[test]
+    fn nested_virtualization_requires_explicit_opt_in() {
+        assert!(!MachineBuilder::new().nested_virt);
+        assert!(MachineBuilder::new().nested_virt(true).nested_virt);
+        assert!(!MachineBuilder::new().nested_virt(false).nested_virt);
+        assert!(!vmm::resources::VmResources::default().nested_enabled);
     }
 
     #[test]

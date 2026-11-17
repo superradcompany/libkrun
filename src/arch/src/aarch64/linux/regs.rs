@@ -113,9 +113,16 @@ pub fn setup_regs(
     cpu_id: u8,
     boot_ip: u64,
     mem_info: &ArchMemoryInfo,
+    nested_enabled: bool,
 ) -> Result<()> {
     // Get the register index of the PSTATE (Processor State) register.
-    vcpu.set_one_reg(arm64_core_reg!(pstate), &PSTATE_FAULT_BITS_64.to_le_bytes())
+    let pstate = if nested_enabled {
+        // Boot the guest hypervisor at EL2h, retaining the interrupt masks.
+        (PSTATE_FAULT_BITS_64 & !0xf) | 0x9
+    } else {
+        PSTATE_FAULT_BITS_64
+    };
+    vcpu.set_one_reg(arm64_core_reg!(pstate), &pstate.to_le_bytes())
         .map_err(Error::SetCoreRegister)?;
 
     // Other vCPUs are powered off initially awaiting PSCI wakeup.
@@ -159,7 +166,7 @@ mod tests {
         let vcpu = vm.create_vcpu(0).unwrap();
         let (mem_info, _regions) = arch_memory_regions(layout::FDT_MAX_SIZE + 0x1000, 0, None);
 
-        match setup_regs(&vcpu, 0, 0x0, &mem_info).unwrap_err() {
+        match setup_regs(&vcpu, 0, 0x0, &mem_info, false).unwrap_err() {
             Error::SetCoreRegister(ref e) => assert_eq!(e.errno(), libc::ENOEXEC),
             _ => panic!("Expected to receive Error::SetCoreRegister"),
         }
@@ -167,7 +174,7 @@ mod tests {
         vm.get_preferred_target(&mut kvi).unwrap();
         vcpu.vcpu_init(&kvi).unwrap();
 
-        assert!(setup_regs(&vcpu, 0, 0x0, &mem_info).is_ok());
+        assert!(setup_regs(&vcpu, 0, 0x0, &mem_info, false).is_ok());
     }
     #[test]
     fn test_read_mpidr() {

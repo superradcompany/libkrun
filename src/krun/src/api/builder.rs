@@ -113,7 +113,7 @@ impl VmBuilder {
     /// - 1 vCPU
     /// - 512 MiB memory
     /// - Hyperthreading disabled
-    /// - Nested virtualization disabled
+    /// - Nested virtualization enabled where the host supports it
     pub fn new() -> Self {
         Self {
             machine: MachineBuilder::new(),

@@ -308,8 +308,18 @@ impl VsockMuxer {
 
     /// Retry proxy work after the caller has released the guest RX queue.
     pub(crate) fn kick_backends(&self) {
+        let mut signal_queue = false;
         for proxy in self.proxy_map.read().unwrap().values() {
-            proxy.lock().unwrap().kick();
+            let mut proxy = proxy.lock().unwrap();
+            // Credit retries cannot depend on backend I/O or notifier polling:
+            // the application may remain silent until its whole upload arrives.
+            signal_queue |= proxy.retry_credit();
+            proxy.kick();
+        }
+        if signal_queue {
+            if let Some(interrupt) = &self.interrupt {
+                interrupt.signal_used_queue();
+            }
         }
     }
 
@@ -1374,6 +1384,199 @@ mod tests {
         let mut events = vec![EpollEvent::new(EventSet::empty(), 0); 2];
         assert_eq!(muxer.epoll.wait(2, 1000, &mut events).unwrap(), 1);
         assert_eq!(events[0].data(), (4001u64 << 32) | 5000);
+    }
+
+    #[test]
+    fn exact_fit_rx_refills_retry_silent_streams_without_download_starvation() {
+        use std::collections::HashSet;
+        use std::io;
+
+        use super::super::device::Vsock;
+        use super::super::packet::VSOCK_PKT_HDR_SIZE;
+        use super::super::{VsockShutdown, VsockStreamBackend};
+        use crate::legacy::DummyIrqChip;
+        use crate::virtio::{Descriptor, DescriptorChain, DeviceState};
+        use vm_memory::{Bytes, GuestAddress};
+
+        struct Stream {
+            readable: bool,
+        }
+        impl VsockStreamBackend for Stream {
+            fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+                if !self.readable {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                buf.fill(b'd');
+                Ok(buf.len())
+            }
+            fn write(&self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn shutdown(&self, _how: VsockShutdown) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // Cover a queue full of non-retryable controls and more silent upload
+        // streams than the credit budget. No background thread is needed: call
+        // the actual RX handler, then service the competing download first.
+        for (control_count, stream_count) in
+            [(defs::MUXER_RXQ_SIZE, 1), (0, defs::MUXER_RXQ_SIZE / 2 + 1)]
+        {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+            let mut queue = VirtQueue::new(256);
+            queue.size = 256;
+            queue.ready = true;
+            queue.desc_table = GuestAddress(0x1000);
+            queue.avail_ring = GuestAddress(0x3000);
+            queue.used_ring = GuestAddress(0x4000);
+            for index in 0..256u16 {
+                let addr = 0x8000 + u64::from(index) * 128;
+                mem.write_slice(&[0xff; 128], GuestAddress(addr)).unwrap();
+                mem.write_obj(
+                    Descriptor {
+                        addr,
+                        len: 128,
+                        flags: 2,
+                        next: 0,
+                    },
+                    GuestAddress(0x1000 + u64::from(index) * 16),
+                )
+                .unwrap();
+                mem.write_obj(index, GuestAddress(0x3004 + u64::from(index) * 2))
+                    .unwrap();
+            }
+            let queue = Arc::new(Mutex::new(queue));
+            let interrupt =
+                InterruptTransport::new(DummyIrqChip::new().into(), "credit-retry".into()).unwrap();
+            let mut device = Vsock::new(3, None, None, None, None, TsiFlags::empty()).unwrap();
+            device.queue_rx = Some(Arc::clone(&queue));
+            device.device_state = DeviceState::Activated(mem.clone(), interrupt.clone());
+            device.muxer.queue = Some(Arc::clone(&queue));
+            device.muxer.mem = Some(mem.clone());
+            device.muxer.interrupt = Some(interrupt);
+            for port in 0..control_count {
+                assert!(device.muxer.rxq.lock().unwrap().push(MuxerRx::Reset {
+                    local_port: port as u32,
+                    peer_port: 1
+                }));
+            }
+
+            let tx_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+            tx_mem
+                .write_obj(
+                    Descriptor {
+                        addr: 0x2000,
+                        len: VSOCK_PKT_HDR_SIZE as u32,
+                        flags: 1,
+                        next: 1,
+                    },
+                    GuestAddress(0x1000),
+                )
+                .unwrap();
+            tx_mem
+                .write_obj(
+                    Descriptor {
+                        addr: 0x3000,
+                        len: 1,
+                        flags: 0,
+                        next: 0,
+                    },
+                    GuestAddress(0x1010),
+                )
+                .unwrap();
+            tx_mem.write_obj(1u32, GuestAddress(0x2018)).unwrap();
+            let tx_head =
+                DescriptorChain::checked_new(&tx_mem, GuestAddress(0x1000), 2, 0).unwrap();
+            let mut tx = VsockPacket::from_tx_virtq_head(&tx_head).unwrap();
+            tx.set_buf_alloc(65536)
+                .set_src_port(8000)
+                .set_dst_port(7000);
+
+            for index in 0..stream_count {
+                let mut proxy = CustomStreamProxy::new(
+                    index as u64 + 1,
+                    3,
+                    5000,
+                    4000 + index as u32,
+                    Box::new(Stream { readable: false }),
+                    VsockNotifier::new().unwrap(),
+                    device.muxer.epoll.clone(),
+                    mem.clone(),
+                    Arc::clone(&queue),
+                    device.muxer.rxq.clone(),
+                )
+                .unwrap();
+                proxy.sendmsg(&tx);
+                device
+                    .muxer
+                    .proxy_map
+                    .write()
+                    .unwrap()
+                    .insert(index as u64 + 1, Mutex::new(Box::new(proxy)));
+            }
+            let mut download = CustomStreamProxy::new(
+                1000,
+                3,
+                7000,
+                8000,
+                Box::new(Stream { readable: true }),
+                VsockNotifier::new().unwrap(),
+                device.muxer.epoll.clone(),
+                mem.clone(),
+                Arc::clone(&queue),
+                device.muxer.rxq.clone(),
+            )
+            .unwrap();
+            download.prepare_connect(&tx);
+            device
+                .muxer
+                .proxy_map
+                .write()
+                .unwrap()
+                .insert(1000, Mutex::new(Box::new(download)));
+
+            let mut credited = HashSet::new();
+            for step in 0..control_count + stream_count {
+                let index = (step % 256) as u16;
+                mem.write_obj((step + 1) as u16, GuestAddress(0x3002))
+                    .unwrap();
+                assert!(
+                    device.process_stream_rx(),
+                    "silent credit lost at refill {step}"
+                );
+                let used: u16 = mem.read_obj(GuestAddress(0x4002)).unwrap();
+                assert_eq!(used, (step + 1) as u16);
+                let head =
+                    DescriptorChain::checked_new(&mem, GuestAddress(0x1000), 256, index).unwrap();
+                let packet = VsockPacket::from_rx_virtq_head(&head).unwrap();
+                assert_eq!(packet.len(), 0);
+                assert_eq!(packet.flags(), 0);
+                if packet.op() == uapi::VSOCK_OP_CREDIT_UPDATE {
+                    assert_eq!(packet.src_port(), 5000);
+                    assert_eq!(packet.fwd_cnt(), 1);
+                    assert!(credited.insert(packet.dst_port()));
+                } else {
+                    assert_eq!(packet.op(), uapi::VSOCK_OP_RST);
+                }
+                // A readable download gets first service after every refill.
+                // It cannot steal the buffer already used for queued credit.
+                let update = device
+                    .muxer
+                    .proxy_map
+                    .read()
+                    .unwrap()
+                    .get(&1000)
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .process_event(EventSet::IN);
+                assert!(!update.signal_queue);
+                assert!(device.muxer.rxq.lock().unwrap().len() <= defs::MUXER_RXQ_SIZE);
+            }
+            assert_eq!(credited.len(), stream_count);
+            assert!(device.muxer.rxq.lock().unwrap().is_empty());
+        }
     }
 
     #[test]

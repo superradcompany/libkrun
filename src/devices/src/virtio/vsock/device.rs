@@ -141,11 +141,12 @@ impl Vsock {
             }
         }
 
-        // Backends can need a retry when the guest has just supplied receive
-        // capacity. Drop the virtqueue lock before taking proxy locks so the
+        // Retained credit also needs a retry when control entries were drained
+        // using every available descriptor: it can now be queued for the next
+        // refill. Drop the virtqueue lock before taking proxy locks so the
         // muxer thread cannot deadlock in the opposite proxy -> queue order.
         drop(queue_rx);
-        if needs_backend_kick {
+        if have_used || needs_backend_kick {
             self.muxer.kick_backends();
         }
 

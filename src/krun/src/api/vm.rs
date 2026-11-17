@@ -401,8 +401,10 @@ impl Vm {
     }
 
     /// Supplies backend-qualified execution state to restore before the first guest instruction.
+    /// The captured nesting mode replaces the boot policy, including its automatic default.
     #[cfg(not(feature = "tee"))]
     pub fn set_execution_restore(&mut self, state: vmm::execution_state::ExecutionState) {
+        self.vmr.nested_enabled = state.nested_enabled();
         self.execution_restore = Some(state);
     }
 
@@ -600,6 +602,15 @@ impl Vm {
         #[cfg(not(feature = "tee"))]
         {
             self.vmr.zeroed_restore_memory = self.memory_restore.is_some();
+        }
+
+        #[cfg(all(not(feature = "tee"), target_os = "windows", target_arch = "x86_64"))]
+        if let Some(state) = &self.execution_restore {
+            self.vmr.tsc_frequency_hz = Some(
+                state
+                    .tsc_frequency_hz()
+                    .map_err(|e| Error::Build(BuildError::Start(format!("restore clock: {e}"))))?,
+            );
         }
 
         let (_vmm, placement_report) = vmm::builder::build_microvm_paused(
@@ -1465,6 +1476,29 @@ mod tests {
 
     #[cfg(not(feature = "tee"))]
     #[test]
+    fn execution_restore_uses_captured_nesting_instead_of_boot_policy() {
+        for (schema, nested) in [(1_u16, false), (2_u16, true)] {
+            // Minimal versioned x86 KVM envelope; no backend is started by this test.
+            let mut bytes = b"MSBKEXEC\0".to_vec();
+            bytes.extend_from_slice(&schema.to_le_bytes());
+            bytes.extend_from_slice(&[1, 1]);
+            bytes.extend_from_slice(&1_u32.to_le_bytes());
+            bytes.extend_from_slice(&1_u64.to_le_bytes());
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+            let state = vmm::execution_state::ExecutionState::decode(&bytes).unwrap();
+            let mut vm = make_vm();
+            vm.vmr.nested_enabled = !nested;
+
+            vm.set_execution_restore(state);
+
+            assert_eq!(vm.vmr.nested_enabled, nested);
+            assert_eq!(vm.execution_restore.unwrap().encode().unwrap(), bytes);
+        }
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
     fn initial_pause_gate_is_explicit_and_disabled_by_default() {
         let mut vm = make_vm();
         assert!(!vm.start_paused);
@@ -1904,6 +1938,15 @@ impl VmControl {
     /// This does not resume the VM or relax any vCPU/device quiescence barriers.
     pub fn wait_until_paused_without_timeout(&self) -> Result<VmExecutionState> {
         self.vmm.wait_until_paused_inner(None)
+    }
+
+    /// Checks execution-state admission without pausing or changing the VM.
+    ///
+    /// Embedders can reject unsupported captures before preparing storage or
+    /// freezing the guest. A successful check does not replace the paused
+    /// boundary or the device and CPU checks performed during capture.
+    pub fn validate_execution_state_capture(&self) -> Result<()> {
+        self.with_running_vmm(|vmm| vmm.require_nested_execution_state_support())
     }
 
     /// Captures the exact backend execution state at the current paused boundary.

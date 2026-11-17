@@ -1,0 +1,60 @@
+name: Publish crates
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Merged release version (for example, 0.1.42)'
+        required: true
+        type: string
+      publish:
+        description: 'Publish to crates.io (leave off to validate the plan only)'
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-crates
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: github.ref == 'refs/heads/krun'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate release plan
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: python3 scripts/publish-crates.py --version "$RELEASE_VERSION"
+      - name: Test release orchestration
+        run: python3 -m unittest discover -s scripts -p 'test_publish_crates.py'
+
+  publish:
+    needs: plan
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Publish release crates
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: python3 scripts/publish-crates.py --version "$RELEASE_VERSION" --publish

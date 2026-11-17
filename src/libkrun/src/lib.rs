@@ -1975,10 +1975,6 @@ pub unsafe extern "C" fn krun_set_console_output(ctx_id: u32, c_filepath: *const
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 pub unsafe extern "C" fn krun_set_nested_virt(ctx_id: u32, enabled: bool) -> i32 {
-    if enabled && !cfg!(target_os = "macos") {
-        return -libc::EINVAL;
-    }
-
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
@@ -1992,14 +1988,10 @@ pub unsafe extern "C" fn krun_set_nested_virt(ctx_id: u32, enabled: bool) -> i32
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 pub unsafe extern "C" fn krun_check_nested_virt() -> i32 {
-    #[cfg(target_os = "macos")]
-    match hvf::check_nested_virt() {
-        Ok(supp) => supp as i32,
-        Err(_) => -libc::EINVAL,
+    match vmm::nested_virt::supported() {
+        Ok(supported) => supported as i32,
+        Err(error) => -error.raw_os_error().unwrap_or(libc::EIO),
     }
-
-    #[cfg(not(target_os = "macos"))]
-    -libc::EOPNOTSUPP
 }
 
 const KRUN_FEATURE_NET: u64 = 0;

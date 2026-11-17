@@ -290,6 +290,9 @@ pub enum MemoryPlacementResult {
 /// A data structure that encapsulates the device configurations
 /// held in the Vmm.
 pub struct VmResources {
+    /// Guest-visible TSC rate to configure before Windows partition setup.
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    pub tsc_frequency_hz: Option<u64>,
     /// Complete immutable private memory image installed before guest activation.
     #[cfg(not(feature = "tee"))]
     pub private_memory_backing: Option<crate::private_memory::PrivateMemoryBacking>,
@@ -404,6 +407,8 @@ pub struct VmResources {
 impl Default for VmResources {
     fn default() -> Self {
         Self {
+            #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+            tsc_frequency_hz: None,
             #[cfg(not(feature = "tee"))]
             private_memory_backing: None,
             #[cfg(not(feature = "tee"))]
@@ -448,7 +453,7 @@ impl Default for VmResources {
             snd_device: false,
             console_output: None,
             smbios_oem_strings: None,
-            nested_enabled: false,
+            nested_enabled: crate::nested_virt::default_enabled(),
             split_irqchip: false,
             metrics: MetricsWriter::default(),
             enable_balloon: true,

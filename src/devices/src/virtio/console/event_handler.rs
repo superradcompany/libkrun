@@ -51,8 +51,8 @@ impl Console {
         // `interest_list()`.
         let self_subscriber = event_manager.subscriber(activate_evt).unwrap();
 
-        for queue_index in 0..self.queues.len() {
-            let queue_evt = eventfd_pollable(&self.queue_events[queue_index]);
+        for (queue_index, event) in self.queue_events[..self.queues.len()].iter().enumerate() {
+            let queue_evt = eventfd_pollable(event);
             event_manager
                 .register(
                     queue_evt,

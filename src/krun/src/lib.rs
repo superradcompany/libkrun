@@ -256,6 +256,10 @@ pub use api::{PrivateMemoryBacking, PrivateMemoryRegion};
 pub use devices::virtio::net::rate_limit::{
     RateLimiterConfig, RateLimiterConfigError, TokenBucketConfig,
 };
+/// Return the default-off nested virtualization policy.
+pub use vmm::nested_virt::default_enabled as default_nested_virt;
+/// Query host/backend nested virtualization support; guest KVM support is separate.
+pub use vmm::nested_virt::supported as nested_virt_supported;
 
 #[cfg(not(target_os = "windows"))]
 pub use backends::console::ConsolePortBackend;

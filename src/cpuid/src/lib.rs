@@ -58,6 +58,10 @@ pub fn filter_cpuid(kvm_cpuid: &mut CpuId, vm_spec: &VmSpec) -> Result<(), Error
     let maybe_cpuid_transformer: Option<&dyn CpuidTransformer> = match vm_spec.cpu_vendor_id() {
         VENDOR_ID_INTEL => Some(&intel::IntelCpuidTransformer {}),
         VENDOR_ID_AMD => Some(&amd::AmdCpuidTransformer {}),
+        // Hygon C86 is Dhyana (Zen-1 derived, CPUID family 24, AMD64 license);
+        // it needs the same leaf handling as AMD (e.g. the leaf-0x1 TSC-deadline
+        // advertisement), otherwise the guest hangs in timer calibration.
+        VENDOR_ID_HYGON => Some(&amd::AmdCpuidTransformer {}),
         _ => None,
     };
 
@@ -99,7 +103,11 @@ mod tests {
     #[test]
     fn test_vm_spec_nested_enabled() {
         let mut vm_spec = VmSpec::new(0, 1, false).unwrap();
+        assert!(!vm_spec.nested_enabled());
+
+        vm_spec.set_nested_enabled(true);
         assert!(vm_spec.nested_enabled());
+
         vm_spec.set_nested_enabled(false);
         assert!(!vm_spec.nested_enabled());
     }
@@ -164,8 +172,7 @@ mod tests {
 
     #[test]
     fn test_filter_cpuid_masks_nested_virt_when_disabled() {
-        let mut vm_spec = VmSpec::new(0, 1, false).unwrap();
-        vm_spec.set_nested_enabled(false);
+        let vm_spec = VmSpec::new(0, 1, false).unwrap();
         let mut cpuid = virt_cpuid();
         filter_cpuid(&mut cpuid, &vm_spec).unwrap();
         assert_eq!(virt_bits(&cpuid), 0);
@@ -173,8 +180,8 @@ mod tests {
 
     #[test]
     fn test_filter_cpuid_keeps_nested_virt_when_enabled() {
-        // Nested virtualization is enabled by default.
-        let vm_spec = VmSpec::new(0, 1, false).unwrap();
+        let mut vm_spec = VmSpec::new(0, 1, false).unwrap();
+        vm_spec.set_nested_enabled(true);
         assert!(vm_spec.nested_enabled());
         let mut cpuid = virt_cpuid();
         filter_cpuid(&mut cpuid, &vm_spec).unwrap();

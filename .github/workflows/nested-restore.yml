@@ -1,0 +1,79 @@
+name: Nested restore
+
+on:
+  pull_request:
+  push:
+    branches: [krun]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nested-restore-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-x86:
+    name: Running nested VM (Linux x86_64)
+    runs-on: [self-hosted, Linux, X64, self-hosted-ubuntu-2404-x64, nested-virt]
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "2"
+      NESTED_BUILD_JOBS: "2"
+      NESTED_TEST_DIR: ${{ github.workspace }}/nested-test-output
+      NESTED_FIRMWARE_DIR: ${{ github.workspace }}/test-firmware
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: superradcompany/libkrunfw
+          ref: 56bf194627a07996dc4ce21211fe86ada4c76080
+          path: test-firmware
+          persist-credentials: false
+      - name: Check nested virtualization host
+        run: |
+          lscpu
+          test -c /dev/kvm
+          grep -Eq '(vmx|svm)' /proc/cpuinfo
+          for module in kvm_intel kvm_amd; do
+            if test -f /sys/module/$module/parameters/nested; then
+              grep -Eq '^(Y|1)$' /sys/module/$module/parameters/nested
+            fi
+          done
+          if ! test -r /dev/kvm || ! test -w /dev/kvm; then
+            echo "::error::The self-hosted runner account needs read/write access to /dev/kvm."
+            exit 1
+          fi
+      - name: Check provisioned build dependencies
+        run: |
+          for package in build-essential musl-tools flex bison libelf-dev libssl-dev bc python3 python3-pyelftools; do
+            if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -qx 'install ok installed'; then
+              echo "::error::Install $package during runner provisioning. CI jobs do not have sudo access."
+              exit 1
+            fi
+          done
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" target add x86_64-unknown-linux-musl
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: nested-cargo-${{ runner.os }}-${{ hashFiles('tests/nested-restore/**/Cargo.lock', 'tests/nested-restore/Cargo.lock') }}
+      - name: Build Rust guest, host harness and firmware
+        run: tests/nested-restore/ci.sh build
+      - name: Capture, restore, fork and recapture with both IRQ profiles
+        run: tests/nested-restore/ci.sh run
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nested-restore-linux-x86_64
+          path: |
+            ${{ github.workspace }}/nested-test-output/**/*.log
+            ${{ github.workspace }}/nested-test-output/**/progress
+            test-firmware/linux-*/.config
+          if-no-files-found: warn
