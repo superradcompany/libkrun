@@ -80,17 +80,18 @@ jobs:
       - name: Setup build environment
         uses: ./.github/actions/setup-build-env
       
-      - name: Cache GLib 2.82 + GTK 4.16 build
+      - name: Cache GTK 4.16 build
         uses: actions/cache@v4
         id: gtk-cache
         with:
           path: ~/gtk-prefix
-          key: ${{ runner.os }}-${{ runner.arch }}-gtk-4.16.0
+          key: ${{ runner.os }}-${{ matrix.runner }}-${{ runner.arch }}-gtk-4.16.0-system-glib-v1
       
       - name: Install GTK system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -yqq --no-install-recommends \
+            libglib2.0-dev \
             libffi-dev \
             libmount-dev \
             libpcre2-dev \
@@ -104,7 +105,7 @@ jobs:
             wayland-protocols \
             libwayland-dev
       
-      - name: Add GLib + GTK paths to environment
+      - name: Add GTK paths to environment
         run: |
           case "$(uname -m)" in
             x86_64)
@@ -131,15 +132,12 @@ jobs:
             ninja-build
           
           
-          # Build GLib first
-          cd /tmp
-          curl -L -o glib-2.82.2.tar.xz https://download.gnome.org/sources/glib/2.82/glib-2.82.2.tar.xz
-          tar -xf glib-2.82.2.tar.xz
-          cd glib-2.82.2
-          meson setup builddir --prefix=$HOME/gtk-prefix --buildtype=release
-          meson compile -C builddir
-          meson install -C builddir
-          
+          # GTK 4.16 requires GLib >= 2.76, already provided by these Ubuntu runners.
+          # Keep the distro tools and libraries together: a private older GLib can
+          # shadow the system library and break glib-compile-resources at startup.
+          pkg-config --atleast-version=2.76.0 glib-2.0 gio-2.0
+          glib-compile-resources --version
+
           # Build GTK
           cd /tmp
           curl -L -o gtk-4.16.0.tar.xz https://download.gnome.org/sources/gtk/4.16/gtk-4.16.0.tar.xz
