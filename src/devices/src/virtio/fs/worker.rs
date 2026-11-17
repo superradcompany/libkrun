@@ -210,7 +210,7 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
                 .map_err(FsError::QueueWriter)
                 .unwrap();
 
-            if let Err(e) = self.server.handle_message(
+            let used_len = match self.server.handle_message(
                 reader,
                 writer,
                 &self.shm_region,
@@ -218,10 +218,19 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 &self.map_sender,
             ) {
-                error!("error handling message: {e:?}");
-            }
+                // Linux validates this against the FUSE reply header. No-reply requests
+                // (such as FORGET) return zero; protocol error replies include a header.
+                Ok(written) => u32::try_from(written).unwrap_or_else(|e| {
+                    error!("FUSE response exceeds the used-ring length field: {e}");
+                    0
+                }),
+                Err(e) => {
+                    error!("error handling message: {e:?}");
+                    0
+                }
+            };
 
-            if let Err(e) = queue.add_used(&self.mem, head.index, 0) {
+            if let Err(e) = queue.add_used(&self.mem, head.index, used_len) {
                 error!("failed to add used elements to the queue: {e:?}");
             }
 
@@ -240,4 +249,140 @@ fn eventfd_pollable(event: &EventFd) -> Pollable {
 #[cfg(windows)]
 fn eventfd_pollable(event: &EventFd) -> Pollable {
     event.as_raw_handle()
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::mem::size_of;
+
+    use utils::eventfd::EFD_NONBLOCK;
+    use vm_memory::{ByteValued, Bytes, GuestAddress};
+
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::fs::filesystem::Context;
+    use crate::virtio::fs::fuse::{AccessIn, ForgetIn, InHeader, Opcode, OutHeader};
+    use crate::virtio::queue::tests::VirtQueue;
+    use crate::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+
+    struct TestFs;
+
+    impl FileSystem for TestFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn readlink(&self, _ctx: Context, _inode: u64) -> io::Result<Vec<u8>> {
+            Ok(b"target".to_vec())
+        }
+
+        fn access(&self, _ctx: Context, _inode: u64, _mask: u32) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn complete(opcode: u32, body: &[u8], reply_capacity: u32) -> (u32, Vec<u8>) {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 8);
+        let header = InHeader {
+            len: (size_of::<InHeader>() + body.len()) as u32,
+            opcode,
+            unique: 42,
+            nodeid: 1,
+            ..Default::default()
+        };
+        mem.write_obj(header, GuestAddress(0x1000)).unwrap();
+        mem.write_slice(body, GuestAddress(0x1000 + size_of::<InHeader>() as u64))
+            .unwrap();
+        // Leave a sentinel beyond the actual reply to detect accidental capacity reporting.
+        mem.write_slice(&[0xa5; 128], GuestAddress(0x2000)).unwrap();
+        vq.dtable[0].set(
+            0x1000,
+            header.len,
+            if reply_capacity == 0 {
+                0
+            } else {
+                VIRTQ_DESC_F_NEXT
+            },
+            1,
+        );
+        vq.dtable[1].set(0x2000, reply_capacity, VIRTQ_DESC_F_WRITE, 0);
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "test-fs".into()).unwrap();
+        let mut worker = FsWorker::new(
+            Arc::new(TestFs),
+            vec![vq.create_queue()],
+            vec![Arc::new(EventFd::new(EFD_NONBLOCK).unwrap())],
+            interrupt,
+            mem.clone(),
+            None,
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            Arc::new(AtomicI32::new(0)),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            None,
+            0,
+        );
+
+        assert!(!worker.process_queue(0));
+        assert_eq!(vq.used.idx.get(), 1);
+        let used = vq.used.ring[0].get();
+        assert_eq!(used.id, 0);
+        let mut reply = vec![0; 128];
+        mem.read_slice(&mut reply, GuestAddress(0x2000)).unwrap();
+        (used.len, reply)
+    }
+
+    fn assert_reply(opcode: u32, body: &[u8], error: i32, payload: &[u8]) {
+        let (used_len, reply) = complete(opcode, body, 128);
+        let header = OutHeader::from_slice(&reply[..size_of::<OutHeader>()]).unwrap();
+        assert_eq!(used_len as usize, size_of::<OutHeader>() + payload.len());
+        assert_eq!(used_len, header.len);
+        assert_eq!(header.unique, 42);
+        assert_eq!(header.error, error);
+        assert_eq!(&reply[size_of::<OutHeader>()..used_len as usize], payload);
+        assert!(reply[used_len as usize..].iter().all(|byte| *byte == 0xa5));
+    }
+
+    #[test]
+    fn used_length_includes_reply_header_and_payload() {
+        assert_reply(Opcode::Readlink as u32, &[], 0, b"target");
+    }
+
+    #[test]
+    fn used_length_includes_success_header_without_payload() {
+        assert_reply(
+            Opcode::Access as u32,
+            AccessIn::default().as_slice(),
+            0,
+            &[],
+        );
+    }
+
+    #[test]
+    fn used_length_includes_protocol_error_header() {
+        // An unsupported opcode produces a valid Linux ENOSYS response, not a transport error.
+        assert_reply(u32::MAX, &[], -38, &[]);
+    }
+
+    #[test]
+    fn forget_completes_without_a_reply_buffer() {
+        let (used_len, reply) =
+            complete(Opcode::Forget as u32, ForgetIn { nlookup: 1 }.as_slice(), 0);
+        assert_eq!(used_len, 0);
+        assert!(reply.iter().all(|byte| *byte == 0xa5));
+    }
+
+    #[test]
+    fn decode_failure_completes_without_claiming_a_reply() {
+        // ACCESS requires a body. A decode failure must not claim unwritten response bytes.
+        let (used_len, reply) = complete(Opcode::Access as u32, &[], 128);
+        assert_eq!(used_len, 0);
+        assert!(reply.iter().all(|byte| *byte == 0xa5));
+    }
 }
