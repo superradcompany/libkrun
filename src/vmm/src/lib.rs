@@ -2305,6 +2305,13 @@ impl Vmm {
     pub fn stop(&mut self, exit_code: i32) {
         info!("Vmm is stopping.");
 
+        // A guest can reach a generic zero-code shutdown after its panic handler.
+        // Preserve the nonzero status for both embedding clients and the host process.
+        let exit_code = if self.guest_metrics.guest_panicked() && exit_code == 0 {
+            1
+        } else {
+            exit_code
+        };
         self.notify_exit_observers(exit_code);
 
         // Exit from Firecracker using the provided exit code. Safe because we're terminating

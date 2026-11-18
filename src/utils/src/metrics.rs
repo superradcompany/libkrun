@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -128,6 +128,7 @@ pub struct FilesystemMetrics {
 }
 
 struct MetricsState {
+    guest_panicked: AtomicBool,
     vcpu_time_ns: AtomicU64,
     vcpu_time_valid: AtomicU64,
     memory_total_bytes: AtomicU64,
@@ -159,6 +160,11 @@ struct BlockDeviceState {
 //--------------------------------------------------------------------------------------------------
 
 impl MetricsHandle {
+    /// True once this VM's guest explicitly signaled a kernel panic.
+    pub fn guest_panicked(&self) -> bool {
+        self.state.guest_panicked.load(Ordering::Acquire)
+    }
+
     /// Return the last coherent report without refreshing its receipt time.
     /// Callers apply freshness using the guest cadence and the platform clock
     /// documented on [`GuestMemoryObservation::received_at`].
@@ -327,6 +333,11 @@ impl MetricsHandle {
 }
 
 impl MetricsWriter {
+    /// The signal belongs to this VM lifetime, independently of sampling or paused time.
+    pub fn record_guest_panic(&self) {
+        self.state.guest_panicked.store(true, Ordering::Release);
+    }
+
     /// Epoch to bind to a guest statistics request before returning its buffer.
     pub fn guest_memory_epoch(&self) -> u64 {
         self.state.guest_memory.lock().unwrap().epoch
@@ -497,6 +508,7 @@ impl BlockMetricsWriter {
 impl Default for MetricsState {
     fn default() -> Self {
         Self {
+            guest_panicked: AtomicBool::new(false),
             vcpu_time_ns: AtomicU64::new(0),
             vcpu_time_valid: AtomicU64::new(0),
             memory_total_bytes: AtomicU64::new(0),

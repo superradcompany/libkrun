@@ -144,16 +144,18 @@ impl VirtioDevice for MsbMetrics {
         &defs::QUEUE_CONFIG
     }
 
-    fn read_config(&self, _offset: u64, _data: &mut [u8]) {
-        error!("msb_metrics: invalid request to read config space");
+    fn read_config(&self, offset: u64, data: &mut [u8]) {
+        data.fill(0);
+        if offset == 0 && data.len() == 4 {
+            data.copy_from_slice(b"PNC1");
+        }
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
-        warn!(
-            "msb_metrics: guest driver attempted to write device config (offset={:x}, len={:x})",
-            offset,
-            data.len()
-        );
+        if offset == 4 && data == b"PNC1" {
+            // Synchronous MMIO delivery survives a stopped workqueue or a full virtqueue.
+            self.metrics.record_guest_panic();
+        }
     }
 
     fn activate(
@@ -263,5 +265,27 @@ mod tests {
 
         assert_eq!(writer.handle().snapshot().filesystem.upper_used_bytes, None);
         assert_eq!(writer.handle().snapshot().filesystem.upper_free_bytes, None);
+    }
+}
+
+#[cfg(test)]
+mod panic_tests {
+    use super::*;
+
+    #[test]
+    fn panic_register_is_exact_sticky_and_vm_local() {
+        let writer = MetricsWriter::default();
+        let mut device = MsbMetrics::new(writer.clone()).unwrap();
+        let mut value = [0; 4];
+        device.read_config(0, &mut value);
+        assert_eq!(&value, b"PNC1");
+        device.write_config(0, &value);
+        device.write_config(4, &value[..3]);
+        device.write_config(4, b"PNC2");
+        assert!(!writer.handle().guest_panicked());
+        device.write_config(4, &value);
+        device.write_config(4, &[0; 4]);
+        assert!(writer.handle().guest_panicked());
+        assert!(!MetricsWriter::default().handle().guest_panicked());
     }
 }
