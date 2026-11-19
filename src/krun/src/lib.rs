@@ -221,15 +221,15 @@ pub use api::builders::{
 pub use api::error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use api::exit_handle::ExitHandle;
 pub use api::metrics::{
-    BlockDeviceMetrics, BlockMetrics, CpuMetrics, FilesystemMetrics, MemoryMetrics, MetricsHandle,
-    VmMetrics,
+    BlockDeviceMetrics, BlockMetrics, CpuMetrics, FilesystemMetrics, GuestMemoryObservation,
+    MemoryMetrics, MetricsHandle, VmMetrics,
 };
 pub use api::vm::Vm;
 #[cfg(not(feature = "tee"))]
 pub use api::vm::{
     VmControl, VmCpuState, VmExecutionState, VmGenerationId, VmGenerationRequest,
-    VmGenerationState, VmGenerationWaitOutcome, VmMemoryRestoreSource, VmMemoryRestoreTarget,
-    VmMemoryState, VmPauseGeneration,
+    VmGenerationState, VmGenerationWaitOutcome, VmMemoryDeviceState, VmMemoryRestoreSource,
+    VmMemoryRestoreTarget, VmMemoryState, VmPauseGeneration,
 };
 #[cfg(all(feature = "blk", not(feature = "tee")))]
 pub use api::{

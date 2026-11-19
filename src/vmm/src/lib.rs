@@ -769,6 +769,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Contains the state and associated methods required for the Firecracker VMM.
 pub struct Vmm {
     // Guest VM core resources.
+    guest_metrics: utils::metrics::MetricsHandle,
     guest_memory: GuestMemoryMmap,
     arch_memory_info: ArchMemoryInfo,
 
@@ -1148,6 +1149,33 @@ impl Vmm {
         }
     }
 
+    /// Read admitted block geometry at the current pause without draining queues or
+    /// reopening a backing path. An intentionally unavailable disk has no observation.
+    #[cfg(feature = "blk")]
+    pub fn block_capacity_bytes(&self, device_id: &str) -> Result<Option<u64>> {
+        self.require_paused_device_boundary()?;
+        let bus_device = self
+            .mmio_device_manager
+            .get_device(DeviceType::Virtio(TYPE_BLOCK), device_id)
+            .ok_or_else(|| Error::DeviceStateNotFound(device_id.to_owned()))?;
+        let mut bus_device = bus_device
+            .lock()
+            .map_err(|_| Error::DeviceState("MMIO device mutex is poisoned".into()))?;
+        let transport = bus_device
+            .as_mut_any()
+            .downcast_mut::<MmioTransport>()
+            .ok_or_else(|| Error::DeviceState("block device is not on virtio-mmio".into()))?;
+        let device = transport.device();
+        let device = device
+            .lock()
+            .map_err(|_| Error::DeviceState("block device mutex is poisoned".into()))?;
+        let block = device
+            .as_any()
+            .downcast_ref::<Block>()
+            .ok_or_else(|| Error::DeviceState("device is not block".into()))?;
+        Ok(block.available_capacity_bytes())
+    }
+
     /// Grows an exclusively owned writable block image while execution is paused.
     /// A failed call can leave larger image metadata; callers must recover forward.
     #[cfg(feature = "blk")]
@@ -1283,6 +1311,8 @@ impl Vmm {
             VmmExecutionState::Indeterminate => return Err(Error::VcpuControlIndeterminate),
         }
 
+        // In-flight pre-pause statistics must not survive the lifecycle boundary.
+        self.guest_metrics.invalidate_guest_memory_observation();
         let request_id = self.next_control_request_id()?;
         self.execution_state = VmmExecutionState::Indeterminate;
 
@@ -1303,6 +1333,8 @@ impl Vmm {
         self.vm
             .pause_execution_time(&self.vcpus_handles)
             .map_err(Error::Vm)?;
+        // A report may have arrived while individual vCPUs were still converging.
+        self.guest_metrics.invalidate_guest_memory_observation();
         let generation = PauseGeneration(request_id);
         self.execution_state = VmmExecutionState::Paused(generation);
         Ok(generation)
@@ -1350,6 +1382,9 @@ impl Vmm {
             // them before running again; failure here leaves execution at the paused boundary.
             self.release_memory_baseline()?;
         }
+        // Require a new request/response after resume, including restoration of
+        // a queue containing pre-checkpoint statistics.
+        self.guest_metrics.invalidate_guest_memory_observation();
         // Repair CPU mappings before reopening device workers, then release vCPUs last.
         // Any mapping repair failure leaves both execution and devices quiesced.
         #[cfg(feature = "blk")]
@@ -2297,6 +2332,13 @@ impl Vmm {
     pub fn stop(&mut self, exit_code: i32) {
         info!("Vmm is stopping.");
 
+        // A guest can reach a generic zero-code shutdown after its panic handler.
+        // Preserve the nonzero status for both embedding clients and the host process.
+        let exit_code = if self.guest_metrics.guest_panicked() && exit_code == 0 {
+            1
+        } else {
+            exit_code
+        };
         self.notify_exit_observers(exit_code);
 
         // Exit from Firecracker using the provided exit code. Safe because we're terminating
