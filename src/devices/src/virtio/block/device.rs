@@ -705,6 +705,15 @@ pub struct Block {
 }
 
 impl Block {
+    /// Capacity advertised to the guest by the admitted backend. A placeholder retains
+    /// geometry for device emulation but cannot establish that backing is available.
+    pub fn available_capacity_bytes(&self) -> Option<u64> {
+        if self.unavailable {
+            return None;
+        }
+        self.config.capacity.checked_mul(SECTOR_SIZE)
+    }
+
     /// Recreate the guest-visible contract while denying all storage I/O.
     /// No source path is accepted or opened. Identity queries remain available.
     pub fn new_unavailable(state: &BlockState, metrics: BlockMetricsWriter) -> io::Result<Self> {
@@ -1626,6 +1635,7 @@ mod tests {
         block.grow_capacity(2 * 1024 * 1024).unwrap();
         let capacity = block.config.capacity;
         assert_eq!(capacity, 4096);
+        assert_eq!(block.available_capacity_bytes(), Some(2 * 1024 * 1024));
         assert_eq!(block.disk.as_ref().unwrap().nsectors, 4096);
         let mut data = [0u8; 512];
         let disk = block.disk_image.lock().unwrap();
@@ -1793,6 +1803,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(block.capture_state().unwrap(), state);
+            assert_eq!(block.available_capacity_bytes(), None);
             block.stop_worker().unwrap();
             let disk = block.disk.take().unwrap();
             assert!(disk.unavailable);

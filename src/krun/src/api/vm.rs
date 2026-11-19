@@ -2018,6 +2018,13 @@ impl VmControl {
         self.with_running_vmm(|vmm| vmm.replace_block_backend(device_id, backend))
     }
 
+    /// Observe guest-visible bytes at a paused boundary without quiescing the block
+    /// worker. A device restored with unavailable backing returns no capacity evidence.
+    #[cfg(feature = "blk")]
+    pub fn block_capacity_bytes(&self, device_id: &str) -> Result<Option<u64>> {
+        self.with_running_vmm(|vmm| vmm.block_capacity_bytes(device_id))
+    }
+
     /// Grows an exclusively owned writable block device at a paused queue boundary.
     /// The image and virtio capacity change; guest filesystem expansion remains the caller's job.
     /// Persist recovery intent first and recover forward if this returns an I/O error.

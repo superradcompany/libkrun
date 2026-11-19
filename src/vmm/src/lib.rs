@@ -1149,6 +1149,33 @@ impl Vmm {
         }
     }
 
+    /// Read admitted block geometry at the current pause without draining queues or
+    /// reopening a backing path. An intentionally unavailable disk has no observation.
+    #[cfg(feature = "blk")]
+    pub fn block_capacity_bytes(&self, device_id: &str) -> Result<Option<u64>> {
+        self.require_paused_device_boundary()?;
+        let bus_device = self
+            .mmio_device_manager
+            .get_device(DeviceType::Virtio(TYPE_BLOCK), device_id)
+            .ok_or_else(|| Error::DeviceStateNotFound(device_id.to_owned()))?;
+        let mut bus_device = bus_device
+            .lock()
+            .map_err(|_| Error::DeviceState("MMIO device mutex is poisoned".into()))?;
+        let transport = bus_device
+            .as_mut_any()
+            .downcast_mut::<MmioTransport>()
+            .ok_or_else(|| Error::DeviceState("block device is not on virtio-mmio".into()))?;
+        let device = transport.device();
+        let device = device
+            .lock()
+            .map_err(|_| Error::DeviceState("block device mutex is poisoned".into()))?;
+        let block = device
+            .as_any()
+            .downcast_ref::<Block>()
+            .ok_or_else(|| Error::DeviceState("device is not block".into()))?;
+        Ok(block.available_capacity_bytes())
+    }
+
     /// Grows an exclusively owned writable block image while execution is paused.
     /// A failed call can leave larger image metadata; callers must recover forward.
     #[cfg(feature = "blk")]
