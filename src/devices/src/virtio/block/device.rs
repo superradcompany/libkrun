@@ -105,8 +105,9 @@ pub(crate) struct DiskProperties {
     // controller and can fail a later activation closed.
     writeback_config: Option<BufferedWritebackConfig>,
     #[cfg(target_os = "linux")]
-    // Bounded mode must account real dirty data, so WRITE_ZEROES reuses this buffer instead of
-    // invoking a filesystem hole-punch or metadata-only zeroing operation.
+    // Bounded mode must account real dirty data, so WRITE_ZEROES and the unaligned edges of an
+    // unmapping zero write reuse this buffer instead of Imago's zeroing, which can fall back to
+    // unaccounted buffered zero-data writes.
     explicit_zero_buffer: Option<Box<[u8]>>,
     #[cfg(windows)]
     windows_raw_file: Option<Arc<WindowsRawFile>>,
@@ -420,13 +421,12 @@ impl DiskProperties {
     }
 
     pub(crate) fn discard_to_any(&self, offset: u64, length: u64) -> io::Result<()> {
-        if self.has_writeback_limit() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "discard is disabled by the bounded writeback policy",
-            ));
-        }
         self.validate_mutation_range(offset, length)?;
+
+        #[cfg(target_os = "linux")]
+        if let Some(controller) = &self.writeback_controller {
+            return self.bounded_discard(controller, offset, length, false);
+        }
 
         #[cfg(windows)]
         if let Some(raw_file) = &self.windows_raw_file {
@@ -438,13 +438,12 @@ impl DiskProperties {
     }
 
     pub(crate) fn discard_to_zero(&self, offset: u64, length: u64) -> io::Result<()> {
-        if self.has_writeback_limit() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "unmapping zero writes are disabled by the bounded writeback policy",
-            ));
-        }
         self.validate_mutation_range(offset, length)?;
+
+        #[cfg(target_os = "linux")]
+        if let Some(controller) = &self.writeback_controller {
+            return self.bounded_discard(controller, offset, length, true);
+        }
 
         #[cfg(windows)]
         if let Some(raw_file) = &self.windows_raw_file {
@@ -484,6 +483,52 @@ impl DiskProperties {
             let diskfile = self.file.lock().unwrap();
             diskfile.write_zeroes(chunk_offset, chunk_length)
         })
+    }
+
+    /// Discards a range under bounded writeback without dirtying unreserved pages.
+    ///
+    /// Only the interior aligned to the controller's discard alignment is punched, so the kernel
+    /// never zeroes a partial block in the page cache. The unaligned edges are left alone for a
+    /// plain discard, whose contents are unspecified, and are zeroed through the accounted
+    /// explicit-zero writer when the range must read back as zeroes. A host filesystem that
+    /// cannot punch turns a plain discard into a no-op and a zeroing discard into accounted zero
+    /// writes.
+    #[cfg(target_os = "linux")]
+    fn bounded_discard(
+        &self,
+        controller: &RefCell<BufferedWritebackController>,
+        offset: u64,
+        length: u64,
+        zeroes: bool,
+    ) -> io::Result<()> {
+        let end = offset.checked_add(length).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "block mutation range overflow")
+        })?;
+        let (aligned_start, aligned_end) = controller.borrow().punchable_range(offset, end);
+
+        if zeroes && offset < aligned_start {
+            self.write_zeroes(offset, aligned_start - offset)?;
+        }
+        if aligned_start < aligned_end {
+            // The punch bypasses Imago without taking its lock: this worker is the only thread
+            // issuing I/O to the image, and a punch may wait on writeback submission.
+            let punched = controller
+                .borrow_mut()
+                .punch_hole(aligned_start, aligned_end - aligned_start);
+            match punched {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                    if zeroes {
+                        self.write_zeroes(aligned_start, aligned_end - aligned_start)?;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if zeroes && aligned_end < end {
+            self.write_zeroes(aligned_end, end - aligned_end)?;
+        }
+        Ok(())
     }
 
     fn run_buffered_mutation<F>(
@@ -995,22 +1040,21 @@ impl Block {
             }
         };
 
+        // Bounded writeback punches only whole pages and filesystem blocks, so advertise its
+        // coarser alignment and let the guest issue discards the controller can retire whole.
         #[cfg(target_os = "linux")]
-        let bounded_writeback_enabled = writeback_config.is_some();
+        let discard_alignment = writeback_config.as_ref().map_or(
+            discard_alignment as u64,
+            BufferedWritebackConfig::discard_alignment,
+        );
         #[cfg(not(target_os = "linux"))]
-        let bounded_writeback_enabled = false;
+        let discard_alignment = discard_alignment as u64;
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)
             | (1u64 << VIRTIO_BLK_F_WRITE_ZEROES)
+            | (1u64 << VIRTIO_BLK_F_DISCARD)
             | (1u64 << VIRTIO_RING_F_EVENT_IDX);
-
-        // DISCARD and WRITE_ZEROES|UNMAP can create metadata-only holes that are invisible to
-        // sync_file_range() accounting. Keep ordinary WRITE_ZEROES, but force it through explicit
-        // zero-data writes while the hard writeback budget is active.
-        if !bounded_writeback_enabled {
-            avail_features |= 1u64 << VIRTIO_BLK_F_DISCARD;
-        }
 
         if sync_mode != SyncMode::None {
             avail_features |= 1u64 << VIRTIO_BLK_F_FLUSH;
@@ -1025,20 +1069,12 @@ impl Block {
             size_max: 0,
             // QUEUE_SIZE - 2
             seg_max: 254,
-            max_discard_sectors: if bounded_writeback_enabled {
-                0
-            } else {
-                u32::MAX
-            },
-            max_discard_seg: u32::from(!bounded_writeback_enabled),
-            discard_sector_alignment: if bounded_writeback_enabled {
-                0
-            } else {
-                discard_alignment as u32 / 512
-            },
+            max_discard_sectors: u32::MAX,
+            max_discard_seg: 1,
+            discard_sector_alignment: (discard_alignment / SECTOR_SIZE) as u32,
             max_write_zeroes_sectors: u32::MAX,
             max_write_zeroes_seg: 1,
-            write_zeroes_may_unmap: u8::from(!bounded_writeback_enabled),
+            write_zeroes_may_unmap: 1,
             ..Default::default()
         };
 
@@ -1146,8 +1182,8 @@ impl Block {
         disk.set_windows_raw_file(backend.windows_raw_file.clone());
         #[cfg(target_os = "linux")]
         if leaving_bounded_writeback {
-            // Guest-visible discard/unmap remains conservatively disabled, but the new direct-I/O
-            // backend bypasses the host page cache and no longer needs raw-offset accounting.
+            // The new direct-I/O backend bypasses the host page cache and no longer needs
+            // raw-offset accounting. Imago now serves discards, aligning them itself.
             self.writeback_config = None;
         }
         self.disk_image = backend.disk_image;
@@ -1695,7 +1731,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bounded_writeback_advertises_only_accountable_zeroing() {
+    fn bounded_writeback_advertises_aligned_discard_and_unmap() {
         let backing = TempFile::new().unwrap();
         backing.as_file().set_len(4 * 1024 * 1024).unwrap();
         let block = Block::new_with_writeback_limit(
@@ -1712,7 +1748,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(block.avail_features & (1u64 << VIRTIO_BLK_F_DISCARD), 0);
+        assert_ne!(block.avail_features & (1u64 << VIRTIO_BLK_F_DISCARD), 0);
         assert_ne!(
             block.avail_features & (1u64 << VIRTIO_BLK_F_WRITE_ZEROES),
             0
@@ -1721,10 +1757,14 @@ mod tests {
         let max_discard_seg = block.config.max_discard_seg;
         let discard_sector_alignment = block.config.discard_sector_alignment;
         let write_zeroes_may_unmap = block.config.write_zeroes_may_unmap;
-        assert_eq!(max_discard_sectors, 0);
-        assert_eq!(max_discard_seg, 0);
-        assert_eq!(discard_sector_alignment, 0);
-        assert_eq!(write_zeroes_may_unmap, 0);
+        let alignment = block.writeback_config.as_ref().unwrap().discard_alignment();
+        // SAFETY: sysconf has no pointer arguments.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        assert!(alignment >= page_size && alignment.is_power_of_two());
+        assert_eq!(max_discard_sectors, u32::MAX);
+        assert_eq!(max_discard_seg, 1);
+        assert_eq!(u64::from(discard_sector_alignment), alignment / SECTOR_SIZE);
+        assert_eq!(write_zeroes_may_unmap, 1);
 
         let legacy = Block::new(
             "legacy".to_string(),
@@ -1856,7 +1896,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bounded_worker_accepts_unmap_zeroes_without_discarding() {
+    fn bounded_worker_punches_only_when_unmap_is_allowed() {
         use std::os::unix::fs::{FileExt, MetadataExt};
 
         use vm_memory::{Bytes, GuestAddress};
@@ -1867,10 +1907,13 @@ mod tests {
             create_descriptor_chain, DescriptorType, Reader, Writer,
         };
 
-        // Cross several explicit-zero chunks under a tiny pressure target. A full overwrite
-        // must persist, retain allocated blocks and leave the neighboring sentinels intact.
+        // Cross several explicit-zero chunks under a tiny pressure target. A plain zero write
+        // must keep its allocation, an unmapping one must deallocate, and both must leave the
+        // neighboring sentinels intact.
         let backing = TempFile::new().unwrap();
-        let length = 4 * 1024 * 1024;
+        let length = (4 * 1024 * 1024).max(16 * test_discard_alignment(&backing) as usize);
+        // Size the file before filling it so no speculative preallocation skews block counts.
+        backing.as_file().set_len(length as u64).unwrap();
         backing
             .as_file()
             .write_all_at(&vec![0x5a; length], 0)
@@ -1892,6 +1935,7 @@ mod tests {
             MetricsWriter::default().register_block_device("zero-regression".into()),
         )
         .unwrap();
+        let alignment = block.writeback_config.as_ref().unwrap().discard_alignment() as usize;
         let mut disk = block.disk.take().unwrap();
         disk.set_writeback_config(block.writeback_config.as_ref())
             .unwrap();
@@ -1937,18 +1981,35 @@ mod tests {
             )
         };
         assert_eq!(std::mem::size_of::<DiscardWriteData>(), 16);
-        for flags in [0, VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP] {
-            assert_eq!(
-                request(
-                    VIRTIO_BLK_T_WRITE_ZEROES,
-                    8,
-                    (length / 512 - 16) as u32,
-                    flags
-                )
-                .unwrap(),
-                0
-            );
-        }
+        let sentinel = alignment;
+        let zero_sectors = ((length - 2 * sentinel) / 512) as u32;
+        let zero_sector = (sentinel / 512) as u64;
+
+        assert_eq!(
+            request(VIRTIO_BLK_T_WRITE_ZEROES, zero_sector, zero_sectors, 0).unwrap(),
+            0
+        );
+        assert!(
+            backing.as_file().metadata().unwrap().blocks() >= allocated,
+            "plain zero writes must not punch holes"
+        );
+
+        assert_eq!(
+            request(
+                VIRTIO_BLK_T_WRITE_ZEROES,
+                zero_sector,
+                zero_sectors,
+                VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP
+            )
+            .unwrap(),
+            0
+        );
+        let after_unmap = backing.as_file().metadata().unwrap().blocks();
+        assert!(
+            after_unmap < allocated,
+            "unmapping zero writes must deallocate the aligned range"
+        );
+
         assert!(matches!(
             request(
                 VIRTIO_BLK_T_WRITE_ZEROES,
@@ -1959,19 +2020,242 @@ mod tests {
             Err(RequestError::InvalidMutationRange(_))
         ));
         assert!(matches!(
-            request(VIRTIO_BLK_T_DISCARD, 0, 8, 0),
-            Err(RequestError::UnsupportedMutation)
+            request(VIRTIO_BLK_T_DISCARD, (length / 512 - 1) as u64, 2, 0),
+            Err(RequestError::InvalidMutationRange(_))
         ));
+
+        // A discard of the leading sentinel deallocates it as well.
+        assert_eq!(
+            request(VIRTIO_BLK_T_DISCARD, 0, (sentinel / 512) as u32, 0).unwrap(),
+            0
+        );
+        assert!(backing.as_file().metadata().unwrap().blocks() < after_unmap);
         request(VIRTIO_BLK_T_FLUSH, 0, 0, 0).unwrap();
         drop(worker);
         let bytes = std::fs::read(backing.as_path()).unwrap();
-        assert!(bytes[..4096].iter().all(|b| *b == 0x5a));
-        assert!(bytes[4096..length - 4096].iter().all(|b| *b == 0));
-        assert!(bytes[length - 4096..].iter().all(|b| *b == 0x5a));
-        assert!(
-            backing.as_file().metadata().unwrap().blocks() >= allocated,
-            "bounded zero writes must not punch holes"
+        assert_eq!(bytes.len(), length);
+        assert!(bytes[..length - sentinel].iter().all(|b| *b == 0));
+        assert!(bytes[length - sentinel..].iter().all(|b| *b == 0x5a));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_discard_alignment(backing: &TempFile) -> u64 {
+        BufferedWritebackConfig::new(
+            Arc::new(backing.as_file().try_clone().unwrap()),
+            WritebackLimit::new(MINIMUM_WRITEBACK_BUDGET_BYTES),
+        )
+        .unwrap()
+        .discard_alignment()
+    }
+
+    /// Opens a bounded disk over `units` discard-alignment units of synced 0x5a data.
+    #[cfg(target_os = "linux")]
+    fn active_bounded_disk(backing: &TempFile, units: u64) -> (Block, DiskProperties, u64) {
+        use std::os::unix::fs::FileExt;
+
+        let alignment = test_discard_alignment(backing);
+        let length = units * alignment;
+        // Size the file before filling it so no speculative preallocation skews block counts.
+        backing.as_file().set_len(length).unwrap();
+        backing
+            .as_file()
+            .write_all_at(&vec![0x5a; length as usize], 0)
+            .unwrap();
+        backing.as_file().sync_all().unwrap();
+        let mut block = Block::new_with_writeback_limit(
+            "bounded-discard".into(),
+            None,
+            CacheType::Writeback,
+            backing.as_path().to_string_lossy().into_owned(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::Full,
+            Some(MINIMUM_WRITEBACK_BUDGET_BYTES),
+            MetricsWriter::default().register_block_device("bounded-discard".into()),
+        )
+        .unwrap();
+        let mut disk = block.disk.take().unwrap();
+        disk.set_writeback_config(block.writeback_config.as_ref())
+            .unwrap();
+        assert_eq!(
+            block.writeback_config.as_ref().unwrap().discard_alignment(),
+            alignment
         );
+        (block, disk, alignment)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn tracked_bytes(disk: &DiskProperties) -> u64 {
+        disk.writeback_controller
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .tracked_bytes()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_accounted(disk: &DiskProperties, offset: u64, data: &[u8]) {
+        disk.run_buffered_mutation(
+            offset,
+            data.len() as u64,
+            None,
+            |chunk_offset, chunk_length| {
+                let start = (chunk_offset - offset) as usize;
+                let diskfile = disk.file.lock().unwrap();
+                diskfile.write(&data[start..start + chunk_length as usize], chunk_offset)
+            },
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_discard_retires_credit_for_dirty_pages() {
+        let backing = TempFile::new().unwrap();
+        let (_block, disk, alignment) = active_bounded_disk(&backing, 8);
+
+        write_accounted(&disk, 0, &vec![0xa5; 4 * alignment as usize]);
+        assert_eq!(tracked_bytes(&disk), 4 * alignment);
+
+        // An unaligned unmapping zero write punches the middle half, so the kernel drops those
+        // pages and their credit returns now. Its explicit edge writes land on pages that are
+        // already charged.
+        disk.discard_to_zero(alignment / 2, 3 * alignment).unwrap();
+        assert_eq!(tracked_bytes(&disk), 2 * alignment);
+
+        // A covering discard retires the rest.
+        disk.discard_to_any(0, 4 * alignment).unwrap();
+        assert_eq!(tracked_bytes(&disk), 0);
+
+        write_accounted(&disk, 0, &vec![0xa5; alignment as usize]);
+        assert_eq!(tracked_bytes(&disk), alignment);
+        disk.flush_to_disk().unwrap();
+        assert_eq!(tracked_bytes(&disk), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_discard_punches_only_the_aligned_interior() {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+
+        let backing = TempFile::new().unwrap();
+        let (_block, disk, alignment) = active_bounded_disk(&backing, 32);
+        let a = alignment as usize;
+        let allocated = backing.as_file().metadata().unwrap().blocks();
+        let read = |offset: usize, len: usize| {
+            let mut bytes = vec![0; len];
+            backing
+                .as_file()
+                .read_exact_at(&mut bytes, offset as u64)
+                .unwrap();
+            bytes
+        };
+
+        // A discard smaller than one alignment unit cannot be punched without dirtying a partial
+        // block, so it is a no-op. Its contents are unspecified, so that is allowed.
+        disk.discard_to_any(512, alignment - 1024).unwrap();
+        assert!(read(0, a).iter().all(|b| *b == 0x5a));
+        assert_eq!(backing.as_file().metadata().unwrap().blocks(), allocated);
+        assert_eq!(tracked_bytes(&disk), 0);
+
+        // An unaligned discard punches only the aligned interior and leaves the edges.
+        disk.discard_to_any(alignment + 512, 3 * alignment - 1024)
+            .unwrap();
+        assert!(read(a, 512).iter().all(|b| *b == 0x5a));
+        assert!(read(2 * a, a).iter().all(|b| *b == 0));
+        assert!(read(3 * a, a).iter().all(|b| *b == 0x5a));
+        let after_discard = backing.as_file().metadata().unwrap().blocks();
+        assert!(after_discard < allocated);
+        assert_eq!(tracked_bytes(&disk), 0);
+
+        // An unaligned unmapping zero write zeroes the edges through accounted writes.
+        let start = 8 * a + 512;
+        let len = 3 * a - 1024;
+        disk.discard_to_zero(start as u64, len as u64).unwrap();
+        assert!(read(8 * a, 512).iter().all(|b| *b == 0x5a));
+        assert!(read(start, len).iter().all(|b| *b == 0));
+        assert!(read(start + len, 512).iter().all(|b| *b == 0x5a));
+        let after_zero = backing.as_file().metadata().unwrap().blocks();
+        assert!(after_zero < after_discard);
+        assert_eq!(tracked_bytes(&disk), 2 * alignment);
+
+        // A zeroing request inside one alignment unit becomes an accounted zero write.
+        disk.discard_to_zero(16 * alignment + 512, 1024).unwrap();
+        assert!(read(16 * a + 512, 1024).iter().all(|b| *b == 0));
+        assert!(read(16 * a, 512).iter().all(|b| *b == 0x5a));
+        assert!(backing.as_file().metadata().unwrap().blocks() >= after_zero);
+        assert_eq!(tracked_bytes(&disk), 3 * alignment);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_discard_without_punch_support_never_writes_unaccounted_data() {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+
+        let backing = TempFile::new().unwrap();
+        let (_block, disk, alignment) = active_bounded_disk(&backing, 8);
+        disk.writeback_controller
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .assume_punch_unsupported();
+        let allocated = backing.as_file().metadata().unwrap().blocks();
+
+        // A plain discard degrades to a no-op, never to zero-data writes.
+        disk.discard_to_any(0, 4 * alignment).unwrap();
+        assert_eq!(tracked_bytes(&disk), 0);
+        let mut bytes = vec![0; 4 * alignment as usize];
+        backing.as_file().read_exact_at(&mut bytes, 0).unwrap();
+        assert!(bytes.iter().all(|b| *b == 0x5a));
+
+        // A zeroing discard degrades to accounted explicit zeroes.
+        disk.discard_to_zero(0, 4 * alignment).unwrap();
+        assert_eq!(tracked_bytes(&disk), 4 * alignment);
+        disk.flush_to_disk().unwrap();
+        backing.as_file().read_exact_at(&mut bytes, 0).unwrap();
+        assert!(bytes.iter().all(|b| *b == 0));
+        assert!(backing.as_file().metadata().unwrap().blocks() >= allocated);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_flush_after_discard_keeps_the_punch_and_stays_healthy() {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+
+        let backing = TempFile::new().unwrap();
+        let (block, disk, alignment) = active_bounded_disk(&backing, 32);
+        let allocated = backing.as_file().metadata().unwrap().blocks();
+        let half = 16 * alignment;
+
+        // Dirty pages that never reached writeback, then discard them before the flush.
+        write_accounted(&disk, 0, &vec![0xa5; 8 * alignment as usize]);
+        assert_eq!(tracked_bytes(&disk), 8 * alignment);
+        disk.discard_to_any(0, half).unwrap();
+        assert_eq!(tracked_bytes(&disk), 0);
+
+        // Every guest flush ends in the full fsync, which also covers the punch's metadata.
+        disk.flush_to_disk().unwrap();
+        assert!(block
+            .writeback_config
+            .as_ref()
+            .unwrap()
+            .record_full_sync_success());
+        let mut bytes = vec![0; half as usize];
+        backing.as_file().read_exact_at(&mut bytes, 0).unwrap();
+        assert!(bytes.iter().all(|b| *b == 0));
+        assert!(backing.as_file().metadata().unwrap().blocks() < allocated);
+
+        // Writes and discards keep working after the flush.
+        write_accounted(&disk, 0, &vec![0xa5; alignment as usize]);
+        disk.discard_to_zero(0, alignment).unwrap();
+        disk.flush_to_disk().unwrap();
+        assert_eq!(tracked_bytes(&disk), 0);
+        backing
+            .as_file()
+            .read_exact_at(&mut bytes[..alignment as usize], 0)
+            .unwrap();
+        assert!(bytes[..alignment as usize].iter().all(|b| *b == 0));
     }
 
     #[cfg(target_os = "linux")]

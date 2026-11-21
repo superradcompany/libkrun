@@ -50,7 +50,6 @@ pub enum RequestError {
     InvalidDataLength,
     InvalidMutationRange(io::Error),
     ReadingFromDescriptor(io::Error),
-    UnsupportedMutation,
     WritingToDescriptor(io::Error),
     WritingZeroes(io::Error),
     UnknownRequest,
@@ -963,11 +962,6 @@ impl BlockWorker {
                 }
             }
             VIRTIO_BLK_T_DISCARD => {
-                if self.disk.has_writeback_limit() {
-                    // Bounded writeback deliberately does not advertise DISCARD. Reject a guest
-                    // that sends it anyway rather than admitting unaccounted metadata mutation.
-                    return Err(RequestError::UnsupportedMutation);
-                }
                 let discard_write_data: DiscardWriteData = reader
                     .read_obj()
                     .map_err(RequestError::ReadingFromDescriptor)?;
@@ -991,10 +985,9 @@ impl BlockWorker {
                 self.disk
                     .validate_mutation_range(offset, length)
                     .map_err(RequestError::InvalidMutationRange)?;
-                // UNMAP grants permission to deallocate; it does not require it. In bounded
-                // mode, satisfy the request using accounted zero writes instead of punching
-                // holes. Linux ext4 legitimately uses this flag during online expansion.
-                if unmap && !self.disk.has_writeback_limit() {
+                // UNMAP grants permission to deallocate; it does not require it. Bounded mode
+                // punches only the aligned interior and zeroes the edges with accounted writes.
+                if unmap {
                     self.disk
                         .discard_to_zero(offset, length)
                         .map_err(RequestError::DiscardingToZero)?;
