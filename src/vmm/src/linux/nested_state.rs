@@ -98,7 +98,14 @@ pub(super) fn capture(vcpu: &VcpuFd) -> io::Result<Snapshot> {
         unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), capacity) };
     bytes[4..8].copy_from_slice(&(capacity as u32).to_le_bytes());
     // SAFETY: storage is aligned, writable, and covers the advertised capacity.
-    if unsafe { libc::ioctl(vcpu.as_raw_fd(), GET_NESTED_STATE, bytes.as_mut_ptr()) } < 0 {
+    if unsafe {
+        libc::ioctl(
+            vcpu.as_raw_fd(),
+            GET_NESTED_STATE as libc::Ioctl,
+            bytes.as_mut_ptr(),
+        )
+    } < 0
+    {
         return Err(io::Error::last_os_error());
     }
     let used = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
@@ -144,7 +151,14 @@ pub(super) fn restore(vcpu: &VcpuFd, snapshot: &Snapshot) -> io::Result<()> {
     aligned.copy_from_slice(bytes);
     // KVM validates VMX/SVM format, flags and guest physical addresses against
     // the configured destination vCPU. Never substitute an empty state on error.
-    if unsafe { libc::ioctl(vcpu.as_raw_fd(), SET_NESTED_STATE, aligned.as_ptr()) } < 0 {
+    if unsafe {
+        libc::ioctl(
+            vcpu.as_raw_fd(),
+            SET_NESTED_STATE as libc::Ioctl,
+            aligned.as_ptr(),
+        )
+    } < 0
+    {
         return Err(io::Error::last_os_error());
     }
     Ok(())
