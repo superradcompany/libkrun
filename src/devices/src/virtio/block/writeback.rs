@@ -32,6 +32,12 @@ const MINIMUM_RETIREMENT_BYTES: u64 = 32 * 1024 * 1024;
 /// 128 KiB.
 const MAX_EXTENTS_PER_GENERATION: usize = 8192;
 const MAX_QUEUED_GENERATIONS: usize = 64;
+/// Largest `st_blksize` accepted as the punch alignment.
+///
+/// Network and parallel filesystems report preferred I/O sizes of several MiB. Aligning to that
+/// would make every unaligned zeroing discard write megabytes of accounted edge data and turn most
+/// guest discards into no-ops, so such files do not punch at all.
+const MAX_DISCARD_ALIGNMENT_BYTES: u64 = 1024 * 1024;
 const WORKER_THREAD_NAME: &str = "virtio-blk-writeback";
 
 //--------------------------------------------------------------------------------------------------
@@ -123,6 +129,14 @@ pub(crate) enum WritebackOutcome {
 trait WritebackBackend: Send + Sync + 'static {
     fn start_writeback(&self, ranges: &[DirtyRange]) -> io::Result<()>;
     fn wait_writeback(&self, ranges: &[DirtyRange]) -> io::Result<()>;
+
+    /// Deallocates an aligned range so it reads back as zeroes, without changing the file size.
+    ///
+    /// Must never fall back to writing data: a backend that cannot deallocate returns
+    /// `ErrorKind::Unsupported` so the caller can choose an accounted fallback.
+    fn punch_hole(&self, _range: DirtyRange) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -137,6 +151,8 @@ pub(crate) struct BufferedWritebackConfig {
     file: Arc<File>,
     limit: WritebackLimit,
     page_size: u64,
+    discard_alignment: u64,
+    punch_supported: bool,
     health: Arc<SharedHealth>,
 }
 
@@ -148,9 +164,16 @@ pub(crate) struct BufferedWritebackConfig {
 /// cannot fit or metadata fragmentation reaches its explicit bound. Guest `FLUSH` remains governed
 /// by the existing full backing-image sync, including the data-retrieval metadata required by the
 /// host filesystem.
+///
+/// Discards punch whole pages and filesystem blocks through the backend, so the kernel never has
+/// a partial block to zero in the page cache. A successful punch removes every page of its range
+/// from the cache, so the controller retires that range's credit immediately.
 pub(crate) struct BufferedWritebackController {
     limit: WritebackLimit,
     page_size: u64,
+    discard_alignment: u64,
+    punch_unsupported: bool,
+    backend: Arc<dyn WritebackBackend>,
     tracked: ExtentSet,
     current_generation: u64,
     current_extents: ExtentSet,
@@ -381,19 +404,74 @@ impl WritebackBackend for SyncFileRangeBackend {
         // cursor cannot consume an error that the guest-visible full sync still needs to report.
         self.sync_ranges(ranges, libc::SYNC_FILE_RANGE_WAIT_AFTER)
     }
+
+    fn punch_hole(&self, range: DirtyRange) -> io::Result<()> {
+        let offset = libc::off64_t::try_from(range.start).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "punch offset exceeds fallocate limits",
+            )
+        })?;
+        let length = libc::off64_t::try_from(range.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "punch length exceeds fallocate limits",
+            )
+        })?;
+
+        // Punch on the controller's descriptor rather than through Imago: Imago's zeroing discard
+        // falls back to buffered zero-data writes when punching is unsupported and shortcuts a
+        // range reaching end of file through truncation, and neither is accounted here. KEEP_SIZE
+        // leaves i_size alone, and EOPNOTSUPP surfaces as ErrorKind::Unsupported.
+        loop {
+            // Safe: the backend owns a live descriptor for the exact backing inode, and the
+            // offsets are validated integers.
+            let result = unsafe {
+                libc::fallocate64(
+                    self.file.as_raw_fd(),
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    offset,
+                    length,
+                )
+            };
+            if result == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl BufferedWritebackConfig {
     pub(crate) fn new(file: Arc<File>, limit: WritebackLimit) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
         let page_size = host_page_size()?;
         validate_policy(limit.maximum_bytes(), page_size)?;
+        // Without a safe alignment the controller never punches, so the page size only shapes
+        // the advertised granularity.
+        let (discard_alignment, punch_supported) =
+            match discard_alignment(page_size, file.metadata()?.blksize()) {
+                Some(alignment) => (alignment, true),
+                None => (page_size, false),
+            };
         Ok(Self {
             file,
             limit,
             page_size,
+            discard_alignment,
+            punch_supported,
             health: Arc::new(SharedHealth::new()),
         })
+    }
+
+    /// Byte alignment of the ranges the controller punches, advertised to the guest.
+    pub(crate) fn discard_alignment(&self) -> u64 {
+        self.discard_alignment
     }
 
     pub(crate) fn controller(&self) -> io::Result<BufferedWritebackController> {
@@ -409,6 +487,8 @@ impl BufferedWritebackConfig {
             }),
             self.limit.clone(),
             self.page_size,
+            self.discard_alignment,
+            self.punch_supported,
             Arc::clone(&self.health),
         )
     }
@@ -438,6 +518,8 @@ impl BufferedWritebackController {
             backend,
             WritebackLimit::new(hard_budget_bytes),
             page_size,
+            page_size,
+            true,
             Arc::new(SharedHealth::new()),
         )
     }
@@ -446,23 +528,35 @@ impl BufferedWritebackController {
         backend: Arc<dyn WritebackBackend>,
         limit: WritebackLimit,
         page_size: u64,
+        discard_alignment: u64,
+        punch_supported: bool,
         health: Arc<SharedHealth>,
     ) -> io::Result<Self> {
         let hard_budget_bytes = limit.maximum_bytes();
         validate_policy(hard_budget_bytes, page_size)?;
+        debug_assert!(discard_alignment.is_power_of_two() && discard_alignment >= page_size);
         let queue_capacity = queue_capacity(hard_budget_bytes);
         let (job_sender, job_receiver) = bounded(queue_capacity);
         let (completion_sender, completion_receiver) = bounded(queue_capacity + 1);
         let (shutdown_sender, shutdown_receiver) = bounded(1);
+        let worker_backend = Arc::clone(&backend);
         let worker = thread::Builder::new()
             .name(WORKER_THREAD_NAME.to_string())
             .spawn(move || {
-                run_worker(backend, job_receiver, completion_sender, shutdown_receiver)
+                run_worker(
+                    worker_backend,
+                    job_receiver,
+                    completion_sender,
+                    shutdown_receiver,
+                )
             })?;
 
         Ok(Self {
             limit,
             page_size,
+            discard_alignment,
+            punch_unsupported: !punch_supported,
+            backend,
             tracked: ExtentSet::default(),
             current_generation: 0,
             current_extents: ExtentSet::default(),
@@ -510,14 +604,7 @@ impl BufferedWritebackController {
                 // generation and stop admitting even hot rewrites until completed writeback has
                 // brought this controller beneath its new target.
                 if !self.current_extents.is_empty() {
-                    if let Err(error) = self.submit_current_generation() {
-                        self.latch_error(&error);
-                        return Err(self
-                            .latched_error
-                            .as_ref()
-                            .expect("submission failure must latch an error")
-                            .to_io_error());
-                    }
+                    self.submit_or_latch()?;
                     continue;
                 }
                 if self.has_in_flight_generations() {
@@ -544,14 +631,7 @@ impl BufferedWritebackController {
             }
 
             if !self.current_extents.is_empty() {
-                if let Err(error) = self.submit_current_generation() {
-                    self.latch_error(&error);
-                    return Err(self
-                        .latched_error
-                        .as_ref()
-                        .expect("submission failure must latch an error")
-                        .to_io_error());
-                }
+                self.submit_or_latch()?;
                 continue;
             }
             if !self.has_in_flight_generations() {
@@ -613,6 +693,86 @@ impl BufferedWritebackController {
         }
 
         self.check_error()
+    }
+
+    /// Returns the largest sub-range of `offset..end` that [`Self::punch_hole`] accepts.
+    ///
+    /// The returned range is empty, starting and ending at the same offset, when no whole
+    /// alignment unit fits.
+    pub(crate) fn punchable_range(&self, offset: u64, end: u64) -> (u64, u64) {
+        let start = align_up(offset, self.discard_alignment).map_or(end, |start| start.min(end));
+        let aligned_end = align_down(end, self.discard_alignment).max(start);
+        (start, aligned_end)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_bytes(&self) -> u64 {
+        self.tracked.bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assume_punch_unsupported(&mut self) {
+        self.punch_unsupported = true;
+    }
+
+    /// Deallocates an aligned range of the backing file and retires its credit.
+    ///
+    /// The range must come from [`Self::punchable_range`], so it covers whole pages and
+    /// whole filesystem blocks and the punch dirties nothing. A successful punch leaves no page of
+    /// the range dirty or under writeback, because the kernel must drop it from the page cache to
+    /// make the range read back as zeroes. Older submitted generations keep their extents; their
+    /// completion already skips pages that a newer generation or the open extents own, so a page
+    /// rewritten after this punch stays charged.
+    ///
+    /// Returns `ErrorKind::Unsupported` without touching the file when the backing filesystem
+    /// cannot punch. Any other failure keeps every credit, and the next full sync reports any
+    /// writeback error the punch encountered.
+    pub(crate) fn punch_hole(&mut self, offset: u64, length: u64) -> io::Result<()> {
+        if length == 0 {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "punch range overflow"))?;
+        if !offset.is_multiple_of(self.discard_alignment)
+            || !end.is_multiple_of(self.discard_alignment)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "punch range is not aligned to the discard alignment",
+            ));
+        }
+        if self.pending.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "cannot punch with a buffered write reservation pending",
+            ));
+        }
+
+        // A punch mutates the image, so it fails closed exactly like a write.
+        self.reap_completions_while_latching();
+        self.check_error()?;
+        if self.punch_unsupported {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+
+        let range = DirtyRange { start: offset, end };
+        if let Err(error) = self.backend.punch_hole(range) {
+            if error.kind() == io::ErrorKind::Unsupported {
+                self.punch_unsupported = true;
+            }
+            return Err(error);
+        }
+
+        self.current_extents.remove(range);
+        self.tracked.remove(range);
+
+        // Punching inside an extent splits it. Submit a generation that has grown past its extent
+        // bound so a run of discards cannot outgrow the per-job range limit.
+        if self.current_extents.ranges.len() > MAX_EXTENTS_PER_GENERATION {
+            self.submit_or_latch()?;
+        }
+        Ok(())
     }
 
     /// Makes the background worker idle before the guest-visible full sync.
@@ -757,6 +917,19 @@ impl BufferedWritebackController {
             status: GenerationStatus::InFlight,
         });
         self.current_generation = next_generation;
+        Ok(())
+    }
+
+    /// Submits the open generation, latching a failure so later mutations also fail closed.
+    fn submit_or_latch(&mut self) -> io::Result<()> {
+        if let Err(error) = self.submit_current_generation() {
+            self.latch_error(&error);
+            return Err(self
+                .latched_error
+                .as_ref()
+                .expect("submission failure must latch an error")
+                .to_io_error());
+        }
         Ok(())
     }
 
@@ -934,8 +1107,21 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
         .map(|rounded| align_down(rounded, alignment))
 }
 
+/// Chooses a punch alignment that covers whole pages and whole filesystem blocks.
+///
+/// A punch that starts or ends inside a filesystem block makes the kernel zero that partial block
+/// in the page cache, which would dirty pages the controller has not reserved. `st_blksize` may
+/// report a preferred I/O size above the block size, which only coarsens the alignment. A value
+/// that no power-of-two range can be aligned to, such as a 12 KiB XFS realtime extent, or one
+/// above [`MAX_DISCARD_ALIGNMENT_BYTES`] disables punching.
 #[cfg(target_os = "linux")]
-fn host_page_size() -> io::Result<u64> {
+fn discard_alignment(page_size: u64, block_size: u64) -> Option<u64> {
+    (block_size.is_power_of_two() && block_size <= MAX_DISCARD_ALIGNMENT_BYTES)
+        .then(|| page_size.max(block_size))
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn host_page_size() -> io::Result<u64> {
     // Safe: sysconf has no pointer arguments or caller-owned memory requirements.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page_size <= 0 {
@@ -1088,6 +1274,8 @@ mod tests {
         start_calls: Mutex<Vec<Vec<DirtyRange>>>,
         wait_calls: Mutex<Vec<Vec<DirtyRange>>>,
         wait_failures: Mutex<VecDeque<io::ErrorKind>>,
+        punch_calls: Mutex<Vec<DirtyRange>>,
+        punch_failures: Mutex<VecDeque<io::ErrorKind>>,
     }
 
     impl WritebackBackend for FakeBackend {
@@ -1103,11 +1291,27 @@ mod tests {
                 None => Ok(()),
             }
         }
+
+        fn punch_hole(&self, range: DirtyRange) -> io::Result<()> {
+            self.punch_calls.lock().unwrap().push(range);
+            match self.punch_failures.lock().unwrap().pop_front() {
+                Some(kind) => Err(io::Error::new(kind, "injected punch failure")),
+                None => Ok(()),
+            }
+        }
     }
 
     impl FakeBackend {
         fn fail_next_wait(&self, kind: io::ErrorKind) {
             self.wait_failures.lock().unwrap().push_back(kind);
+        }
+
+        fn fail_next_punch(&self, kind: io::ErrorKind) {
+            self.punch_failures.lock().unwrap().push_back(kind);
+        }
+
+        fn punch_calls(&self) -> Vec<DirtyRange> {
+            self.punch_calls.lock().unwrap().clone()
         }
 
         fn wait_calls(&self) -> usize {
@@ -1140,6 +1344,10 @@ mod tests {
         }
 
         fn wait_writeback(&self, _ranges: &[DirtyRange]) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn punch_hole(&self, _range: DirtyRange) -> io::Result<()> {
             Ok(())
         }
     }
@@ -1327,6 +1535,300 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_backend_punches_without_changing_size_or_neighbors() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Size everything from the real alignment: with 64 KiB pages on tmpfs, a 4 KiB layout
+        // fits in one page and the punch could not deallocate anything.
+        let backing = TempFile::new().unwrap();
+        let page_size = host_page_size().unwrap();
+        let unit = discard_alignment(page_size, backing.as_file().metadata().unwrap().blksize())
+            .unwrap_or(page_size);
+        let length = unit * 4;
+        backing.as_file().set_len(length).unwrap();
+        backing
+            .as_file()
+            .write_all_at(&vec![0xa5; length as usize], 0)
+            .unwrap();
+        backing.as_file().sync_all().unwrap();
+        let allocated = backing.as_file().metadata().unwrap().blocks();
+
+        let backend = SyncFileRangeBackend {
+            file: Arc::new(backing.as_file().try_clone().unwrap()),
+        };
+        backend
+            .punch_hole(DirtyRange {
+                start: unit,
+                end: unit * 3,
+            })
+            .unwrap();
+
+        let metadata = backing.as_file().metadata().unwrap();
+        assert_eq!(metadata.len(), length);
+        assert!(metadata.blocks() < allocated, "punch must deallocate");
+        let mut bytes = vec![0; length as usize];
+        backing.as_file().read_exact_at(&mut bytes, 0).unwrap();
+        let unit = unit as usize;
+        assert!(bytes[..unit].iter().all(|byte| *byte == 0xa5));
+        assert!(bytes[unit..3 * unit].iter().all(|byte| *byte == 0));
+        assert!(bytes[3 * unit..].iter().all(|byte| *byte == 0xa5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discard_alignment_covers_whole_pages_and_filesystem_blocks() {
+        assert_eq!(discard_alignment(4096, 4096), Some(4096));
+        assert_eq!(discard_alignment(4096, 1024), Some(4096));
+        assert_eq!(discard_alignment(4096, 65536), Some(65536));
+        assert_eq!(discard_alignment(16384, 4096), Some(16384));
+        assert_eq!(discard_alignment(4096, 0), None);
+        assert_eq!(discard_alignment(4096, 3 * 4096), None);
+        assert_eq!(
+            discard_alignment(4096, MAX_DISCARD_ALIGNMENT_BYTES),
+            Some(MAX_DISCARD_ALIGNMENT_BYTES)
+        );
+        assert_eq!(
+            discard_alignment(4096, MAX_DISCARD_ALIGNMENT_BYTES * 2),
+            None
+        );
+    }
+
+    #[test]
+    fn punch_retires_credit_for_exactly_the_punched_range() {
+        let (backend, mut controller) = fake_controller(TEST_PAGE_SIZE, true);
+        write_tracked(&mut controller, 0, TEST_PAGE_SIZE * 3);
+
+        controller
+            .punch_hole(TEST_PAGE_SIZE, TEST_PAGE_SIZE)
+            .unwrap();
+
+        let punched = DirtyRange {
+            start: TEST_PAGE_SIZE,
+            end: TEST_PAGE_SIZE * 2,
+        };
+        assert_eq!(backend.punch_calls(), vec![punched]);
+        assert_eq!(controller.tracked.bytes, TEST_PAGE_SIZE * 2);
+        assert_eq!(controller.current_extents.bytes, TEST_PAGE_SIZE * 2);
+
+        // The range kick no longer walks pages the punch already removed from the cache.
+        controller.quiesce().unwrap();
+        assert_eq!(
+            *backend.start_calls.lock().unwrap(),
+            vec![vec![
+                DirtyRange {
+                    start: 0,
+                    end: TEST_PAGE_SIZE,
+                },
+                DirtyRange {
+                    start: TEST_PAGE_SIZE * 2,
+                    end: TEST_PAGE_SIZE * 3,
+                },
+            ]]
+        );
+        assert_eq!(controller.tracked.bytes, 0);
+    }
+
+    #[test]
+    fn punch_of_untracked_range_leaves_accounting_unchanged() {
+        let (backend, mut controller) = fake_controller(TEST_PAGE_SIZE, true);
+        write_tracked(&mut controller, 0, 512);
+
+        controller
+            .punch_hole(TEST_PAGE_SIZE * 8, TEST_PAGE_SIZE * 8)
+            .unwrap();
+
+        assert_eq!(backend.punch_calls().len(), 1);
+        assert_eq!(controller.tracked.bytes, TEST_PAGE_SIZE);
+        assert_eq!(controller.current_extents.bytes, TEST_PAGE_SIZE);
+    }
+
+    #[test]
+    fn page_rewritten_after_punch_stays_charged_past_older_completion() {
+        let backend = Arc::new(GatedBackend::default());
+        let mut controller = BufferedWritebackController::spawn(
+            backend.clone(),
+            MINIMUM_WRITEBACK_BUDGET_BYTES,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+        write_tracked(&mut controller, 0, MINIMUM_RETIREMENT_BYTES);
+        controller.submit_current_generation().unwrap();
+        backend.wait_for_calls(1);
+
+        // Punch part of the in-flight generation, then dirty its first page again.
+        controller.punch_hole(0, TEST_PAGE_SIZE * 2).unwrap();
+        assert_eq!(
+            controller.tracked.bytes,
+            MINIMUM_RETIREMENT_BYTES - TEST_PAGE_SIZE * 2
+        );
+        write_tracked(&mut controller, 0, TEST_PAGE_SIZE);
+        assert_eq!(
+            controller.tracked.bytes,
+            MINIMUM_RETIREMENT_BYTES - TEST_PAGE_SIZE
+        );
+
+        // The older generation still lists page zero, but must not release the rewrite.
+        backend.allow(1);
+        controller.wait_for_completion().unwrap();
+        assert!(controller.submitted.is_empty());
+        assert_eq!(controller.tracked.bytes, TEST_PAGE_SIZE);
+        assert_eq!(
+            controller.tracked.ranges,
+            vec![DirtyRange {
+                start: 0,
+                end: TEST_PAGE_SIZE,
+            }]
+        );
+
+        backend.allow(1);
+        controller.quiesce().unwrap();
+        assert_eq!(controller.tracked.bytes, 0);
+    }
+
+    #[test]
+    fn punch_that_splits_a_full_generation_submits_it() {
+        let backend = Arc::new(GatedBackend::default());
+        let mut controller = BufferedWritebackController::spawn(
+            backend.clone(),
+            MINIMUM_WRITEBACK_BUDGET_BYTES * 2,
+            TEST_PAGE_SIZE,
+        )
+        .unwrap();
+
+        // Populate a generation at its extent bound whose last extent spans three pages.
+        for page in 0..MAX_EXTENTS_PER_GENERATION as u64 {
+            let start = page * TEST_PAGE_SIZE * 4;
+            let range = DirtyRange {
+                start,
+                end: start + TEST_PAGE_SIZE * 3,
+            };
+            controller.current_extents.insert(range);
+            controller.tracked.insert(range);
+        }
+        let last = (MAX_EXTENTS_PER_GENERATION as u64 - 1) * TEST_PAGE_SIZE * 4;
+
+        controller
+            .punch_hole(last + TEST_PAGE_SIZE, TEST_PAGE_SIZE)
+            .unwrap();
+        backend.wait_for_calls(1);
+        assert!(controller.current_extents.is_empty());
+        assert_eq!(
+            backend.calls()[0].len(),
+            MAX_EXTENTS_PER_GENERATION + 1,
+            "the split may exceed the bound by one extent before submission"
+        );
+
+        backend.allow(1);
+        controller.quiesce().unwrap();
+        assert_eq!(controller.tracked.bytes, 0);
+    }
+
+    #[test]
+    fn failed_punch_keeps_credit_without_latching() {
+        let (backend, mut controller) = fake_controller(TEST_PAGE_SIZE, true);
+        backend.fail_next_punch(io::ErrorKind::Other);
+        write_tracked(&mut controller, 0, TEST_PAGE_SIZE);
+
+        assert_eq!(
+            controller.punch_hole(0, TEST_PAGE_SIZE).unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+        assert_eq!(controller.tracked.bytes, TEST_PAGE_SIZE);
+        assert!(controller.latched_error.is_none());
+        assert!(controller.health.is_healthy());
+
+        // The failure is the guest's IOERR, not a containment failure: the next punch proceeds.
+        controller.punch_hole(0, TEST_PAGE_SIZE).unwrap();
+        assert_eq!(controller.tracked.bytes, 0);
+        assert_eq!(backend.punch_calls().len(), 2);
+    }
+
+    #[test]
+    fn unsupported_punch_is_remembered_and_keeps_credit() {
+        let (backend, mut controller) = fake_controller(TEST_PAGE_SIZE, true);
+        backend.fail_next_punch(io::ErrorKind::Unsupported);
+        write_tracked(&mut controller, 0, TEST_PAGE_SIZE);
+
+        for _ in 0..2 {
+            assert_eq!(
+                controller.punch_hole(0, TEST_PAGE_SIZE).unwrap_err().kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
+        assert_eq!(backend.punch_calls().len(), 1);
+        assert_eq!(controller.tracked.bytes, TEST_PAGE_SIZE);
+        assert!(controller.latched_error.is_none());
+    }
+
+    #[test]
+    fn punch_rejects_unaligned_ranges_and_pending_reservations() {
+        let (backend, mut controller) = fake_controller(TEST_PAGE_SIZE * 4, true);
+        assert_eq!(
+            controller.punchable_range(512, TEST_PAGE_SIZE * 9 - 512),
+            (TEST_PAGE_SIZE * 4, TEST_PAGE_SIZE * 8)
+        );
+        assert_eq!(
+            controller.punchable_range(512, TEST_PAGE_SIZE * 3),
+            (TEST_PAGE_SIZE * 3, TEST_PAGE_SIZE * 3)
+        );
+
+        // Page alignment is not enough when the filesystem block is larger than a page.
+        for (offset, length) in [
+            (TEST_PAGE_SIZE, TEST_PAGE_SIZE * 4),
+            (0, TEST_PAGE_SIZE),
+            (512, TEST_PAGE_SIZE * 4),
+        ] {
+            assert_eq!(
+                controller.punch_hole(offset, length).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        controller.punch_hole(0, 0).unwrap();
+        assert!(backend.punch_calls().is_empty());
+
+        let reservation = controller.plan_write(0, 512).unwrap();
+        assert_eq!(
+            controller
+                .punch_hole(0, TEST_PAGE_SIZE * 4)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        controller
+            .finish_write(reservation, WritebackOutcome::Written(512))
+            .unwrap();
+        controller.punch_hole(0, TEST_PAGE_SIZE * 4).unwrap();
+        assert_eq!(controller.tracked.bytes, 0);
+    }
+
+    #[test]
+    fn missing_safe_alignment_never_punches() {
+        let (backend, mut controller) = fake_controller(TEST_PAGE_SIZE, false);
+
+        assert_eq!(
+            controller.punch_hole(0, TEST_PAGE_SIZE).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(backend.punch_calls().is_empty());
+    }
+
+    #[test]
+    fn punch_fails_closed_after_a_writeback_error() {
+        let (backend, mut controller) = fake_controller(TEST_PAGE_SIZE, true);
+        backend.fail_next_wait(io::ErrorKind::Other);
+        write_tracked(&mut controller, 0, 512);
+        assert!(controller.quiesce().is_err());
+
+        assert_eq!(
+            controller.punch_hole(0, TEST_PAGE_SIZE).unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+        assert!(backend.punch_calls().is_empty());
+        assert_eq!(controller.tracked.bytes, TEST_PAGE_SIZE);
+    }
+
     #[test]
     fn extent_set_preserves_holes_and_unique_bytes() {
         let mut set = ExtentSet::default();
@@ -1502,6 +2004,8 @@ mod tests {
             backend,
             limit.clone(),
             TEST_PAGE_SIZE,
+            TEST_PAGE_SIZE,
+            true,
             Arc::new(SharedHealth::new()),
         )
         .unwrap();
@@ -1532,6 +2036,8 @@ mod tests {
             backend.clone(),
             limit.clone(),
             TEST_PAGE_SIZE,
+            TEST_PAGE_SIZE,
+            true,
             Arc::new(SharedHealth::new()),
         )
         .unwrap();
@@ -1558,6 +2064,8 @@ mod tests {
             backend,
             limit.clone(),
             TEST_PAGE_SIZE,
+            TEST_PAGE_SIZE,
+            true,
             Arc::new(SharedHealth::new()),
         )
         .unwrap();
@@ -2007,11 +2515,32 @@ mod tests {
     }
 
     fn submit_small_generation(controller: &mut BufferedWritebackController, offset: u64) {
-        let reservation = controller.plan_write(offset, 512).unwrap();
-        controller
-            .finish_write(reservation, WritebackOutcome::Written(512))
-            .unwrap();
+        write_tracked(controller, offset, 512);
         controller.submit_current_generation().unwrap();
+    }
+
+    fn write_tracked(controller: &mut BufferedWritebackController, offset: u64, length: u64) {
+        let reservation = controller.plan_write(offset, length).unwrap();
+        controller
+            .finish_write(reservation, WritebackOutcome::Written(length))
+            .unwrap();
+    }
+
+    fn fake_controller(
+        discard_alignment: u64,
+        punch_supported: bool,
+    ) -> (Arc<FakeBackend>, BufferedWritebackController) {
+        let backend = Arc::new(FakeBackend::default());
+        let controller = BufferedWritebackController::spawn_with_health(
+            backend.clone(),
+            WritebackLimit::new(MINIMUM_WRITEBACK_BUDGET_BYTES),
+            TEST_PAGE_SIZE,
+            discard_alignment,
+            punch_supported,
+            Arc::new(SharedHealth::new()),
+        )
+        .unwrap();
+        (backend, controller)
     }
 
     fn bitmap_ranges(pages: &[bool]) -> Vec<DirtyRange> {
