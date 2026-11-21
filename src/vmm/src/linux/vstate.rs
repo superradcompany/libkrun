@@ -2222,11 +2222,16 @@ impl Vcpu {
         // Register with the enforcement kicker: a guest thread spinning without VM exits would never let the enforcement check in `running` observe a lowered ceiling, so
         // the kicker signals this thread (same mechanism as `VcpuHandle::send_event`) to force KVM_RUN back to the host.
         if let Some(enforcement) = &self.enforcement {
-            let thread = unsafe { libc::pthread_self() };
+            // musl defines pthread_t as a pointer, which cannot be captured by
+            // the Send + Sync kicker callback. Preserve its opaque bits as usize.
+            let thread_id = unsafe { libc::pthread_self() } as usize;
             self.kick_slot = Some(enforcement.register_kicker(
                 self.id as u32,
                 Box::new(move || unsafe {
-                    libc::pthread_kill(thread, sigrtmin() + VCPU_RTSIG_OFFSET);
+                    libc::pthread_kill(
+                        thread_id as libc::pthread_t,
+                        sigrtmin() + VCPU_RTSIG_OFFSET,
+                    );
                 }),
             ));
         }
