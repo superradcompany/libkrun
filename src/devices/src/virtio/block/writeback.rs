@@ -1121,7 +1121,7 @@ fn discard_alignment(page_size: u64, block_size: u64) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn host_page_size() -> io::Result<u64> {
+pub(super) fn host_page_size() -> io::Result<u64> {
     // Safe: sysconf has no pointer arguments or caller-owned memory requirements.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page_size <= 0 {

@@ -516,11 +516,13 @@ impl DiskProperties {
                 .punch_hole(aligned_start, aligned_end - aligned_start);
             match punched {
                 Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::Unsupported => {
-                    if zeroes {
-                        self.write_zeroes(aligned_start, aligned_end - aligned_start)?;
-                    }
+                // A zeroing request must still succeed when the punch fails for any reason, so
+                // it falls back to accounted zero writes, which also fail closed if the
+                // controller has latched an error.
+                Err(_) if zeroes => {
+                    self.write_zeroes(aligned_start, aligned_end - aligned_start)?;
                 }
+                Err(error) if error.kind() == io::ErrorKind::Unsupported => {}
                 Err(error) => return Err(error),
             }
         }
@@ -2185,7 +2187,8 @@ mod tests {
         assert_bytes(&backing, 16 * a + 512, 1024, 0);
         assert_bytes(&backing, 16 * a, 512, 0x5a);
         assert!(backing.as_file().metadata().unwrap().blocks() >= after_zero);
-        assert_eq!(tracked_bytes(&disk), 3 * alignment);
+        let page_size = super::super::writeback::host_page_size().unwrap();
+        assert_eq!(tracked_bytes(&disk), 2 * alignment + page_size);
     }
 
     #[cfg(target_os = "linux")]
