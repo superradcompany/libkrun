@@ -151,7 +151,10 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) -> bool {
                 .set_len(0)
                 .set_type(uapi::VSOCK_TYPE_STREAM)
                 .set_flags(0)
-                .set_buf_alloc(0)
+                // Linux takes the peer's credit from every packet, resets
+                // included: a zero would leave a socket that still holds
+                // unread data with no send space and no POLLOUT.
+                .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
                 .set_fwd_cnt(0);
         }
         #[cfg(unix)]
@@ -443,5 +446,41 @@ mod tests {
             );
             assert_eq!(packet.buf_alloc(), defs::CONN_TX_BUF_SIZE as u32);
         }
+    }
+
+    // A reset must carry the Host's real receive credit. Linux takes the
+    // peer's buf_alloc from every packet, the RST included, so a zero here
+    // leaves a guest socket that still holds unread data (and so stays
+    // connected) with no send space and no POLLOUT: a nonblocking connect
+    // waiting for writability then times out though the Host accepted and
+    // answered. Linux's own transport sends its resets with a real buf_alloc.
+    #[test]
+    fn reset_carries_receive_credit() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        mem.write_obj(
+            Descriptor {
+                addr: 0x2000,
+                len: 128,
+                flags: 2,
+                next: 0,
+            },
+            GuestAddress(0x1000),
+        )
+        .unwrap();
+        mem.write_slice(&[0xff; 128], GuestAddress(0x2000)).unwrap();
+        let head = DescriptorChain::checked_new(&mem, GuestAddress(0x1000), 1, 0).unwrap();
+        let mut packet = VsockPacket::from_rx_virtq_head(&head).unwrap();
+        assert!(rx_to_pkt(
+            3,
+            MuxerRx::Reset {
+                local_port: 5,
+                peer_port: 6
+            },
+            &mut packet
+        ));
+        assert_eq!(packet.op(), uapi::VSOCK_OP_RST);
+        assert_eq!((packet.src_port(), packet.dst_port()), (5, 6));
+        assert_eq!(packet.len(), 0);
+        assert_eq!(packet.buf_alloc(), defs::CONN_TX_BUF_SIZE as u32);
     }
 }
