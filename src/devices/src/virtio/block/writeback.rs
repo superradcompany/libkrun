@@ -32,6 +32,12 @@ const MINIMUM_RETIREMENT_BYTES: u64 = 32 * 1024 * 1024;
 /// 128 KiB.
 const MAX_EXTENTS_PER_GENERATION: usize = 8192;
 const MAX_QUEUED_GENERATIONS: usize = 64;
+/// Largest `st_blksize` accepted as the punch alignment.
+///
+/// Network and parallel filesystems report preferred I/O sizes of several MiB. Aligning to that
+/// would make every unaligned zeroing discard write megabytes of accounted edge data and turn most
+/// guest discards into no-ops, so such files do not punch at all.
+const MAX_DISCARD_ALIGNMENT_BYTES: u64 = 1024 * 1024;
 const WORKER_THREAD_NAME: &str = "virtio-blk-writeback";
 
 //--------------------------------------------------------------------------------------------------
@@ -145,7 +151,8 @@ pub(crate) struct BufferedWritebackConfig {
     file: Arc<File>,
     limit: WritebackLimit,
     page_size: u64,
-    discard_alignment: Option<u64>,
+    discard_alignment: u64,
+    punch_supported: bool,
     health: Arc<SharedHealth>,
 }
 
@@ -445,19 +452,26 @@ impl BufferedWritebackConfig {
 
         let page_size = host_page_size()?;
         validate_policy(limit.maximum_bytes(), page_size)?;
-        let discard_alignment = discard_alignment(page_size, file.metadata()?.blksize());
+        // Without a safe alignment the controller never punches, so the page size only shapes
+        // the advertised granularity.
+        let (discard_alignment, punch_supported) =
+            match discard_alignment(page_size, file.metadata()?.blksize()) {
+                Some(alignment) => (alignment, true),
+                None => (page_size, false),
+            };
         Ok(Self {
             file,
             limit,
             page_size,
             discard_alignment,
+            punch_supported,
             health: Arc::new(SharedHealth::new()),
         })
     }
 
     /// Byte alignment of the ranges the controller punches, advertised to the guest.
     pub(crate) fn discard_alignment(&self) -> u64 {
-        self.discard_alignment.unwrap_or(self.page_size)
+        self.discard_alignment
     }
 
     pub(crate) fn controller(&self) -> io::Result<BufferedWritebackController> {
@@ -474,6 +488,7 @@ impl BufferedWritebackConfig {
             self.limit.clone(),
             self.page_size,
             self.discard_alignment,
+            self.punch_supported,
             Arc::clone(&self.health),
         )
     }
@@ -503,7 +518,8 @@ impl BufferedWritebackController {
             backend,
             WritebackLimit::new(hard_budget_bytes),
             page_size,
-            Some(page_size),
+            page_size,
+            true,
             Arc::new(SharedHealth::new()),
         )
     }
@@ -512,21 +528,13 @@ impl BufferedWritebackController {
         backend: Arc<dyn WritebackBackend>,
         limit: WritebackLimit,
         page_size: u64,
-        discard_alignment: Option<u64>,
+        discard_alignment: u64,
+        punch_supported: bool,
         health: Arc<SharedHealth>,
     ) -> io::Result<Self> {
         let hard_budget_bytes = limit.maximum_bytes();
         validate_policy(hard_budget_bytes, page_size)?;
-        // Without a safe alignment the controller never punches, so the page size only shapes
-        // the advertised granularity.
-        let punch_unsupported = discard_alignment.is_none();
-        let discard_alignment = discard_alignment.unwrap_or(page_size);
-        if !discard_alignment.is_power_of_two() || discard_alignment < page_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "discard alignment must be a power of two no smaller than the page size",
-            ));
-        }
+        debug_assert!(discard_alignment.is_power_of_two() && discard_alignment >= page_size);
         let queue_capacity = queue_capacity(hard_budget_bytes);
         let (job_sender, job_receiver) = bounded(queue_capacity);
         let (completion_sender, completion_receiver) = bounded(queue_capacity + 1);
@@ -547,7 +555,7 @@ impl BufferedWritebackController {
             limit,
             page_size,
             discard_alignment,
-            punch_unsupported,
+            punch_unsupported: !punch_supported,
             backend,
             tracked: ExtentSet::default(),
             current_generation: 0,
@@ -596,14 +604,7 @@ impl BufferedWritebackController {
                 // generation and stop admitting even hot rewrites until completed writeback has
                 // brought this controller beneath its new target.
                 if !self.current_extents.is_empty() {
-                    if let Err(error) = self.submit_current_generation() {
-                        self.latch_error(&error);
-                        return Err(self
-                            .latched_error
-                            .as_ref()
-                            .expect("submission failure must latch an error")
-                            .to_io_error());
-                    }
+                    self.submit_or_latch()?;
                     continue;
                 }
                 if self.has_in_flight_generations() {
@@ -630,14 +631,7 @@ impl BufferedWritebackController {
             }
 
             if !self.current_extents.is_empty() {
-                if let Err(error) = self.submit_current_generation() {
-                    self.latch_error(&error);
-                    return Err(self
-                        .latched_error
-                        .as_ref()
-                        .expect("submission failure must latch an error")
-                        .to_io_error());
-                }
+                self.submit_or_latch()?;
                 continue;
             }
             if !self.has_in_flight_generations() {
@@ -776,14 +770,7 @@ impl BufferedWritebackController {
         // Punching inside an extent splits it. Submit a generation that has grown past its extent
         // bound so a run of discards cannot outgrow the per-job range limit.
         if self.current_extents.ranges.len() > MAX_EXTENTS_PER_GENERATION {
-            if let Err(error) = self.submit_current_generation() {
-                self.latch_error(&error);
-                return Err(self
-                    .latched_error
-                    .as_ref()
-                    .expect("submission failure must latch an error")
-                    .to_io_error());
-            }
+            self.submit_or_latch()?;
         }
         Ok(())
     }
@@ -930,6 +917,19 @@ impl BufferedWritebackController {
             status: GenerationStatus::InFlight,
         });
         self.current_generation = next_generation;
+        Ok(())
+    }
+
+    /// Submits the open generation, latching a failure so later mutations also fail closed.
+    fn submit_or_latch(&mut self) -> io::Result<()> {
+        if let Err(error) = self.submit_current_generation() {
+            self.latch_error(&error);
+            return Err(self
+                .latched_error
+                .as_ref()
+                .expect("submission failure must latch an error")
+                .to_io_error());
+        }
         Ok(())
     }
 
@@ -1112,11 +1112,11 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
 /// A punch that starts or ends inside a filesystem block makes the kernel zero that partial block
 /// in the page cache, which would dirty pages the controller has not reserved. `st_blksize` may
 /// report a preferred I/O size above the block size, which only coarsens the alignment. A value
-/// that no power-of-two range can be aligned to, such as a 12 KiB XFS realtime extent, disables
-/// punching rather than risk a partial unit.
+/// that no power-of-two range can be aligned to, such as a 12 KiB XFS realtime extent, or one
+/// above [`MAX_DISCARD_ALIGNMENT_BYTES`] disables punching.
 #[cfg(target_os = "linux")]
 fn discard_alignment(page_size: u64, block_size: u64) -> Option<u64> {
-    (block_size.is_power_of_two() && block_size <= MINIMUM_WRITEBACK_BUDGET_BYTES)
+    (block_size.is_power_of_two() && block_size <= MAX_DISCARD_ALIGNMENT_BYTES)
         .then(|| page_size.max(block_size))
 }
 
@@ -1540,8 +1540,14 @@ mod tests {
     fn linux_backend_punches_without_changing_size_or_neighbors() {
         use std::os::unix::fs::MetadataExt;
 
+        // Size everything from the real alignment: with 64 KiB pages on tmpfs, a 4 KiB layout
+        // fits in one page and the punch could not deallocate anything.
         let backing = TempFile::new().unwrap();
-        let length = TEST_PAGE_SIZE * 4;
+        let page_size = host_page_size().unwrap();
+        let unit = discard_alignment(page_size, backing.as_file().metadata().unwrap().blksize())
+            .unwrap_or(page_size);
+        let length = unit * 4;
+        backing.as_file().set_len(length).unwrap();
         backing
             .as_file()
             .write_all_at(&vec![0xa5; length as usize], 0)
@@ -1554,8 +1560,8 @@ mod tests {
         };
         backend
             .punch_hole(DirtyRange {
-                start: TEST_PAGE_SIZE,
-                end: TEST_PAGE_SIZE * 3,
+                start: unit,
+                end: unit * 3,
             })
             .unwrap();
 
@@ -1564,10 +1570,10 @@ mod tests {
         assert!(metadata.blocks() < allocated, "punch must deallocate");
         let mut bytes = vec![0; length as usize];
         backing.as_file().read_exact_at(&mut bytes, 0).unwrap();
-        let page = TEST_PAGE_SIZE as usize;
-        assert!(bytes[..page].iter().all(|byte| *byte == 0xa5));
-        assert!(bytes[page..3 * page].iter().all(|byte| *byte == 0));
-        assert!(bytes[3 * page..].iter().all(|byte| *byte == 0xa5));
+        let unit = unit as usize;
+        assert!(bytes[..unit].iter().all(|byte| *byte == 0xa5));
+        assert!(bytes[unit..3 * unit].iter().all(|byte| *byte == 0));
+        assert!(bytes[3 * unit..].iter().all(|byte| *byte == 0xa5));
     }
 
     #[cfg(target_os = "linux")]
@@ -1580,24 +1586,19 @@ mod tests {
         assert_eq!(discard_alignment(4096, 0), None);
         assert_eq!(discard_alignment(4096, 3 * 4096), None);
         assert_eq!(
-            discard_alignment(4096, MINIMUM_WRITEBACK_BUDGET_BYTES * 2),
+            discard_alignment(4096, MAX_DISCARD_ALIGNMENT_BYTES),
+            Some(MAX_DISCARD_ALIGNMENT_BYTES)
+        );
+        assert_eq!(
+            discard_alignment(4096, MAX_DISCARD_ALIGNMENT_BYTES * 2),
             None
         );
     }
 
     #[test]
     fn punch_retires_credit_for_exactly_the_punched_range() {
-        let backend = Arc::new(FakeBackend::default());
-        let mut controller = BufferedWritebackController::spawn(
-            backend.clone(),
-            MINIMUM_WRITEBACK_BUDGET_BYTES,
-            TEST_PAGE_SIZE,
-        )
-        .unwrap();
-        let reservation = controller.plan_write(0, TEST_PAGE_SIZE * 3).unwrap();
-        controller
-            .finish_write(reservation, WritebackOutcome::Written(TEST_PAGE_SIZE * 3))
-            .unwrap();
+        let (backend, mut controller) = fake_controller(TEST_PAGE_SIZE, true);
+        write_tracked(&mut controller, 0, TEST_PAGE_SIZE * 3);
 
         controller
             .punch_hole(TEST_PAGE_SIZE, TEST_PAGE_SIZE)
@@ -1631,17 +1632,8 @@ mod tests {
 
     #[test]
     fn punch_of_untracked_range_leaves_accounting_unchanged() {
-        let backend = Arc::new(FakeBackend::default());
-        let mut controller = BufferedWritebackController::spawn(
-            backend.clone(),
-            MINIMUM_WRITEBACK_BUDGET_BYTES,
-            TEST_PAGE_SIZE,
-        )
-        .unwrap();
-        let reservation = controller.plan_write(0, 512).unwrap();
-        controller
-            .finish_write(reservation, WritebackOutcome::Written(512))
-            .unwrap();
+        let (backend, mut controller) = fake_controller(TEST_PAGE_SIZE, true);
+        write_tracked(&mut controller, 0, 512);
 
         controller
             .punch_hole(TEST_PAGE_SIZE * 8, TEST_PAGE_SIZE * 8)
@@ -1661,10 +1653,7 @@ mod tests {
             TEST_PAGE_SIZE,
         )
         .unwrap();
-        let first = controller.plan_write(0, MINIMUM_RETIREMENT_BYTES).unwrap();
-        controller
-            .finish_write(first, WritebackOutcome::Written(MINIMUM_RETIREMENT_BYTES))
-            .unwrap();
+        write_tracked(&mut controller, 0, MINIMUM_RETIREMENT_BYTES);
         controller.submit_current_generation().unwrap();
         backend.wait_for_calls(1);
 
@@ -1674,10 +1663,7 @@ mod tests {
             controller.tracked.bytes,
             MINIMUM_RETIREMENT_BYTES - TEST_PAGE_SIZE * 2
         );
-        let rewrite = controller.plan_write(0, TEST_PAGE_SIZE).unwrap();
-        controller
-            .finish_write(rewrite, WritebackOutcome::Written(TEST_PAGE_SIZE))
-            .unwrap();
+        write_tracked(&mut controller, 0, TEST_PAGE_SIZE);
         assert_eq!(
             controller.tracked.bytes,
             MINIMUM_RETIREMENT_BYTES - TEST_PAGE_SIZE
@@ -1741,18 +1727,9 @@ mod tests {
 
     #[test]
     fn failed_punch_keeps_credit_without_latching() {
-        let backend = Arc::new(FakeBackend::default());
+        let (backend, mut controller) = fake_controller(TEST_PAGE_SIZE, true);
         backend.fail_next_punch(io::ErrorKind::Other);
-        let mut controller = BufferedWritebackController::spawn(
-            backend.clone(),
-            MINIMUM_WRITEBACK_BUDGET_BYTES,
-            TEST_PAGE_SIZE,
-        )
-        .unwrap();
-        let reservation = controller.plan_write(0, TEST_PAGE_SIZE).unwrap();
-        controller
-            .finish_write(reservation, WritebackOutcome::Written(TEST_PAGE_SIZE))
-            .unwrap();
+        write_tracked(&mut controller, 0, TEST_PAGE_SIZE);
 
         assert_eq!(
             controller.punch_hole(0, TEST_PAGE_SIZE).unwrap_err().kind(),
@@ -1770,18 +1747,9 @@ mod tests {
 
     #[test]
     fn unsupported_punch_is_remembered_and_keeps_credit() {
-        let backend = Arc::new(FakeBackend::default());
+        let (backend, mut controller) = fake_controller(TEST_PAGE_SIZE, true);
         backend.fail_next_punch(io::ErrorKind::Unsupported);
-        let mut controller = BufferedWritebackController::spawn(
-            backend.clone(),
-            MINIMUM_WRITEBACK_BUDGET_BYTES,
-            TEST_PAGE_SIZE,
-        )
-        .unwrap();
-        let reservation = controller.plan_write(0, TEST_PAGE_SIZE).unwrap();
-        controller
-            .finish_write(reservation, WritebackOutcome::Written(TEST_PAGE_SIZE))
-            .unwrap();
+        write_tracked(&mut controller, 0, TEST_PAGE_SIZE);
 
         for _ in 0..2 {
             assert_eq!(
@@ -1796,15 +1764,7 @@ mod tests {
 
     #[test]
     fn punch_rejects_unaligned_ranges_and_pending_reservations() {
-        let backend = Arc::new(FakeBackend::default());
-        let mut controller = BufferedWritebackController::spawn_with_health(
-            backend.clone(),
-            WritebackLimit::new(MINIMUM_WRITEBACK_BUDGET_BYTES),
-            TEST_PAGE_SIZE,
-            Some(TEST_PAGE_SIZE * 4),
-            Arc::new(SharedHealth::new()),
-        )
-        .unwrap();
+        let (backend, mut controller) = fake_controller(TEST_PAGE_SIZE * 4, true);
         assert_eq!(
             controller.punchable_range(512, TEST_PAGE_SIZE * 9 - 512),
             (TEST_PAGE_SIZE * 4, TEST_PAGE_SIZE * 8)
@@ -1841,33 +1801,11 @@ mod tests {
             .unwrap();
         controller.punch_hole(0, TEST_PAGE_SIZE * 4).unwrap();
         assert_eq!(controller.tracked.bytes, 0);
-
-        assert_eq!(
-            BufferedWritebackController::spawn_with_health(
-                Arc::new(FakeBackend::default()),
-                WritebackLimit::new(MINIMUM_WRITEBACK_BUDGET_BYTES),
-                TEST_PAGE_SIZE,
-                Some(TEST_PAGE_SIZE / 2),
-                Arc::new(SharedHealth::new()),
-            )
-            .err()
-            .unwrap()
-            .kind(),
-            io::ErrorKind::InvalidInput
-        );
     }
 
     #[test]
     fn missing_safe_alignment_never_punches() {
-        let backend = Arc::new(FakeBackend::default());
-        let mut controller = BufferedWritebackController::spawn_with_health(
-            backend.clone(),
-            WritebackLimit::new(MINIMUM_WRITEBACK_BUDGET_BYTES),
-            TEST_PAGE_SIZE,
-            None,
-            Arc::new(SharedHealth::new()),
-        )
-        .unwrap();
+        let (backend, mut controller) = fake_controller(TEST_PAGE_SIZE, false);
 
         assert_eq!(
             controller.punch_hole(0, TEST_PAGE_SIZE).unwrap_err().kind(),
@@ -1878,18 +1816,9 @@ mod tests {
 
     #[test]
     fn punch_fails_closed_after_a_writeback_error() {
-        let backend = Arc::new(FakeBackend::default());
+        let (backend, mut controller) = fake_controller(TEST_PAGE_SIZE, true);
         backend.fail_next_wait(io::ErrorKind::Other);
-        let mut controller = BufferedWritebackController::spawn(
-            backend.clone(),
-            MINIMUM_WRITEBACK_BUDGET_BYTES,
-            TEST_PAGE_SIZE,
-        )
-        .unwrap();
-        let reservation = controller.plan_write(0, 512).unwrap();
-        controller
-            .finish_write(reservation, WritebackOutcome::Written(512))
-            .unwrap();
+        write_tracked(&mut controller, 0, 512);
         assert!(controller.quiesce().is_err());
 
         assert_eq!(
@@ -2075,7 +2004,8 @@ mod tests {
             backend,
             limit.clone(),
             TEST_PAGE_SIZE,
-            Some(TEST_PAGE_SIZE),
+            TEST_PAGE_SIZE,
+            true,
             Arc::new(SharedHealth::new()),
         )
         .unwrap();
@@ -2106,7 +2036,8 @@ mod tests {
             backend.clone(),
             limit.clone(),
             TEST_PAGE_SIZE,
-            Some(TEST_PAGE_SIZE),
+            TEST_PAGE_SIZE,
+            true,
             Arc::new(SharedHealth::new()),
         )
         .unwrap();
@@ -2133,7 +2064,8 @@ mod tests {
             backend,
             limit.clone(),
             TEST_PAGE_SIZE,
-            Some(TEST_PAGE_SIZE),
+            TEST_PAGE_SIZE,
+            true,
             Arc::new(SharedHealth::new()),
         )
         .unwrap();
@@ -2583,11 +2515,32 @@ mod tests {
     }
 
     fn submit_small_generation(controller: &mut BufferedWritebackController, offset: u64) {
-        let reservation = controller.plan_write(offset, 512).unwrap();
-        controller
-            .finish_write(reservation, WritebackOutcome::Written(512))
-            .unwrap();
+        write_tracked(controller, offset, 512);
         controller.submit_current_generation().unwrap();
+    }
+
+    fn write_tracked(controller: &mut BufferedWritebackController, offset: u64, length: u64) {
+        let reservation = controller.plan_write(offset, length).unwrap();
+        controller
+            .finish_write(reservation, WritebackOutcome::Written(length))
+            .unwrap();
+    }
+
+    fn fake_controller(
+        discard_alignment: u64,
+        punch_supported: bool,
+    ) -> (Arc<FakeBackend>, BufferedWritebackController) {
+        let backend = Arc::new(FakeBackend::default());
+        let controller = BufferedWritebackController::spawn_with_health(
+            backend.clone(),
+            WritebackLimit::new(MINIMUM_WRITEBACK_BUDGET_BYTES),
+            TEST_PAGE_SIZE,
+            discard_alignment,
+            punch_supported,
+            Arc::new(SharedHealth::new()),
+        )
+        .unwrap();
+        (backend, controller)
     }
 
     fn bitmap_ranges(pages: &[bool]) -> Vec<DirtyRange> {

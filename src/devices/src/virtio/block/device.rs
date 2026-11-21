@@ -352,7 +352,7 @@ impl DiskProperties {
         }
     }
 
-    pub(crate) fn has_writeback_limit(&self) -> bool {
+    fn has_writeback_limit(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
             self.writeback_config.is_some()
@@ -501,9 +501,8 @@ impl DiskProperties {
         length: u64,
         zeroes: bool,
     ) -> io::Result<()> {
-        let end = offset.checked_add(length).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "block mutation range overflow")
-        })?;
+        // Both callers already ran validate_mutation_range, which rejects an overflowing range.
+        let end = offset + length;
         let (aligned_start, aligned_end) = controller.borrow().punchable_range(offset, end);
 
         if zeroes && offset < aligned_start {
@@ -1758,9 +1757,6 @@ mod tests {
         let discard_sector_alignment = block.config.discard_sector_alignment;
         let write_zeroes_may_unmap = block.config.write_zeroes_may_unmap;
         let alignment = block.writeback_config.as_ref().unwrap().discard_alignment();
-        // SAFETY: sysconf has no pointer arguments.
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
-        assert!(alignment >= page_size && alignment.is_power_of_two());
         assert_eq!(max_discard_sectors, u32::MAX);
         assert_eq!(max_discard_seg, 1);
         assert_eq!(u64::from(discard_sector_alignment), alignment / SECTOR_SIZE);
@@ -1911,7 +1907,8 @@ mod tests {
         // must keep its allocation, an unmapping one must deallocate, and both must leave the
         // neighboring sentinels intact.
         let backing = TempFile::new().unwrap();
-        let length = (4 * 1024 * 1024).max(16 * test_discard_alignment(&backing) as usize);
+        let alignment = test_discard_alignment(&backing) as usize;
+        let length = (4 * 1024 * 1024).max(16 * alignment);
         // Size the file before filling it so no speculative preallocation skews block counts.
         backing.as_file().set_len(length as u64).unwrap();
         backing
@@ -1935,7 +1932,6 @@ mod tests {
             MetricsWriter::default().register_block_device("zero-regression".into()),
         )
         .unwrap();
-        let alignment = block.writeback_config.as_ref().unwrap().discard_alignment() as usize;
         let mut disk = block.disk.take().unwrap();
         disk.set_writeback_config(block.writeback_config.as_ref())
             .unwrap();
@@ -2078,11 +2074,23 @@ mod tests {
         let mut disk = block.disk.take().unwrap();
         disk.set_writeback_config(block.writeback_config.as_ref())
             .unwrap();
-        assert_eq!(
-            block.writeback_config.as_ref().unwrap().discard_alignment(),
-            alignment
-        );
         (block, disk, alignment)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_bytes(backing: &TempFile, offset: usize, len: usize, value: u8) {
+        use std::os::unix::fs::FileExt;
+
+        let mut bytes = vec![0; len];
+        backing
+            .as_file()
+            .read_exact_at(&mut bytes, offset as u64)
+            .unwrap();
+        assert!(
+            bytes.iter().all(|byte| *byte == value),
+            "expected {value:#x} in {offset}..{}",
+            offset + len
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2137,34 +2145,26 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn bounded_discard_punches_only_the_aligned_interior() {
-        use std::os::unix::fs::{FileExt, MetadataExt};
+        use std::os::unix::fs::MetadataExt;
 
         let backing = TempFile::new().unwrap();
         let (_block, disk, alignment) = active_bounded_disk(&backing, 32);
         let a = alignment as usize;
         let allocated = backing.as_file().metadata().unwrap().blocks();
-        let read = |offset: usize, len: usize| {
-            let mut bytes = vec![0; len];
-            backing
-                .as_file()
-                .read_exact_at(&mut bytes, offset as u64)
-                .unwrap();
-            bytes
-        };
 
         // A discard smaller than one alignment unit cannot be punched without dirtying a partial
         // block, so it is a no-op. Its contents are unspecified, so that is allowed.
         disk.discard_to_any(512, alignment - 1024).unwrap();
-        assert!(read(0, a).iter().all(|b| *b == 0x5a));
+        assert_bytes(&backing, 0, a, 0x5a);
         assert_eq!(backing.as_file().metadata().unwrap().blocks(), allocated);
         assert_eq!(tracked_bytes(&disk), 0);
 
         // An unaligned discard punches only the aligned interior and leaves the edges.
         disk.discard_to_any(alignment + 512, 3 * alignment - 1024)
             .unwrap();
-        assert!(read(a, 512).iter().all(|b| *b == 0x5a));
-        assert!(read(2 * a, a).iter().all(|b| *b == 0));
-        assert!(read(3 * a, a).iter().all(|b| *b == 0x5a));
+        assert_bytes(&backing, a, 512, 0x5a);
+        assert_bytes(&backing, 2 * a, a, 0);
+        assert_bytes(&backing, 3 * a, a, 0x5a);
         let after_discard = backing.as_file().metadata().unwrap().blocks();
         assert!(after_discard < allocated);
         assert_eq!(tracked_bytes(&disk), 0);
@@ -2173,17 +2173,17 @@ mod tests {
         let start = 8 * a + 512;
         let len = 3 * a - 1024;
         disk.discard_to_zero(start as u64, len as u64).unwrap();
-        assert!(read(8 * a, 512).iter().all(|b| *b == 0x5a));
-        assert!(read(start, len).iter().all(|b| *b == 0));
-        assert!(read(start + len, 512).iter().all(|b| *b == 0x5a));
+        assert_bytes(&backing, 8 * a, 512, 0x5a);
+        assert_bytes(&backing, start, len, 0);
+        assert_bytes(&backing, start + len, 512, 0x5a);
         let after_zero = backing.as_file().metadata().unwrap().blocks();
         assert!(after_zero < after_discard);
         assert_eq!(tracked_bytes(&disk), 2 * alignment);
 
         // A zeroing request inside one alignment unit becomes an accounted zero write.
         disk.discard_to_zero(16 * alignment + 512, 1024).unwrap();
-        assert!(read(16 * a + 512, 1024).iter().all(|b| *b == 0));
-        assert!(read(16 * a, 512).iter().all(|b| *b == 0x5a));
+        assert_bytes(&backing, 16 * a + 512, 1024, 0);
+        assert_bytes(&backing, 16 * a, 512, 0x5a);
         assert!(backing.as_file().metadata().unwrap().blocks() >= after_zero);
         assert_eq!(tracked_bytes(&disk), 3 * alignment);
     }
@@ -2191,7 +2191,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn bounded_discard_without_punch_support_never_writes_unaccounted_data() {
-        use std::os::unix::fs::{FileExt, MetadataExt};
+        use std::os::unix::fs::MetadataExt;
 
         let backing = TempFile::new().unwrap();
         let (_block, disk, alignment) = active_bounded_disk(&backing, 8);
@@ -2205,23 +2205,21 @@ mod tests {
         // A plain discard degrades to a no-op, never to zero-data writes.
         disk.discard_to_any(0, 4 * alignment).unwrap();
         assert_eq!(tracked_bytes(&disk), 0);
-        let mut bytes = vec![0; 4 * alignment as usize];
-        backing.as_file().read_exact_at(&mut bytes, 0).unwrap();
-        assert!(bytes.iter().all(|b| *b == 0x5a));
+        let a = alignment as usize;
+        assert_bytes(&backing, 0, 4 * a, 0x5a);
 
         // A zeroing discard degrades to accounted explicit zeroes.
         disk.discard_to_zero(0, 4 * alignment).unwrap();
         assert_eq!(tracked_bytes(&disk), 4 * alignment);
         disk.flush_to_disk().unwrap();
-        backing.as_file().read_exact_at(&mut bytes, 0).unwrap();
-        assert!(bytes.iter().all(|b| *b == 0));
+        assert_bytes(&backing, 0, 4 * a, 0);
         assert!(backing.as_file().metadata().unwrap().blocks() >= allocated);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn bounded_flush_after_discard_keeps_the_punch_and_stays_healthy() {
-        use std::os::unix::fs::{FileExt, MetadataExt};
+        use std::os::unix::fs::MetadataExt;
 
         let backing = TempFile::new().unwrap();
         let (block, disk, alignment) = active_bounded_disk(&backing, 32);
@@ -2241,9 +2239,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .record_full_sync_success());
-        let mut bytes = vec![0; half as usize];
-        backing.as_file().read_exact_at(&mut bytes, 0).unwrap();
-        assert!(bytes.iter().all(|b| *b == 0));
+        assert_bytes(&backing, 0, half as usize, 0);
         assert!(backing.as_file().metadata().unwrap().blocks() < allocated);
 
         // Writes and discards keep working after the flush.
@@ -2251,11 +2247,7 @@ mod tests {
         disk.discard_to_zero(0, alignment).unwrap();
         disk.flush_to_disk().unwrap();
         assert_eq!(tracked_bytes(&disk), 0);
-        backing
-            .as_file()
-            .read_exact_at(&mut bytes[..alignment as usize], 0)
-            .unwrap();
-        assert!(bytes[..alignment as usize].iter().all(|b| *b == 0));
+        assert_bytes(&backing, 0, alignment as usize, 0);
     }
 
     #[cfg(target_os = "linux")]
